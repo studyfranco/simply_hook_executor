@@ -1,0 +1,73 @@
+[Unit]
+# Production systemd unit for simply_hook_executor.
+#
+# Install:
+#   sudo useradd --system --create-home --home-dir /var/lib/simply_hook_executor \
+#                --shell /usr/sbin/nologin hookrunner
+#   sudo install -m 0755 target/release/simply_hook_executor /usr/local/bin/
+#   sudo install -d -o hookrunner -g hookrunner /var/lib/simply_hook_executor
+#   sudo cp -r static /var/lib/simply_hook_executor/static
+#   sudo cp deploy/simply_hook_executor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now simply_hook_executor
+#
+# The bootstrap master key is printed once, at first start:
+#   sudo journalctl -u simply_hook_executor | grep -A2 BOOTSTRAP
+Description=Simply Hook Executor — secure hook execution daemon
+Documentation=https://github.com/studyfranco/simply_hook_executor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# Never root. Hook scripts inherit this identity, so `hookrunner` defines the blast radius of
+# every hook this daemon can run — grant it only what those scripts genuinely need (e.g. a
+# targeted sudoers rule for one command, rather than broad privileges).
+User=hookrunner
+Group=hookrunner
+
+# The daemon serves the SPA from ./static relative to its working directory.
+WorkingDirectory=/var/lib/simply_hook_executor
+ExecStart=/usr/local/bin/simply_hook_executor
+
+Environment=RUST_LOG=info
+Environment=DATABASE_URL=sqlite:///var/lib/simply_hook_executor/simply_hook_executor.db?mode=rwc
+# Variables hook sub-processes inherit; everything else is cleared before each spawn.
+Environment=ALLOWED_ENV_VARS=PATH,LANG,TERM
+Environment=LOG_RETENTION_DAYS=30
+# Optional overrides:
+#   Environment=RETENTION_SWEEP_SECONDS=3600
+#   Environment=MAX_OUTPUT_BYTES=1048576
+#   Environment=BOOTSTRAP_SUBNET=10.0.0.0/8
+
+Restart=on-failure
+RestartSec=5s
+
+# SIGTERM triggers the graceful shutdown path (drain in-flight executions, stop the retention
+# worker). The timeout is generous enough for a long-running hook to finish first.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# ── Hardening ───────────────────────────────────────────────────────────────
+# Deliberately conservative rather than maximal: this daemon's whole purpose is to run local
+# scripts, so filters that break `execve` or the filesystem paths those scripts need would make it
+# useless. Loosen individual settings if a hook legitimately requires more.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# The database, and nothing else, is writable.
+ReadWritePaths=/var/lib/simply_hook_executor
+
+# Listens on :3000. Front it with a reverse proxy for TLS; the daemon reads the client address
+# from X-Forwarded-For / X-Real-IP when enforcing an API key's bound CIDRs.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

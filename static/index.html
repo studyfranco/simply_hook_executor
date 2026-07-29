@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Simply Hook Executor — secure hook execution and orchestration dashboard.">
+    <title>Simply Hook Executor</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- Login Screen Overlay -->
+    <div id="login-screen" class="login-screen">
+        <div class="login-card">
+            <div class="logo">
+                <div class="logo-icon"></div>
+                <h1>Simply Hook Executor</h1>
+            </div>
+            <h2>Secure Execution Daemon</h2>
+            <p class="subtitle">Please enter your API key to access the dashboard.</p>
+            <form id="login-form" class="login-form">
+                <div class="form-group">
+                    <label for="login-key">API Key</label>
+                    <input type="password" id="login-key" placeholder="Enter X-API-Key..." required class="input-field">
+                </div>
+                <button type="submit" id="login-submit" class="btn btn-primary">Unlock Dashboard</button>
+            </form>
+            <div id="login-error" class="message error hidden"></div>
+        </div>
+    </div>
+
+    <!-- Main Dashboard Container -->
+    <div id="dashboard-container" class="container hidden">
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon"></div>
+                <h1>Simply Hook Executor</h1>
+            </div>
+            <div class="header-actions">
+                <span id="identity-badge" class="badge badge-scope"></span>
+                <button id="refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
+                <button id="logout-btn" class="btn btn-logout">Logout</button>
+            </div>
+        </header>
+
+        <!-- Tab Navigation -->
+        <nav class="tab-nav" role="tablist">
+            <button class="tab-btn active" data-tab="executions" role="tab" aria-selected="true">Executions</button>
+            <button class="tab-btn" data-tab="hooks" id="hooks-tab-btn" role="tab" aria-selected="false">Hooks Management</button>
+            <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
+            <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
+        </nav>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Executions / Dashboard                     -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-executions" class="tab-panel active">
+            <section class="stat-grid">
+                <div class="stat-tile">
+                    <span class="stat-label">Executions (loaded)</span>
+                    <span class="stat-value" id="stat-total">0</span>
+                </div>
+                <div class="stat-tile stat-success">
+                    <span class="stat-label">Success</span>
+                    <span class="stat-value" id="stat-success">0</span>
+                </div>
+                <div class="stat-tile stat-danger">
+                    <span class="stat-label">Failed</span>
+                    <span class="stat-value" id="stat-failed">0</span>
+                </div>
+                <div class="stat-tile stat-warning">
+                    <span class="stat-label">Timeout</span>
+                    <span class="stat-value" id="stat-timeout">0</span>
+                </div>
+                <div class="stat-tile">
+                    <span class="stat-label">Avg duration</span>
+                    <span class="stat-value" id="stat-duration">–</span>
+                </div>
+            </section>
+
+            <div class="grid-layout">
+                <section class="card form-section" id="run-hook-section">
+                    <h2>Run a Hook</h2>
+                    <p class="subtitle">Pick a hook, fill its parameters, then dry-run or execute it.</p>
+
+                    <div class="form-group">
+                        <label for="run-hook-search">Hook <span>*</span></label>
+                        <div class="combobox" id="run-hook-combobox">
+                            <input type="text" id="run-hook-search" class="input-field combobox-input" placeholder="-- Select Hook --" autocomplete="off">
+                            <input type="hidden" id="run-hook-id">
+                            <div class="combobox-menu hidden"></div>
+                        </div>
+                    </div>
+
+                    <div id="run-hook-meta" class="hook-meta hidden"></div>
+
+                    <form id="run-hook-form" class="manage-form">
+                        <div id="run-hook-params" class="param-fields">
+                            <p class="text-muted text-sm">Select a hook to see its parameters.</p>
+                        </div>
+
+                        <div class="form-actions">
+                            <button type="button" id="btn-test-hook" class="btn btn-secondary" disabled>Dry Run</button>
+                            <button type="submit" id="btn-execute-hook" class="btn btn-primary" disabled>Execute</button>
+                        </div>
+                    </form>
+
+                    <div id="run-hook-result" class="hidden"></div>
+                </section>
+
+                <section class="card list-section">
+                    <div class="list-header">
+                        <h2>Execution History</h2>
+                        <div class="filters">
+                            <div class="combobox" id="exec-hook-filter-combobox">
+                                <input type="text" id="exec-hook-filter" placeholder="Filter by hook..." class="input-field combobox-input" autocomplete="off">
+                                <div class="combobox-menu hidden"></div>
+                            </div>
+                            <select id="exec-status-filter" class="input-field select-field">
+                                <option value="">All Statuses</option>
+                                <option value="SUCCESS">Success</option>
+                                <option value="FAILED">Failed</option>
+                                <option value="TIMEOUT">Timeout</option>
+                            </select>
+                            <button type="button" id="exec-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
+                        </div>
+                    </div>
+
+                    <div class="batch-actions">
+                        <button type="button" id="delete-selected-executions" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                    </div>
+
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="select-all-executions" title="Select all"></th>
+                                    <th>Time</th>
+                                    <th>Hook</th>
+                                    <th>Status</th>
+                                    <th>Exit</th>
+                                    <th>Duration</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="executions-table-body">
+                                <tr>
+                                    <td colspan="7" class="text-center text-muted">Loading data...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="pagination">
+                        <button id="exec-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
+                        <span id="exec-page-indicator">Page 1</span>
+                        <button id="exec-btn-next" class="btn btn-icon">Next &raquo;</button>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Hooks Management                           -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-hooks" class="tab-panel">
+            <div class="admin-grid">
+                <section class="card admin-section" id="hooks-section">
+                    <h2>Hooks</h2>
+                    <p class="subtitle">Define the executables this daemon is allowed to run.</p>
+
+                    <form id="form-create-hook" class="admin-form">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="hook-name">Hook Name <span>*</span></label>
+                                <input type="text" id="hook-name" placeholder="e.g. nftables_ban" required class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="hook-timeout">Timeout (seconds) <span>*</span></label>
+                                <input type="number" id="hook-timeout" value="30" min="1" max="86400" required class="input-field">
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label for="hook-script-path">Script Path (absolute) <span>*</span></label>
+                                <input type="text" id="hook-script-path" placeholder="/usr/local/bin/ban.sh" required class="input-field">
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label for="hook-description">Description</label>
+                                <textarea id="hook-description" class="input-field" rows="2" placeholder="What does this hook do?"></textarea>
+                            </div>
+                        </div>
+                        <div class="form-actions mt-4">
+                            <button type="submit" class="btn btn-primary">Create Hook</button>
+                        </div>
+                    </form>
+
+                    <div class="batch-actions">
+                        <button type="button" id="delete-selected-hooks" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                    </div>
+
+                    <div class="table-container mt-4">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="select-all-hooks" title="Select all"></th>
+                                    <th>Name</th>
+                                    <th>Script Path</th>
+                                    <th>Timeout</th>
+                                    <th>Parameters</th>
+                                    <th>Your Rights</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="hooks-table-body">
+                                <tr>
+                                    <td colspan="7" class="text-center text-muted">No hooks loaded.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: API Keys & Permissions                     -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-keys" class="tab-panel">
+            <div class="admin-grid">
+                <section class="card admin-section" id="apikey-section">
+                    <h2>API Keys</h2>
+                    <p class="subtitle">Create and manage API keys, their global scopes, and their execution budgets.</p>
+
+                    <form id="form-create-apikey" class="admin-form">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="apikey-name">Key Name <span>*</span></label>
+                                <input type="text" id="apikey-name" placeholder="e.g. Vault Webhook Client" required class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="apikey-max-jobs">Max Concurrent Jobs <span>*</span></label>
+                                <input type="number" id="apikey-max-jobs" value="10" min="1" max="1000" required class="input-field">
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
+                                <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
+                            </div>
+                        </div>
+
+                        <div class="permissions-grid mt-2 mb-4">
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-is-master">
+                                <span class="checkmark"></span>
+                                Master Access
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-manage-keys">
+                                <span class="checkmark"></span>
+                                Manage Keys
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-manage-hooks">
+                                <span class="checkmark"></span>
+                                Create Hooks
+                            </label>
+                        </div>
+
+                        <div class="form-actions mt-4">
+                            <button type="submit" class="btn btn-primary">Create API Key</button>
+                        </div>
+                    </form>
+
+                    <div id="apikey-created" class="key-reveal hidden">
+                        <p class="key-reveal-label">New API Key (copy now):</p>
+                        <code id="apikey-plaintext" class="key-reveal-value"></code>
+                    </div>
+
+                    <div class="batch-actions">
+                        <button type="button" id="delete-selected-keys" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                    </div>
+
+                    <div class="table-container mt-4">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="select-all-keys" title="Select all"></th>
+                                    <th>Name</th>
+                                    <th>Bound IPs</th>
+                                    <th>Jobs</th>
+                                    <th>Scopes &amp; Hook Permissions</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="apikeys-table-body">
+                                <tr>
+                                    <td colspan="6" class="text-center text-muted">No API keys loaded.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Grant hook rights to an existing key -->
+                    <div class="mt-4 pt-4" style="border-top: 1px solid var(--border);">
+                        <h4>Manage Hook Rights</h4>
+                        <p class="subtitle text-sm">Grant a specific key execute/manage rights on a specific hook.</p>
+                        <form id="form-manage-rights" class="admin-form">
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="manage-rights-key">Target Key <span>*</span></label>
+                                    <select id="manage-rights-key" class="input-field select-field" required>
+                                        <option value="">-- Select API Key --</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="manage-rights-hook-search">Hook <span>*</span></label>
+                                    <div class="combobox" id="manage-rights-hook-combobox">
+                                        <input type="text" id="manage-rights-hook-search" class="input-field combobox-input" placeholder="-- Select Hook --" autocomplete="off" required>
+                                        <input type="hidden" id="manage-rights-hook">
+                                        <div class="combobox-menu hidden"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="permissions-grid mt-2 mb-4">
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="manage-rights-execute" checked>
+                                    <span class="checkmark"></span> Execute
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="manage-rights-manage">
+                                    <span class="checkmark"></span> Manage
+                                </label>
+                            </div>
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-secondary">Assign Hook Rights</button>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: System Settings                            -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-settings" class="tab-panel">
+            <div class="admin-grid">
+                <section class="card admin-section">
+                    <h2>Runtime Configuration</h2>
+                    <p class="subtitle">Read-only view of the daemon's environment-driven settings.</p>
+                    <div id="settings-grid" class="kv-grid">
+                        <p class="text-muted text-sm">Loading settings...</p>
+                    </div>
+
+                    <div class="mt-4 pt-4" style="border-top: 1px solid var(--border);">
+                        <h4>Purge Execution History</h4>
+                        <p class="subtitle text-sm">Run the retention sweep now, instead of waiting for the background worker.</p>
+                        <form id="form-purge" class="admin-form">
+                            <div class="form-row">
+                                <div class="form-group form-group-grow">
+                                    <label for="purge-days">Delete executions older than (days)</label>
+                                    <input type="number" id="purge-days" min="0" class="input-field" placeholder="defaults to LOG_RETENTION_DAYS">
+                                </div>
+                                <div class="form-group form-group-action">
+                                    <label class="label-spacer">&nbsp;</label>
+                                    <button type="submit" class="btn btn-danger">Purge Now</button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+
+                <section class="card admin-section">
+                    <h2>Audit Logs</h2>
+                    <p class="subtitle">Every mutating configuration change and execution request. Master keys only.</p>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>API Key</th>
+                                    <th>Client IP</th>
+                                    <th>Action</th>
+                                    <th>Target</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="audit-logs-table-body">
+                                <tr>
+                                    <td colspan="6" class="text-center text-muted">Loading data...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pagination">
+                        <button id="audit-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
+                        <span id="audit-page-indicator">Page 1</span>
+                        <button id="audit-btn-next" class="btn btn-icon">Next &raquo;</button>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Execution Detail Modal -->
+    <div id="execution-modal" class="modal-overlay hidden">
+        <div class="modal-card modal-card-wide card">
+            <h3>Execution Detail</h3>
+            <div id="execution-modal-body"></div>
+            <div class="form-actions mt-4">
+                <button type="button" id="execution-modal-close" class="btn btn-primary">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hook Parameters Modal -->
+    <div id="params-modal" class="modal-overlay hidden">
+        <div class="modal-card modal-card-wide card">
+            <h3 id="params-modal-title">Hook Parameters</h3>
+            <p class="subtitle">Parameters are injected as <code>HOOK_PARAM_&lt;KEY&gt;</code> and, in this order, as positional CLI arguments.</p>
+
+            <form id="form-add-param" class="admin-form">
+                <input type="hidden" id="params-modal-hook-id">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="param-key">Key <span>*</span></label>
+                        <input type="text" id="param-key" placeholder="target_address" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="param-default">Default Value</label>
+                        <input type="text" id="param-default" placeholder="(none)" class="input-field">
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="param-description">Description</label>
+                        <input type="text" id="param-description" class="input-field">
+                    </div>
+                </div>
+                <div class="permissions-grid mt-2 mb-4">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="param-required" checked>
+                        <span class="checkmark"></span> Required
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Add Parameter</button>
+                </div>
+            </form>
+
+            <div class="table-container mt-4">
+                <table class="data-table">
+                    <thead>
+                        <tr><th>#</th><th>Key</th><th>Default</th><th>Required</th><th>Description</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody id="params-table-body"></tbody>
+                </table>
+            </div>
+
+            <div class="form-actions mt-4">
+                <button type="button" id="params-modal-close" class="btn btn-secondary">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Hook Modal -->
+    <div id="edit-hook-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>Edit Hook</h3>
+            <form id="form-edit-hook">
+                <input type="hidden" id="edit-hook-id">
+                <div class="form-group">
+                    <label for="edit-hook-name">Hook Name <span>*</span></label>
+                    <input type="text" id="edit-hook-name" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-hook-script-path">Script Path <span>*</span></label>
+                    <input type="text" id="edit-hook-script-path" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-hook-timeout">Timeout (seconds) <span>*</span></label>
+                    <input type="number" id="edit-hook-timeout" min="1" max="86400" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-hook-description">Description</label>
+                    <textarea id="edit-hook-description" class="input-field" rows="2"></textarea>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="button" id="edit-hook-cancel" class="btn btn-secondary">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Edit API Key Modal -->
+    <div id="edit-key-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>Edit API Key</h3>
+            <form id="form-edit-key">
+                <input type="hidden" id="edit-key-id">
+                <div class="form-group">
+                    <label for="edit-key-name">Key Name <span>*</span></label>
+                    <input type="text" id="edit-key-name" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-key-bound-ips">Bound IPs (CIDR)</label>
+                    <textarea id="edit-key-bound-ips" class="input-field" rows="2"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="edit-key-max-jobs">Max Concurrent Jobs</label>
+                    <input type="number" id="edit-key-max-jobs" min="1" max="1000" class="input-field">
+                </div>
+                <div class="permissions-grid mt-2 mb-4">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-key-can-manage-keys">
+                        <span class="checkmark"></span> Manage Keys
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-key-can-manage-hooks">
+                        <span class="checkmark"></span> Create Hooks
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="button" id="edit-key-cancel" class="btn btn-secondary">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Secret Reveal Modal (used after key rotation) -->
+    <div id="secret-reveal-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>New Secret Generated</h3>
+            <p class="subtitle">Copy this key now — it will not be shown again.</p>
+            <code id="secret-reveal-value" class="key-reveal-value"></code>
+            <div class="form-actions mt-4">
+                <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Confirmation Modal (replaces native window.confirm()) -->
+    <div id="confirm-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3 id="confirm-modal-title">Are you sure?</h3>
+            <p id="confirm-modal-message" class="subtitle"></p>
+            <div class="modal-actions mt-4">
+                <button type="button" id="confirm-modal-cancel" class="btn btn-secondary">Cancel</button>
+                <button type="button" id="confirm-modal-confirm" class="btn btn-danger">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container" class="toast-container"></div>
+    <script src="app.js"></script>
+</body>
+</html>
