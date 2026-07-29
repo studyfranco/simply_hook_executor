@@ -5,13 +5,19 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use common::*;
 use hmac::{Hmac, KeyInit, Mac};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, PaginatorTrait};
+use sea_orm::EntityTrait;
 use serde_json::json;
 use sha2::Sha256;
-use simply_hook_executor::{create_app, entities::execution};
+use simply_hook_executor::{
+    config::RuntimeConfig, create_app, entities::prelude::Execution,
+    retention::purge_expired_executions, spawn_retention_worker, state::AppState,
+};
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────
@@ -91,6 +97,74 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
 
     // Malformed signature header: rejected.
     assert_eq!(send(&app, signed("sha256=deadbeef", &body)).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn hmac_signature_failures_are_rejected_without_executing_anything() {
+    let dir = ScriptDir::new();
+    let side_effect = dir.path_for("must-not-run");
+    let script = dir.write_script("signed_fail.sh", &format!("touch \"{side_effect}\""));
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Signer", "0.0.0.0/0", KeyScopes::plain()).await;
+    // A second valid key: a signature made with *someone else's* valid secret must not pass.
+    let (_, other_key) = insert_key(&db, "Other Signer", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "signed_fail", &script, 30).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let sign = |secret: &str, payload: &str| {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+        mac.update(payload.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    };
+
+    let request = |sig: &str, payload: &str| {
+        with_connect_info(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/hooks/{hook_id}/execute"))
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json")
+                .header("X-Signature-256", sig),
+        )
+        .body(axum::body::Body::from(payload.to_owned()))
+        .expect("request builds")
+    };
+
+    let body = json!({ "parameters": {} }).to_string();
+    let valid = sign(&key, &body);
+
+    // Every one of these presents a *valid* API key — only the signature is wrong, so each must
+    // still be rejected at the authentication layer.
+    let rejected: Vec<(&str, String, String)> = vec![
+        ("tampered body", valid.clone(), json!({ "parameters": { "x": "1" } }).to_string()),
+        ("body with trailing whitespace", valid.clone(), format!("{body} ")),
+        ("signature from another valid key", sign(&other_key, &body), body.clone()),
+        ("signature of a different payload", sign(&key, "{}"), body.clone()),
+        ("missing sha256= prefix", valid.trim_start_matches("sha256=").to_owned(), body.clone()),
+        ("wrong algorithm prefix", format!("sha1={}", &valid[7..]), body.clone()),
+        ("non-hex digest", "sha256=zzzz".to_owned(), body.clone()),
+        ("empty digest", "sha256=".to_owned(), body.clone()),
+        ("truncated digest", format!("sha256={}", &valid[7..20]), body.clone()),
+    ];
+
+    for (label, signature, payload) in rejected {
+        let response = send(&app, request(&signature, &payload)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "{label} should have been rejected with 401"
+        );
+    }
+
+    // Rejection happens before the engine is reached: nothing ran, nothing was recorded.
+    assert!(!std::path::Path::new(&side_effect).exists(), "a rejected request must not spawn the script");
+    assert_eq!(execution_count(&db).await, 0);
+
+    // The control case still works, proving the hook itself was executable all along.
+    assert_eq!(send(&app, request(&valid, &body)).await.status, StatusCode::OK);
+    assert_eq!(execution_count(&db).await, 1);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -466,6 +540,98 @@ async fn exceeding_max_concurrent_jobs_returns_429() {
     assert_eq!(third.status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
+    let dir = ScriptDir::new();
+    // Long enough that a queued (rather than rejected) request would be visibly slow.
+    let script = dir.write_script("saturate.sh", "touch \"$HOOK_PARAM_MARKER\"\nsleep 5");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let budget = 2;
+    let (key_id, key) = insert_key(&db, "Peak", "0.0.0.0/0", KeyScopes::plain().with_jobs(budget)).await;
+    let hook_id = insert_hook(&db, "saturate", &script, 30).await;
+    insert_parameter(&db, hook_id, "marker", None, true).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+
+    // Fill every slot, each job announcing itself through its own marker file.
+    let markers: Vec<String> = (0..budget).map(|i| dir.path_for(&format!("slot-{i}"))).collect();
+    let occupying: Vec<_> = markers
+        .iter()
+        .map(|marker| {
+            let app = app.clone();
+            let key = key.clone();
+            let uri = uri.clone();
+            let body = json!({ "parameters": { "marker": marker } });
+            tokio::spawn(async move { send(&app, json_request("POST", &uri, &key, Some(body))).await })
+        })
+        .collect();
+
+    let saturated = wait_until(Duration::from_secs(15), async || {
+        markers.iter().all(|m| std::path::Path::new(m).exists())
+    })
+    .await;
+    assert!(saturated, "the budget was never fully occupied");
+
+    // Now hammer it well past the budget, all at once.
+    let burst_size = 12;
+    let started = std::time::Instant::now();
+    let burst: Vec<_> = (0..burst_size)
+        .map(|i| {
+            let app = app.clone();
+            let key = key.clone();
+            let uri = uri.clone();
+            let body = json!({ "parameters": { "marker": dir.path_for(&format!("burst-{i}")) } });
+            tokio::spawn(async move { send(&app, json_request("POST", &uri, &key, Some(body))).await })
+        })
+        .collect();
+
+    let mut rejected = 0;
+    for task in burst {
+        let response = task.await.expect("burst request task completes");
+        assert_eq!(
+            response.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "every over-budget request must be rejected, not admitted"
+        );
+        assert!(response.string("error").contains("Concurrency limit"));
+        rejected += 1;
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(rejected, burst_size);
+    // The occupying jobs sleep 5s. A burst that queued behind them could not have come back this
+    // fast, so this is what actually distinguishes "rejected immediately" from "served eventually".
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the burst should fail fast, but took {elapsed:?}"
+    );
+    // Nothing over budget was spawned: no burst marker exists.
+    for i in 0..burst_size {
+        assert!(
+            !std::path::Path::new(&dir.path_for(&format!("burst-{i}"))).exists(),
+            "a rejected request must not have started a process"
+        );
+    }
+    // ...and no history rows were written for them either.
+    assert_eq!(execution_count(&db).await, 0);
+
+    // Once the occupying jobs finish, the full budget is available again.
+    for task in occupying {
+        let response = task.await.expect("occupying request task completes");
+        assert_eq!(response.status, StatusCode::OK);
+    }
+    assert_eq!(execution_count(&db).await, u64::try_from(budget).expect("small budget"));
+
+    for i in 0..budget {
+        let body = json!({ "parameters": { "marker": dir.path_for(&format!("after-{i}")) } });
+        let response = send(&app, json_request("POST", &uri, &key, Some(body))).await;
+        assert_eq!(response.status, StatusCode::OK, "slot {i} was not released");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Validation (400)
 // ─────────────────────────────────────────────────────────────
@@ -508,7 +674,201 @@ async fn parameter_validation_rejects_missing_unknown_and_malformed_input() {
     assert_eq!(send(&app, malformed).await.status, StatusCode::BAD_REQUEST);
 
     // No execution row was created by any of the rejected requests.
-    assert_eq!(execution::Entity::find().count(&db).await.expect("count succeeds"), 0);
+    assert_eq!(execution_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn non_scalar_parameter_values_are_rejected() {
+    let dir = ScriptDir::new();
+    let side_effect = dir.path_for("ran-anyway");
+    let script = dir.write_script("scalar.sh", &format!("touch \"{side_effect}\""));
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "scalar_only", &script, 30).await;
+    insert_parameter(&db, hook_id, "value", None, true).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+
+    // An environment variable and an argv entry are both flat strings. Silently JSON-encoding a
+    // structure would hand the script something it never asked for, so these are hard errors.
+    let non_scalars = [
+        ("array", json!(["a", "b"])),
+        ("empty array", json!([])),
+        ("nested object", json!({ "inner": "value" })),
+        ("empty object", json!({})),
+        ("array of objects", json!([{ "a": 1 }])),
+        ("deeply nested", json!({ "a": { "b": { "c": [1, 2] } } })),
+    ];
+
+    for (label, value) in non_scalars {
+        let response = send(
+            &app,
+            json_request("POST", &uri, &key, Some(json!({ "parameters": { "value": value } }))),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{label} must be rejected");
+        assert!(
+            response.string("error").contains("value"),
+            "{label}: the error should name the offending parameter, got {:?}",
+            response.string("error")
+        );
+    }
+
+    // Scalars of every JSON flavour are accepted and stringified.
+    let scalars = [
+        (json!("text"), "text"),
+        (json!(42), "42"),
+        (json!(-1), "-1"),
+        (json!(3.5), "3.5"),
+        (json!(true), "true"),
+        (json!(false), "false"),
+    ];
+
+    for (value, expected) in scalars {
+        let response = send(
+            &app,
+            json_request("POST", &uri, &key, Some(json!({ "parameters": { "value": value } }))),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{value} should be accepted");
+        assert_eq!(response.field("parameters"), &json!({ "value": expected }));
+    }
+
+    assert!(std::path::Path::new(&side_effect).exists(), "the accepted runs did execute");
+}
+
+#[tokio::test]
+async fn json_null_is_treated_as_an_omitted_parameter() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("nulls.sh", "echo \"[$1][$2]\"");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "nulls", &script, 30).await;
+    insert_parameter(&db, hook_id, "defaulted", Some("fallback"), true).await;
+    insert_parameter(&db, hook_id, "optional", None, false).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+
+    // `null` means "I am not supplying this" — not "supply an empty string" — so the declared
+    // default still applies.
+    let with_null = send(
+        &app,
+        json_request(
+            "POST",
+            &uri,
+            &key,
+            Some(json!({ "parameters": { "defaulted": null, "optional": null } })),
+        ),
+    )
+    .await;
+    assert_eq!(with_null.status, StatusCode::OK);
+    assert_eq!(with_null.field("parameters"), &json!({ "defaulted": "fallback" }));
+    assert_eq!(with_null.string("stdout").trim(), "[fallback][]");
+
+    // An explicit empty string is distinguishable from `null`: it overrides the default.
+    let with_empty = send(
+        &app,
+        json_request("POST", &uri, &key, Some(json!({ "parameters": { "defaulted": "" } }))),
+    )
+    .await;
+    assert_eq!(with_empty.status, StatusCode::OK);
+    assert_eq!(with_empty.field("parameters"), &json!({ "defaulted": "" }));
+
+    // `null` on a required parameter with no default is still a missing parameter.
+    let required_id = insert_hook(&db, "nulls_required", &script, 30).await;
+    insert_parameter(&db, required_id, "mandatory", None, true).await;
+    grant(&db, key_id, required_id, true, false).await;
+    let missing = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{required_id}/execute"),
+            &key,
+            Some(json!({ "parameters": { "mandatory": null } })),
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert!(missing.string("error").contains("mandatory"));
+}
+
+#[tokio::test]
+async fn positional_argument_order_is_deterministic_and_append_only() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("order.sh", "echo \"$1|$2|$3|$4\"");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "ordered", &script, 30).await;
+    grant(&db, key_id, hook_id, true, true).await;
+
+    // Declared in an order that does NOT match alphabetical or reverse-alphabetical sorting, so a
+    // passing assertion can only mean declaration order is what's actually used.
+    for (param, default) in [("zulu", "z"), ("alpha", "a"), ("mike", "m")] {
+        let created = send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook_id}/parameters"),
+                &key,
+                Some(json!({ "param_key": param, "default_value": default })),
+            ),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::OK);
+    }
+
+    let expected = json!(["z", "a", "m"]);
+    let preview = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/test"), &key, None)).await;
+    assert_eq!(preview.json["command"]["args"], expected, "declaration order, not sorted order");
+
+    // Repeated calls must produce the identical vector — an unstable ORDER BY would show up here
+    // as an intermittent difference across runs.
+    for attempt in 0..5 {
+        let run = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+        assert_eq!(run.status, StatusCode::OK);
+        assert_eq!(run.string("stdout").trim(), "z|a|m|", "attempt {attempt} differed");
+
+        let preview = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/test"), &key, None)).await;
+        assert_eq!(preview.json["command"]["args"], expected, "attempt {attempt} differed");
+    }
+
+    // A parameter declared later appends to the end rather than reshuffling existing positions,
+    // so adding one cannot silently change what an existing caller's script receives as $1..$3.
+    let added = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/parameters"),
+            &key,
+            Some(json!({ "param_key": "bravo", "default_value": "b" })),
+        ),
+    )
+    .await;
+    assert_eq!(added.status, StatusCode::OK);
+
+    let run = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    assert_eq!(run.string("stdout").trim(), "z|a|m|b");
+
+    // Supplied values land in the same positions as their defaults did.
+    let run = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &key,
+            Some(json!({ "parameters": { "mike": "M!", "zulu": "Z!" } })),
+        ),
+    )
+    .await;
+    assert_eq!(run.string("stdout").trim(), "Z!|a|M!|b");
 }
 
 #[tokio::test]
@@ -634,7 +994,7 @@ async fn dry_run_previews_the_command_without_executing() {
     assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_BETA"], json!("fallback"));
 
     assert!(!std::path::Path::new(&side_effect).exists(), "a dry run must not spawn the script");
-    assert_eq!(execution::Entity::find().count(&db).await.expect("count succeeds"), 0);
+    assert_eq!(execution_count(&db).await, 0);
 
     // Missing requirements are reported as data, not as a 400.
     let blocked = send(
@@ -733,39 +1093,23 @@ async fn retention_purges_only_expired_executions() {
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
     let hook_id = insert_hook(&db, "aged", "/bin/true", 30).await;
 
-    let insert_execution = async |age_days: i64| {
-        execution::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            hook_id: Set(hook_id),
-            api_key_id: Set(None),
-            status: Set(execution::ExecutionStatus::Success),
-            exit_code: Set(Some(0)),
-            stdout: Set(String::new()),
-            stderr: Set(String::new()),
-            parameters_json: Set("{}".to_owned()),
-            duration_ms: Set(5),
-            timestamp: Set((chrono::Utc::now() - chrono::Duration::days(age_days)).naive_utc()),
-        }
-        .insert(&db)
-        .await
-        .expect("seeding an execution succeeds");
-    };
+    insert_execution_aged(&db, hook_id, 60).await;
+    insert_execution_aged(&db, hook_id, 45).await;
+    let recent = insert_execution_aged(&db, hook_id, 1).await;
 
-    insert_execution(60).await;
-    insert_execution(45).await;
-    insert_execution(1).await;
-
-    let purged = simply_hook_executor::retention::purge_expired_executions(&db, 30)
-        .await
-        .expect("purge succeeds");
+    let purged = purge_expired_executions(&db, 30).await.expect("purge succeeds");
     assert_eq!(purged, 2);
-    assert_eq!(execution::Entity::find().count(&db).await.expect("count succeeds"), 1);
+    assert_eq!(execution_count(&db).await, 1);
+    // The survivor is specifically the one inside the window, not merely "one row".
+    assert!(
+        Execution::find_by_id(recent).one(&db).await.expect("query succeeds").is_some(),
+        "the row inside the retention window must survive"
+    );
 
     // A retention window of 0 means "keep forever" and must delete nothing.
-    let noop = simply_hook_executor::retention::purge_expired_executions(&db, 0)
-        .await
-        .expect("purge succeeds");
+    let noop = purge_expired_executions(&db, 0).await.expect("purge succeeds");
     assert_eq!(noop, 0);
+    assert_eq!(execution_count(&db).await, 1);
 
     // The same sweep is available on demand, master-only.
     let (_, scoped) = insert_key(&db, "Scoped", "0.0.0.0/0", KeyScopes::plain()).await;
@@ -774,10 +1118,87 @@ async fn retention_purges_only_expired_executions() {
         StatusCode::FORBIDDEN
     );
 
-    insert_execution(90).await;
+    insert_execution_aged(&db, hook_id, 90).await;
     let response = send(&app, json_request("DELETE", "/api/executions?older_than_days=30", &master, None)).await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.field("purged"), &json!(1));
+
+    // `older_than_days=0` on the endpoint carries the same "keep forever" meaning as the config
+    // flag, rather than the "delete everything" a caller might assume.
+    insert_execution_aged(&db, hook_id, 365).await;
+    let zero = send(&app, json_request("DELETE", "/api/executions?older_than_days=0", &master, None)).await;
+    assert_eq!(zero.status, StatusCode::OK);
+    assert_eq!(zero.field("purged"), &json!(0));
+    assert_eq!(execution_count(&db).await, 2);
+
+    let negative = send(&app, json_request("DELETE", "/api/executions?older_than_days=-5", &master, None)).await;
+    assert_eq!(negative.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn retention_worker_purges_on_its_own_schedule_and_shuts_down_cleanly() {
+    let db = setup_test_db().await;
+    let hook_id = insert_hook(&db, "worker_aged", "/bin/true", 30).await;
+
+    insert_execution_aged(&db, hook_id, 10).await;
+    insert_execution_aged(&db, hook_id, 7).await;
+    let survivor = insert_execution_aged(&db, hook_id, 1).await;
+
+    // A 2-day window with a fast sweep interval: the worker's first tick fires immediately, so
+    // this does not depend on the interval actually elapsing.
+    let state = AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig {
+            log_retention_days: 2,
+            retention_sweep_seconds: 1,
+            ..(*test_config()).clone()
+        }),
+    );
+    let (shutdown_tx, worker) = spawn_retention_worker(&state);
+
+    let purged = wait_until(Duration::from_secs(10), async || execution_count(&db).await == 1).await;
+    assert!(purged, "the worker did not purge expired executions");
+    assert!(
+        Execution::find_by_id(survivor).one(&db).await.expect("query succeeds").is_some(),
+        "the worker purged a record inside the retention window"
+    );
+
+    // Rows that age past the window while the worker runs are picked up by a later sweep.
+    insert_execution_aged(&db, hook_id, 30).await;
+    let purged_again = wait_until(Duration::from_secs(10), async || execution_count(&db).await == 1).await;
+    assert!(purged_again, "a later sweep did not run");
+
+    // Dropping the sender is the shutdown signal; the worker must then finish promptly rather
+    // than being left to be aborted at process exit.
+    drop(shutdown_tx);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    assert!(stopped.is_ok(), "the worker did not shut down when its channel closed");
+}
+
+#[tokio::test]
+async fn retention_worker_is_disabled_when_retention_days_is_zero() {
+    let db = setup_test_db().await;
+    let hook_id = insert_hook(&db, "kept_forever", "/bin/true", 30).await;
+    insert_execution_aged(&db, hook_id, 3650).await;
+
+    let state = AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig {
+            log_retention_days: 0,
+            retention_sweep_seconds: 1,
+            ..(*test_config()).clone()
+        }),
+    );
+    let (shutdown_tx, worker) = spawn_retention_worker(&state);
+
+    // With retention disabled the worker exits immediately — without waiting for the shutdown
+    // signal, which is still held here precisely to prove that.
+    let stopped = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    assert!(stopped.is_ok(), "a disabled worker should return instead of ticking forever");
+
+    // A decade-old record is still there.
+    assert_eq!(execution_count(&db).await, 1);
+    drop(shutdown_tx);
 }
 
 // ─────────────────────────────────────────────────────────────

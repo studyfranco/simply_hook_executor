@@ -90,7 +90,7 @@ async fn create_audit_log(
         details: Set(details),
         timestamp: Set(Utc::now().naive_utc()),
     };
-    audit_log::Entity::insert(log).exec(db).await?;
+    AuditLog::insert(log).exec(db).await?;
     Ok(())
 }
 
@@ -121,7 +121,7 @@ async fn hook_permission(
     key_id: Uuid,
     hook_id: Uuid,
 ) -> Result<Option<api_key_hook_permission::Model>, AppError> {
-    Ok(api_key_hook_permission::Entity::find()
+    Ok(ApiKeyHookPermission::find()
         .filter(
             Condition::all()
                 .add(api_key_hook_permission::Column::ApiKeyId.eq(key_id))
@@ -197,7 +197,7 @@ async fn visible_hook_ids(
     if key.is_master {
         return Ok(None);
     }
-    let ids = api_key_hook_permission::Entity::find()
+    let ids = ApiKeyHookPermission::find()
         .filter(api_key_hook_permission::Column::ApiKeyId.eq(key.id))
         .filter(
             Condition::any()
@@ -219,7 +219,7 @@ async fn load_parameters(
     db: &sea_orm::DatabaseConnection,
     hook_id: Uuid,
 ) -> Result<Vec<hook_parameter::Model>, AppError> {
-    Ok(hook_parameter::Entity::find()
+    Ok(HookParameter::find()
         .filter(hook_parameter::Column::HookId.eq(hook_id))
         .order_by_asc(hook_parameter::Column::CreatedAt)
         .order_by_asc(hook_parameter::Column::ParamKey)
@@ -336,9 +336,9 @@ async fn load_hook_permissions(
     db: &sea_orm::DatabaseConnection,
     key_id: Uuid,
 ) -> Result<Vec<HookPermissionView>, AppError> {
-    let rows = api_key_hook_permission::Entity::find()
+    let rows = ApiKeyHookPermission::find()
         .filter(api_key_hook_permission::Column::ApiKeyId.eq(key_id))
-        .find_also_related(hook::Entity)
+        .find_also_related(Hook)
         .all(db)
         .await?;
 
@@ -493,7 +493,7 @@ async fn grant_full_hook_permission(
         can_manage: Set(true),
         created_at: Set(Utc::now().naive_utc()),
     };
-    api_key_hook_permission::Entity::insert(model)
+    ApiKeyHookPermission::insert(model)
         .on_conflict(
             OnConflict::columns([
                 api_key_hook_permission::Column::ApiKeyId,
@@ -554,7 +554,7 @@ pub async fn create_hook(
         updated_at: Set(now),
     };
 
-    if let Err(err) = hook::Entity::insert(model).exec(&state.db).await {
+    if let Err(err) = Hook::insert(model).exec(&state.db).await {
         if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
             return Err(AppError::Conflict(format!(
                 "A hook named '{name}' already exists"
@@ -573,7 +573,7 @@ pub async fn create_hook(
             is_required: Set(param.is_required.unwrap_or(true)),
             created_at: Set(Utc::now().naive_utc()),
         };
-        if let Err(err) = hook_parameter::Entity::insert(param_model).exec(&state.db).await {
+        if let Err(err) = HookParameter::insert(param_model).exec(&state.db).await {
             if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
                 return Err(AppError::Conflict(format!(
                     "Duplicate parameter '{}' for this hook",
@@ -792,7 +792,7 @@ pub async fn create_hook_parameter(
         created_at: Set(Utc::now().naive_utc()),
     };
 
-    if let Err(err) = hook_parameter::Entity::insert(param).exec(&state.db).await {
+    if let Err(err) = HookParameter::insert(param).exec(&state.db).await {
         if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
             return Err(AppError::Conflict(format!(
                 "Parameter '{}' is already declared on this hook",
@@ -816,7 +816,7 @@ pub async fn create_hook_parameter(
     )
     .await?;
 
-    let created = hook_parameter::Entity::find_by_id(param_id)
+    let created = HookParameter::find_by_id(param_id)
         .one(&state.db)
         .await?
         .ok_or(AppError::Internal)?;
@@ -834,7 +834,7 @@ pub async fn update_hook_parameter(
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
 
-    let param = hook_parameter::Entity::find_by_id(param_id)
+    let param = HookParameter::find_by_id(param_id)
         .one(&state.db)
         .await?
         .filter(|p| p.hook_id == model.id)
@@ -879,14 +879,14 @@ pub async fn delete_hook_parameter(
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
 
-    let param = hook_parameter::Entity::find_by_id(param_id)
+    let param = HookParameter::find_by_id(param_id)
         .one(&state.db)
         .await?
         .filter(|p| p.hook_id == model.id)
         .ok_or(AppError::NotFound)?;
     let param_key = param.param_key.clone();
 
-    hook_parameter::Entity::delete_by_id(param_id).exec(&state.db).await?;
+    HookParameter::delete_by_id(param_id).exec(&state.db).await?;
 
     create_audit_log(
         &state.db,
@@ -1138,7 +1138,7 @@ pub async fn list_executions(
     Extension(key): Extension<api_key::Model>,
     Query(query): Query<ExecutionQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut q = execution::Entity::find().order_by_desc(execution::Column::Timestamp);
+    let mut q = Execution::find().order_by_desc(execution::Column::Timestamp);
 
     if let Some(ids) = visible_hook_ids(&state.db, &key).await? {
         if ids.is_empty() {
@@ -1158,7 +1158,7 @@ pub async fn list_executions(
     }
 
     let rows = q
-        .find_also_related(hook::Entity)
+        .find_also_related(Hook)
         .limit(query.limit.unwrap_or(DEFAULT_PAGE_LIMIT))
         .offset(query.offset.unwrap_or(0))
         .all(&state.db)
@@ -1400,7 +1400,7 @@ pub async fn create_api_key(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    api_key::Entity::insert(model).exec(&state.db).await?;
+    ApiKey::insert(model).exec(&state.db).await?;
 
     create_audit_log(
         &state.db,
@@ -1652,7 +1652,7 @@ pub async fn update_key_hook_permissions(
         can_manage: Set(payload.can_manage),
         created_at: Set(Utc::now().naive_utc()),
     };
-    api_key_hook_permission::Entity::insert(perm)
+    ApiKeyHookPermission::insert(perm)
         .on_conflict(
             OnConflict::columns([
                 api_key_hook_permission::Column::ApiKeyId,
@@ -1697,7 +1697,7 @@ pub async fn revoke_key_hook_permission(
 
     let hook_model = resolve_hook(&state.db, &hook_identifier).await?;
 
-    let result = api_key_hook_permission::Entity::delete_many()
+    let result = ApiKeyHookPermission::delete_many()
         .filter(
             Condition::all()
                 .add(api_key_hook_permission::Column::ApiKeyId.eq(id))
@@ -1757,7 +1757,7 @@ pub async fn list_audit_logs(
         ));
     }
 
-    let mut q = audit_log::Entity::find().order_by_desc(audit_log::Column::Timestamp);
+    let mut q = AuditLog::find().order_by_desc(audit_log::Column::Timestamp);
     if let Some(action) = query.action.as_deref().filter(|a| !a.is_empty()) {
         q = q.filter(audit_log::Column::Action.eq(action));
     }

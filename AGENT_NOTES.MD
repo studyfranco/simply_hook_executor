@@ -129,9 +129,144 @@ security properties themselves: shell-injection inertness, environment isolation
 
 ### Known gaps / possible follow-ups
 
-- The listen address is still hard-coded to `0.0.0.0:3000` (inherited; `scripts/test_e2e.sh`
-  depends on it and refuses to run if the port is busy).
 - `hook_parameters` has no explicit ordering column, so re-ordering positional arguments means
   re-creating parameters. Adding a `position` column would need a `SCHEMA.MD` change first.
+  (Appending is safe — see the ordering test below.)
 - Executions are recorded only on completion, so there is no "running" state visible in the UI
   while a long hook is in flight; the request simply blocks until it finishes.
+
+---
+
+## 2026-07-29 (later) — Dead code cleanup, configurable binding, expanded coverage
+
+### 1. Dead code & legacy asset cleanup
+
+Audited `src/`, `static/`, `src/migration/`, and `Cargo.toml` for anything left behind by the
+`simply_ip_vault` domain. A repo-wide grep for the old vocabulary (`ip_vault`, `banlist`,
+`whitelist`, `ip_record`, `ip_group`, `webhook_config`, `firewall`) now returns **zero** hits
+outside `target/`.
+
+**CSS** — removed 76 lines of orphaned rules, verified by extracting every class token actually
+referenced from `class="..."` attributes, `classList` calls, `querySelector` arguments and
+template-literal class strings, then diffing against the stylesheet:
+`.api-key-container`, `.main-content`, `.header-input`, `.btn-success`, `.btn-toggle.active`,
+`.input-field.input-error`, `.combobox-option.highlighted`, `.message.success`, `.text-accent`,
+`.text-danger`, `.gap-4`, `.flex-between`, `.items-center`, `.w-full`, plus the matching
+`@media` overrides. The four classes the extractor still reports as "unreferenced"
+(`.badge-timeout`, `.toast`, `.toast-success`, `.toast-error`) are composed at runtime
+(`` `toast toast-${type}` ``, and a status→class map) and were confirmed live by hand.
+
+`.pagination #page-indicator` targeted an id that no longer exists — the tables were renamed to
+`#exec-page-indicator`/`#audit-page-indicator` — so it was silently styling nothing. Replaced with
+`.pagination span`, which covers both and needs no edit when a third paginated table appears.
+
+**JS** — removed `SearchableSelect.setValue()`, added speculatively and never wired up.
+
+**HTML** — removed three `id` attributes nothing referenced (`#login-submit`, `#hooks-section`,
+`#apikey-section`). The only ids now unreferenced by a literal string are `#tab-executions`,
+`#tab-hooks`, `#tab-keys` and `#tab-settings`, which are resolved dynamically from
+`data-tab` (`` `tab-${trg.dataset.tab}` ``).
+
+**Rust** — `src/api.rs` mixed `entity::Entity::…` with the prelude aliases, which left
+`ApiKeyHookPermission`, `HookParameter` and `AuditLog` as unused re-exports. Converted every call
+site to the prelude aliases, so all six exports are live and the file reads consistently.
+
+**`#[allow(dead_code)]` eliminated.** The one instance (`tests/common/mod.rs`) existed to absorb
+warnings from helpers used by only some test files. Removing it is safe because the suite lives in
+a single integration binary; `cargo clippy --all-targets -- -D warnings` confirms every helper has
+a real caller, so an unused fixture is now a real finding instead of a silenced one.
+
+**`Cargo.toml`** — every remaining dependency was confirmed used by grep. Removed the `axum`
+dev-dependency, which existed only to enable the `macros` feature for `#[debug_handler]` that
+nothing uses. The three SQL drivers on `sea-orm` are kept deliberately (AGENT.MD's SQL-agnostic /
+PostgreSQL-ready requirement) and now say so in a comment, so a future audit doesn't strip them.
+
+### 2. Configurable network binding
+
+`BIND_HOST` (or `HOST`, default `0.0.0.0`) and `PORT` (default `3000`) now drive the listen
+address via `config::resolve_bind_addr()`.
+
+- **`BIND_HOST` beats `HOST`** when both are set. `HOST` is widely used and some environments set
+  it to something unrelated (a hostname, a target triple); an operator who set the explicit name
+  should not have it overridden by ambient configuration.
+- **Hostnames are rejected, literal IPs only.** Resolving a name can yield several addresses with
+  no principled way to choose, and binding the wrong interface is a security problem rather than a
+  convenience one. `localhost` therefore falls back to the default *with a warning* instead of
+  quietly binding something unintended.
+- **Malformed values warn and fall back** rather than aborting startup, matching how the rest of
+  `config.rs` treats bad overrides — a typo in a unit file should not take the service down.
+- **`PORT=0` is passed through** so the OS can assign an ephemeral port; the bound address is read
+  back from the listener (not from the requested address) and logged, so the real port is visible.
+
+The parsing lives in a pure `parse_bind_addr(Option<&str>, Option<&str>)` with the env read in a
+thin wrapper — unit tests then cover defaults, overrides, IPv6, trimming and every malformed case
+without mutating process-global environment state (which is both racy under parallel tests and
+`unsafe` in edition 2024).
+
+`deploy/simply_hook_executor.service`, `Dockerfile`, `docker-compose.yml` and the README were
+updated. The unit file documents `BIND_HOST=127.0.0.1` for the reverse-proxy case; the container
+files note that `0.0.0.0` must stay inside a container and the *published* port is what to change.
+
+**`scripts/test_e2e.sh`** no longer hard-codes 3000. It honors `$PORT` when set — and fails fast
+if that exact port is busy, since silently moving would defeat the point of pinning it — otherwise
+it scans 3000→3100 for the first free port. Port probing uses bash's own `/dev/tcp` inside a
+subshell, so it needs no `ss`/`lsof`/`fuser` and leaks no descriptor. It also binds `127.0.0.1`
+rather than every interface, so a test server is never briefly exposed to the network. A new check
+asserts the startup log reports the requested address, making the feature itself covered. All
+three paths were exercised: explicit port, auto-scan with 3000 occupied, and fail-fast on a busy
+explicit port.
+
+### 3. Extended test coverage
+
+Unit tests 19 → 23, integration tests 25 → 32, E2E checks 183 → 199.
+
+**Retention worker** (previously only the pure purge function was covered):
+- `retention_worker_purges_on_its_own_schedule_and_shuts_down_cleanly` — drives the real worker
+  through `spawn_retention_worker`, asserts it purges expired rows, that a row *inside* the window
+  specifically survives (not merely "one row remains"), that a later sweep picks up newly-expired
+  rows, and that dropping the shutdown sender makes it exit promptly.
+- `retention_worker_is_disabled_when_retention_days_is_zero` — asserts the worker returns
+  immediately *while the shutdown sender is still held*, which is what proves the early return
+  rather than a coincidental shutdown, and that a decade-old record survives.
+- The purge-function test now also pins the endpoint's `older_than_days=0` (no-op, matching the
+  config flag) and negative-value (`400`) semantics.
+
+**HMAC failure** — `hmac_signature_failures_are_rejected_without_executing_anything` presents a
+*valid* API key with nine bad signatures (tampered body, body with trailing whitespace, a
+signature made with a different valid key's secret, a signature over a different payload, missing
+`sha256=` prefix, `sha1=` prefix, non-hex, empty and truncated digests). Each must be `401`, and
+the test additionally asserts nothing was spawned (a canary file) and no execution row was
+written — i.e. rejection happens before the engine — with a control case proving the hook was
+runnable all along.
+
+**Parameter contract edge cases:**
+- `non_scalar_parameter_values_are_rejected` — six non-scalar shapes (array, empty array, nested
+  object, empty object, array-of-objects, deeply nested) each `400` with the offending key named;
+  six scalar flavours (string, int, negative, float, true, false) accepted and stringified.
+- `json_null_is_treated_as_an_omitted_parameter` — `null` falls back to the declared default,
+  an explicit `""` is distinguishable from `null` and *does* override the default, and `null` on a
+  required undefaulted parameter is still a missing-parameter `400`.
+- `positional_argument_order_is_deterministic_and_append_only` — parameters declared in an order
+  that matches neither alphabetical nor reverse-alphabetical sorting, so a pass can only mean
+  declaration order is used; five repeated executions and dry runs must produce byte-identical
+  argument vectors (an unstable `ORDER BY` would surface as an intermittent diff); and a parameter
+  declared later appends rather than reshuffling, so adding one cannot silently change what an
+  existing caller's script receives as `$1..$n`.
+
+**Peak-load throttling** — `peak_load_burst_is_rejected_immediately_rather_than_queued` saturates
+a 2-job budget (each job announcing itself via its own marker file, so the burst can't race the
+setup), then fires 12 concurrent requests. All 12 must be `429`; the burst must complete in under
+3s against occupying jobs that sleep 5s — which is what actually distinguishes *rejected* from
+*eventually served*; no burst marker may exist and no history row may be written; and the full
+budget must be usable again once the occupying jobs finish.
+
+The E2E suite gained matching black-box checks for null handling, empty-string-vs-null, scalar
+coercion, nested-object rejection, and argument-order stability/append-only behavior.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 23 unit + 32 integration tests pass.
+- `./scripts/test_e2e.sh` — 199/199 checks pass (also verified on `PORT=3456` and with 3000
+  occupied).

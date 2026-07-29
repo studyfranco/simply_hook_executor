@@ -47,6 +47,10 @@ EXPOSE 3000
 # Default environment configuration
 ENV DATABASE_URL=sqlite://data/simply_hook_executor.db?mode=rwc
 ENV RUST_LOG=info
+# Listen address. Inside a container this must stay 0.0.0.0 to be reachable from the host;
+# remap the published port instead of changing PORT if you need a different external port.
+ENV BIND_HOST=0.0.0.0
+ENV PORT=3000
 # Environment variables hook sub-processes inherit; everything else is cleared before each spawn.
 ENV ALLOWED_ENV_VARS=PATH,LANG,TERM
 ENV LOG_RETENTION_DAYS=30

@@ -89,11 +89,6 @@ class SearchableSelect {
         this.closeMenu();
     }
 
-    setValue(value) {
-        const match = this.options.find(o => String(o.value) === String(value));
-        if (match) this.select(match);
-    }
-
     openMenu() {
         this.menu.classList.remove('hidden');
     }

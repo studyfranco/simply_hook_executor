@@ -35,6 +35,13 @@ Environment=DATABASE_URL=sqlite:///var/lib/simply_hook_executor/simply_hook_exec
 # Variables hook sub-processes inherit; everything else is cleared before each spawn.
 Environment=ALLOWED_ENV_VARS=PATH,LANG,TERM
 Environment=LOG_RETENTION_DAYS=30
+
+# Listen address. BIND_HOST must be a literal IP (hostnames are not resolved). Behind a reverse
+# proxy on the same host, prefer 127.0.0.1 so the daemon is never reachable directly:
+#   Environment=BIND_HOST=127.0.0.1
+Environment=BIND_HOST=0.0.0.0
+Environment=PORT=3000
+
 # Optional overrides:
 #   Environment=RETENTION_SWEEP_SECONDS=3600
 #   Environment=MAX_OUTPUT_BYTES=1048576
@@ -65,8 +72,8 @@ LockPersonality=yes
 # The database, and nothing else, is writable.
 ReadWritePaths=/var/lib/simply_hook_executor
 
-# Listens on :3000. Front it with a reverse proxy for TLS; the daemon reads the client address
-# from X-Forwarded-For / X-Real-IP when enforcing an API key's bound CIDRs.
+# Listens on BIND_HOST:PORT (see above). Front it with a reverse proxy for TLS; the daemon reads
+# the client address from X-Forwarded-For / X-Real-IP when enforcing an API key's bound CIDRs.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]

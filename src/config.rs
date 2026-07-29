@@ -5,10 +5,15 @@
 //! override logs a warning and falls back to the default rather than aborting startup, since a
 //! typo in a unit file should never take the whole service down.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 /// Default environment variables inherited by hook sub-processes, per `AGENT.MD`.
 const DEFAULT_ALLOWED_ENV_VARS: &str = "PATH,LANG,TERM,SYSTEMROOT";
+/// Default listen address: every interface.
+const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+/// Default listen port.
+const DEFAULT_BIND_PORT: u16 = 3000;
 /// Default retention window for `executions` rows, in days.
 const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 /// Default interval between retention sweeps, in seconds (hourly).
@@ -90,6 +95,60 @@ impl RuntimeConfig {
     }
 }
 
+/// Resolves the socket address the HTTP server binds to, from `BIND_HOST`/`HOST` and `PORT`.
+///
+/// Reads the environment and delegates to [`parse_bind_addr`], which holds the actual logic so it
+/// can be unit-tested without mutating process-global state.
+pub fn resolve_bind_addr() -> SocketAddr {
+    // `BIND_HOST` wins over `HOST` because `HOST` is a widely-used variable that some environments
+    // set to something entirely unrelated (a hostname, a build target triple); an operator who
+    // sets the explicit name should not have it silently overridden by ambient configuration.
+    let host = std::env::var("BIND_HOST").or_else(|_| std::env::var("HOST")).ok();
+    let port = std::env::var("PORT").ok();
+    parse_bind_addr(host.as_deref(), port.as_deref())
+}
+
+/// Builds a listen address from optional raw `host`/`port` strings.
+///
+/// Both are parsed leniently: an unparseable value logs a warning and falls back to the default
+/// rather than aborting startup, matching how the rest of this module treats malformed overrides.
+/// A host must be a literal IP address — resolving a hostname could yield several addresses with
+/// no principled way to pick one, and binding the wrong interface is a security problem, not a
+/// convenience one.
+///
+/// Port `0` is passed through deliberately: the OS then assigns an ephemeral free port, which is
+/// exactly what a test harness or a socket-activated deployment wants.
+pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
+    let ip = match host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(raw) => match raw.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid bind host {raw:?} (expected a literal IP address such as 0.0.0.0, \
+                     127.0.0.1, or ::) — falling back to {DEFAULT_BIND_HOST}"
+                );
+                DEFAULT_BIND_HOST
+            }
+        },
+        None => DEFAULT_BIND_HOST,
+    };
+
+    let port = match port.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid PORT {raw:?} — falling back to {DEFAULT_BIND_PORT}"
+                );
+                DEFAULT_BIND_PORT
+            }
+        },
+        None => DEFAULT_BIND_PORT,
+    };
+
+    SocketAddr::new(ip, port)
+}
+
 /// Splits a comma-separated variable list, trimming blanks and dropping empty entries.
 fn parse_env_var_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -137,5 +196,39 @@ mod tests {
             RuntimeConfig::default().allowed_env_vars,
             vec!["PATH", "LANG", "TERM", "SYSTEMROOT"]
         );
+    }
+
+    #[test]
+    fn bind_addr_defaults_to_all_interfaces_on_3000() {
+        assert_eq!(parse_bind_addr(None, None).to_string(), "0.0.0.0:3000");
+        // Empty strings are treated as "unset", so an unset variable in a unit file or compose
+        // file behaves the same as an absent one.
+        assert_eq!(parse_bind_addr(Some(""), Some("  ")).to_string(), "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn bind_addr_honors_host_and_port_overrides() {
+        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("8080")).to_string(), "127.0.0.1:8080");
+        assert_eq!(parse_bind_addr(Some(" 127.0.0.1 "), Some(" 8080 ")).to_string(), "127.0.0.1:8080");
+        // Port 0 is passed through so the OS can assign an ephemeral port.
+        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("0")).to_string(), "127.0.0.1:0");
+    }
+
+    #[test]
+    fn bind_addr_supports_ipv6_literals() {
+        let addr = parse_bind_addr(Some("::1"), Some("9000"));
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.port(), 9000);
+        assert_eq!(parse_bind_addr(Some("::"), None).ip(), "::".parse::<IpAddr>().expect("valid"));
+    }
+
+    #[test]
+    fn bind_addr_falls_back_on_malformed_values() {
+        // A hostname is not a literal IP and is rejected rather than resolved.
+        assert_eq!(parse_bind_addr(Some("localhost"), Some("8080")).to_string(), "0.0.0.0:8080");
+        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("not-a-port")).to_string(), "127.0.0.1:3000");
+        // Out of u16 range.
+        assert_eq!(parse_bind_addr(Some("127.0.0.1"), Some("70000")).to_string(), "127.0.0.1:3000");
+        assert_eq!(parse_bind_addr(Some("999.1.1.1"), Some("-1")).to_string(), "0.0.0.0:3000");
     }
 }

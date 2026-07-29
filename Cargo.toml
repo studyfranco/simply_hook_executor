@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
+# All three SQL drivers stay enabled on purpose: AGENT.MD requires the codebase to remain
+# SQL-agnostic and PostgreSQL-ready, even though SQLite is the zero-config default.
 sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
 sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 ipnetwork = "0.21"
@@ -29,5 +31,5 @@ log = "0.4"
 libc = "0.2"
 
 [dev-dependencies]
+# `ServiceExt::oneshot`, used to drive the real router in integration tests without binding a port.
 tower = { version = "0.5", features = ["util"] }
-axum = { version = "0.8", features = ["macros"] }

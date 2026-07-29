@@ -11,6 +11,9 @@ services:
       - RUST_LOG=info
       - ALLOWED_ENV_VARS=PATH,LANG,TERM
       - LOG_RETENTION_DAYS=30
+      # Keep 0.0.0.0 inside the container; change the published port mapping above instead.
+      - BIND_HOST=0.0.0.0
+      - PORT=3000
     volumes:
       - ./data:/app/data
       # Hook scripts must exist inside the container for the daemon to execute them.

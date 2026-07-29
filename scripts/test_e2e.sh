@@ -17,8 +17,15 @@
 # logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
-# Requires: curl, jq, cargo. Needs port 3000 free (the app's listen address is not configurable).
+# Requires: curl, jq, cargo.
 # Optional: openssl (only for the HMAC signing section; without it that one section is skipped).
+#
+# Port selection: honors $PORT if set (and fails fast if that exact port is busy, since an
+# explicit request should not be silently overridden); otherwise starts at 3000 and scans upward
+# for the first free port, so concurrent runs and a locally-running instance never collide.
+# $BIND_HOST (default 127.0.0.1) picks the interface — the suite binds loopback rather than every
+# interface so a test server is never briefly exposed to the network.
+#
 # Exit code: 0 if every check passed, 1 otherwise.
 
 set -uo pipefail
@@ -29,9 +36,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-# 127.0.0.1 rather than "localhost": avoids any IPv6 (::1) resolution first-try delay against a
-# server that only ever binds the IPv4 wildcard address.
-BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
+# 127.0.0.1 rather than "localhost": avoids any IPv6 (::1) resolution first-try delay, and keeps
+# the test server off every other interface.
+BIND_HOST="${BIND_HOST:-127.0.0.1}"
+# Empty unless the caller pinned one; resolved to a concrete port in Preflight below.
+REQUESTED_PORT="${PORT:-}"
+SERVER_PORT=""
+BASE_URL=""
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
 MASTER_KEY="e2e_master_secret_key_for_testing_123456789"
@@ -184,6 +195,47 @@ make_hook_script() {
     echo "$path"
 }
 
+# Whether something is already listening on a TCP port, using bash's own /dev/tcp rather than
+# ss/lsof/fuser so the check works on any bash without extra tooling. A successful connect means
+# the port is taken.
+port_in_use() {
+    local port="$1"
+    # The subshell's exit status is the connect result, and the descriptor it opens dies with it,
+    # so nothing leaks into the caller's shell.
+    (exec 3<>"/dev/tcp/$BIND_HOST/$port") 2>/dev/null
+}
+
+# Resolves $SERVER_PORT: an explicitly requested port is used as-is (and its being busy is a hard
+# error — silently moving would defeat the point of pinning it), otherwise the first free port at
+# or above 3000 is chosen.
+pick_port() {
+    if [ -n "$REQUESTED_PORT" ]; then
+        if port_in_use "$REQUESTED_PORT"; then
+            err "PORT=$REQUESTED_PORT was requested but something is already listening on it."
+            exit 1
+        fi
+        SERVER_PORT="$REQUESTED_PORT"
+        log "Using explicitly requested port $SERVER_PORT"
+        return
+    fi
+
+    local candidate
+    for candidate in $(seq 3000 3100); do
+        if ! port_in_use "$candidate"; then
+            SERVER_PORT="$candidate"
+            if [ "$candidate" -ne 3000 ]; then
+                log "Port 3000 is busy; using the next free port $SERVER_PORT"
+            else
+                log "Using default port $SERVER_PORT"
+            fi
+            return
+        fi
+    done
+
+    err "No free port found in the range 3000-3100. Set PORT=<port> explicitly."
+    exit 1
+}
+
 cleanup() {
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
         log "Stopping server (pid $SERVER_PID)..."
@@ -206,11 +258,9 @@ for bin in curl jq cargo; do
     log "Found $bin: $(command -v "$bin")"
 done
 
-if command -v fuser >/dev/null 2>&1 && fuser 3000/tcp >/dev/null 2>&1; then
-    err "Port 3000 is already in use (the app's listen address is not configurable)."
-    err "Stop whatever is bound to it and re-run this script."
-    exit 1
-fi
+pick_port
+BASE_URL="http://$BIND_HOST:$SERVER_PORT"
+log "Test server base URL: $BASE_URL"
 
 # openssl is a *soft* dependency: only the HMAC body-signing section needs it to compute a
 # signature the way a real client would. Its absence degrades that one section to a warning +
@@ -237,12 +287,13 @@ fi
 log "Build succeeded."
 
 log_section "Boot"
-log "Starting server against a fresh database at $DB_PATH"
+log "Starting server on $BIND_HOST:$SERVER_PORT against a fresh database at $DB_PATH"
 log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping needed)"
 # ALLOWED_ENV_VARS=PATH pins the passthrough allowlist so §7's isolation assertions are exact:
 # anything other than PATH and HOOK_PARAM_* showing up in a child's environment is a real leak.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     ALLOWED_ENV_VARS="PATH" LOG_RETENTION_DAYS=30 \
+    BIND_HOST="$BIND_HOST" PORT="$SERVER_PORT" \
     "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -273,6 +324,11 @@ if [ "$READY" -ne 1 ]; then
     exit 1
 fi
 log "Server is up."
+
+# The readiness probe above already proves the server bound the requested host:port (nothing else
+# is listening there), and this pins the startup log line that reports it.
+check_local "$(grep -c "listening on http://$BIND_HOST:$SERVER_PORT" "$SERVER_LOG")" "1" \
+    "the server honored BIND_HOST=$BIND_HOST and PORT=$SERVER_PORT"
 
 api_call GET "/api/auth/me" "$MASTER_KEY"
 check "200" "the deterministic INITIAL_MASTER_KEY authenticates"
@@ -416,7 +472,44 @@ check "200" "a flat JSON body (no \"parameters\" wrapper) is accepted"
 check_true '.stdout | contains("argv:flat-payload|from-default")' "the flat payload resolved the same way"
 
 api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"alpha":["not","a","scalar"]}}'
-check "400" "a non-scalar parameter value is rejected"
+check "400" "a non-scalar array parameter value is rejected"
+
+api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"alpha":{"nested":"object"}}}'
+check "400" "a nested-object parameter value is rejected"
+
+# JSON null means "not supplied" rather than "empty string", so the declared default applies.
+api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"alpha":"given","beta":null}}'
+check "200" "a null parameter falls back to its declared default"
+check_jq ".parameters.beta" "from-default" "null did not override the default"
+
+api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"alpha":null}}'
+check "400" "null on a required parameter with no default is still missing"
+
+# An explicit empty string is distinguishable from null and does override the default.
+api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"alpha":"given","beta":""}}'
+check "200" "an explicit empty string is accepted"
+check_jq ".parameters.beta" "" "the empty string overrode the default"
+
+api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"alpha":7,"beta":true}}'
+check "200" "numeric and boolean scalars are accepted"
+check_true '.stdout | contains("argv:7|true")' "scalars are stringified for argv"
+
+# Positional order must be declaration order, and must not drift between identical calls.
+api_call POST "/api/hooks/$PARAM_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"alpha":"one"}}'
+check "200" "dry-run the parameter hook"
+ORDER_FIRST=$(echo "$RESP_BODY" | jq -r '.command.args | join(",")')
+api_call POST "/api/hooks/$PARAM_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"alpha":"one"}}'
+check "200" "dry-run it again"
+ORDER_SECOND=$(echo "$RESP_BODY" | jq -r '.command.args | join(",")')
+check_local "$ORDER_FIRST" "one,from-default" "argument order follows declaration order"
+check_local "$ORDER_SECOND" "$ORDER_FIRST" "argument order is stable across identical calls"
+
+# A parameter declared later appends rather than reshuffling existing positions.
+api_call POST "/api/hooks/$PARAM_HOOK_ID/parameters" "$MASTER_KEY" '{"param_key":"gamma","default_value":"appended","is_required":true}'
+check "200" "declare a third parameter after the fact"
+api_call POST "/api/hooks/$PARAM_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"alpha":"one"}}'
+check "200" "dry-run after the new declaration"
+check_jq ".command.args | join(\",\")" "one,from-default,appended" "the new parameter appended at the end"
 
 # ── 6. Shell injection safety ───────────────────────────────────────────────
 

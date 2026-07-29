@@ -1,9 +1,9 @@
 //! Shared fixtures for the integration test suite: in-memory databases, key/hook seeding, request
 //! construction, and disposable executable scripts.
-
-// Every integration test file compiles its own copy of this module, so a helper used by only some
-// of them would otherwise warn here.
-#![allow(dead_code)]
+//!
+//! Deliberately has no `#![allow(dead_code)]`: the suite lives in a single integration test
+//! binary, so every helper here has a real caller and an unused one is a genuine finding rather
+//! than an artifact of per-file compilation.
 
 use std::sync::Arc;
 
@@ -11,11 +11,11 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
     config::RuntimeConfig,
-    entities::{api_key, api_key_hook_permission, hook, hook_parameter},
+    entities::{api_key, api_key_hook_permission, execution, hook, hook_parameter},
     migration,
     state::AppState,
 };
@@ -163,6 +163,61 @@ pub async fn insert_parameter(
     .await
     .expect("seeding a hook parameter succeeds");
     id
+}
+
+/// Inserts a completed execution record backdated by `age_days`, returning its id.
+///
+/// Backdating is the only way to exercise retention without waiting: `executions.timestamp` is
+/// written by the engine at execution time, so an age has to be seeded directly.
+pub async fn insert_execution_aged(
+    db: &DatabaseConnection,
+    hook_id: Uuid,
+    age_days: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    execution::ActiveModel {
+        id: Set(id),
+        hook_id: Set(hook_id),
+        api_key_id: Set(None),
+        status: Set(execution::ExecutionStatus::Success),
+        exit_code: Set(Some(0)),
+        stdout: Set(String::new()),
+        stderr: Set(String::new()),
+        parameters_json: Set("{}".to_owned()),
+        duration_ms: Set(5),
+        timestamp: Set((chrono::Utc::now() - chrono::Duration::days(age_days)).naive_utc()),
+    }
+    .insert(db)
+    .await
+    .expect("seeding an execution succeeds");
+    id
+}
+
+/// Counts the execution rows currently stored.
+pub async fn execution_count(db: &DatabaseConnection) -> u64 {
+    use sea_orm::PaginatorTrait;
+    execution::Entity::find()
+        .count(db)
+        .await
+        .expect("counting executions succeeds")
+}
+
+/// Polls `condition` until it holds or `timeout` elapses; returns whether it held.
+///
+/// Used instead of a fixed sleep wherever a background worker or sub-process has to reach some
+/// state: it makes the test both faster in the common case and robust on a loaded CI machine.
+pub async fn wait_until<F>(timeout: std::time::Duration, mut condition: F) -> bool
+where
+    F: AsyncFnMut() -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if condition().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    condition().await
 }
 
 /// Grants a key rights over a hook.

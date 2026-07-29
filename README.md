@@ -86,7 +86,8 @@ On first boot, `simply_hook_executor`:
    Copy that key immediately — only its SHA-256 hash is stored, so it cannot be recovered later.
    If you lose every master key, delete the corresponding rows from `api_keys` (or the whole
    database, for a fresh start) and restart; a new one will be generated the same way.
-3. Starts listening on `0.0.0.0:3000` and serves the dashboard from `static/` at `/`.
+3. Starts listening on `0.0.0.0:3000` (configurable — see `BIND_HOST`/`PORT` below) and serves
+   the dashboard from `static/` at `/`. The bound address is logged at startup.
 
 Open `http://localhost:3000` and paste the key into the login screen, or drive the API directly
 with `curl` (see below).
@@ -103,10 +104,18 @@ automatically if present):
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |
 | `MAX_OUTPUT_BYTES` | `1048576` | Per-stream cap on captured stdout/stderr. Excess is discarded (but still drained) and flagged in the stored output. |
+| `BIND_HOST` (or `HOST`) | `0.0.0.0` | Interface to listen on. Must be a literal IP (`0.0.0.0`, `127.0.0.1`, `::`, `::1`) — hostnames are not resolved, since picking one of several resolved addresses is a security decision, not a convenience. `BIND_HOST` wins if both are set. |
+| `PORT` | `3000` | Listen port. `0` lets the OS assign a free ephemeral port (useful for tests); the actual port is logged at startup. |
 | `BOOTSTRAP_SUBNET` | `0.0.0.0/0` | `bound_ips` assigned to the auto-generated master key. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_hook_executor=debug`. |
 
-The listen address is currently fixed at `0.0.0.0:3000`.
+A malformed `BIND_HOST` or `PORT` logs a warning and falls back to the default rather than
+aborting startup — a typo in a unit file should not take the service down. Behind a reverse proxy
+on the same host, `BIND_HOST=127.0.0.1` keeps the daemon unreachable from outside:
+
+```bash
+BIND_HOST=127.0.0.1 PORT=8080 cargo run
+```
 
 ### Deployment
 

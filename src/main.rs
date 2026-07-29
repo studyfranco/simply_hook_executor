@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
-    api, config::RuntimeConfig, create_app, entities, migration, spawn_retention_worker,
+    api, config, config::RuntimeConfig, create_app, entities, migration, spawn_retention_worker,
     state::AppState,
 };
 use tokio::net::TcpListener;
@@ -163,10 +163,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = create_app(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    tracing::info!("Simply Hook Executor API listening on {}", addr);
-
+    let addr = config::resolve_bind_addr();
     let listener = TcpListener::bind(addr).await?;
+    // Reported from the listener rather than from `addr`: with `PORT=0` the OS assigns an
+    // ephemeral port, and the requested address would then be a misleading thing to log.
+    let bound = listener.local_addr().unwrap_or(addr);
+    tracing::info!("Simply Hook Executor API listening on http://{}", bound);
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
