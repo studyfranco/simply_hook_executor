@@ -29,6 +29,10 @@ log = "0.4"
 # only signals the direct child, which would leave orphaned grandchildren behind. Already in the
 # dependency tree via tokio on Unix, so this adds no new compilation.
 libc = "0.2"
+# Encryption-at-rest for `api_keys.signing_secret`. HMAC verification needs the secret back in
+# plaintext to recompute a signature, so — unlike `key_hash` — it cannot be hashed. XChaCha20-Poly1305
+# (pure Rust, no C toolchain) keeps a database-only compromise from yielding forgeable signatures.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
 
 [dev-dependencies]
 # `ServiceExt::oneshot`, used to drive the real router in integration tests without binding a port.

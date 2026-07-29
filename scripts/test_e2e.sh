@@ -601,10 +601,13 @@ create_scoped_key() {
     check "200" "create scoped key '$name'"
     CREATED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
     CREATED_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    CREATED_KEY_ID=$(echo "$RESP_BODY" | jq -r '.key_id')
+    CREATED_SIGNING_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
 }
 
 create_scoped_key "Execute-Only Key"
 EXEC_KEY="$CREATED_KEY"; EXEC_ID="$CREATED_ID"
+EXEC_KEY_ID="$CREATED_KEY_ID"; EXEC_SIGNING_SECRET="$CREATED_SIGNING_SECRET"
 create_scoped_key "Manage-Only Key"
 MANAGE_KEY="$CREATED_KEY"; MANAGE_ID="$CREATED_ID"
 create_scoped_key "No-Access Key"
@@ -734,11 +737,14 @@ check "200" "the slot is released once the process exits"
 log_section "12. HMAC-SHA256 Body Signing"
 
 if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    # Signatures are keyed on the key's *signing secret*, not on the bearer API key.
+    sign_body() { printf '%s' "$2" | openssl dgst -sha256 -hmac "$1" -r | cut -d' ' -f1; }
+
     SIGNED_BODY='{"parameters":{"target":"signed"}}'
-    SIGNATURE=$(printf '%s' "$SIGNED_BODY" | openssl dgst -sha256 -hmac "$EXEC_KEY" -r | cut -d' ' -f1)
+    SIGNATURE=$(sign_body "$EXEC_SIGNING_SECRET" "$SIGNED_BODY")
 
     api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: sha256=$SIGNATURE"
-    check "200" "a correctly signed body is accepted"
+    check "200" "a correctly signed body is accepted alongside a bearer key"
     check_jq ".status" "SUCCESS" "the signed request executed"
 
     TAMPERED_BODY='{"parameters":{"target":"tampered"}}'
@@ -750,6 +756,64 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: notprefixed"
     check "401" "a malformed signature header is rejected"
+
+    # Signing with the bearer key instead of the signing secret must NOT authenticate: the two are
+    # deliberately distinct credentials.
+    WRONG_MATERIAL=$(sign_body "$EXEC_KEY" "$SIGNED_BODY")
+    api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: sha256=$WRONG_MATERIAL"
+    check "401" "a signature keyed on the API key rather than the signing secret is rejected"
+
+    # --- Key ID + signature, with no bearer credential at all (the webhook-sender pattern) ---
+    curl_signed() {
+        local path="$1" key_id="$2" secret="$3" body="$4"
+        local sig; sig=$(sign_body "$secret" "$body")
+        RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+            -H "X-Key-Id: $key_id" -H "Content-Type: application/json" \
+            -H "X-Signature-256: sha256=$sig" -d "$body" "$BASE_URL$path")
+        RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+        local color; color=$(status_color "$RESP_STATUS")
+        printf "%s ${color}[%s]${RESET} %-6s %s\n" "$(ts)" "$RESP_STATUS" "POST" "$BASE_URL$path" >&2
+        print_response_body
+    }
+
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "$EXEC_SIGNING_SECRET" '{"target":"via-key-id"}'
+    check "200" "X-Key-Id plus a valid signature authenticates without any API key"
+    check_jq ".stdout | rtrimstr(\"\n\")" "hello via-key-id" "the signed webhook executed"
+
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "definitely-not-the-secret" '{"target":"forged"}'
+    check "401" "a signature made with the wrong secret is rejected"
+
+    curl_signed "/webhook/echo_hook" "shk_00000000000000000000000000000000" "$EXEC_SIGNING_SECRET" '{"target":"x"}'
+    check "401" "an unknown key id is rejected"
+
+    # A key id alone is public and must not authenticate anything.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $EXEC_KEY_ID" -H "Content-Type: application/json" \
+        -d '{"target":"unsigned"}' "$BASE_URL/webhook/echo_hook")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a key id without a signature is rejected"
+    check_true '.error | contains("X-Signature-256")' "the error explains that a signature is required"
+
+    # Rotation issues a new pair and invalidates the old secret immediately. All three credentials
+    # are captured here, before any later call overwrites $RESP_BODY.
+    api_call POST "/api/keys/$EXEC_ID/rotate" "$MASTER_KEY"
+    check "200" "rotate the execute-only key"
+    check_true '.key_id | startswith("shk_")' "rotation returns a new key id"
+    check_true '.signing_secret | length == 64' "rotation returns a new 32-byte signing secret"
+    ROTATED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    ROTATED_KEY_ID=$(echo "$RESP_BODY" | jq -r '.key_id')
+    ROTATED_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "$EXEC_SIGNING_SECRET" '{"target":"stale"}'
+    check "401" "the pre-rotation key id and secret no longer authenticate"
+
+    curl_signed "/webhook/echo_hook" "$ROTATED_KEY_ID" "$ROTATED_SECRET" '{"target":"rotated"}'
+    check "200" "the rotated pair authenticates"
+
+    # Later sections keep using this key, so adopt the rotated credentials wholesale.
+    EXEC_KEY="$ROTATED_KEY"
+    EXEC_KEY_ID="$ROTATED_KEY_ID"
+    EXEC_SIGNING_SECRET="$ROTATED_SECRET"
 else
     warn "Skipping §12: openssl is not available to compute an HMAC signature."
 fi
@@ -1171,6 +1235,50 @@ api_call POST "/api/hooks/$PRIV_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"tar
 check "200" "dry-run after dropping elevation"
 check_jq ".command.program" "$PRIV_SCRIPT" "the sudo wrapper is gone"
 
+# --- Master-only guard: a non-master may create hooks but never elevate them ---
+create_scoped_key "Hook Creator No Elevation" ',"can_manage_hooks":true'
+NOELEV_KEY="$CREATED_KEY"; NOELEV_ID="$CREATED_ID"
+
+NOELEV_SCRIPT=$(make_hook_script "noelev_hook.sh" 'echo ok')
+api_call POST "/api/hooks" "$NOELEV_KEY" "{\"name\":\"noelev_ordinary\",\"script_path\":\"$NOELEV_SCRIPT\"}"
+check "200" "a can_manage_hooks key can create a standard hook"
+check_jq ".run_as_user" "null" "the hook is unelevated"
+NOELEV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks" "$NOELEV_KEY" "{\"name\":\"noelev_root\",\"script_path\":\"$NOELEV_SCRIPT\",\"run_as_user\":\"root\"}"
+check "403" "the same key is refused when it supplies run_as_user=root"
+check_jq ".error" "Only master API keys can assign run_as_user privileges" "the refusal message is exact"
+
+api_call GET "/api/hooks/noelev_root" "$MASTER_KEY"
+check "404" "no hook was created by the refused request"
+
+# Authorization, not validation: a malformed account from a non-master is still a 403, so the
+# field cannot be probed to learn what would be accepted.
+api_call POST "/api/hooks" "$NOELEV_KEY" "{\"name\":\"noelev_probe\",\"script_path\":\"$NOELEV_SCRIPT\",\"run_as_user\":\"-i\"}"
+check "403" "a malformed run_as_user from a non-master is refused as forbidden, not invalid"
+
+# Explicit non-elevation is fine.
+api_call POST "/api/hooks" "$NOELEV_KEY" "{\"name\":\"noelev_explicit_null\",\"script_path\":\"$NOELEV_SCRIPT\",\"run_as_user\":null}"
+check "200" "an explicit null run_as_user is allowed for a non-master"
+
+# The guard covers updates, including on a hook the key owns outright, and via PATCH.
+api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"run_as_user":"root"}'
+check "403" "a non-master cannot elevate its own hook via PUT"
+api_call PATCH "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"run_as_user":"root"}'
+check "403" "...nor via PATCH"
+
+api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$MASTER_KEY" '{"run_as_user":"root"}'
+check "200" "a master can elevate the same hook"
+check_jq ".run_as_user" "root" "the elevation took effect"
+
+api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"description":"unrelated"}'
+check "200" "a non-master may still edit other fields of an elevated hook"
+check_jq ".run_as_user" "root" "the elevation is preserved by an unrelated edit"
+
+api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"run_as_user":""}'
+check "200" "dropping elevation is not an escalation, so a non-master may do it"
+check_jq ".run_as_user" "null" "the hook is unelevated again"
+
 # --- The elevation is auditable ---
 api_call GET "/api/audit-logs?action=HOOK_CREATE&limit=50" "$MASTER_KEY"
 check "200" "fetch hook creation audit entries"
@@ -1180,6 +1288,74 @@ check_true '[.[] | select(.target_resource == "privileged_hook") | .details | te
     "the audit trail records which account a hook was created to run as"
 check_true '[.[] | select(.target_resource == "plain_compare") | .details | test("runs as the daemon user")] | length == 1' \
     "an unprivileged hook is audited as running unelevated"
+
+# ── 23. Test (dry-run) vs Launch (execute) endpoints ────────────────────────
+
+log_section "23. Test vs Launch Execution Endpoints"
+
+TL_SIDE_EFFECT="$WORK_DIR/launch_side_effect"
+TL_SCRIPT=$(make_hook_script "test_vs_launch.sh" "touch \"$TL_SIDE_EFFECT\"
+echo \"launched:\${HOOK_PARAM_MODE}\"
+echo \"diagnostics\" >&2
+exit 0")
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"test_vs_launch\",\"script_path\":\"$TL_SCRIPT\",\"parameters\":[{\"param_key\":\"mode\",\"default_value\":\"default-mode\",\"is_required\":true}]}"
+check "200" "create a hook with an observable side effect"
+TL_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# Test = dry run: resolves and previews, spawns nothing.
+api_call POST "/api/hooks/$TL_HOOK_ID/test" "$MASTER_KEY" '{}'
+check "200" "Test (dry run) returns a preview"
+check_jq ".would_execute" "true" "the preview reports the hook is runnable"
+check_jq ".command.program" "$TL_SCRIPT" "the preview names the program"
+check_jq ".resolved_parameters.mode" "default-mode" "the preview resolves defaults"
+check_true '.stdout == null' "a dry run reports no stdout, because nothing ran"
+if [ -e "$TL_SIDE_EFFECT" ]; then
+    check_local "side effect ran" "no side effect" "Test must not execute the script"
+else
+    check_local "no side effect" "no side effect" "Test must not execute the script"
+fi
+
+api_call GET "/api/executions?hook=test_vs_launch&limit=10" "$MASTER_KEY"
+check "200" "query the hook's history after the dry run"
+check_jq "length" "0" "a dry run records no execution"
+
+# Launch = the real thing, with captured output and a history row.
+api_call POST "/api/hooks/$TL_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"mode":"production"}}'
+check "200" "Launch executes the hook"
+check_jq ".status" "SUCCESS" "the execution succeeded"
+check_jq ".exit_code" "0" "the exit code is captured"
+check_jq ".stdout | rtrimstr(\"\n\")" "launched:production" "stdout is captured"
+check_jq ".stderr | rtrimstr(\"\n\")" "diagnostics" "stderr is captured separately"
+check_true '.duration_ms >= 0' "a duration is recorded"
+if [ -e "$TL_SIDE_EFFECT" ]; then
+    check_local "side effect ran" "side effect ran" "Launch really executed the script"
+else
+    check_local "no side effect" "side effect ran" "Launch really executed the script"
+fi
+
+api_call GET "/api/executions?hook=test_vs_launch&limit=10" "$MASTER_KEY"
+check "200" "query the hook's history after the launch"
+check_jq "length" "1" "exactly one execution was recorded"
+check_jq ".[0].status" "SUCCESS" "the recorded status matches"
+
+# Both endpoints require can_execute; can_manage alone is not enough for either.
+api_call POST "/api/keys/$MANAGE_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$TL_HOOK_ID\",\"can_execute\":false,\"can_manage\":true}"
+check "200" "grant a manage-only mapping on the hook"
+api_call POST "/api/hooks/$TL_HOOK_ID/test" "$MANAGE_KEY" '{}'
+check "403" "manage-only cannot dry-run (the preview reveals the resolved command line)"
+api_call POST "/api/hooks/$TL_HOOK_ID/execute" "$MANAGE_KEY" '{}'
+check "403" "manage-only cannot launch"
+
+api_call POST "/api/keys/$NOACCESS_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$TL_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+check "200" "grant an execute-only mapping on the hook"
+api_call POST "/api/hooks/$TL_HOOK_ID/test" "$NOACCESS_KEY" '{}'
+check "200" "execute-only can dry-run"
+api_call POST "/api/hooks/$TL_HOOK_ID/execute" "$NOACCESS_KEY" '{}'
+check "200" "execute-only can launch"
+api_call PUT "/api/hooks/$TL_HOOK_ID" "$NOACCESS_KEY" '{"description":"nope"}'
+check "403" "...but still cannot modify the hook"
+api_call DELETE "/api/hooks/$TL_HOOK_ID" "$NOACCESS_KEY"
+check "403" "...nor delete it"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

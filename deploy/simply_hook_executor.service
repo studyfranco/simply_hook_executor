@@ -43,6 +43,13 @@ Environment=DATABASE_URL=sqlite:///var/lib/simply_hook_executor/simply_hook_exec
 Environment=ALLOWED_ENV_VARS=PATH,LANG,TERM
 Environment=LOG_RETENTION_DAYS=30
 
+# Encrypts api_keys.signing_secret at rest, so database read access alone is not enough to forge
+# webhook signatures. Generate with `openssl rand -hex 32`. Prefer delivering it out of the unit
+# file entirely — `EnvironmentFile=/etc/simply_hook_executor/secrets.env` (chmod 0600, owned by
+# root) keeps it out of `systemctl show` output and world-readable unit files.
+#   Environment=SIGNING_SECRET_KEY=<64 hex characters>
+# EnvironmentFile=-/etc/simply_hook_executor/secrets.env
+
 # Directories hook scripts must live in. Strongly recommended: without it, any key holding
 # can_manage_hooks can point a hook at *any* absolute path, turning this into a generic
 # "run anything as hookrunner" service. Paths are re-checked after symlink resolution, so a

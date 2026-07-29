@@ -10,10 +10,8 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::*;
-use hmac::{Hmac, KeyInit, Mac};
 use sea_orm::EntityTrait;
 use serde_json::json;
-use sha2::Sha256;
 use simply_hook_executor::{
     config::RuntimeConfig, create_app, entities::prelude::Execution,
     retention::purge_expired_executions, spawn_retention_worker, state::AppState,
@@ -74,21 +72,19 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (key_id, key) = insert_key(&db, "Signer", "0.0.0.0/0", KeyScopes::plain()).await;
+    let signer = insert_key_full(&db, "Signer", "0.0.0.0/0", KeyScopes::plain()).await;
     let hook_id = insert_hook(&db, "signed_hook", &script, 30).await;
-    grant(&db, key_id, hook_id, true, false).await;
+    grant(&db, signer.id, hook_id, true, false).await;
 
     let body = json!({ "parameters": {} }).to_string();
-    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key");
-    mac.update(body.as_bytes());
-    let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let signature = sign_body(&signer.signing_secret, &body);
 
-    let signed = |sig: &str, payload: &str| {
+    let bearer_and_signature = |sig: &str, payload: &str| {
         with_connect_info(
             axum::http::Request::builder()
                 .method("POST")
                 .uri(format!("/api/hooks/{hook_id}/execute"))
-                .header("X-API-Key", &key)
+                .header("X-API-Key", &signer.plaintext)
                 .header("Content-Type", "application/json")
                 .header("X-Signature-256", sig),
         )
@@ -96,14 +92,161 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
         .expect("request builds")
     };
 
-    assert_eq!(send(&app, signed(&signature, &body)).await.status, StatusCode::OK);
+    // A bearer key plus a correct signature: the signature adds body integrity on top.
+    assert_eq!(send(&app, bearer_and_signature(&signature, &body)).await.status, StatusCode::OK);
 
     // Same signature, altered body: rejected.
     let tampered = json!({ "parameters": { "x": "1" } }).to_string();
-    assert_eq!(send(&app, signed(&signature, &tampered)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, bearer_and_signature(&signature, &tampered)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // Malformed signature header: rejected.
-    assert_eq!(send(&app, signed("sha256=deadbeef", &body)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, bearer_and_signature("sha256=deadbeef", &body)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The signature is keyed on the *signing secret*, not the bearer key: signing with the API key
+    // itself must no longer authenticate.
+    let wrong_key_material = sign_body(&signer.plaintext, &body);
+    assert_eq!(
+        send(&app, bearer_and_signature(&wrong_key_material, &body)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn key_id_and_signature_authenticate_without_a_bearer_key() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("webhook_signed.sh", "echo \"signed:$HOOK_PARAM_TARGET\"");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_full(&db, "Webhook Sender", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "webhook_signed", &script, 30).await;
+    insert_parameter(&db, hook_id, "target", None, true).await;
+    grant(&db, sender.id, hook_id, true, false).await;
+
+    let body = json!({ "target": "203.0.113.7" }).to_string();
+
+    // The whole point of the signing pair: a third-party sender authenticates with a public
+    // identifier and a signature, never transmitting a bearer credential at all.
+    let response = send(
+        &app,
+        signed_request("POST", "/webhook/webhook_signed", &sender.key_id, &sender.signing_secret, &body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.string("stdout").trim(), "signed:203.0.113.7");
+
+    // A key id with a signature made from the wrong secret is rejected.
+    let forged = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook/webhook_signed")
+            .header("X-Key-Id", &sender.key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Signature-256", sign_body("not-the-secret", &body)),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    assert_eq!(send(&app, forged).await.status, StatusCode::UNAUTHORIZED);
+
+    // A key id on its own proves nothing — it is public — so it must not authenticate.
+    let unsigned = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook/webhook_signed")
+            .header("X-Key-Id", &sender.key_id)
+            .header("Content-Type", "application/json"),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    let response = send(&app, unsigned).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("X-Signature-256"));
+
+    // An unknown key id is rejected with the same message as a bad key, so the endpoint cannot be
+    // used to enumerate which key ids exist.
+    let unknown = signed_request(
+        "POST",
+        "/webhook/webhook_signed",
+        "shk_00000000000000000000000000000000",
+        &sender.signing_secret,
+        &body,
+    );
+    assert_eq!(send(&app, unknown).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
+    use sea_orm::EntityTrait as _;
+    use simply_hook_executor::{crypto::SecretCipher, entities::prelude::ApiKey};
+
+    let db = setup_test_db().await;
+    let cipher = Arc::new(
+        SecretCipher::from_hex_key("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .expect("valid key"),
+    );
+    let app = create_app(test_state_with_cipher(&db, cipher.clone()));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    let created = send(
+        &app,
+        json_request("POST", "/api/keys", &master, Some(json!({ "name": "sealed", "bound_ips": "0.0.0.0/0" }))),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK);
+    let signing_secret = created.string("signing_secret");
+    let key_id = created.string("key_id");
+    assert!(key_id.starts_with("shk_"));
+    assert!(!signing_secret.is_empty());
+
+    // The stored column must not contain the secret in any readable form.
+    let stored = ApiKey::find_by_id(Uuid::parse_str(&created.string("id")).expect("valid uuid"))
+        .one(&db)
+        .await
+        .expect("query succeeds")
+        .expect("the key exists")
+        .signing_secret
+        .expect("a signing secret was stored");
+    assert!(!stored.contains(&signing_secret), "the raw secret must not be stored");
+    assert!(stored.starts_with("v1.xchacha20poly1305."), "it should be sealed: {stored}");
+    assert_eq!(cipher.open(&stored).expect("opens"), signing_secret);
+
+    // And the sealed secret still verifies a real signature end to end.
+    let dir = ScriptDir::new();
+    let script = dir.write_script("sealed.sh", "echo sealed-ok");
+    let hook = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "sealed_hook", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(hook.status, StatusCode::OK);
+    send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{}/permissions", created.string("id")),
+            &master,
+            Some(json!({ "hook_name": "sealed_hook", "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+
+    let body = json!({}).to_string();
+    let response = send(&app, signed_request("POST", "/webhook/sealed_hook", &key_id, &signing_secret, &body)).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.string("stdout").trim(), "sealed-ok");
+
+    // The listing exposes the public identifier but never the secret.
+    let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+    let serialized = listed.json.to_string();
+    assert!(serialized.contains(&key_id), "key_id should be listed");
+    assert!(!serialized.contains(&signing_secret), "the signing secret must never be listed");
+    assert!(!serialized.contains("signing_secret\":\""), "no raw secret field is exposed");
 }
 
 #[tokio::test]
@@ -114,24 +257,18 @@ async fn hmac_signature_failures_are_rejected_without_executing_anything() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (key_id, key) = insert_key(&db, "Signer", "0.0.0.0/0", KeyScopes::plain()).await;
+    let signer = insert_key_full(&db, "Signer", "0.0.0.0/0", KeyScopes::plain()).await;
     // A second valid key: a signature made with *someone else's* valid secret must not pass.
-    let (_, other_key) = insert_key(&db, "Other Signer", "0.0.0.0/0", KeyScopes::plain()).await;
+    let other = insert_key_full(&db, "Other Signer", "0.0.0.0/0", KeyScopes::plain()).await;
     let hook_id = insert_hook(&db, "signed_fail", &script, 30).await;
-    grant(&db, key_id, hook_id, true, false).await;
-
-    let sign = |secret: &str, payload: &str| {
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
-        mac.update(payload.as_bytes());
-        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
-    };
+    grant(&db, signer.id, hook_id, true, false).await;
 
     let request = |sig: &str, payload: &str| {
         with_connect_info(
             axum::http::Request::builder()
                 .method("POST")
                 .uri(format!("/api/hooks/{hook_id}/execute"))
-                .header("X-API-Key", &key)
+                .header("X-API-Key", &signer.plaintext)
                 .header("Content-Type", "application/json")
                 .header("X-Signature-256", sig),
         )
@@ -140,15 +277,16 @@ async fn hmac_signature_failures_are_rejected_without_executing_anything() {
     };
 
     let body = json!({ "parameters": {} }).to_string();
-    let valid = sign(&key, &body);
+    let valid = sign_body(&signer.signing_secret, &body);
 
     // Every one of these presents a *valid* API key — only the signature is wrong, so each must
     // still be rejected at the authentication layer.
     let rejected: Vec<(&str, String, String)> = vec![
         ("tampered body", valid.clone(), json!({ "parameters": { "x": "1" } }).to_string()),
         ("body with trailing whitespace", valid.clone(), format!("{body} ")),
-        ("signature from another valid key", sign(&other_key, &body), body.clone()),
-        ("signature of a different payload", sign(&key, "{}"), body.clone()),
+        ("signature from another valid key", sign_body(&other.signing_secret, &body), body.clone()),
+        ("signature of a different payload", sign_body(&signer.signing_secret, "{}"), body.clone()),
+        ("signature keyed on the bearer key instead of the signing secret", sign_body(&signer.plaintext, &body), body.clone()),
         ("missing sha256= prefix", valid.trim_start_matches("sha256=").to_owned(), body.clone()),
         ("wrong algorithm prefix", format!("sha1={}", &valid[7..]), body.clone()),
         ("non-hex digest", "sha256=zzzz".to_owned(), body.clone()),
@@ -1043,6 +1181,219 @@ async fn run_as_user_survives_hook_crud_and_is_audited() {
 }
 
 #[tokio::test]
+async fn only_master_keys_may_assign_run_as_user() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("guarded_priv.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    // A fully-scoped non-master: it may create hooks, it simply may not elevate them.
+    let (_, manager) = insert_key(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    // Creating a *standard* hook is allowed and must keep working.
+    let ordinary = send(
+        &app,
+        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "ordinary", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(ordinary.status, StatusCode::OK);
+    assert_eq!(ordinary.field("run_as_user"), &json!(null));
+
+    // Requesting elevation is not.
+    for account in ["root", "postgres", "nobody"] {
+        let denied = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/hooks",
+                &manager,
+                Some(json!({ "name": format!("escalate_{account}"), "script_path": script, "run_as_user": account })),
+            ),
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "run_as_user={account} must be refused");
+        assert_eq!(
+            denied.string("error"),
+            "Only master API keys can assign run_as_user privileges"
+        );
+    }
+
+    // The refusal is authorization, not validation: a syntactically invalid account from a
+    // non-master must still be a 403, so probing the field cannot reveal what would be accepted.
+    let probe = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &manager,
+            Some(json!({ "name": "probe", "script_path": script, "run_as_user": "-i" })),
+        ),
+    )
+    .await;
+    assert_eq!(probe.status, StatusCode::FORBIDDEN);
+
+    // Explicitly *not* elevating is fine for a non-master, in both spellings.
+    for null_ish in [json!(null), json!("")] {
+        let allowed = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/hooks",
+                &manager,
+                Some(json!({ "name": format!("plain_{null_ish}"), "script_path": script, "run_as_user": null_ish })),
+            ),
+        )
+        .await;
+        assert_eq!(allowed.status, StatusCode::OK, "an unelevated hook must still be creatable");
+        assert_eq!(allowed.field("run_as_user"), &json!(null));
+    }
+
+    // The guard covers updates too — including on a hook the non-master owns outright.
+    let owned_id = ordinary.string("id");
+    let escalate = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "root" }))),
+    )
+    .await;
+    assert_eq!(escalate.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        escalate.string("error"),
+        "Only master API keys can assign run_as_user privileges"
+    );
+
+    // ...and via PATCH, which is routed to the same handler.
+    let patched = send(
+        &app,
+        json_request("PATCH", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "root" }))),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::FORBIDDEN);
+
+    // A master can do what the manager could not.
+    let elevated = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{owned_id}"), &master, Some(json!({ "run_as_user": "root" }))),
+    )
+    .await;
+    assert_eq!(elevated.status, StatusCode::OK);
+    assert_eq!(elevated.field("run_as_user"), &json!("root"));
+
+    // And a non-master may still edit other fields of that now-elevated hook without tripping the
+    // guard, since omitting run_as_user leaves it untouched. (The manager already holds full
+    // rights here: creating the hook auto-provisioned them.)
+    let unrelated = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "description": "edited" }))),
+    )
+    .await;
+    assert_eq!(unrelated.status, StatusCode::OK);
+    assert_eq!(unrelated.field("run_as_user"), &json!("root"), "the elevation is preserved");
+
+    // But it cannot clear the elevation either — that is still a change to a privileged field.
+    // (An empty string is "no elevation", which the guard permits.)
+    let cleared = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "" }))),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "dropping elevation is not an escalation");
+    assert_eq!(cleared.field("run_as_user"), &json!(null));
+}
+
+#[tokio::test]
+async fn granular_hook_permissions_separate_execute_from_manage() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("granular.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (executor_id, executor) = insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
+    let (manager_id, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::plain()).await;
+    let (_, stranger) = insert_key(&db, "Stranger", "0.0.0.0/0", KeyScopes::plain()).await;
+
+    let hook_id = insert_hook(&db, "granular", &script, 30).await;
+    grant(&db, executor_id, hook_id, true, false).await;
+    grant(&db, manager_id, hook_id, false, true).await;
+
+    let execute_uri = format!("/api/hooks/{hook_id}/execute");
+    let test_uri = format!("/api/hooks/{hook_id}/test");
+    let hook_uri = format!("/api/hooks/{hook_id}");
+
+    // can_execute: may run and dry-run...
+    assert_eq!(send(&app, json_request("POST", &execute_uri, &executor, None)).await.status, StatusCode::OK);
+    assert_eq!(send(&app, json_request("POST", &test_uri, &executor, None)).await.status, StatusCode::OK);
+    // ...may read the definition, its parameters, and its history...
+    assert_eq!(send(&app, json_request("GET", &hook_uri, &executor, None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, json_request("GET", &format!("{hook_uri}/parameters"), &executor, None)).await.status,
+        StatusCode::OK
+    );
+    let history = send(&app, json_request("GET", "/api/executions", &executor, None)).await;
+    assert_eq!(history.status, StatusCode::OK);
+    assert_eq!(history.json.as_array().map(Vec::len), Some(1));
+    // ...but may not modify or delete it.
+    assert_eq!(
+        send(&app, json_request("PUT", &hook_uri, &executor, Some(json!({ "name": "hijacked" })))).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&app, json_request("PATCH", &hook_uri, &executor, Some(json!({ "name": "hijacked" })))).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(send(&app, json_request("DELETE", &hook_uri, &executor, None)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(&app, json_request("POST", &format!("{hook_uri}/parameters"), &executor, Some(json!({ "param_key": "x" })))).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // can_manage: may edit and read...
+    assert_eq!(
+        send(&app, json_request("PUT", &hook_uri, &manager, Some(json!({ "description": "managed" })))).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(send(&app, json_request("GET", &hook_uri, &manager, None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, json_request("POST", &format!("{hook_uri}/parameters"), &manager, Some(json!({ "param_key": "added", "default_value": "v" })))).await.status,
+        StatusCode::OK
+    );
+    // ...but manage alone does NOT confer the right to run it, in either mode.
+    assert_eq!(
+        send(&app, json_request("POST", &execute_uri, &manager, None)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&app, json_request("POST", &test_uri, &manager, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "a dry run reveals the resolved command line, so it requires execute rights"
+    );
+
+    // A key with no mapping at all sees and does nothing.
+    for (method, uri) in [
+        ("GET", hook_uri.as_str()),
+        ("POST", execute_uri.as_str()),
+        ("POST", test_uri.as_str()),
+        ("PUT", hook_uri.as_str()),
+        ("DELETE", hook_uri.as_str()),
+    ] {
+        let body = if method == "PUT" { Some(json!({ "description": "x" })) } else { None };
+        assert_eq!(
+            send(&app, json_request(method, uri, &stranger, body)).await.status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must be denied without a mapping"
+        );
+    }
+    assert_eq!(
+        send(&app, json_request("GET", "/api/executions", &stranger, None)).await.json.as_array().map(Vec::len),
+        Some(0),
+        "history is scoped to hooks the key can see"
+    );
+
+    // Deletion is the manager's, and it is the last word.
+    assert_eq!(send(&app, json_request("DELETE", &hook_uri, &manager, None)).await.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn run_as_user_rejects_option_injection_and_malformed_accounts() {
     let dir = ScriptDir::new();
     let script = dir.write_script("reject_priv.sh", "echo ok");
@@ -1675,6 +2026,7 @@ async fn retention_worker_purges_on_its_own_schedule_and_shuts_down_cleanly() {
             retention_sweep_seconds: 1,
             ..(*test_config()).clone()
         }),
+        test_cipher(),
     );
     let (shutdown_tx, worker) = spawn_retention_worker(&state);
 
@@ -1710,6 +2062,7 @@ async fn retention_worker_is_disabled_when_retention_days_is_zero() {
             retention_sweep_seconds: 1,
             ..(*test_config()).clone()
         }),
+        test_cipher(),
     );
     let (shutdown_tx, worker) = spawn_retention_worker(&state);
 

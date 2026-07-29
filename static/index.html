@@ -276,10 +276,6 @@
                         </div>
                     </form>
 
-                    <div id="apikey-created" class="key-reveal hidden">
-                        <p class="key-reveal-label">New API Key (copy now):</p>
-                        <code id="apikey-plaintext" class="key-reveal-value"></code>
-                    </div>
 
                     <div class="batch-actions">
                         <button type="button" id="delete-selected-keys" class="btn btn-batch-delete" disabled>Delete Selected</button>
@@ -291,6 +287,7 @@
                                 <tr>
                                     <th><input type="checkbox" id="select-all-keys" title="Select all"></th>
                                     <th>Name</th>
+                                    <th>Key ID</th>
                                     <th>Bound IPs</th>
                                     <th>Jobs</th>
                                     <th>Scopes &amp; Hook Permissions</th>
@@ -299,7 +296,7 @@
                             </thead>
                             <tbody id="apikeys-table-body">
                                 <tr>
-                                    <td colspan="6" class="text-center text-muted">No API keys loaded.</td>
+                                    <td colspan="7" class="text-center text-muted">No API keys loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -537,14 +534,28 @@
         </div>
     </div>
 
-    <!-- Secret Reveal Modal (used after key rotation) -->
+    <!-- One-time credential reveal (used after key creation and rotation) -->
     <div id="secret-reveal-modal" class="modal-overlay hidden">
-        <div class="modal-card card">
-            <h3>New Secret Generated</h3>
-            <p class="subtitle">Copy this key now — it will not be shown again.</p>
-            <code id="secret-reveal-value" class="key-reveal-value"></code>
+        <div class="modal-card modal-card-wide card">
+            <h3 id="secret-reveal-title">API Key Credentials</h3>
+            <p class="subtitle">
+                Copy these now — the API key and signing secret are shown <strong>once</strong> and
+                cannot be retrieved again. Rotating the key is the only way to issue new ones.
+            </p>
+            <div id="secret-reveal-body"></div>
             <div class="form-actions mt-4">
-                <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
+                <button type="button" id="secret-reveal-close" class="btn btn-primary">I have copied them</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hook run result (Test dry-run preview, or Launch execution output) -->
+    <div id="hook-result-modal" class="modal-overlay hidden">
+        <div class="modal-card modal-card-wide card">
+            <h3 id="hook-result-title">Hook Result</h3>
+            <div id="hook-result-body"></div>
+            <div class="form-actions mt-4">
+                <button type="button" id="hook-result-close" class="btn btn-primary">Close</button>
             </div>
         </div>
     </div>

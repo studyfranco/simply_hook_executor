@@ -46,6 +46,8 @@ Stores authentication keys, global scopes, and network restrictions.
 | `name` | String | NOT NULL | Human-readable label (e.g., "Vault Webhook Client"). |
 | `plaintext_prefix`| String | NOT NULL | First 8 characters of plaintext key for display/logs. |
 | `key_hash` | String | NOT NULL, UNIQUE | Argon2id or SHA-256 hash of the secret key. |
+| `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`). Safe to log and to send in the clear as `X-Key-Id`; selects which `signing_secret` verifies a webhook signature. `NULL` only for keys issued before signature auth existed — rotate such a key to mint a pair. |
+| `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret. **Cannot be hashed** — verifying a signature means recomputing it, which needs the original bytes — so it is stored *encrypted at rest* (XChaCha20-Poly1305 under `SIGNING_SECRET_KEY`) rather than digested. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
 | `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. |
 | `max_concurrent_jobs`| Integer | NOT NULL, DEFAULT `10` | Maximum simultaneous script executions allowed for this key. |
 | `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all RBAC checks if `true`. |

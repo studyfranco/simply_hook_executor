@@ -48,6 +48,46 @@ A hook's `script_path` is validated twice:
    the roots. A symlink planted *inside* an allowed root that points at `/bin/sh` or `/etc/shadow`
    passes the first check and is caught by the second, before anything is spawned.
 
+### Webhook signatures (`key_id` + `signing_secret`)
+
+Every API key carries two further credentials, both returned **once** by `POST /api/keys` (and by
+`/rotate`):
+
+| Credential | Secret? | Sent as | Purpose |
+| :--- | :--- | :--- | :--- |
+| `plaintext_key` | yes | `X-API-Key` | Bearer credential. Only its SHA-256 hash is stored. |
+| `key_id` | no | `X-Key-Id` | Public identifier (`shk_<32 hex>`). Selects which signing secret to verify against. |
+| `signing_secret` | yes | *never sent* | HMAC-SHA256 key. Used to compute `X-Signature-256`. |
+
+A webhook sender authenticates with the *public* id plus a signature, transmitting no bearer
+credential at all:
+
+```bash
+BODY='{"target_address":"203.0.113.7"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SIGNING_SECRET" -r | cut -d' ' -f1)
+curl -X POST -H "X-Key-Id: $KEY_ID" -H "Content-Type: application/json" \
+     -H "X-Signature-256: sha256=$SIG" -d "$BODY" \
+     http://localhost:3000/webhook/nftables_ban
+```
+
+A `key_id` on its own is not a credential, so a request presenting one **must** carry a valid
+signature. An `X-API-Key` may also be accompanied by a signature, which then adds body integrity on
+top of bearer auth. Unknown key ids and bad signatures return the same `401`, so the endpoint
+cannot be used to enumerate which key ids exist.
+
+**Storage.** Unlike the API key, the signing secret cannot be hashed — verifying a signature means
+recomputing it, which needs the original bytes. It is therefore stored **encrypted at rest** with
+XChaCha20-Poly1305:
+
+```bash
+SIGNING_SECRET_KEY=$(openssl rand -hex 32)
+```
+
+Without `SIGNING_SECRET_KEY` the daemon still runs, but stores signing secrets unencrypted and says
+so loudly at startup — anyone able to read the database could then forge signatures. A malformed
+key aborts startup rather than silently downgrading. Enabling encryption later is safe: secrets
+written before it stay readable, and new ones are sealed from then on.
+
 ### Privileged execution (`run_as_user`)
 
 A hook may declare an optional `run_as_user`. When set, the script is invoked through `sudo`
@@ -65,8 +105,13 @@ instead of directly:
   (`[A-Za-z_][A-Za-z0-9_-]*`, plus a trailing `$`), which makes an option-shaped value such as
   `-i` or `--login` unrepresentable rather than relying on sudo to be defensive about it.
 
-**This field requests elevation; it cannot grant it.** `sudoers` remains the sole authority, so a
-matching rule is required — scoped as narrowly as the job allows:
+**Setting `run_as_user` requires a master key.** `can_manage_hooks` is the right to define
+automation, not the right to choose which OS account it runs as; a non-master supplying the field
+gets `403 Only master API keys can assign run_as_user privileges`, whether on create, `PUT`, or
+`PATCH`. Clearing it (sending `""`) is not an escalation and stays open to any hook manager.
+
+**Even for a master, this field requests elevation; it cannot grant it.** `sudoers` remains the
+sole authority, so a matching rule is required — scoped as narrowly as the job allows:
 
 ```sudoers
 hookrunner ALL=(root) NOPASSWD: /opt/hooks/ban.sh
@@ -176,6 +221,7 @@ automatically if present):
 | :--- | :--- | :--- |
 | `DATABASE_URL` | `sqlite://simply_hook_executor.db?mode=rwc` | SeaORM connection string. |
 | `ALLOWED_ENV_VARS` | `PATH,LANG,TERM,SYSTEMROOT` | Comma-separated allowlist of host variables passed through to hook sub-processes. Everything else is cleared. An empty value means total isolation. |
+| `SIGNING_SECRET_KEY` | *(unset — no encryption)* | 64 hex characters (32 bytes) used to encrypt `api_keys.signing_secret` at rest. Strongly recommended: without it, database read access is enough to forge webhook signatures. A malformed value aborts startup rather than silently storing secrets in the clear. |
 | `ALLOWED_SCRIPT_ROOTS` | *(unset — unrestricted)* | Comma-separated absolute directories that a hook's `script_path` must live under. Strongly recommended in production: without it, any key holding `can_manage_hooks` can point a hook at any absolute path. Relative entries are ignored with a warning (a boundary that moves with the working directory is not a boundary). |
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |
@@ -221,9 +267,10 @@ hook's UUID or its unique name.
 | :--- | :--- | :--- |
 | `GET` | `/api/auth/me` | Identity + effective RBAC permissions for the calling key. |
 | `POST` / `GET` | `/api/hooks` | Create / list hooks (creation requires `is_master` or `can_manage_hooks`). |
-| `GET` / `PUT` / `DELETE` | `/api/hooks/{identifier}` | Read / update / delete one hook. |
-| `POST` | `/api/hooks/{identifier}/execute` | Run the hook and return its recorded outcome. |
-| `POST` | `/api/hooks/{identifier}/test` | Dry run: preview the resolved command without executing. |
+| `GET` | `/api/hooks/{identifier}` | Read one hook. Needs any mapping (`can_execute` or `can_manage`). |
+| `PUT` / `PATCH` / `DELETE` | `/api/hooks/{identifier}` | Update / delete one hook. Needs `can_manage`. |
+| `POST` | `/api/hooks/{identifier}/execute` | Run the hook and return its recorded outcome. Needs `can_execute`. |
+| `POST` | `/api/hooks/{identifier}/test` | Dry run: preview the resolved command without executing. Needs `can_execute` — the preview reveals the resolved command line and child environment. |
 | `GET` / `POST` | `/api/hooks/{identifier}/parameters` | List / declare parameters. |
 | `PUT` / `DELETE` | `/api/hooks/{identifier}/parameters/{param_id}` | Update / remove a parameter. |
 | `POST` | `/webhook/{identifier}` | Webhook-facing alias of `/execute`, for flat third-party payloads. |

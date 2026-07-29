@@ -350,6 +350,31 @@ class HookExecutorClient {
         // A key with no executable hook has nothing to run.
         const canExecuteAny = p.is_master || (p.hook_permissions || []).some(h => h.can_execute);
         document.getElementById('run-hook-section').style.display = canExecuteAny ? 'block' : 'none';
+
+        // Assigning run_as_user is a privilege-escalation request and is master-only server side.
+        // The field is disabled rather than merely hidden, so a non-master sees that the capability
+        // exists and why it is unavailable, instead of wondering where it went.
+        this.applyRunAsUserGuard();
+    }
+
+    // Disables the run_as_user inputs for non-master keys, matching the backend's 403.
+    applyRunAsUserGuard() {
+        const isMaster = Boolean(this.state.profile?.is_master);
+        ['hook-run-as-user', 'edit-hook-run-as-user'].forEach(id => {
+            const input = document.getElementById(id);
+            if (!input) return;
+            input.disabled = !isMaster;
+            input.placeholder = isMaster
+                ? 'leave empty to run as the daemon user'
+                : 'master keys only';
+            input.title = isMaster ? '' : 'Only master API keys can assign run_as_user privileges';
+            const hint = input.nextElementSibling;
+            if (hint && hint.classList.contains('text-muted')) {
+                hint.textContent = isMaster
+                    ? 'Runs the script via sudo -n -u <user> --. Requires a matching NOPASSWD rule in sudoers.'
+                    : 'Only master API keys can assign run_as_user privileges.';
+            }
+        });
     }
 
     // ───────────────────────────────────────────────────────
@@ -820,6 +845,112 @@ class HookExecutorClient {
         return `<span class="badge badge-elevated" title="Runs via sudo -n -u ${escapeHtml(runAsUser)} --">⬆ ${escapeHtml(runAsUser)}</span>`;
     }
 
+    // Collects a hook's parameters for a table-initiated run. Only parameters that already carry
+    // a default can be resolved without a form, so a hook with unsatisfied required parameters is
+    // routed to the Run panel rather than being launched with a guess.
+    hookNeedsInput(hook) {
+        return hook.parameters.some(p => p.is_required && p.default_value === null);
+    }
+
+    sendToRunPanel(hook, message) {
+        this.showToast(message, 'info');
+        document.querySelector('.tab-btn[data-tab="executions"]').click();
+        this.runHookCombobox.select({ value: hook.id, label: hook.name });
+    }
+
+    // Test = dry run. It resolves parameters and renders the exact command, environment and
+    // timeout that *would* be used, and deliberately spawns nothing — so there is no stdout,
+    // stderr or exit code to show, and claiming otherwise would be a lie about what ran.
+    async testHookFromTable(hookId) {
+        const hook = this.state.hooks.find(h => h.id === hookId);
+        if (!hook) return;
+        if (this.hookNeedsInput(hook)) {
+            this.sendToRunPanel(hook, 'This hook has required parameters — fill them in below, then Dry Run.');
+            return;
+        }
+
+        try {
+            const res = await this.apiFetch(`/hooks/${hookId}/test`, {
+                method: 'POST',
+                body: JSON.stringify({ parameters: {} })
+            });
+
+            const envRows = Object.entries(res.command.env).map(([k, v]) => `${k}=${v}`).join('\n');
+            const argList = res.command.args.length
+                ? res.command.args.map((a, i) => `argv[${i + 1}] = ${a}`).join('\n')
+                : '(none)';
+
+            this.showHookResultModal(`Dry Run — ${hook.name}`, `
+                <div class="result-header">
+                    <span class="badge ${res.would_execute ? 'badge-success' : 'badge-failed'}">
+                        ${res.would_execute ? 'WOULD EXECUTE' : 'BLOCKED'}
+                    </span>
+                    <span class="text-sm text-muted">timeout ${res.timeout_seconds}s</span>
+                    ${res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
+                </div>
+                <p class="subtitle">Nothing was executed — this is the command that would run.</p>
+                ${res.blocking_reason ? `<p class="message error">${escapeHtml(res.blocking_reason)}</p>` : ''}
+                ${this.outputBlock('program', res.command.program)}
+                ${this.outputBlock('positional arguments', argList)}
+                ${this.outputBlock('environment', envRows)}
+            `);
+        } catch (e) {}
+    }
+
+    // Launch = the real thing, with the recorded stdout/stderr/exit code.
+    async launchHookFromTable(hookId) {
+        const hook = this.state.hooks.find(h => h.id === hookId);
+        if (!hook) return;
+        if (this.hookNeedsInput(hook)) {
+            this.sendToRunPanel(hook, 'This hook has required parameters — fill them in below, then Execute.');
+            return;
+        }
+
+        const ok = await this.showConfirmModal({
+            title: `Launch "${hook.name}"`,
+            message: hook.run_as_user
+                ? `This runs ${hook.script_path} as "${hook.run_as_user}" via sudo. Continue?`
+                : `This runs ${hook.script_path} for real. Continue?`,
+            confirmText: 'Launch',
+            danger: Boolean(hook.run_as_user)
+        });
+        if (!ok) return;
+
+        try {
+            const res = await this.apiFetch(`/hooks/${hookId}/execute`, {
+                method: 'POST',
+                body: JSON.stringify({ parameters: {} })
+            });
+
+            this.showHookResultModal(`Execution — ${hook.name}`, `
+                <div class="result-header">
+                    ${this.statusBadge(res.status)}
+                    <span class="text-sm text-muted">exit ${res.exit_code === null ? '–' : res.exit_code} · ${formatDuration(res.duration_ms)}</span>
+                    ${hook.run_as_user ? this.privilegeBadge(hook.run_as_user) : ''}
+                </div>
+                ${this.outputBlock('stdout', res.stdout)}
+                ${this.outputBlock('stderr', res.stderr)}
+            `);
+            this.showToast(`Execution finished: ${res.status}`, res.status === 'SUCCESS' ? 'success' : 'error');
+            this.loadExecutions();
+        } catch (e) {}
+    }
+
+    // Jumps to the execution history filtered to this hook.
+    showHookLogs(hookId) {
+        const hook = this.state.hooks.find(h => h.id === hookId);
+        if (!hook) return;
+        document.querySelector('.tab-btn[data-tab="executions"]').click();
+        document.getElementById('exec-hook-filter').value = hook.name;
+        this.loadExecutions();
+    }
+
+    showHookResultModal(title, bodyHtml) {
+        document.getElementById('hook-result-title').textContent = title;
+        document.getElementById('hook-result-body').innerHTML = bodyHtml;
+        document.getElementById('hook-result-modal').classList.remove('hidden');
+    }
+
     renderHooksTable() {
         const tbody = document.getElementById('hooks-table-body');
 
@@ -843,6 +974,11 @@ class HookExecutorClient {
                     <td><div class="scope-badges">${rights}</div></td>
                     <td>
                         <div class="flex gap-2">
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.testHookFromTable('${h.id}')" ${h.can_execute ? '' : 'disabled'}
+                                title="${h.can_execute ? 'Dry run: resolve the command without executing it' : 'Requires execute permission'}">Test</button>
+                            <button class="btn btn-sm btn-primary" onclick="window.app.launchHookFromTable('${h.id}')" ${h.can_execute ? '' : 'disabled'}
+                                title="${h.can_execute ? 'Execute this hook for real' : 'Requires execute permission'}">Launch</button>
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.showHookLogs('${h.id}')">Logs</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openParamsModal('${h.id}')" ${h.can_manage ? '' : 'disabled'}>Parameters</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openEditHookModal('${h.id}')" ${h.can_manage ? '' : 'disabled'}>Edit</button>
                             <button class="btn btn-sm btn-danger" onclick="window.app.deleteHook('${h.id}')" ${h.can_manage ? '' : 'disabled'}>Delete</button>
@@ -889,6 +1025,9 @@ class HookExecutorClient {
         document.getElementById('edit-hook-timeout').value = h.default_timeout_seconds;
         document.getElementById('edit-hook-run-as-user').value = h.run_as_user || '';
         document.getElementById('edit-hook-description').value = h.description || '';
+        // Re-applied on open: the modal's inputs persist across renders, so the guard has to be
+        // reasserted rather than assumed from login time.
+        this.applyRunAsUserGuard();
         document.getElementById('edit-hook-modal').classList.remove('hidden');
     }
 
@@ -1022,12 +1161,16 @@ class HookExecutorClient {
     renderKeysTable() {
         const tbody = document.getElementById('apikeys-table-body');
         if (this.state.apiKeys.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No API keys.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No API keys.</td></tr>';
         } else {
             tbody.innerHTML = this.state.apiKeys.map(k => `
                 <tr>
                     <td><input type="checkbox" class="row-select" data-id="${k.id}"></td>
                     <td><strong>${escapeHtml(k.name)}</strong><div class="text-muted text-sm font-mono">${escapeHtml(k.prefix)}...</div></td>
+                    <td class="font-mono text-sm">
+                        ${k.key_id ? escapeHtml(k.key_id) : '<span class="text-muted">none — rotate to mint</span>'}
+                        ${k.key_id && !k.has_signing_secret ? '<div class="text-muted text-sm">no signing secret</div>' : ''}
+                    </td>
                     <td class="font-mono text-sm">${escapeHtml(k.bound_ips || '-')}</td>
                     <td class="text-sm">${k.max_concurrent_jobs}</td>
                     <td>${this.renderKeyScopes(k)}</td>
@@ -1094,12 +1237,31 @@ class HookExecutorClient {
 
         try {
             const res = await this.apiFetch('/keys', { method: 'POST', body: JSON.stringify(payload) });
-            document.getElementById('apikey-plaintext').textContent = res.plaintext_key;
-            document.getElementById('apikey-created').classList.remove('hidden');
+            this.revealCredentials('API Key Created', res);
             document.getElementById('form-create-apikey').reset();
             document.getElementById('apikey-max-jobs').value = 10;
             this.loadKeys();
         } catch (err) {}
+    }
+
+    // One-time reveal of the credentials a key creation or rotation just minted. The signing
+    // secret is stored encrypted and never returned again, so this modal is the only chance to
+    // copy it — hence the deliberate friction of an "I have copied them" button.
+    revealCredentials(title, res) {
+        const field = (label, value, hint) => `
+            <div class="form-group">
+                <label>${escapeHtml(label)}</label>
+                <code class="key-reveal-value">${escapeHtml(value)}</code>
+                ${hint ? `<span class="text-muted text-sm">${escapeHtml(hint)}</span>` : ''}
+            </div>`;
+
+        document.getElementById('secret-reveal-title').textContent = title;
+        document.getElementById('secret-reveal-body').innerHTML = [
+            field('API Key', res.plaintext_key, 'Send as the X-API-Key header.'),
+            field('Key ID', res.key_id, 'Public identifier. Send as X-Key-Id when authenticating by signature.'),
+            field('Signing Secret', res.signing_secret, 'Secret. Compute HMAC-SHA256 over the raw JSON body and send it as X-Signature-256: sha256=<hex>.')
+        ].join('');
+        document.getElementById('secret-reveal-modal').classList.remove('hidden');
     }
 
     async manageKeyRights(e) {
@@ -1183,9 +1345,8 @@ class HookExecutorClient {
         if (!ok) return;
         try {
             const res = await this.apiFetch(`/keys/${id}/rotate`, { method: 'POST' });
-            document.getElementById('secret-reveal-value').textContent = res.plaintext_key;
-            document.getElementById('secret-reveal-modal').classList.remove('hidden');
-            this.showToast('Secret rotated', 'success');
+            this.revealCredentials('New Credentials Generated', res);
+            this.showToast('Key and signing secret rotated', 'success');
             this.loadKeys();
         } catch (e) {}
     }
@@ -1381,6 +1542,9 @@ class HookExecutorClient {
         });
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
+        });
+        document.getElementById('hook-result-close').addEventListener('click', () => {
+            document.getElementById('hook-result-modal').classList.add('hidden');
         });
 
         // Settings

@@ -491,3 +491,134 @@ Creating a privileged hook currently needs only `can_manage_hooks`, the same sco
 hook. The OS remains the real gate (sudoers decides what is actually permitted), but a dedicated
 `can_elevate` scope — or restricting `run_as_user` to master keys — would be a defensible tightening.
 It is not in `SCHEMA.MD`, so it was not invented here.
+
+*(Resolved in the next entry: `run_as_user` is now master-only.)*
+
+---
+
+## 2026-07-29 (later) — Signing secrets, the `run_as_user` master guard, and Test/Launch
+
+### Two divergences from `SCHEMA.MD`, flagged rather than papered over
+
+1. **`can_read` does not exist.** The task described a three-flag per-hook model
+   (`can_execute` / `can_read` / `can_manage`), but `SCHEMA.MD`'s `api_key_hook_permissions` table
+   defines only `can_execute` and `can_manage`. Rather than invent a column the schema document
+   does not sanction, read access is derived: **any** mapping (execute or manage) grants visibility
+   of the hook, its parameters, and its execution history — see `require_visibility`. That yields
+   the intended behaviour (an execute-only key can read what it runs; a key with no mapping sees
+   nothing) with the columns that actually exist. Adding a real `can_read` flag would need a
+   `SCHEMA.MD` change first, and would only matter for a "may read but may neither run nor edit"
+   role that nothing currently asks for.
+2. **`key_id` / `signing_secret` were not in `api_keys`.** These were added — schema, migration,
+   entity — and `SCHEMA.MD` was updated in the same change, as with `run_as_user`.
+
+### Signing secrets cannot be hashed
+
+The task said to store the signing secret "hashed/encrypted". Only one of those is actually
+possible: verifying an HMAC means *recomputing* it, which needs the original bytes. A hash would
+make signature verification impossible — which is precisely why the previous implementation had to
+key signatures on the presented API key and could never support a sender that transmits no bearer
+credential.
+
+So the secret is stored **encrypted at rest** (`src/crypto.rs`), XChaCha20-Poly1305 under
+`SIGNING_SECRET_KEY`:
+
+- **Encryption is optional but loud.** Unset ⇒ secrets stored verbatim, with a startup `WARN`
+  spelling out the consequence. Set-but-malformed ⇒ **hard startup failure**, never a silent
+  downgrade: an operator who set the variable believes their secrets are encrypted, and quietly
+  writing them in the clear would betray that at exactly the wrong moment.
+- **Versioned storage prefixes** (`v1.plain.` / `v1.xchacha20poly1305.`) mean enabling encryption
+  on a running deployment does not invalidate previously-issued secrets — old rows stay readable,
+  new ones are sealed. A sealed row with no key configured reports "key mismatch", not "corrupt",
+  because the fix is to set the variable.
+- Even the plaintext mode hex-encodes, so a `grep` of a database dump does not surface secrets.
+- `SecretCipher`'s `Debug` is hand-written to redact key material, so `{:?}` of app state cannot
+  leak it.
+
+### Authentication model, restated
+
+| Presented | Result |
+| :--- | :--- |
+| `X-API-Key` | Bearer auth. A signature, if also present, must verify (body integrity on top). |
+| `X-Key-Id` + `X-Signature-256` | Signature auth. The key id is *public*, so a valid signature is **mandatory**. |
+| `X-Key-Id` alone | `401` — a public identifier proves nothing. |
+| neither | `401` |
+
+Unknown key id and bad signature return the same `401`, so the endpoint is not a key-id oracle.
+A key with no signing secret (issued before this migration) is told so specifically — that is a
+configuration problem the operator fixes by rotating, not a credential to obscure. Rotation
+replaces the signing pair as well as the bearer key: a rotation answers "this may be compromised",
+and leaving the old signing secret live would keep an attacker able to forge.
+
+**Migration.** `key_id`/`signing_secret` are nullable rather than backfilled. Minting secrets
+during an upgrade would create credentials nobody was told about; a placeholder would either break
+`key_id` uniqueness or fabricate something that looks usable but is not. `NULL` states the truth,
+and multiple `NULL`s coexist under the unique index because SQL treats them as distinct. (An
+earlier draft backfilled via `CONCAT`, which SQLite does not have — caught before it shipped.)
+
+### `run_as_user` is now master-only
+
+`normalize_run_as_user` takes the acting key and rejects any non-empty value from a non-master with
+the exact message the task specifies. Two deliberate details:
+
+- **Authorization is checked before syntax.** A non-master submitting `-i` gets `403`, not `400`,
+  so the field cannot be probed to learn what would be accepted.
+- **Clearing elevation stays open** to any hook manager: `""` means "no elevation", which is a
+  de-escalation, not an escalation. Omitting the field leaves the current value untouched, so a
+  non-master can still edit other fields of a hook a master elevated.
+
+### `/test` now requires `can_execute`
+
+Previously either grant sufficed. It was tightened because a dry run returns the fully-resolved
+command line and the child's environment — execution-shaped knowledge, even though nothing spawns.
+A manage-only key can still edit the contract; it just cannot preview the resolved result.
+`PATCH` was added as a synonym for `PUT` (every `UpdateHookPayload` field is already optional, so
+the handler is partial-update either way).
+
+### Frontend
+
+- **One-time credential modal** replaces the old inline reveal, showing all three credentials
+  (API key, key id, signing secret) with an explicit "I have copied them" button — deliberate
+  friction, since the signing secret is unrecoverable afterwards. Used by both creation and
+  rotation. The keys table gained a Key ID column; it shows `has_signing_secret` rather than the
+  secret, which no endpoint ever returns again.
+- **`run_as_user` is disabled, not hidden,** for non-masters, with the reason in the placeholder
+  and tooltip — a hidden control makes users think the feature is missing; a disabled one with an
+  explanation tells them who to ask. Re-applied when the edit modal opens, since its inputs persist
+  across renders.
+- **Test vs Launch.** Test calls `/test` and shows the resolved program, argv and environment,
+  captioned "Nothing was executed". It deliberately does **not** claim stdout/stderr/exit code:
+  a dry run spawns nothing, so there are none, and fabricating them would misrepresent what ran.
+  Launch calls `/execute`, confirms first (with a stronger warning for elevated hooks), and shows
+  the real captured output. Hooks whose required parameters have no defaults route to the Run panel
+  instead of being launched with a guess. Both buttons are gated on `can_execute`, Edit/Delete/
+  Parameters on `can_manage`.
+
+### Test coverage
+
+Unit 35 → 42, integration 43 → 47, E2E 267 → 322.
+
+- `crypto`: round-trip in both modes, fresh nonce per seal, wrong key rejected, tamper detection,
+  plaintext-readable-after-upgrade, malformed inputs.
+- `only_master_keys_may_assign_run_as_user`: a `can_manage_hooks` key creates standard hooks fine
+  but is refused on every elevation attempt (create, `PUT`, `PATCH`), with the exact message; a
+  malformed value from a non-master is still `403`; explicit `null`/`""` are allowed; a master can
+  elevate the same hook; and the non-master can then edit other fields without disturbing it.
+- `granular_hook_permissions_separate_execute_from_manage`: execute-only runs, dry-runs, reads
+  definition/parameters/history but cannot modify or delete; manage-only edits but can run
+  *neither* `/execute` nor `/test`; an unmapped key is denied everything and sees no history.
+- `key_id_and_signature_authenticate_without_a_bearer_key`, plus a rejection table that now
+  includes "signature keyed on the bearer key instead of the signing secret".
+- `signing_secrets_are_encrypted_at_rest_when_a_key_is_configured`: asserts the stored column is
+  sealed, contains the secret nowhere in readable form, still verifies a live signature, and that
+  `GET /api/keys` exposes the key id but never the secret.
+- E2E §12 covers key-id auth, rotation invalidating the old pair, and the bearer-key-as-signing-key
+  mistake; §22 the master guard; §23 Test-vs-Launch including that a dry run leaves no side effect
+  and no history row while a launch does both.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 42 unit + 47 integration tests pass.
+- `./scripts/test_e2e.sh` — 322/322 checks pass.

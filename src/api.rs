@@ -25,6 +25,7 @@ use crate::entities::{
     api_key, api_key_hook_permission, audit_log, execution, execution::ExecutionStatus, hook,
     hook_parameter, prelude::*,
 };
+use crate::crypto::SecretCipher;
 use crate::error::AppError;
 use crate::executor;
 use crate::middleware::ClientIp;
@@ -56,6 +57,35 @@ pub fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Generates a public key identifier (`shk_<32 hex>`).
+///
+/// Non-secret by design: it travels in the clear as `X-Key-Id` and appears in logs, so it only
+/// needs to be unique and unguessable enough not to invite enumeration — never to authenticate.
+pub fn generate_key_id() -> String {
+    let bytes: [u8; 16] = rand::rng().random();
+    format!("shk_{}", hex::encode(bytes))
+}
+
+/// Generates a 32-byte HMAC signing secret.
+pub fn generate_signing_secret() -> String {
+    let bytes: [u8; 32] = rand::rng().random();
+    hex::encode(bytes)
+}
+
+/// Mints and seals a fresh `(key_id, signing_secret)` pair, returning the plaintext secret.
+///
+/// The plaintext is handed back exactly once so the caller can put it in the HTTP response; only
+/// the sealed form is ever persisted.
+fn mint_signing_pair(cipher: &SecretCipher) -> Result<(String, String, String), AppError> {
+    let key_id = generate_key_id();
+    let signing_secret = generate_signing_secret();
+    let sealed = cipher.seal(&signing_secret).map_err(|e| {
+        tracing::error!("Failed to seal a signing secret: {e}");
+        AppError::Internal
+    })?;
+    Ok((key_id, signing_secret, sealed))
 }
 
 /// Formats a target resource for a human-readable audit log `details` string, e.g.
@@ -227,13 +257,32 @@ async fn load_parameters(
         .await?)
 }
 
-/// Normalizes and validates a submitted `run_as_user`.
+/// Normalizes and validates a submitted `run_as_user`, enforcing the master-only guard.
 ///
-/// Returns `Ok(None)` for an absent or blank value — "no elevation" — and validates anything else
-/// against [`executor::validate_run_as_user`] before it can reach a `sudo` argument vector.
-fn normalize_run_as_user(run_as_user: Option<&str>) -> Result<Option<String>, AppError> {
+/// Returns `Ok(None)` for an absent or blank value — "no elevation", which any hook manager may
+/// set. Requesting an actual account is a privilege-escalation request and is restricted to master
+/// keys: `can_manage_hooks` is the right to define automation, not the right to decide which OS
+/// account that automation runs as. Note this is a *second* gate in front of `sudoers`, which
+/// remains the ultimate authority — it stops a compromised management key from even asking.
+///
+/// The authorization check runs before syntax validation so a non-master probing the field gets a
+/// consistent `403` regardless of whether their candidate value happened to be well-formed.
+fn normalize_run_as_user(
+    key: &api_key::Model,
+    run_as_user: Option<&str>,
+) -> Result<Option<String>, AppError> {
     match executor::effective_run_as_user(run_as_user) {
         Some(user) => {
+            if !key.is_master {
+                tracing::warn!(
+                    key = %key.prefix,
+                    requested_user = %user,
+                    "Non-master key attempted to assign run_as_user"
+                );
+                return Err(AppError::Forbidden(
+                    "Only master API keys can assign run_as_user privileges".to_owned(),
+                ));
+            }
             executor::validate_run_as_user(user)?;
             Ok(Some(user.to_owned()))
         }
@@ -342,6 +391,8 @@ pub struct MeResponse {
     pub name: String,
     /// First 8 characters of the key, for display.
     pub prefix: String,
+    /// Public key identifier used for signature auth, if this key has one.
+    pub key_id: Option<String>,
     /// Bound CIDRs.
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget.
@@ -391,6 +442,7 @@ pub async fn get_me(
         id: key.id,
         name: key.name,
         prefix: key.prefix,
+        key_id: key.key_id,
         bound_ips: key.bound_ips,
         max_concurrent_jobs: key.max_concurrent_jobs,
         is_master: key.is_master,
@@ -566,7 +618,7 @@ pub async fn create_hook(
 
     // Normalized to `None` when blank, so an empty text field from the UI stores NULL rather than
     // an empty string that later has to be re-interpreted everywhere.
-    let run_as_user = normalize_run_as_user(payload.run_as_user.as_deref())?;
+    let run_as_user = normalize_run_as_user(&key, payload.run_as_user.as_deref())?;
 
     // Validated before the hook row is written, so a bad parameter can't leave a half-created
     // hook behind.
@@ -722,7 +774,7 @@ pub async fn update_hook(
     if let Some(raw) = payload.run_as_user {
         // Present-but-blank is a deliberate "drop elevation", distinct from the field being
         // absent, which leaves the current setting alone.
-        let normalized = normalize_run_as_user(Some(&raw))?;
+        let normalized = normalize_run_as_user(&key, Some(&raw))?;
         changes.push(describe_privilege(normalized.as_deref()));
         active.run_as_user = Set(normalized);
     }
@@ -1114,9 +1166,9 @@ pub async fn test_hook(
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let hook_model = resolve_hook(&state.db, &identifier).await?;
-    // Either grant suffices: previewing is how an executor debugs a payload and how a manager
-    // validates a contract they just edited.
-    require_visibility(&state.db, &key, hook_model.id).await?;
+    // `can_execute`, not merely visibility: a dry run reveals the fully-resolved command line and
+    // the child's environment, which is execution-shaped knowledge even though nothing is spawned.
+    require_execute(&state.db, &key, hook_model.id).await?;
 
     let supplied = extract_parameter_map(&body)?;
     let declared = load_parameters(&state.db, hook_model.id).await?;
@@ -1340,13 +1392,19 @@ pub struct CreateApiKeyPayload {
     pub can_manage_hooks: Option<bool>,
 }
 
-/// Response after creating an API key — the only time the plaintext secret is ever available.
+/// Response after creating an API key — the only time the secrets are ever available.
 #[derive(Serialize)]
 pub struct CreateApiKeyResponse {
-    /// Key ID.
+    /// Internal UUID.
     pub id: Uuid,
     /// The raw key string. Shown once; only its hash is stored.
     pub plaintext_key: String,
+    /// Public key identifier, sent as `X-Key-Id` when authenticating by signature. Not a secret —
+    /// it stays retrievable from `GET /api/keys` afterwards.
+    pub key_id: String,
+    /// The HMAC signing secret. Shown **once**; only its encrypted form is stored, and no endpoint
+    /// will ever return it again. Rotating the key is the only way to obtain a new one.
+    pub signing_secret: String,
     /// Key name.
     pub name: String,
     /// Bound CIDRs.
@@ -1363,6 +1421,12 @@ pub struct ApiKeySummary {
     pub name: String,
     /// First 8 characters of the plaintext key, for display.
     pub prefix: String,
+    /// Public key identifier used for signature auth. Safe to display — it is not a credential.
+    /// `None` for keys issued before signature auth existed; rotating mints one.
+    pub key_id: Option<String>,
+    /// Whether a signing secret exists for this key. The secret itself is deliberately absent:
+    /// it left the server once, at creation, and no listing will ever hand it back.
+    pub has_signing_secret: bool,
     /// Bound CIDRs.
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget.
@@ -1390,6 +1454,8 @@ async fn build_api_key_summary(
         id: model.id,
         name: model.name,
         prefix: model.prefix,
+        key_id: model.key_id,
+        has_signing_secret: model.signing_secret.is_some(),
         bound_ips: model.bound_ips,
         max_concurrent_jobs: model.max_concurrent_jobs,
         is_master: model.is_master,
@@ -1435,6 +1501,7 @@ pub async fn create_api_key(
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
+    let (key_id, signing_secret, sealed_secret) = mint_signing_pair(&state.cipher)?;
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
@@ -1443,6 +1510,8 @@ pub async fn create_api_key(
         key_hash: Set(key_hash),
         name: Set(payload.name.clone()),
         prefix: Set(prefix),
+        key_id: Set(Some(key_id.clone())),
+        signing_secret: Set(Some(sealed_secret)),
         bound_ips: Set(payload.bound_ips.clone()),
         max_concurrent_jobs: Set(max_concurrent_jobs),
         is_master: Set(payload.is_master.unwrap_or(false)),
@@ -1466,6 +1535,8 @@ pub async fn create_api_key(
     Ok(Json(CreateApiKeyResponse {
         id,
         plaintext_key,
+        key_id,
+        signing_secret,
         name: payload.name,
         bound_ips: payload.bound_ips,
     }))
@@ -1598,13 +1669,17 @@ pub async fn delete_api_key(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Response after rotating an API key's secret.
+/// Response after rotating an API key's secrets.
 #[derive(Serialize)]
 pub struct RotateKeyResponse {
-    /// Key ID.
+    /// Internal UUID.
     pub id: Uuid,
     /// The new plaintext key. Shown only once — only its hash is stored.
     pub plaintext_key: String,
+    /// The new public key identifier.
+    pub key_id: String,
+    /// The new HMAC signing secret. Shown only once.
+    pub signing_secret: String,
 }
 
 /// Handles `POST /api/keys/{id}/rotate` — issues a new secret, immediately invalidating the old
@@ -1626,10 +1701,16 @@ pub async fn rotate_api_key(
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
+    // Rotation replaces the signing pair as well: a rotation is a response to "this credential may
+    // be compromised", and leaving the old signing secret in place would keep an attacker able to
+    // forge signatures. It is also how a pre-signature-auth key acquires its first pair.
+    let (key_id, signing_secret, sealed_secret) = mint_signing_pair(&state.cipher)?;
 
     let mut active: api_key::ActiveModel = target.into();
     active.key_hash = Set(key_hash);
     active.prefix = Set(prefix);
+    active.key_id = Set(Some(key_id.clone()));
+    active.signing_secret = Set(Some(sealed_secret));
     active.updated_at = Set(Utc::now().naive_utc());
     active.update(&state.db).await?;
 
@@ -1643,7 +1724,12 @@ pub async fn rotate_api_key(
     )
     .await?;
 
-    Ok(Json(RotateKeyResponse { id, plaintext_key }))
+    Ok(Json(RotateKeyResponse {
+        id,
+        plaintext_key,
+        key_id,
+        signing_secret,
+    }))
 }
 
 /// Input for granting a key rights over a hook.

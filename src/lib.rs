@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 
 pub mod api;
 pub mod config;
+pub mod crypto;
 pub mod entities;
 pub mod error;
 pub mod executor;
@@ -37,6 +38,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/hooks", get(api::list_hooks))
         .route("/hooks/{identifier}", get(api::get_hook))
         .route("/hooks/{identifier}", put(api::update_hook))
+        // PATCH is accepted as a synonym: every field of `UpdateHookPayload` is already optional,
+        // so the handler's semantics are partial-update either way.
+        .route("/hooks/{identifier}", axum::routing::patch(api::update_hook))
         .route("/hooks/{identifier}", delete(api::delete_hook))
         .route("/hooks/{identifier}/execute", post(api::execute_hook_endpoint))
         .route("/hooks/{identifier}/test", post(api::test_hook))

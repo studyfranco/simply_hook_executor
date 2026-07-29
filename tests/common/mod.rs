@@ -15,6 +15,7 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, 
 use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
     config::RuntimeConfig,
+    crypto::SecretCipher,
     entities::{api_key, api_key_hook_permission, execution, hook, hook_parameter},
     migration,
     state::AppState,
@@ -50,9 +51,16 @@ pub fn test_config() -> Arc<RuntimeConfig> {
     })
 }
 
+/// The cipher used by most tests: unencrypted storage, so a seeded signing secret can be written
+/// directly. Encryption itself is covered by `crypto`'s own unit tests and by
+/// [`test_state_with_cipher`].
+pub fn test_cipher() -> Arc<SecretCipher> {
+    Arc::new(SecretCipher::Plaintext)
+}
+
 /// Builds application state around a database handle.
 pub fn test_state(db: &DatabaseConnection) -> AppState {
-    AppState::new(db.clone(), test_config())
+    AppState::new(db.clone(), test_config(), test_cipher())
 }
 
 /// Builds application state whose hook scripts are confined to `roots`.
@@ -63,7 +71,13 @@ pub fn test_state_with_roots(db: &DatabaseConnection, roots: Vec<std::path::Path
             allowed_script_roots: roots,
             ..(*test_config()).clone()
         }),
+        test_cipher(),
     )
+}
+
+/// Builds application state with a specific secret cipher.
+pub fn test_state_with_cipher(db: &DatabaseConnection, cipher: Arc<SecretCipher>) -> AppState {
+    AppState::new(db.clone(), test_config(), cipher)
 }
 
 /// Whether this test process can read a path whose permissions should deny it.
@@ -106,15 +120,46 @@ impl KeyScopes {
     }
 }
 
-/// Inserts an API key, returning its id and plaintext secret.
+/// Every credential a seeded API key carries.
+pub struct SeededKey {
+    /// Internal UUID.
+    pub id: Uuid,
+    /// Bearer credential, sent as `X-API-Key`.
+    pub plaintext: String,
+    /// Public identifier, sent as `X-Key-Id`.
+    pub key_id: String,
+    /// HMAC signing secret, in plaintext, for computing test signatures.
+    pub signing_secret: String,
+}
+
+/// Inserts an API key, returning its id and plaintext bearer credential.
+///
+/// The signing pair is minted too but discarded here; use [`insert_key_full`] when a test needs
+/// to compute a signature.
 pub async fn insert_key(
     db: &DatabaseConnection,
     name: &str,
     bound_ips: &str,
     scopes: KeyScopes,
 ) -> (Uuid, String) {
+    let seeded = insert_key_full(db, name, bound_ips, scopes).await;
+    (seeded.id, seeded.plaintext)
+}
+
+/// Inserts an API key and returns its full credential set.
+///
+/// The signing secret is stored through [`SecretCipher::Plaintext`], matching [`test_cipher`], so
+/// the handler under test recovers exactly the value returned here.
+pub async fn insert_key_full(
+    db: &DatabaseConnection,
+    name: &str,
+    bound_ips: &str,
+    scopes: KeyScopes,
+) -> SeededKey {
     let id = Uuid::new_v4();
     let plaintext = simply_hook_executor::api::generate_random_key();
+    let key_id = simply_hook_executor::api::generate_key_id();
+    let signing_secret = simply_hook_executor::api::generate_signing_secret();
     let now = chrono::Utc::now().naive_utc();
 
     api_key::ActiveModel {
@@ -122,6 +167,12 @@ pub async fn insert_key(
         key_hash: Set(simply_hook_executor::api::hash_key(&plaintext)),
         name: Set(name.to_owned()),
         prefix: Set(plaintext.chars().take(8).collect()),
+        key_id: Set(Some(key_id.clone())),
+        signing_secret: Set(Some(
+            SecretCipher::Plaintext
+                .seal(&signing_secret)
+                .expect("sealing a test secret succeeds"),
+        )),
         bound_ips: Set(Some(bound_ips.to_owned())),
         max_concurrent_jobs: Set(scopes.max_concurrent_jobs.max(1)),
         is_master: Set(scopes.is_master),
@@ -134,7 +185,31 @@ pub async fn insert_key(
     .await
     .expect("seeding an API key succeeds");
 
-    (id, plaintext)
+    SeededKey { id, plaintext, key_id, signing_secret }
+}
+
+/// Computes the `X-Signature-256` header value a well-behaved client would send.
+pub fn sign_body(signing_secret: &str, body: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(body.as_bytes());
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Builds a request authenticated purely by `X-Key-Id` + `X-Signature-256`, with no bearer key —
+/// the webhook-sender pattern.
+pub fn signed_request(method: &str, uri: &str, key_id: &str, signing_secret: &str, body: &str) -> Request<Body> {
+    with_connect_info(
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Key-Id", key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Signature-256", sign_body(signing_secret, body)),
+    )
+    .body(Body::from(body.to_owned()))
+    .expect("request builds")
 }
 
 /// Inserts an unprivileged hook pointing at `script_path`.

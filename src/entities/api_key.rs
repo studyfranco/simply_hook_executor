@@ -18,6 +18,19 @@ pub struct Model {
     pub key_hash: String,
     /// First 8 characters of the plaintext key, kept for display and log correlation.
     pub prefix: String,
+    /// Public, non-secret identifier (`shk_<32 hex>`) sent in the clear as `X-Key-Id` to select
+    /// which signing secret verifies a webhook signature.
+    ///
+    /// `None` only for keys issued before signature auth existed; rotating such a key mints a pair.
+    #[sea_orm(unique)]
+    pub key_id: Option<String>,
+    /// HMAC-SHA256 signing secret, **encrypted at rest** (see [`crate::crypto`]).
+    ///
+    /// Unlike `key_hash` this cannot be a digest: verifying a signature means recomputing it, so
+    /// the original bytes have to be recoverable. Never serialized to a client — it leaves the
+    /// server exactly once, in the creation/rotation response, and only as plaintext.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub signing_secret: Option<String>,
     /// Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`). An empty
     /// value means no CIDR restriction is enforced.
     pub bound_ips: Option<String>,

@@ -13,6 +13,8 @@ use crate::state::AppState;
 
 /// Header carrying the caller's secret key.
 const API_KEY_HEADER: &str = "X-API-Key";
+/// Header carrying the caller's public key identifier, for signature-only authentication.
+const KEY_ID_HEADER: &str = "X-Key-Id";
 /// Header carrying the optional `sha256=<hex>` body signature.
 const SIGNATURE_HEADER: &str = "X-Signature-256";
 /// Largest request body that will be buffered in order to verify a signature. Signed payloads are
@@ -53,11 +55,11 @@ fn rightmost_ip(header_value: &str) -> Option<std::net::IpAddr> {
 
 /// Verifies an `X-Signature-256: sha256=<hex>` header against the raw request body.
 ///
-/// The HMAC key is the caller's own plaintext API key. Only its SHA-256 hash is stored server
-/// side, so the secret used to *verify* has to be the one the caller just presented — meaning the
-/// signature is an integrity guarantee over the body (nothing between client and daemon can alter
-/// the payload undetected), layered on top of the key authentication that already happened, not a
-/// replacement for it.
+/// The HMAC key is the API key's `signing_secret`, recovered from storage via
+/// [`crate::crypto::SecretCipher`]. Because that secret is recoverable (unlike `key_hash`, which is
+/// a one-way digest), a caller can authenticate with nothing but a public `X-Key-Id` and a valid
+/// signature — the standard webhook-sender pattern, where the sender never transmits a bearer
+/// credential at all.
 ///
 /// Comparison goes through [`Mac::verify_slice`], which is constant-time; comparing hex strings
 /// with `==` would leak the correct signature one byte at a time.
@@ -77,6 +79,32 @@ fn verify_signature(header_value: &str, secret: &str, body: &[u8]) -> Result<(),
 
     mac.verify_slice(&expected)
         .map_err(|_| AppError::Unauthorized("Invalid request signature".to_owned()))
+}
+
+/// Recovers a key's signing secret from storage, ready to verify a signature against.
+///
+/// A key with no secret (issued before signature auth existed) cannot verify anything, and is told
+/// so specifically — that is a configuration problem the operator can fix by rotating, not a
+/// credential problem worth obscuring. A secret that fails to *decrypt*, by contrast, means the
+/// daemon's `SIGNING_SECRET_KEY` no longer matches what wrote the row: an operator emergency,
+/// logged loudly and reported as a generic server error rather than as "your signature is wrong".
+fn recover_signing_secret(
+    state: &AppState,
+    key_record: &crate::entities::api_key::Model,
+) -> Result<String, AppError> {
+    let stored = key_record.signing_secret.as_deref().ok_or_else(|| {
+        AppError::Unauthorized(
+            "This API key has no signing secret; rotate it to obtain one".to_owned(),
+        )
+    })?;
+
+    state.cipher.open(stored).map_err(|e| {
+        tracing::error!(
+            key = %key_record.prefix,
+            "Failed to decrypt a stored signing secret: {e}"
+        );
+        AppError::Internal
+    })
 }
 
 /// Enforces API key authentication, CIDR binding, and (when present) body signing for every
@@ -107,23 +135,44 @@ pub async fn auth_middleware(
         .unwrap_or(addr.ip());
     let client_ip = normalize_ip(client_ip);
 
-    let presented_key = req
-        .headers()
-        .get(API_KEY_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .ok_or(AppError::Unauthorized("Missing API Key".to_owned()))?
-        .to_owned();
+    // Two ways to name yourself: a bearer API key, or a public key id backed by a signature.
+    let presented_key = headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok());
+    let presented_key_id = headers.get(KEY_ID_HEADER).and_then(|h| h.to_str().ok());
 
-    let mut hasher = Sha256::new();
-    hasher.update(presented_key.as_bytes());
-    let key_hash = hex::encode(hasher.finalize());
+    let (key_record, signature_required) = match (presented_key, presented_key_id) {
+        (Some(plaintext), _) => {
+            let mut hasher = Sha256::new();
+            hasher.update(plaintext.as_bytes());
+            let key_hash = hex::encode(hasher.finalize());
 
-    let key_record = ApiKey::find()
-        .filter(crate::entities::api_key::Column::KeyHash.eq(key_hash))
-        .one(&state.db)
-        .await
-        .map_err(AppError::DbError)?
-        .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
+            let record = ApiKey::find()
+                .filter(crate::entities::api_key::Column::KeyHash.eq(key_hash))
+                .one(&state.db)
+                .await
+                .map_err(AppError::DbError)?
+                .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
+            // The bearer key is itself the credential, so a signature is optional here — when
+            // present it still has to verify (below), adding body integrity on top.
+            (record, false)
+        }
+        (None, Some(key_id)) => {
+            let record = ApiKey::find()
+                .filter(crate::entities::api_key::Column::KeyId.eq(key_id))
+                .one(&state.db)
+                .await
+                .map_err(AppError::DbError)?
+                // Deliberately the same message as a bad API key: distinguishing "no such key id"
+                // from "bad signature" would turn the endpoint into a key-id oracle.
+                .ok_or(AppError::Unauthorized("Invalid credentials".to_owned()))?;
+            // A key id is public. On its own it proves nothing, so a valid signature is mandatory.
+            (record, true)
+        }
+        (None, None) => {
+            return Err(AppError::Unauthorized(
+                "Missing credentials: provide X-API-Key, or X-Key-Id with X-Signature-256".to_owned(),
+            ));
+        }
+    };
 
     // Validate the client IP against the bound CIDRs.
     let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
@@ -157,17 +206,25 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
 
-    let mut req = if let Some(signature) = signature {
-        let (parts, body) = req.into_parts();
-        let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
-            .await
-            .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
+    let mut req = match signature {
+        Some(signature) => {
+            let secret = recover_signing_secret(&state, &key_record)?;
 
-        verify_signature(&signature, &presented_key, &bytes)?;
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
+                .await
+                .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
 
-        Request::from_parts(parts, Body::from(bytes))
-    } else {
-        req
+            verify_signature(&signature, &secret, &bytes)?;
+
+            Request::from_parts(parts, Body::from(bytes))
+        }
+        None if signature_required => {
+            return Err(AppError::Unauthorized(
+                "X-Key-Id authentication requires an X-Signature-256 header".to_owned(),
+            ));
+        }
+        None => req,
     };
 
     req.extensions_mut().insert(ClientIp(client_ip));

@@ -9,8 +9,8 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
-    api, config, config::RuntimeConfig, create_app, entities, migration, spawn_retention_worker,
-    state::AppState,
+    api, config, config::RuntimeConfig, create_app, crypto, entities, migration,
+    spawn_retention_worker, state::AppState,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -62,7 +62,10 @@ async fn shutdown_signal() {
 /// scraping it back out of stdout — it is deliberately **not** a normal deployment option, since a
 /// human-chosen secret defeats the point of a random 256-bit key. A warning is logged whenever
 /// it's used, so it cannot be enabled in a real deployment without someone noticing.
-async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
+async fn bootstrap_master_key(
+    db: &DatabaseConnection,
+    cipher: &crypto::SecretCipher,
+) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
     let existing_master = ApiKey::find()
@@ -90,11 +93,18 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     let now = chrono::Utc::now().naive_utc();
 
+    // The bootstrap key gets a full signing pair too, so webhook signature auth is usable
+    // immediately rather than requiring a rotation first.
+    let key_id = api::generate_key_id();
+    let signing_secret = api::generate_signing_secret();
+
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(key_hash),
         name: Set("System Master".to_owned()),
         prefix: Set(prefix),
+        key_id: Set(Some(key_id.clone())),
+        signing_secret: Set(Some(cipher.seal(&signing_secret)?)),
         bound_ips: Set(Some(bound_ip.clone())),
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
@@ -109,11 +119,15 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     tracing::info!(
         "\n╔══════════════════════════════════════════════════════════════╗\n\
          ║  BOOTSTRAP: Master API Key Generated                       ║\n\
-         ║  Key:    {}  ║\n\
-         ║  Bound:  {:54}║\n\
-         ║  ⚠ This key will NOT be shown again. Store it securely!    ║\n\
+         ║  Key:      {}  ║\n\
+         ║  Key ID:   {:52}║\n\
+         ║  Secret:   {}  ║\n\
+         ║  Bound:    {:52}║\n\
+         ║  ⚠ Shown once. Store the key and signing secret securely!  ║\n\
          ╚══════════════════════════════════════════════════════════════╝",
         plaintext_key,
+        key_id,
+        signing_secret,
         bound_ip
     );
 
@@ -153,7 +167,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;
 
-    bootstrap_master_key(&db).await?;
+    // Built before the bootstrap key is minted, since that key's signing secret is sealed with it.
+    // A malformed SIGNING_SECRET_KEY stops startup here rather than silently degrading to writing
+    // signing secrets in the clear.
+    let cipher = crypto::SecretCipher::from_env()?;
+    if cipher.is_encrypting() {
+        tracing::info!("Signing secrets are encrypted at rest (SIGNING_SECRET_KEY is configured).");
+    } else {
+        tracing::warn!(
+            "SIGNING_SECRET_KEY is not set: API key signing secrets are stored unencrypted. \
+             Anyone who can read the database can forge webhook signatures. Generate a key with \
+             `openssl rand -hex 32` and set SIGNING_SECRET_KEY to enable encryption at rest."
+        );
+    }
+
+    bootstrap_master_key(&db, &cipher).await?;
 
     let config = RuntimeConfig::from_env();
     tracing::info!(
@@ -163,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Runtime configuration loaded."
     );
 
-    let state = AppState::new(db, config.shared());
+    let state = AppState::new(db, config.shared(), std::sync::Arc::new(cipher));
     let (retention_tx, retention_handle) = spawn_retention_worker(&state);
 
     let app = create_app(state);
