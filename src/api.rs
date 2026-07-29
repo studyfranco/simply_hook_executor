@@ -227,6 +227,31 @@ async fn load_parameters(
         .await?)
 }
 
+/// Normalizes and validates a submitted `run_as_user`.
+///
+/// Returns `Ok(None)` for an absent or blank value — "no elevation" — and validates anything else
+/// against [`executor::validate_run_as_user`] before it can reach a `sudo` argument vector.
+fn normalize_run_as_user(run_as_user: Option<&str>) -> Result<Option<String>, AppError> {
+    match executor::effective_run_as_user(run_as_user) {
+        Some(user) => {
+            executor::validate_run_as_user(user)?;
+            Ok(Some(user.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Renders a hook's elevation setting for an audit log entry.
+///
+/// Privileged hooks are the highest-value thing in this system to be able to reconstruct after the
+/// fact, so the account is written into the audit trail at creation and on every change.
+fn describe_privilege(run_as_user: Option<&str>) -> String {
+    match run_as_user {
+        Some(user) => format!("runs as '{user}' via sudo"),
+        None => "runs as the daemon user".to_owned(),
+    }
+}
+
 /// Validates a proposed hook timeout.
 fn validate_timeout(seconds: i32) -> Result<(), AppError> {
     if seconds <= 0 {
@@ -403,6 +428,9 @@ pub struct CreateHookPayload {
     pub script_path: String,
     /// Maximum runtime in seconds. Defaults to 30.
     pub default_timeout_seconds: Option<i32>,
+    /// Account to run the script as, via `sudo`. Omit (or send `null`/`""`) to run it directly as
+    /// the daemon user.
+    pub run_as_user: Option<String>,
     /// Optional parameter contract, declared inline so a hook and its parameters can be created
     /// in one request instead of N+1.
     pub parameters: Option<Vec<ParameterInput>>,
@@ -419,6 +447,9 @@ pub struct UpdateHookPayload {
     pub script_path: Option<String>,
     /// New timeout, in seconds.
     pub default_timeout_seconds: Option<i32>,
+    /// New `run_as_user`. Send `""` to drop elevation and run as the daemon user again; omitting
+    /// the field leaves the current setting untouched.
+    pub run_as_user: Option<String>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -434,6 +465,8 @@ pub struct HookDetail {
     pub script_path: String,
     /// Maximum runtime in seconds.
     pub default_timeout_seconds: i32,
+    /// Account the script runs as via `sudo`, or `None` when it runs as the daemon user.
+    pub run_as_user: Option<String>,
     /// Declared parameters, in the order used for positional CLI arguments.
     pub parameters: Vec<hook_parameter::Model>,
     /// Whether the requesting key may execute this hook.
@@ -468,6 +501,7 @@ async fn build_hook_detail(
         description: model.description,
         script_path: model.script_path,
         default_timeout_seconds: model.default_timeout_seconds,
+        run_as_user: model.run_as_user,
         parameters,
         can_execute,
         can_manage,
@@ -530,6 +564,10 @@ pub async fn create_hook(
     let timeout = payload.default_timeout_seconds.unwrap_or(30);
     validate_timeout(timeout)?;
 
+    // Normalized to `None` when blank, so an empty text field from the UI stores NULL rather than
+    // an empty string that later has to be re-interpreted everywhere.
+    let run_as_user = normalize_run_as_user(payload.run_as_user.as_deref())?;
+
     // Validated before the hook row is written, so a bad parameter can't leave a half-created
     // hook behind.
     let declared = payload.parameters.unwrap_or_default();
@@ -550,6 +588,7 @@ pub async fn create_hook(
         description: Set(payload.description.clone()),
         script_path: Set(payload.script_path.clone()),
         default_timeout_seconds: Set(timeout),
+        run_as_user: Set(run_as_user.clone()),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -592,7 +631,12 @@ pub async fn create_hook(
         client_ip.0,
         "HOOK_CREATE",
         Some(name.clone()),
-        Some(format!("Created hook {} -> {}", format_reference(&name, id), payload.script_path)),
+        Some(format!(
+            "Created hook {} -> {} ({})",
+            format_reference(&name, id),
+            payload.script_path,
+            describe_privilege(run_as_user.as_deref())
+        )),
     )
     .await?;
 
@@ -674,6 +718,13 @@ pub async fn update_hook(
     if let Some(timeout) = payload.default_timeout_seconds {
         changes.push(format!("default_timeout_seconds={timeout}"));
         active.default_timeout_seconds = Set(timeout);
+    }
+    if let Some(raw) = payload.run_as_user {
+        // Present-but-blank is a deliberate "drop elevation", distinct from the field being
+        // absent, which leaves the current setting alone.
+        let normalized = normalize_run_as_user(Some(&raw))?;
+        changes.push(describe_privilege(normalized.as_deref()));
+        active.run_as_user = Set(normalized);
     }
     active.updated_at = Set(Utc::now().naive_utc());
 
@@ -1080,7 +1131,7 @@ pub async fn test_hook(
     } else {
         // A dry run reports the permission/path diagnostic as data instead of failing: seeing
         // exactly why a hook would be refused is the whole point of the preview.
-        executor::ensure_executable(&hook_model.script_path, &state.config.allowed_script_roots)
+        executor::ensure_runnable(&hook_model, &state.config)
             .err()
             .map(|diagnosis| diagnosis.detail)
     };

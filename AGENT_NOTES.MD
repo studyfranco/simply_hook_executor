@@ -379,3 +379,115 @@ actually logged with its classification, which is what caught the ANSI bug.
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - `cargo test` — 29 unit + 38 integration tests pass.
 - `./scripts/test_e2e.sh` — 236/236 checks pass.
+
+---
+
+## 2026-07-29 (final) — `run_as_user`: privileged execution via sudo
+
+### Schema
+
+`hooks.run_as_user` (nullable string, default `NULL`) added via a **new** migration
+(`m20230102_000001_add_run_as_user`) rather than by editing the initial one, so databases created
+by an earlier build are upgraded in place instead of silently diverging from the entity. `SCHEMA.MD`
+was updated in the same change — the schema document is a mandatory reference, so letting the code
+carry a column it does not describe would break the next reader.
+
+`NULL` and empty are treated identically ("run as the daemon user"), normalized to `NULL` on write
+so an empty text field from the UI can never be stored as a username of `""`.
+
+### Command construction
+
+```
+/usr/bin/sudo -n -u <run_as_user> -- <script_path> <param1> <param2> ...
+```
+
+- **`-n`** — non-interactive. Without it, a missing `NOPASSWD` rule would block on a password
+  prompt that no one can answer, and the hook would sit there until its timeout `SIGKILL`ed it.
+  With it, the refusal is immediate and lands in `stderr` as a normal `FAILED` execution.
+- **`--`** — mandatory, per the spec, and load-bearing: it terminates sudo's option parsing so a
+  script path or parameter value beginning with `-` is data, not a sudo flag. A test asserts that
+  a parameter valued `--login` lands *after* the separator.
+- **`/usr/bin/sudo` is hard-coded**, not resolved through `PATH`. `PATH` is an operator-configurable
+  passthrough variable, and an elevation path that follows it would be a privilege-escalation
+  vector rather than a convenience.
+
+**`run_as_user` validation is the primary guard.** The value lands in argv immediately after `-u`,
+so it is validated against the POSIX-portable username shape (`[A-Za-z_][A-Za-z0-9_-]*`, plus a
+trailing `$` for Samba machine accounts, capped at 32 chars). This makes an option-shaped value
+such as `-i` or `--login` *unrepresentable* rather than relying on sudo's own parsing to be
+defensive about it. Enforced on create and on update, and re-checked in the executor.
+
+### Environment behaviour — the honest caveat
+
+`env_clear()` plus explicit `HOOK_PARAM_*` injection is applied to the **sudo** process exactly as
+it is to a direct spawn, so the code path is genuinely identical. But modern sudo defaults to
+`env_reset`, which strips those variables before `execve`ing the target. That is sudo's behaviour,
+not something this daemon can override from the calling side without either
+`--preserve-env=<list>` (which *hard-fails* when sudoers lacks the `SETENV` tag, turning a degraded
+case into a broken one) or interposing `/usr/bin/env` (which requires sudoers to permit `env`,
+effectively "allow anything").
+
+The spec pins the argument vector to `-n -u <user> -- <script>`, so neither was added. Instead:
+positional parameters — which always survive — are the reliable channel under sudo, and the
+sudoers snippet for `env_keep += "HOOK_PARAM_*"` is documented in the README and the unit file for
+operators who want the variables too. Since every parameter is passed **both** ways, a privileged
+hook written against `$1..$n` works with no sudoers changes beyond the `NOPASSWD` rule itself.
+
+### Pre-flight interaction
+
+A privileged hook is routinely a root-owned `0700` script the daemon user is *not* meant to be able
+to run directly — that is what sudo is for. The existing executable check already asked "does this
+file have an execute bit for **someone**" rather than "can *we* execute it", so it needed no
+change; the reasoning is now written down next to it, since it is subtle and load-bearing.
+Stat'ing and canonicalizing such a file only needs search permission on its parents, which the
+daemon does have, so containment checks still work unchanged.
+
+Added `ensure_sudo_available`: without it a missing `sudo` surfaced as a bare `ENOENT` naming
+`/usr/bin/sudo`, which is accurate but baffling to an operator staring at their own script path.
+`ensure_runnable` now validates elevation **before** touching the filesystem, so a malformed
+account name is never reported as a confusing path problem.
+
+### Audit & observability
+
+`run_as_user` is written into `HOOK_CREATE`/`HOOK_UPDATE` audit details ("runs as 'root' via sudo"
+/ "runs as the daemon user") and attached to every execution log line. "Which hooks run as another
+account, and who made them that way" is answerable from the audit trail alone.
+
+### UI
+
+Create form and edit modal gained a "Run as User (sudo)" field; the edit modal always submits it,
+so clearing the box is an explicit "drop elevation" (the API distinguishes a present-but-empty
+value from an absent one). The hooks table gained a "Runs As" column rendering a deliberately loud
+red `⬆ <user>` tag — privileged hooks are the highest-consequence rows in the UI and must not be
+missable — and the dry-run panel repeats it alongside the previewed command.
+
+### Test coverage
+
+Unit 29 → 35, integration 38 → 42, E2E 236 → 267.
+
+- Unit: the exact argument vector for both modes, blank/whitespace `run_as_user` treated as
+  unprivileged, whitespace trimming, an option-shaped *parameter* forced after `--`, and a table of
+  13 hostile usernames.
+- Integration: dry-run preview of the full sudo vector (with the unprivileged form asserted
+  side-by-side), CRUD round-trip plus audit assertions, option-injection rejection on both create
+  and update, and a real end-to-end sudo execution that asserts *both* legitimate outcomes —
+  permitted (stdout captured) or refused (non-zero exit captured in `stderr`, no hang thanks to
+  `-n`) — since a test must not assume anything about the host's sudoers.
+- E2E §22 mirrors all of it black-box, including that `--` immediately precedes the script path and
+  that parameters sit after it.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 35 unit + 43 integration tests pass (including a migration upgrade-path test that
+  applies the initial schema alone, then the new migration, exercising ALTER TABLE rather than a
+  fresh CREATE).
+- `./scripts/test_e2e.sh` — 267/267 checks pass.
+
+### Follow-up worth considering
+
+Creating a privileged hook currently needs only `can_manage_hooks`, the same scope as any other
+hook. The OS remains the real gate (sudoers decides what is actually permitted), but a dedicated
+`can_elevate` scope — or restricting `run_as_user` to master keys — would be a defensible tightening.
+It is not in `SCHEMA.MD`, so it was not invented here.

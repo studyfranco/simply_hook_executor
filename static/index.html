@@ -185,6 +185,11 @@
                                 <input type="text" id="hook-script-path" placeholder="/usr/local/bin/ban.sh" required class="input-field">
                             </div>
                             <div class="form-group col-span-2">
+                                <label for="hook-run-as-user">Run as User (sudo)</label>
+                                <input type="text" id="hook-run-as-user" placeholder="leave empty to run as the daemon user" class="input-field">
+                                <span class="text-muted text-sm">Runs the script via <code>sudo -n -u &lt;user&gt; --</code>. Requires a matching NOPASSWD rule in sudoers.</span>
+                            </div>
+                            <div class="form-group col-span-2">
                                 <label for="hook-description">Description</label>
                                 <textarea id="hook-description" class="input-field" rows="2" placeholder="What does this hook do?"></textarea>
                             </div>
@@ -205,6 +210,7 @@
                                     <th><input type="checkbox" id="select-all-hooks" title="Select all"></th>
                                     <th>Name</th>
                                     <th>Script Path</th>
+                                    <th>Runs As</th>
                                     <th>Timeout</th>
                                     <th>Parameters</th>
                                     <th>Your Rights</th>
@@ -213,7 +219,7 @@
                             </thead>
                             <tbody id="hooks-table-body">
                                 <tr>
-                                    <td colspan="7" class="text-center text-muted">No hooks loaded.</td>
+                                    <td colspan="8" class="text-center text-muted">No hooks loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -477,6 +483,11 @@
                 <div class="form-group">
                     <label for="edit-hook-timeout">Timeout (seconds) <span>*</span></label>
                     <input type="number" id="edit-hook-timeout" min="1" max="86400" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-hook-run-as-user">Run as User (sudo)</label>
+                    <input type="text" id="edit-hook-run-as-user" placeholder="empty = run as the daemon user" class="input-field">
+                    <span class="text-muted text-sm">Clear this field to drop elevation.</span>
                 </div>
                 <div class="form-group">
                     <label for="edit-hook-description">Description</label>

@@ -712,6 +712,15 @@ body {
     border: 1px solid var(--border);
 }
 
+/* Hooks that escalate via sudo. Deliberately the loudest badge in the table: an operator
+   scanning the list must never miss which entries run as another (often privileged) account. */
+.badge-elevated {
+    background-color: rgba(231, 76, 60, 0.18);
+    color: #ff8b7d;
+    border: 1px solid rgba(231, 76, 60, 0.45);
+    font-family: var(--font-mono);
+}
+
 .scope-badges {
     display: flex;
     flex-wrap: wrap;

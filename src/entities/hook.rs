@@ -21,6 +21,12 @@ pub struct Model {
     pub script_path: String,
     /// Maximum allowed runtime, in seconds, before the process group is `SIGKILL`ed.
     pub default_timeout_seconds: i32,
+    /// Target account for privileged execution.
+    ///
+    /// `None` (or empty) runs the script directly under the daemon's own user. A value runs it
+    /// through `sudo -n -u <user> --`, so what is actually permitted remains governed by
+    /// `sudoers` — this field can request elevation, never grant it.
+    pub run_as_user: Option<String>,
     /// Hook creation timestamp.
     pub created_at: DateTime,
     /// Hook last-update timestamp.

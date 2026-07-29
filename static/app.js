@@ -632,6 +632,7 @@ class HookExecutorClient {
         meta.innerHTML = `
             <div class="font-mono text-sm">${escapeHtml(hook.script_path)}</div>
             <div class="text-muted text-sm">Timeout: ${hook.default_timeout_seconds}s${hook.description ? ' · ' + escapeHtml(hook.description) : ''}</div>
+            ${hook.run_as_user ? `<div class="mt-2">${this.privilegeBadge(hook.run_as_user)}</div>` : ''}
         `;
 
         if (hook.parameters.length === 0) {
@@ -732,6 +733,7 @@ class HookExecutorClient {
                         ${res.would_execute ? 'DRY RUN OK' : 'BLOCKED'}
                     </span>
                     <span class="text-sm text-muted">timeout ${res.timeout_seconds}s</span>
+                    ${res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
                 </div>
                 ${res.blocking_reason ? `<p class="message error">${escapeHtml(res.blocking_reason)}</p>` : ''}
                 ${this.outputBlock('command', res.command.program)}
@@ -810,11 +812,19 @@ class HookExecutorClient {
     // ───────────────────────────────────────────────────────
     // Rendering — Hooks
     // ───────────────────────────────────────────────────────
+
+    // A hook that escalates via sudo is the highest-consequence thing in this UI, so it gets a
+    // loud, distinctly-coloured tag naming the target account rather than a subtle marker.
+    privilegeBadge(runAsUser) {
+        if (!runAsUser) return '<span class="text-muted text-sm">daemon user</span>';
+        return `<span class="badge badge-elevated" title="Runs via sudo -n -u ${escapeHtml(runAsUser)} --">⬆ ${escapeHtml(runAsUser)}</span>`;
+    }
+
     renderHooksTable() {
         const tbody = document.getElementById('hooks-table-body');
 
         if (this.state.hooks.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No hooks defined.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No hooks defined.</td></tr>';
         } else {
             tbody.innerHTML = this.state.hooks.map(h => {
                 const rights = [
@@ -827,6 +837,7 @@ class HookExecutorClient {
                     <td>${h.can_manage ? `<input type="checkbox" class="row-select" data-id="${h.id}">` : ''}</td>
                     <td><strong>${escapeHtml(h.name)}</strong></td>
                     <td class="font-mono text-sm truncate">${escapeHtml(h.script_path)}</td>
+                    <td>${this.privilegeBadge(h.run_as_user)}</td>
                     <td class="text-sm">${h.default_timeout_seconds}s</td>
                     <td class="text-sm">${h.parameters.length}</td>
                     <td><div class="scope-badges">${rights}</div></td>
@@ -856,6 +867,8 @@ class HookExecutorClient {
             name: document.getElementById('hook-name').value,
             script_path: document.getElementById('hook-script-path').value,
             default_timeout_seconds: parseInt(document.getElementById('hook-timeout').value, 10),
+            // Blank means "no elevation"; the backend normalizes it to NULL.
+            run_as_user: document.getElementById('hook-run-as-user').value.trim() || null,
             description: document.getElementById('hook-description').value || null
         };
         try {
@@ -874,6 +887,7 @@ class HookExecutorClient {
         document.getElementById('edit-hook-name').value = h.name;
         document.getElementById('edit-hook-script-path').value = h.script_path;
         document.getElementById('edit-hook-timeout').value = h.default_timeout_seconds;
+        document.getElementById('edit-hook-run-as-user').value = h.run_as_user || '';
         document.getElementById('edit-hook-description').value = h.description || '';
         document.getElementById('edit-hook-modal').classList.remove('hidden');
     }
@@ -885,6 +899,9 @@ class HookExecutorClient {
             name: document.getElementById('edit-hook-name').value,
             script_path: document.getElementById('edit-hook-script-path').value,
             default_timeout_seconds: parseInt(document.getElementById('edit-hook-timeout').value, 10),
+            // Always sent, so clearing the field is an explicit "drop elevation" rather than a
+            // no-op: the backend distinguishes an empty string from an absent field.
+            run_as_user: document.getElementById('edit-hook-run-as-user').value.trim(),
             description: document.getElementById('edit-hook-description').value
         };
         try {

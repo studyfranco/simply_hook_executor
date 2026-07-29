@@ -48,6 +48,45 @@ A hook's `script_path` is validated twice:
    the roots. A symlink planted *inside* an allowed root that points at `/bin/sh` or `/etc/shadow`
    passes the first check and is caught by the second, before anything is spawned.
 
+### Privileged execution (`run_as_user`)
+
+A hook may declare an optional `run_as_user`. When set, the script is invoked through `sudo`
+instead of directly:
+
+```
+/usr/bin/sudo -n -u <run_as_user> -- /opt/hooks/ban.sh <param1> <param2> ...
+```
+
+- `-n` keeps sudo non-interactive: a missing `NOPASSWD` rule fails immediately instead of blocking
+  on a password prompt nothing can answer.
+- `--` terminates sudo's own option parsing, so a script path or parameter beginning with `-` is
+  passed through as data rather than absorbed as a sudo flag.
+- `run_as_user` is validated against the POSIX-portable username shape
+  (`[A-Za-z_][A-Za-z0-9_-]*`, plus a trailing `$`), which makes an option-shaped value such as
+  `-i` or `--login` unrepresentable rather than relying on sudo to be defensive about it.
+
+**This field requests elevation; it cannot grant it.** `sudoers` remains the sole authority, so a
+matching rule is required — scoped as narrowly as the job allows:
+
+```sudoers
+hookrunner ALL=(root) NOPASSWD: /opt/hooks/ban.sh
+```
+
+**Environment caveat.** Parameters are always passed *positionally* (`$1`, `$2`, …) and that works
+regardless of sudo configuration. The `HOOK_PARAM_*` environment variables are set on the `sudo`
+process, but modern sudo resets the environment by default, so they only survive into the script
+if sudoers is told to keep them:
+
+```sudoers
+Defaults:hookrunner env_keep += "HOOK_PARAM_*"
+```
+
+If you would rather not touch `env_keep`, write privileged hook scripts against `$1..$n`. The
+dry-run endpoint always shows the exact argument vector, so there is no need to guess.
+
+Privileged hooks are called out in the UI with a red `⬆ <user>` tag, logged on every execution
+with `run_as_user=`, and recorded in the audit trail at creation and on every change.
+
 ### Permission diagnostics
 
 When a script cannot be run, the failure is classified rather than passed through as a bare OS
@@ -73,8 +112,9 @@ execution record — nothing ran, so nothing is logged as having run.
 
 ## Features
 
-- Define **hooks**: a name, an absolute `script_path`, a timeout, and a declared parameter
-  contract (`param_key`, `default_value`, `is_required`).
+- Define **hooks**: a name, an absolute `script_path`, a timeout, an optional `run_as_user` for
+  `sudo`-elevated execution, and a declared parameter contract (`param_key`, `default_value`,
+  `is_required`).
 - Execute them via `POST /api/hooks/{id}/execute`, or via `POST /webhook/{name}` for third-party
   senders that post their own flat JSON document to a fixed URL.
 - Parameters reach the script **both ways**: as `HOOK_PARAM_<UPPERCASED_KEY>` environment

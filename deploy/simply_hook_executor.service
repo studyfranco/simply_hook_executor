@@ -23,6 +23,13 @@ Type=exec
 # Never root. Hook scripts inherit this identity, so `hookrunner` defines the blast radius of
 # every hook this daemon can run — grant it only what those scripts genuinely need (e.g. a
 # targeted sudoers rule for one command, rather than broad privileges).
+#
+# A hook may set `run_as_user` to escalate through sudo. That only *requests* elevation; sudoers
+# decides. Keep each rule pinned to one command:
+#     hookrunner ALL=(root) NOPASSWD: /opt/hooks/ban.sh
+# HOOK_PARAM_* variables are reset by sudo unless you also add:
+#     Defaults:hookrunner env_keep += "HOOK_PARAM_*"
+# Positional arguments ($1, $2, ...) always reach the script regardless.
 User=hookrunner
 Group=hookrunner
 

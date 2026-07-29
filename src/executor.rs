@@ -34,6 +34,15 @@ use crate::state::AppState;
 /// Prefix applied to every parameter injected into a hook's environment.
 pub const PARAM_ENV_PREFIX: &str = "HOOK_PARAM_";
 
+/// Absolute path to `sudo`, used when a hook declares `run_as_user`.
+///
+/// Hard-coded rather than resolved through `PATH`: a hook's elevation path must not depend on a
+/// mutable environment variable, and `PATH` is itself an operator-configurable passthrough.
+pub const SUDO_BINARY: &str = "/usr/bin/sudo";
+
+/// Longest accepted `run_as_user` value — `useradd` caps usernames at 32 characters.
+const MAX_USERNAME_LEN: usize = 32;
+
 /// How long to wait for the stdout/stderr readers to observe EOF after the process has been
 /// reaped. Reaching this bound is not an error — whatever was captured so far is kept — it only
 /// guards against a detached grandchild holding a pipe open forever.
@@ -162,12 +171,68 @@ pub fn resolve_parameters(
 /// [`Command`] inline.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct CommandPlan {
-    /// Absolute path of the binary/script to run. Never a shell.
+    /// Absolute path of the binary to run: the hook's script, or [`SUDO_BINARY`] when the hook
+    /// declares a `run_as_user`. Never a shell.
     pub program: String,
-    /// Positional arguments, in declaration order of the resolved parameters.
+    /// The full argument vector, in order. For a privileged hook this begins with sudo's own
+    /// `-n -u <user> --` and the script path, followed by the hook's positional parameters.
     pub args: Vec<String>,
     /// The child's complete environment after `env_clear()`.
     pub env: BTreeMap<String, String>,
+    /// The account the script will run as, when elevation is configured. Surfaced so the dry-run
+    /// preview can state plainly that a hook is privileged.
+    pub run_as_user: Option<String>,
+}
+
+/// Normalizes a stored `run_as_user` into `Some(user)` only when it carries an actual value.
+///
+/// An empty or whitespace-only column is treated as "unset" rather than as a username, so a UI
+/// that submits an empty text field can never accidentally request elevation to `""`.
+pub fn effective_run_as_user(run_as_user: Option<&str>) -> Option<&str> {
+    run_as_user.map(str::trim).filter(|user| !user.is_empty())
+}
+
+/// Validates a `run_as_user` value.
+///
+/// This is the primary guard against option injection into `sudo`. The value lands in the argument
+/// vector immediately after `-u`, so a hostile value such as `-i` or `--login` must never reach
+/// it. Restricting to the POSIX-portable username shape (`[A-Za-z_][A-Za-z0-9_-]*`, plus a
+/// trailing `$` for Samba machine accounts) makes an argument that starts with `-` unrepresentable
+/// by construction, rather than relying on sudo's own parsing to be defensive.
+pub fn validate_run_as_user(run_as_user: &str) -> Result<(), ScriptError> {
+    let user = run_as_user.trim();
+
+    let invalid = |reason: &str| {
+        Err(ScriptError::new(
+            ScriptRejection::InvalidRunAsUser,
+            format!("Invalid run_as_user '{run_as_user}': {reason}"),
+        ))
+    };
+
+    if user.is_empty() {
+        return invalid("must not be empty (omit the field to run as the daemon user)");
+    }
+    if user.len() > MAX_USERNAME_LEN {
+        return invalid(&format!("must be at most {MAX_USERNAME_LEN} characters"));
+    }
+
+    let mut chars = user.chars();
+    match chars.next() {
+        // A leading '-' is exactly the option-injection case this rejects.
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return invalid("must start with an ASCII letter or underscore"),
+    }
+
+    let body: Vec<char> = chars.collect();
+    let (body, _trailing_dollar) = match body.split_last() {
+        Some((&'$', rest)) => (rest, true),
+        _ => (body.as_slice(), false),
+    };
+    if !body.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-') {
+        return invalid("may only contain ASCII letters, digits, '_' and '-'");
+    }
+
+    Ok(())
 }
 
 /// Builds the [`CommandPlan`] for a hook and a set of resolved parameters.
@@ -176,6 +241,14 @@ pub struct CommandPlan {
 /// as `HOOK_PARAM_<UPPERCASED_KEY>` in the environment, and as a bare positional argument (for
 /// Python/shell scripts reading `sys.argv`/`$1`). Positional order is the parameter declaration
 /// order, which the `/test` endpoint surfaces explicitly so it never has to be guessed.
+///
+/// When the hook declares a `run_as_user`, the program becomes [`SUDO_BINARY`] and the vector is
+/// prefixed with `-n -u <user> --`:
+///
+/// - `-n` keeps sudo non-interactive, so a missing NOPASSWD rule fails immediately instead of
+///   blocking on a password prompt that nothing can ever answer.
+/// - `--` terminates sudo's own option parsing, so a script path or parameter beginning with `-`
+///   is passed through as data rather than absorbed as a sudo flag.
 pub fn build_command_plan(
     hook: &hook::Model,
     resolved: &ResolvedParameters,
@@ -197,10 +270,29 @@ pub fn build_command_plan(
         env.insert(format!("{PARAM_ENV_PREFIX}{}", key.to_uppercase()), value.clone());
     }
 
+    let positional = resolved.values.iter().map(|(_, v)| v.clone());
+    let run_as_user = effective_run_as_user(hook.run_as_user.as_deref());
+
+    let (program, mut args) = match run_as_user {
+        Some(user) => (
+            SUDO_BINARY.to_owned(),
+            vec![
+                "-n".to_owned(),
+                "-u".to_owned(),
+                user.to_owned(),
+                "--".to_owned(),
+                hook.script_path.clone(),
+            ],
+        ),
+        None => (hook.script_path.clone(), Vec::new()),
+    };
+    args.extend(positional);
+
     CommandPlan {
-        program: hook.script_path.clone(),
-        args: resolved.values.iter().map(|(_, v)| v.clone()).collect(),
+        program,
+        args,
         env,
+        run_as_user: run_as_user.map(str::to_owned),
     }
 }
 
@@ -226,6 +318,10 @@ pub enum ScriptRejection {
     OutsideAllowedRoots,
     /// The path is relative, traverses with `..`, or is otherwise malformed.
     MalformedPath,
+    /// `run_as_user` is not a syntactically valid account name.
+    InvalidRunAsUser,
+    /// `sudo` is required by this hook but is not usable.
+    SudoUnavailable,
     /// Anything else the OS reported.
     Unusable,
 }
@@ -438,6 +534,12 @@ pub fn ensure_executable(
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode();
+        // Deliberately "executable by *someone*", not "executable by us": a privileged hook is
+        // routinely a root-owned `0700` script that the daemon user is not meant to be able to run
+        // directly — that is precisely what `sudo` is for. Requiring an owner/group/other execute
+        // bit still catches the real mistake (a file deployed without `chmod +x` at all), while
+        // stat'ing and canonicalizing such a file only needs search permission on its parents,
+        // which the daemon does have.
         if mode & 0o111 == 0 {
             return Err(ScriptError::new(
                 ScriptRejection::NotExecutable,
@@ -454,6 +556,59 @@ pub fn ensure_executable(
     }
 
     Ok(())
+}
+
+/// Verifies that `sudo` itself is present and executable before a privileged hook is attempted.
+///
+/// Without this, a missing or non-executable `sudo` surfaces as a bare `ENOENT` naming
+/// `/usr/bin/sudo` — technically accurate but baffling to an operator who was looking at their own
+/// script path.
+fn ensure_sudo_available(run_as_user: &str) -> Result<(), ScriptError> {
+    let sudo_error = |cause: &str, remedy: &str| {
+        ScriptError::new(
+            ScriptRejection::SudoUnavailable,
+            format!(
+                "[ERROR] Cannot run this hook as '{run_as_user}': {cause}. {remedy}"
+            ),
+        )
+    };
+
+    let metadata = std::fs::metadata(SUDO_BINARY).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => sudo_error(
+            &format!("'{SUDO_BINARY}' does not exist"),
+            "Install sudo, or clear the hook's run_as_user to run it as the daemon user.",
+        ),
+        _ => sudo_error(
+            &format!("'{SUDO_BINARY}' is not accessible ({e})"),
+            "Check that the daemon user can reach it.",
+        ),
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(sudo_error(
+                &format!("'{SUDO_BINARY}' is not executable"),
+                "Restore its permissions (normally 4755).",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Full pre-flight for a hook: elevation configuration first, then the script itself.
+///
+/// Order matters. A hook whose `run_as_user` is malformed is rejected before the filesystem is
+/// touched, so a bad account name can never be reported as a confusing path problem.
+pub fn ensure_runnable(hook: &hook::Model, config: &RuntimeConfig) -> Result<(), ScriptError> {
+    if let Some(user) = effective_run_as_user(hook.run_as_user.as_deref()) {
+        validate_run_as_user(user)?;
+        ensure_sudo_available(user)?;
+    }
+
+    ensure_executable(&hook.script_path, &config.allowed_script_roots)
 }
 
 /// Validates a `script_path` at hook *definition* time.
@@ -823,7 +978,7 @@ pub async fn execute_hook(
     key: &api_key::Model,
     resolved: &ResolvedParameters,
 ) -> Result<execution::Model, AppError> {
-    if let Err(diagnosis) = ensure_executable(&hook.script_path, &state.config.allowed_script_roots) {
+    if let Err(diagnosis) = ensure_runnable(hook, &state.config) {
         // Logged at WARN with the classification attached, so a misconfigured or tampered-with
         // hook is greppable in journald (`rejection=PermissionDenied`) and not merely a 400 that
         // only the caller ever sees.
@@ -844,10 +999,13 @@ pub async fn execute_hook(
     let timeout = state.config.timeout_for(hook.default_timeout_seconds);
     let started_at = chrono::Utc::now().naive_utc();
 
+    // `run_as_user` is logged on every privileged execution: an operator auditing what ran as root
+    // should be able to find it in journald without cross-referencing the hooks table.
     tracing::info!(
         hook = %hook.name,
         key = %key.prefix,
         timeout_s = timeout.as_secs(),
+        run_as_user = plan.run_as_user.as_deref().unwrap_or("-"),
         "Executing hook"
     );
 
@@ -980,17 +1138,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plan_injects_prefixed_env_and_positional_args() {
-        let hook = hook::Model {
+    /// A hook fixture, optionally elevated.
+    fn demo_hook(run_as_user: Option<&str>) -> hook::Model {
+        hook::Model {
             id: Uuid::new_v4(),
             name: "demo".to_owned(),
             description: None,
             script_path: "/usr/local/bin/demo.sh".to_owned(),
             default_timeout_seconds: 30,
+            run_as_user: run_as_user.map(str::to_owned),
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
-        };
+        }
+    }
+
+    /// A config with no host passthrough, so env assertions are independent of the test machine.
+    fn isolated_config() -> RuntimeConfig {
+        RuntimeConfig {
+            allowed_env_vars: Vec::new(),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    #[test]
+    fn plan_injects_prefixed_env_and_positional_args() {
+        let hook = demo_hook(None);
         let resolved = ResolvedParameters {
             values: vec![
                 ("target_address".to_owned(), "203.0.113.7".to_owned()),
@@ -999,17 +1171,107 @@ mod tests {
             missing_required: Vec::new(),
         };
         // An empty passthrough list keeps this assertion independent of the host environment.
-        let config = RuntimeConfig {
-            allowed_env_vars: Vec::new(),
-            ..RuntimeConfig::default()
-        };
-
-        let plan = build_command_plan(&hook, &resolved, &config);
+        let plan = build_command_plan(&hook, &resolved, &isolated_config());
         assert_eq!(plan.program, "/usr/local/bin/demo.sh");
         assert_eq!(plan.args, vec!["203.0.113.7", "abuse"]);
+        assert_eq!(plan.run_as_user, None);
         assert_eq!(plan.env.get("HOOK_PARAM_TARGET_ADDRESS").map(String::as_str), Some("203.0.113.7"));
         assert_eq!(plan.env.get("HOOK_PARAM_REASON").map(String::as_str), Some("abuse"));
         assert_eq!(plan.env.len(), 2, "no host variables leak in with an empty allowlist");
+    }
+
+    #[test]
+    fn plan_wraps_privileged_hooks_in_sudo() {
+        let hook = demo_hook(Some("root"));
+        let resolved = ResolvedParameters {
+            values: vec![
+                ("target_address".to_owned(), "203.0.113.7".to_owned()),
+                ("reason".to_owned(), "abuse".to_owned()),
+            ],
+            missing_required: Vec::new(),
+        };
+
+        let plan = build_command_plan(&hook, &resolved, &isolated_config());
+
+        assert_eq!(plan.program, SUDO_BINARY);
+        // The exact vector matters: -n (never prompt), -u <user>, then `--` before anything
+        // attacker-influenceable, then the script and its positional parameters.
+        assert_eq!(
+            plan.args,
+            vec!["-n", "-u", "root", "--", "/usr/local/bin/demo.sh", "203.0.113.7", "abuse"]
+        );
+        assert_eq!(plan.run_as_user.as_deref(), Some("root"));
+
+        // `--` must sit immediately before the script path, so nothing after it can be parsed as
+        // a sudo option.
+        let separator = plan.args.iter().position(|a| a == "--").expect("the -- separator is present");
+        assert_eq!(plan.args[separator + 1], "/usr/local/bin/demo.sh");
+
+        // Environment injection is identical to the unprivileged path.
+        assert_eq!(plan.env.get("HOOK_PARAM_TARGET_ADDRESS").map(String::as_str), Some("203.0.113.7"));
+        assert_eq!(plan.env.get("HOOK_PARAM_REASON").map(String::as_str), Some("abuse"));
+        assert_eq!(plan.env.len(), 2, "no host variables leak in with an empty allowlist");
+    }
+
+    #[test]
+    fn plan_treats_blank_run_as_user_as_unprivileged() {
+        let resolved = ResolvedParameters::default();
+        for blank in ["", "   ", "\t"] {
+            let plan = build_command_plan(&demo_hook(Some(blank)), &resolved, &isolated_config());
+            assert_eq!(plan.program, "/usr/local/bin/demo.sh", "{blank:?} must not trigger sudo");
+            assert!(plan.args.is_empty());
+            assert_eq!(plan.run_as_user, None);
+        }
+    }
+
+    #[test]
+    fn plan_trims_surrounding_whitespace_from_run_as_user() {
+        let plan = build_command_plan(&demo_hook(Some("  postgres  ")), &ResolvedParameters::default(), &isolated_config());
+        assert_eq!(plan.args, vec!["-n", "-u", "postgres", "--", "/usr/local/bin/demo.sh"]);
+        assert_eq!(plan.run_as_user.as_deref(), Some("postgres"));
+    }
+
+    #[test]
+    fn privileged_plan_keeps_parameters_positional_after_the_separator() {
+        // A parameter value that looks like a sudo option must land after `--`, where sudo can
+        // only treat it as an argument to the script.
+        let resolved = ResolvedParameters {
+            values: vec![("flag".to_owned(), "--login".to_owned())],
+            missing_required: Vec::new(),
+        };
+        let plan = build_command_plan(&demo_hook(Some("root")), &resolved, &isolated_config());
+
+        let separator = plan.args.iter().position(|a| a == "--").expect("the -- separator is present");
+        let hostile = plan.args.iter().position(|a| a == "--login").expect("the value is present");
+        assert!(hostile > separator, "a option-shaped value must sit after the separator");
+    }
+
+    #[test]
+    fn validates_run_as_user_against_option_injection() {
+        for valid in ["root", "postgres", "_svc", "deploy-bot", "user_1", "machine$"] {
+            assert!(validate_run_as_user(valid).is_ok(), "{valid} should be accepted");
+        }
+
+        // The leading-dash cases are the option-injection attempts this exists to stop.
+        for invalid in [
+            "-i", "--login", "-u", "", "   ", "root user", "root;id", "root\0", "root/../x",
+            "1user", "user$name", "üser", "root\n-i",
+        ] {
+            let err = validate_run_as_user(invalid).expect_err("{invalid} should be rejected");
+            assert_eq!(err.rejection, ScriptRejection::InvalidRunAsUser, "for {invalid:?}");
+        }
+
+        // Length cap.
+        assert!(validate_run_as_user(&"a".repeat(MAX_USERNAME_LEN)).is_ok());
+        assert!(validate_run_as_user(&"a".repeat(MAX_USERNAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn normalizes_effective_run_as_user() {
+        assert_eq!(effective_run_as_user(None), None);
+        assert_eq!(effective_run_as_user(Some("")), None);
+        assert_eq!(effective_run_as_user(Some("  ")), None);
+        assert_eq!(effective_run_as_user(Some(" root ")), Some("root"));
     }
 
     #[test]

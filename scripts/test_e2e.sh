@@ -1093,6 +1093,94 @@ api_call GET "/api/executions?hook=symlink_escape&limit=10" "$MASTER_KEY"
 check "200" "query the escaped hook's history"
 check_jq "length" "0" "a refused script never creates an execution record"
 
+# ── 22. Privileged execution (run_as_user / sudo) ───────────────────────────
+
+log_section "22. Privileged Execution (run_as_user via sudo)"
+
+PRIV_SCRIPT=$(make_hook_script "privileged_hook.sh" 'echo "elevated:${HOOK_PARAM_TARGET}"')
+
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"privileged_hook\",\"script_path\":\"$PRIV_SCRIPT\",\"run_as_user\":\"root\",\"parameters\":[{\"param_key\":\"target\",\"is_required\":true},{\"param_key\":\"reason\",\"default_value\":\"routine\",\"is_required\":true}]}"
+check "200" "create a hook that elevates to root"
+PRIV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+check_jq ".run_as_user" "root" "the elevation is stored and returned"
+
+api_call POST "/api/hooks/$PRIV_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target":"203.0.113.7"}}'
+check "200" "dry-run the privileged hook"
+check_jq ".command.program" "/usr/bin/sudo" "the program is sudo, not the script"
+check_jq ".command.run_as_user" "root" "the preview names the target account"
+check_jq ".command.args | join(\" \")" "-n -u root -- $PRIV_SCRIPT 203.0.113.7 routine" \
+    "the preview shows the exact sudo argument vector"
+# The -- separator must sit immediately before the script path.
+check_true '(.command.args | index("--")) as $i | .command.args[$i + 1] == "'"$PRIV_SCRIPT"'"' \
+    "the -- separator immediately precedes the script path"
+check_true '(.command.args | index("--")) < (.command.args | index("203.0.113.7"))' \
+    "parameters are placed after the separator, where sudo cannot parse them as options"
+check_jq ".command.env.HOOK_PARAM_TARGET" "203.0.113.7" "HOOK_PARAM_* injection is unchanged under sudo"
+check_jq ".command.env.HOOK_PARAM_REASON" "routine" "defaulted parameters are injected too"
+
+# An unprivileged hook must show no sudo wrapper at all. Created here rather than reusing an
+# earlier section's hook, so this comparison never depends on what §20's cascade deleted.
+PLAIN_SCRIPT=$(make_hook_script "plain_compare.sh" 'echo "plain:$1"')
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"plain_compare\",\"script_path\":\"$PLAIN_SCRIPT\",\"parameters\":[{\"param_key\":\"target\",\"is_required\":true}]}"
+check "200" "create an unprivileged hook for comparison"
+PLAIN_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+check_jq ".run_as_user" "null" "it reports no elevation"
+
+api_call POST "/api/hooks/$PLAIN_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target":"one"}}'
+check "200" "dry-run the unprivileged hook"
+check_jq ".command.program" "$PLAIN_SCRIPT" "the program is the script itself"
+check_jq ".command.run_as_user" "null" "no elevation is reported"
+check_jq ".command.args | join(\" \")" "one" "only the hook's own parameters are passed"
+check_true '(.command.args | index("--")) == null' "no sudo separator appears"
+
+# --- run_as_user validation: option injection into sudo ---
+PRIV_BLOCKED=0
+PRIV_TOTAL=0
+for candidate in "-i" "--login" "-u" "-s" "root user" "root;id" "root|id" "1root" "root/../etc"; do
+    PRIV_TOTAL=$((PRIV_TOTAL + 1))
+    api_call POST "/api/hooks" "$MASTER_KEY" \
+        "$(jq -nc --arg p "$PRIV_SCRIPT" --arg u "$candidate" '{name:"hostile_user",script_path:$p,run_as_user:$u}')"
+    if [ "$RESP_STATUS" == "400" ]; then
+        PRIV_BLOCKED=$((PRIV_BLOCKED + 1))
+    else
+        err "run_as_user '$candidate' was NOT rejected (status $RESP_STATUS)"
+    fi
+done
+check_local "$PRIV_BLOCKED" "$PRIV_TOTAL" "every malformed/option-shaped run_as_user is rejected"
+
+api_call GET "/api/hooks/hostile_user" "$MASTER_KEY"
+check "404" "no hook was created by any hostile run_as_user"
+
+# --- Elevation can be changed and dropped ---
+api_call PUT "/api/hooks/$PRIV_HOOK_ID" "$MASTER_KEY" '{"run_as_user":"postgres"}'
+check "200" "change the target account"
+check_jq ".run_as_user" "postgres" "the new account is persisted"
+
+api_call PUT "/api/hooks/$PRIV_HOOK_ID" "$MASTER_KEY" '{"run_as_user":"-i"}'
+check "400" "an existing hook cannot be re-pointed at an option-shaped account"
+
+api_call PUT "/api/hooks/$PRIV_HOOK_ID" "$MASTER_KEY" '{"description":"unrelated change"}'
+check "200" "omitting run_as_user leaves the elevation untouched"
+check_jq ".run_as_user" "postgres" "the elevation survived an unrelated update"
+
+api_call PUT "/api/hooks/$PRIV_HOOK_ID" "$MASTER_KEY" '{"run_as_user":""}'
+check "200" "an explicit empty string drops elevation"
+check_jq ".run_as_user" "null" "the hook runs as the daemon user again"
+
+api_call POST "/api/hooks/$PRIV_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target":"203.0.113.7"}}'
+check "200" "dry-run after dropping elevation"
+check_jq ".command.program" "$PRIV_SCRIPT" "the sudo wrapper is gone"
+
+# --- The elevation is auditable ---
+api_call GET "/api/audit-logs?action=HOOK_CREATE&limit=50" "$MASTER_KEY"
+check "200" "fetch hook creation audit entries"
+# `test()` with `.` wildcards instead of literal apostrophes: the surrounding jq filter is single
+# quoted for bash, so an embedded ' would terminate it.
+check_true '[.[] | select(.target_resource == "privileged_hook") | .details | test("runs as .root. via sudo")] | length == 1' \
+    "the audit trail records which account a hook was created to run as"
+check_true '[.[] | select(.target_resource == "plain_compare") | .details | test("runs as the daemon user")] | length == 1' \
+    "an unprivileged hook is audited as running unelevated"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

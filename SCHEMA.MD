@@ -66,6 +66,7 @@ Defines executable script definitions and execution constraints.
 | `description` | String | NULLABLE | Optional summary of what the hook script does. |
 | `script_path` | String | NOT NULL | Absolute filesystem path to executable (`/usr/local/bin/ban.sh`). |
 | `default_timeout_seconds` | Integer | NOT NULL, DEFAULT `30` | Maximum allowed runtime before `SIGKILL`. |
+| `run_as_user` | String | NULLABLE, DEFAULT `NULL` | Target account for privileged execution. `NULL`/empty runs the script directly as the daemon user; a value (e.g. `root`, `postgres`) runs it via `sudo -n -u <user> --`. |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
 

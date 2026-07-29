@@ -137,12 +137,23 @@ pub async fn insert_key(
     (id, plaintext)
 }
 
-/// Inserts a hook pointing at `script_path`.
+/// Inserts an unprivileged hook pointing at `script_path`.
 pub async fn insert_hook(
     db: &DatabaseConnection,
     name: &str,
     script_path: &str,
     timeout_seconds: i32,
+) -> Uuid {
+    insert_hook_as(db, name, script_path, timeout_seconds, None).await
+}
+
+/// Inserts a hook, optionally elevated to `run_as_user`.
+pub async fn insert_hook_as(
+    db: &DatabaseConnection,
+    name: &str,
+    script_path: &str,
+    timeout_seconds: i32,
+    run_as_user: Option<&str>,
 ) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
@@ -153,6 +164,7 @@ pub async fn insert_hook(
         description: Set(None),
         script_path: Set(script_path.to_owned()),
         default_timeout_seconds: Set(timeout_seconds),
+        run_as_user: Set(run_as_user.map(str::to_owned)),
         created_at: Set(now),
         updated_at: Set(now),
     }

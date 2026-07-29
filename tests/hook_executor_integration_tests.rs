@@ -879,6 +879,275 @@ async fn positional_argument_order_is_deterministic_and_append_only() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Privileged execution (run_as_user / sudo)
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn run_as_user_migration_upgrades_an_existing_database() {
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    use sea_orm_migration::MigratorTrait;
+    use simply_hook_executor::{entities::hook, migration::Migrator};
+
+    let db = sea_orm::Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory SQLite is available");
+
+    // Stop at the initial schema: this is what a database created by the previous release looks
+    // like, i.e. `hooks` without a `run_as_user` column.
+    Migrator::up(&db, Some(1)).await.expect("the initial schema applies");
+
+    // Then apply the rest, exercising the ALTER TABLE upgrade path rather than a fresh CREATE.
+    Migrator::up(&db, None).await.expect("the run_as_user migration applies to an existing schema");
+
+    // The new column is present, nullable, and defaults to NULL for pre-existing rows.
+    let now = chrono::Utc::now().naive_utc();
+    let legacy = hook::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("legacy".to_owned()),
+        description: Set(None),
+        script_path: Set("/bin/true".to_owned()),
+        default_timeout_seconds: Set(30),
+        run_as_user: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await
+    .expect("a hook is insertable after the upgrade");
+    assert_eq!(legacy.run_as_user, None, "an unelevated hook keeps running as the daemon user");
+
+    // And the column accepts a value.
+    let mut active: hook::ActiveModel = legacy.into();
+    active.run_as_user = Set(Some("root".to_owned()));
+    let elevated = active.update(&db).await.expect("run_as_user is writable");
+    assert_eq!(elevated.run_as_user.as_deref(), Some("root"));
+
+    // Re-running the migrator is a no-op rather than an error, so a restart never fails.
+    Migrator::up(&db, None).await.expect("migrations are idempotent");
+}
+
+#[tokio::test]
+async fn dry_run_previews_the_exact_sudo_command_for_a_privileged_hook() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("privileged.sh", "echo elevated");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook_as(&db, "privileged", &script, 30, Some("root")).await;
+    insert_parameter(&db, hook_id, "target", None, true).await;
+    insert_parameter(&db, hook_id, "reason", Some("routine"), true).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let preview = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &key,
+            Some(json!({ "parameters": { "target": "203.0.113.7" } })),
+        ),
+    )
+    .await;
+
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.json["command"]["program"], json!("/usr/bin/sudo"));
+    assert_eq!(preview.json["command"]["run_as_user"], json!("root"));
+    // The whole point of the preview: the operator sees the literal argv, sudo flags included.
+    assert_eq!(
+        preview.json["command"]["args"],
+        json!(["-n", "-u", "root", "--", script, "203.0.113.7", "routine"])
+    );
+    // Parameters still reach the environment exactly as they do for an unprivileged hook.
+    assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_TARGET"], json!("203.0.113.7"));
+    assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_REASON"], json!("routine"));
+
+    // The unprivileged form of the same hook has no sudo wrapper at all.
+    let plain_id = insert_hook_as(&db, "unprivileged", &script, 30, None).await;
+    grant(&db, key_id, plain_id, true, false).await;
+    let plain = send(&app, json_request("POST", &format!("/api/hooks/{plain_id}/test"), &key, None)).await;
+    assert_eq!(plain.json["command"]["program"], json!(script));
+    assert_eq!(plain.json["command"]["args"], json!([]));
+    assert_eq!(plain.json["command"]["run_as_user"], json!(null));
+}
+
+#[tokio::test]
+async fn run_as_user_survives_hook_crud_and_is_audited() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("crud_priv.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "priv_crud", "script_path": script, "run_as_user": "postgres" })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK);
+    assert_eq!(created.field("run_as_user"), &json!("postgres"));
+    let hook_id = created.string("id");
+
+    // It round-trips through the read paths.
+    let fetched = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    assert_eq!(fetched.field("run_as_user"), &json!("postgres"));
+    let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
+    assert_eq!(listed.json[0]["run_as_user"], json!("postgres"));
+
+    // Creation is audited with the elevation, so "what runs as another account" is answerable
+    // from the audit trail alone.
+    let audit = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_CREATE&limit=1", &master, None)).await;
+    assert!(
+        audit.json[0]["details"].as_str().unwrap_or_default().contains("runs as 'postgres' via sudo"),
+        "audit details should record the elevation: {}",
+        audit.json[0]["details"]
+    );
+
+    // Changing the account is recorded too.
+    let updated = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "run_as_user": "root" }))),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::OK);
+    assert_eq!(updated.field("run_as_user"), &json!("root"));
+
+    let audit = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_UPDATE&limit=1", &master, None)).await;
+    assert!(
+        audit.json[0]["details"].as_str().unwrap_or_default().contains("runs as 'root' via sudo"),
+        "{}",
+        audit.json[0]["details"]
+    );
+
+    // An explicit empty string drops elevation; the field being absent would have left it alone.
+    let cleared = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "run_as_user": "" }))),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_eq!(cleared.field("run_as_user"), &json!(null));
+
+    let untouched = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "description": "unrelated" }))),
+    )
+    .await;
+    assert_eq!(untouched.field("run_as_user"), &json!(null));
+}
+
+#[tokio::test]
+async fn run_as_user_rejects_option_injection_and_malformed_accounts() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("reject_priv.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    // Each of these would be an argument to sudo's `-u`; a leading dash is the injection case.
+    let hostile = [
+        "-i", "--login", "-u", "-s", "root user", "root;id", "root&&id", "root|id",
+        "1root", "root/../etc", "üser", "root\nother", &"a".repeat(64),
+    ];
+
+    for candidate in hostile {
+        let response = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/hooks",
+                &master,
+                Some(json!({ "name": "hostile", "script_path": script, "run_as_user": candidate })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "run_as_user {candidate:?} must be rejected"
+        );
+        assert!(
+            response.string("error").contains("Invalid run_as_user"),
+            "{candidate:?}: unhelpful error {}",
+            response.string("error")
+        );
+    }
+
+    // Nothing was created by any of them.
+    let hooks = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
+    assert_eq!(hooks.json.as_array().map(Vec::len), Some(0));
+
+    // The same validation guards the update path.
+    let created = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "ok", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK);
+    let hook_id = created.string("id");
+
+    let rejected = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "run_as_user": "-i" }))),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+
+    let still_unprivileged = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    assert_eq!(still_unprivileged.field("run_as_user"), &json!(null));
+}
+
+#[tokio::test]
+async fn a_privileged_hook_actually_executes_through_sudo() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("via_sudo.sh", "echo ran");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    // Elevating to this test's *own* user keeps the sudoers requirement as small as possible,
+    // but the suite still must not depend on any sudo configuration to pass.
+    let whoami = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+    let hook_id = insert_hook_as(&db, "via_sudo", &script, 30, Some(&whoami)).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    if !std::path::Path::new("/usr/bin/sudo").exists() {
+        eprintln!("skipping: /usr/bin/sudo is not installed");
+        return;
+    }
+
+    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    assert_eq!(response.status, StatusCode::OK, "the request itself must complete");
+
+    // Whether sudo *permits* the elevation depends entirely on this machine's sudoers, which a
+    // test must not assume. Both outcomes are asserted precisely:
+    //   - permitted  -> the script ran and its stdout is captured;
+    //   - refused    -> sudo exits non-zero without a password prompt (because of `-n`), which is
+    //                   recorded as a normal FAILED execution rather than hanging or crashing.
+    let status = response.string("status");
+    if status == "SUCCESS" {
+        assert_eq!(response.string("stdout").trim(), "ran");
+    } else {
+        assert_eq!(status, "FAILED");
+        let stderr = response.string("stderr");
+        assert!(
+            stderr.contains("sudo") || stderr.contains("password") || stderr.contains("not allowed"),
+            "a sudo refusal should be captured in stderr, got: {stderr:?}"
+        );
+    }
+
+    // Either way the attempt is recorded, with the hook's elevation intact.
+    assert_eq!(execution_count(&db).await, 1);
+}
+
+// ─────────────────────────────────────────────────────────────
 // Linux permission & path-containment diagnostics
 // ─────────────────────────────────────────────────────────────
 
