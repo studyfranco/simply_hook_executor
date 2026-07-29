@@ -274,6 +274,11 @@ else
 fi
 
 mkdir -p "$HOOK_DIR"
+# Resolve to the physical path: it is handed to the server as ALLOWED_SCRIPT_ROOTS, and the
+# server compares it against canonicalized script paths. On systems where the temp directory is
+# itself a symlink (e.g. /tmp -> /private/tmp), the literal and physical forms differ and every
+# containment check would fail for the wrong reason.
+HOOK_DIR="$(cd "$HOOK_DIR" && pwd -P)"
 
 # ── Build & start ────────────────────────────────────────────────────────────
 
@@ -291,8 +296,12 @@ log "Starting server on $BIND_HOST:$SERVER_PORT against a fresh database at $DB_
 log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping needed)"
 # ALLOWED_ENV_VARS=PATH pins the passthrough allowlist so §7's isolation assertions are exact:
 # anything other than PATH and HOOK_PARAM_* showing up in a child's environment is a real leak.
+# ALLOWED_SCRIPT_ROOTS is pinned to the throwaway hook directory, so every hook the suite creates
+# exercises the containment check on the happy path, and §21 can prove a path outside it is
+# refused without needing a second server instance.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     ALLOWED_ENV_VARS="PATH" LOG_RETENTION_DAYS=30 \
+    ALLOWED_SCRIPT_ROOTS="$HOOK_DIR" \
     BIND_HOST="$BIND_HOST" PORT="$SERVER_PORT" \
     "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -956,6 +965,133 @@ api_call GET "/api/keys" "$MASTER_KEY"
 check "200" "list keys after the cascade"
 check_true 'all(.[]; [.hook_permissions[] | select(.hook_name == "param_hook")] | length == 0)' \
     "permission mappings for the deleted hook cascaded away too"
+
+# ── 21. Linux permission & path containment diagnostics ─────────────────────
+
+log_section "21. Linux Permission Diagnostics & Path Containment"
+
+# --- Non-executable script (chmod 0600): must fail with an actionable EACCES-class message ---
+NOEXEC_SCRIPT="$HOOK_DIR/no_exec_bit.sh"
+printf '#!/bin/sh\necho should never run\n' > "$NOEXEC_SCRIPT"
+chmod 0600 "$NOEXEC_SCRIPT"
+
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"no_exec_bit\",\"script_path\":\"$NOEXEC_SCRIPT\"}"
+check "200" "declare a hook pointing at a non-executable file"
+NOEXEC_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$NOEXEC_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "400" "executing a non-executable script is refused"
+check_true '.error | startswith("[ERROR] Cannot execute ")' "the error uses the standard diagnostic prefix"
+check_true '.error | contains("no execute bit set")' "the diagnostic names the actual cause"
+check_true '.error | contains("0600")' "the diagnostic reports the file's real mode"
+check_true '.error | contains("chmod +x")' "the diagnostic states the remedy"
+check_true '.error | contains("uid=")' "the diagnostic identifies the user the daemon runs as"
+
+# The same diagnostic must reach the system log, not just the HTTP caller.
+check_local "$(grep -c 'rejection=PermissionDenied\|rejection=NotExecutable' "$SERVER_LOG")" "1" \
+    "the refusal is logged once via tracing with its classification"
+
+# The dry run reports it as data instead of failing.
+api_call POST "/api/hooks/$NOEXEC_HOOK_ID/test" "$MASTER_KEY" '{}'
+check "200" "dry-running a non-executable hook still returns a preview"
+check_jq ".would_execute" "false" "the preview reports it would be blocked"
+check_true '.blocking_reason | contains("no execute bit set")' "the preview carries the same diagnostic"
+
+# Granting the bit makes it run — proving the refusal was purely about permissions.
+chmod +x "$NOEXEC_SCRIPT"
+api_call POST "/api/hooks/$NOEXEC_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "the same hook runs once the execute bit is granted"
+check_jq ".status" "SUCCESS" "it succeeds after chmod +x"
+
+# --- Missing script: ENOENT, clearly distinguished from a permission problem ---
+api_call POST "/api/hooks/$GHOST_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "400" "executing a hook whose script does not exist is refused"
+check_true '.error | contains("No such file or directory (ENOENT)")' "the diagnostic reports ENOENT"
+check_true '.error | contains("Deploy the script")' "the diagnostic states the remedy"
+check_true '(.error | contains("EACCES")) | not' "ENOENT is not mislabelled as a permission error"
+
+# --- A directory is not a script ---
+mkdir -p "$HOOK_DIR/i_am_a_directory"
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"dir_hook\",\"script_path\":\"$HOOK_DIR/i_am_a_directory\"}"
+check "200" "declare a hook pointing at a directory"
+DIR_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/hooks/$DIR_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "400" "executing a directory is refused"
+check_true '.error | contains("not a regular file")' "the diagnostic explains why"
+
+# --- Unsearchable parent directory: EACCES naming the blocking directory ---
+# Root bypasses directory search bits entirely, so this scenario cannot be built as root.
+if [ "$(id -u)" -eq 0 ]; then
+    warn "Skipping the unsearchable-directory check: running as root bypasses search bits."
+else
+    LOCKED_DIR="$HOOK_DIR/locked"
+    mkdir -p "$LOCKED_DIR"
+    printf '#!/bin/sh\necho hidden\n' > "$LOCKED_DIR/hidden.sh"
+    chmod 0755 "$LOCKED_DIR/hidden.sh"
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"locked_dir\",\"script_path\":\"$LOCKED_DIR/hidden.sh\"}"
+    check "200" "declare a hook inside a directory that is about to be locked"
+    LOCKED_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    chmod 0000 "$LOCKED_DIR"
+    api_call POST "/api/hooks/$LOCKED_HOOK_ID/execute" "$MASTER_KEY" '{}'
+    check "400" "executing a script behind an unsearchable directory is refused"
+    check_true '.error | contains("Permission denied (EACCES)")' "the diagnostic reports EACCES"
+    check_true ".error | contains(\"$LOCKED_DIR\")" "the diagnostic pinpoints the blocking directory"
+    chmod 0755 "$LOCKED_DIR"
+fi
+
+# --- Path traversal payloads are blocked at definition time ---
+TRAVERSAL_BLOCKED=0
+TRAVERSAL_TOTAL=0
+for payload in \
+    "/scripts/../../etc/shadow" \
+    "/opt/hooks/../../../etc/passwd" \
+    "../../../bin/sh" \
+    "../relative_escape.sh" \
+    "relative.sh" \
+    "./also_relative.sh" \
+    "$HOOK_DIR/../../etc/shadow"
+do
+    TRAVERSAL_TOTAL=$((TRAVERSAL_TOTAL + 1))
+    api_call POST "/api/hooks" "$MASTER_KEY" "$(jq -nc --arg p "$payload" '{name:"traversal_probe",script_path:$p}')"
+    if [ "$RESP_STATUS" == "400" ]; then
+        TRAVERSAL_BLOCKED=$((TRAVERSAL_BLOCKED + 1))
+    else
+        err "Traversal payload '$payload' was NOT rejected (status $RESP_STATUS)"
+    fi
+done
+check_local "$TRAVERSAL_BLOCKED" "$TRAVERSAL_TOTAL" "every path traversal payload is blocked at hook creation"
+
+api_call GET "/api/hooks/traversal_probe" "$MASTER_KEY"
+check "404" "no hook was created by any traversal payload"
+
+# --- Confinement to ALLOWED_SCRIPT_ROOTS ---
+api_call GET "/api/settings" "$MASTER_KEY"
+check "200" "settings report the configured script roots"
+check_jq ".allowed_script_roots | join(\",\")" "$HOOK_DIR" "the confinement roots are visible to master keys"
+
+api_call POST "/api/hooks" "$MASTER_KEY" '{"name":"outside_root","script_path":"/bin/true"}'
+check "400" "an absolute path outside ALLOWED_SCRIPT_ROOTS is refused"
+check_true '.error | contains("outside the allowed script roots")' "the diagnostic explains the confinement"
+
+api_call PUT "/api/hooks/$ECHO_HOOK_ID" "$MASTER_KEY" '{"script_path":"/bin/true"}'
+check "400" "an existing hook cannot be re-pointed outside the allowed roots"
+
+# --- A symlink whose literal path is contained but whose target escapes ---
+ln -sf /bin/true "$HOOK_DIR/looks_contained.sh"
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"symlink_escape\",\"script_path\":\"$HOOK_DIR/looks_contained.sh\"}"
+check "200" "a symlink inside the root passes the lexical check at definition time"
+SYMLINK_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$SYMLINK_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "400" "...but resolving it at execution time catches the escape"
+check_true '.error | contains("outside the allowed script roots")' "the symlink escape is reported as a containment failure"
+check_true '.error | contains("it resolves to")' "the diagnostic reveals the real target"
+
+# Nothing above should have produced an execution record.
+api_call GET "/api/executions?hook=symlink_escape&limit=10" "$MASTER_KEY"
+check "200" "query the escaped hook's history"
+check_jq "length" "0" "a refused script never creates an execution record"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

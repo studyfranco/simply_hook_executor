@@ -270,3 +270,112 @@ coercion, nested-object rejection, and argument-order stability/append-only beha
 - `cargo test` — 23 unit + 32 integration tests pass.
 - `./scripts/test_e2e.sh` — 199/199 checks pass (also verified on `PORT=3456` and with 3000
   occupied).
+
+---
+
+## 2026-07-29 (later still) — Permission diagnostics & path containment
+
+### Classified spawn/permission errors
+
+`std::io::Error` from the pre-flight check and from `execve` is now classified into a
+`ScriptRejection` (`NotFound`, `PermissionDenied`, `NotARegularFile`, `NotExecutable`,
+`OutsideAllowedRoots`, `MalformedPath`, `Unusable`) carried by a `ScriptError` alongside a single
+operator-facing line in the shape:
+
+```
+[ERROR] Cannot execute '<path>': <precise cause>. <what to do about it>
+```
+
+Two details worth keeping:
+
+- **`EACCES` names the directory at fault.** Stat'ing a file only needs *search* permission on its
+  parents, so an unsearchable directory stats perfectly well — what fails is stat'ing something
+  *inside* it. `first_unsearchable_directory` therefore walks the chain root-downward, finds the
+  first path that reports `EACCES`, and reports **its parent**. The first version of this walked
+  for the first ancestor that failed to stat, which found nothing at all in exactly the scenario it
+  existed for; the E2E check for "the diagnostic pinpoints the blocking directory" is what caught it.
+- **The mode is reported** (`no execute bit set (mode 0600)`), so an operator can tell 0600 from
+  0644 without another round-trip, and the running identity is included (`'hookrunner' (uid=999
+  gid=999)`) so they know who to grant it to. The name comes from `USER`/`LOGNAME`, which systemd
+  sets from the unit's `User=`; the numeric ids come from `geteuid`/`getegid` and are always
+  available.
+
+The same text goes to three places: the HTTP error body, a `tracing` event tagged with
+`rejection=<classification>` (WARN for a refusal, ERROR for a spawn failure), and — for failures
+that only appear at `execve` time, such as a `noexec` mount or a permission change between
+pre-flight and spawn — the execution record's `stderr`.
+
+**Interpretation worth flagging.** The task asked for the diagnostic in "the execution record's
+stderr / error message field", but AGENT.MD's test matrix requires an invalid script to be
+*rejected* with `400`, and a rejected request never runs. Writing a `FAILED` history row for
+something that never executed would corrupt the dashboard's success/failure counts. Resolution:
+pre-flight refusals return `400` with the diagnostic in the response's `error` field (and in the
+log), while genuinely spawn-time failures — the only ones where a process was actually attempted —
+produce a `FAILED` record whose `stderr` holds the identical text.
+
+**ANSI in logs.** Verifying the log assertion surfaced that `tracing_subscriber` was emitting
+colour escapes unconditionally, so a redirected log or journald contained
+`rejection<ESC>[0m<ESC>[2m=<ESC>[0mNotExecutable` — unreadable, and `grep 'rejection=…'` silently
+matched nothing. Now gated on `IsTerminal`.
+
+### Path containment (`ALLOWED_SCRIPT_ROOTS`)
+
+New optional config: a comma-separated list of absolute directories a `script_path` must live
+under. Defaults to empty (unrestricted) to stay zero-config and non-breaking, with a startup log
+line explaining how to restrict it; the systemd unit and compose file ship with it set, since a
+real deployment should.
+
+Validation happens at two moments, and both are needed:
+
+- **Lexical, at definition time** — absolute, no `..`, no interior NUL, and inside a root. The file
+  need not exist yet (hooks are routinely declared before the script is deployed), so symlinks
+  cannot be resolved here.
+- **Physical, at execution time** — `canonicalize()` resolves symlinks and the containment check
+  runs again. A symlink planted *inside* an allowed root pointing at `/bin/sh` passes the lexical
+  check and is caught here, before anything is spawned. This is the bypass the second check exists
+  for, and it has a dedicated test.
+
+Containment uses component-wise `Path::starts_with`, not string prefixes, so `/opt/hooks` never
+admits `/opt/hooks-evil`. Relative entries in the variable are dropped with a warning: a boundary
+that moves with the working directory is not a boundary.
+
+### Test coverage
+
+Unit 23 → 29, integration 32 → 38, E2E 199 → 236.
+
+New unit tests: root confinement (including the `/opt/hooks-evil` prefix trap and `.` segments),
+NUL rejection, an expanded traversal payload table, `classify_io_error` for each errno (asserting
+ENOENT is never labelled EACCES, and that the spawn-time variant additionally implicates `noexec`),
+and the `ScriptError -> 400` mapping.
+
+New integration tests:
+- `non_executable_script_is_refused_with_an_actionable_diagnostic` — `chmod 0600`; asserts the
+  prefix, path, cause, actual mode, remedy and uid all appear; that no execution row is written;
+  that the dry run reports the *identical* string as `blocking_reason`; and that `chmod +x` makes
+  the very same hook succeed, proving the refusal was purely about permissions.
+- `missing_script_is_refused_with_an_enoent_diagnostic` — asserts ENOENT wording and explicitly
+  that `EACCES` is *absent*, since the two send an operator to completely different places.
+- `unsearchable_parent_directory_is_diagnosed_as_eacces` — skips itself when running as root
+  (root bypasses search bits, so the scenario cannot be constructed there).
+- `a_directory_as_script_path_is_refused`.
+- `path_traversal_payloads_are_blocked_at_definition_time` — seven payloads, rejected on **create
+  and update**, with a final assertion that the hook still points where it did before.
+- `script_paths_are_confined_to_allowed_roots` and
+  `a_symlink_escaping_the_allowed_roots_is_blocked_at_execution` — the latter also asserts that a
+  symlink staying *inside* the root still works, i.e. this is containment, not a symlink ban.
+
+`invalid_script_paths_are_rejected` was **removed**: every one of its assertions now has a
+stronger dedicated home above, and it was the only test still asserting the pre-diagnostic wording.
+
+E2E gained §21 (permission diagnostics and containment), and the suite now boots with
+`ALLOWED_SCRIPT_ROOTS` pinned to its throwaway hook directory — so every hook it creates exercises
+the containment happy path for free, and the outside-the-root and symlink-escape cases can be
+proven without a second server instance. §21 also greps the server log to confirm the refusal was
+actually logged with its classification, which is what caught the ANSI bug.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 29 unit + 38 integration tests pass.
+- `./scripts/test_e2e.sh` — 236/236 checks pass.

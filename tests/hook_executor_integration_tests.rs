@@ -20,6 +20,13 @@ use simply_hook_executor::{
 };
 use uuid::Uuid;
 
+/// Builds a permission set from a raw Unix mode.
+#[cfg(unix)]
+fn permissions(mode: u32) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(mode)
+}
+
 // ─────────────────────────────────────────────────────────────
 // Authentication (401) & network binding (403)
 // ─────────────────────────────────────────────────────────────
@@ -871,45 +878,291 @@ async fn positional_argument_order_is_deterministic_and_append_only() {
     assert_eq!(run.string("stdout").trim(), "Z!|a|M!|b");
 }
 
+// ─────────────────────────────────────────────────────────────
+// Linux permission & path-containment diagnostics
+// ─────────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn invalid_script_paths_are_rejected() {
+async fn non_executable_script_is_refused_with_an_actionable_diagnostic() {
     let dir = ScriptDir::new();
-    let missing_script = dir.path_for("does-not-exist.sh");
+    // Exists, is readable, but carries no execute bit — the classic "forgot chmod +x" deployment.
+    let script = dir.write_with_mode("no_exec_bit.sh", "echo should never run", 0o600);
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (key_id, key) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "no_exec_bit", &script, 30).await;
+    grant(&db, key_id, hook_id, true, true).await;
 
-    // Relative paths are rejected at definition time.
-    let relative = send(
+    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let error = response.string("error");
+    assert!(error.starts_with("[ERROR] Cannot execute '"), "unexpected shape: {error}");
+    assert!(error.contains(&script), "the diagnostic must name the offending path: {error}");
+    assert!(error.contains("no execute bit set"), "{error}");
+    // The exact mode is reported, so an operator can tell 0600 from 0644 without another round-trip.
+    assert!(error.contains("0600"), "the diagnostic must report the actual mode: {error}");
+    assert!(error.contains("chmod +x"), "the diagnostic must state the remedy: {error}");
+    // ...and who to grant it to.
+    assert!(error.contains("uid="), "the diagnostic must identify the running user: {error}");
+
+    // Nothing ran, so nothing is recorded: a refused hook must not pollute execution history.
+    assert_eq!(execution_count(&db).await, 0);
+
+    // The dry run reports the identical diagnostic as data rather than as an error.
+    let preview = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/test"), &key, None)).await;
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.field("would_execute"), &json!(false));
+    assert_eq!(preview.string("blocking_reason"), error);
+
+    // Granting the bit makes it run, proving the refusal was about permissions and nothing else.
+    std::fs::set_permissions(&script, permissions(0o755)).expect("permissions are settable");
+    let now_ok = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    assert_eq!(now_ok.status, StatusCode::OK);
+    assert_eq!(now_ok.field("status"), &json!("SUCCESS"));
+}
+
+#[tokio::test]
+async fn missing_script_is_refused_with_an_enoent_diagnostic() {
+    let dir = ScriptDir::new();
+    let missing = dir.path_for("never_deployed.sh");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "never_deployed", &missing, 30).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let error = response.string("error");
+    assert!(error.starts_with("[ERROR] Cannot execute '"), "unexpected shape: {error}");
+    assert!(error.contains("No such file or directory (ENOENT)"), "{error}");
+    assert!(error.contains("Deploy the script"), "the diagnostic must state the remedy: {error}");
+    // ENOENT must not be reported as a permission problem — the two send an operator to very
+    // different places.
+    assert!(!error.contains("EACCES"), "{error}");
+    assert_eq!(execution_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn a_directory_as_script_path_is_refused() {
+    let dir = ScriptDir::new();
+    let subdir = dir.make_dir("i_am_a_directory");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "dir_hook", &subdir, 30).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert!(response.string("error").contains("not a regular file"), "{}", response.string("error"));
+    assert_eq!(execution_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn unsearchable_parent_directory_is_diagnosed_as_eacces() {
+    let dir = ScriptDir::new();
+    let locked = dir.make_dir("locked");
+    let script = format!("{locked}/hidden.sh");
+    std::fs::write(&script, "#!/bin/sh\necho hidden\n").expect("file is writable");
+    std::fs::set_permissions(&script, permissions(0o755)).expect("permissions are settable");
+    // Remove the search bit from the parent: the file is fine, but nobody can traverse into it.
+    std::fs::set_permissions(&locked, permissions(0o000)).expect("permissions are settable");
+
+    // Root ignores the `x` bit entirely, so this scenario cannot be constructed there.
+    if !permissions_are_enforced_for_this_user(&script) {
+        eprintln!("skipping: running with permissions that bypass directory search bits (root?)");
+        std::fs::set_permissions(&locked, permissions(0o755)).ok();
+        return;
+    }
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "locked_dir", &script, 30).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let error = response.string("error");
+    assert!(error.contains("Permission denied (EACCES)"), "{error}");
+    // The diagnostic must pinpoint the directory at fault, not just the script: an EACCES on a
+    // file almost always means a parent lacks the search bit.
+    assert!(error.contains(&locked), "the diagnostic must name the blocking directory: {error}");
+    assert!(error.contains("uid="), "{error}");
+    assert_eq!(execution_count(&db).await, 0);
+
+    // Restore so the directory can be cleaned up on drop.
+    std::fs::set_permissions(&locked, permissions(0o755)).expect("permissions are restorable");
+}
+
+#[tokio::test]
+async fn path_traversal_payloads_are_blocked_at_definition_time() {
+    let dir = ScriptDir::new();
+    let legit = dir.write_script("legit.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+
+    let payloads = [
+        "/scripts/../../etc/shadow",
+        "/opt/hooks/../../../etc/passwd",
+        "../../../bin/sh",
+        "../relative_escape.sh",
+        "relative.sh",
+        "./also_relative.sh",
+        "/opt/hooks/./../../etc/shadow",
+    ];
+
+    for payload in payloads {
+        let response = send(
+            &app,
+            json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "evil", "script_path": payload }))),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "traversal payload {payload:?} must be rejected at creation"
+        );
+        let error = response.string("error");
+        assert!(
+            error.contains("absolute") || error.contains("traversal"),
+            "{payload:?}: unhelpful error {error}"
+        );
+    }
+
+    // No hook was created by any of them.
+    let hooks = send(&app, json_request("GET", "/api/hooks", &manager, None)).await;
+    assert_eq!(hooks.json.as_array().map(Vec::len), Some(0));
+
+    // The same validation runs on update, so an existing hook cannot be re-pointed at /etc/shadow.
+    let created = send(
         &app,
-        json_request("POST", "/api/hooks", &key, Some(json!({ "name": "rel", "script_path": "relative.sh" }))),
+        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "legit", "script_path": legit }))),
     )
     .await;
-    assert_eq!(relative.status, StatusCode::BAD_REQUEST);
+    assert_eq!(created.status, StatusCode::OK);
+    let hook_id = created.string("id");
 
-    let traversal = send(
+    for payload in payloads {
+        let response = send(
+            &app,
+            json_request(
+                "PUT",
+                &format!("/api/hooks/{hook_id}"),
+                &manager,
+                Some(json!({ "script_path": payload })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "traversal payload {payload:?} must be rejected on update"
+        );
+    }
+
+    // The hook still points where it did before every rejected update.
+    let unchanged = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &manager, None)).await;
+    assert_eq!(unchanged.string("script_path"), legit);
+}
+
+#[tokio::test]
+async fn script_paths_are_confined_to_allowed_roots() {
+    let allowed = ScriptDir::new();
+    let forbidden = ScriptDir::new();
+    let inside = allowed.write_script("inside.sh", "echo inside");
+    let outside = forbidden.write_script("outside.sh", "echo outside");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state_with_roots(&db, vec![allowed.root()]));
+    let (_, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+
+    let ok = send(
         &app,
-        json_request("POST", "/api/hooks", &key, Some(json!({ "name": "trav", "script_path": "/usr/../etc/shadow" }))),
+        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "inside", "script_path": inside }))),
     )
     .await;
-    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+    assert_eq!(ok.status, StatusCode::OK);
+    let inside_id = ok.string("id");
+    assert_eq!(
+        send(&app, json_request("POST", &format!("/api/hooks/{inside_id}/execute"), &manager, None)).await.status,
+        StatusCode::OK
+    );
 
-    // A path that is well-formed but absent is only detectable at execution time.
-    let hook_id = insert_hook(&db, "ghost", &missing_script, 30).await;
-    grant(&db, key_id, hook_id, true, false).await;
-    let executed = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
-    assert_eq!(executed.status, StatusCode::BAD_REQUEST);
-    assert!(executed.string("error").contains("not accessible"));
+    // A perfectly valid absolute path that simply is not inside a vetted root.
+    let rejected = send(
+        &app,
+        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "outside", "script_path": outside }))),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected.string("error").contains("outside the allowed script roots"),
+        "{}",
+        rejected.string("error")
+    );
 
-    // A file with no executable bit is rejected too.
-    let non_exec = dir.path_for("plain.txt");
-    std::fs::write(&non_exec, "not executable").expect("file is writable");
-    let hook_id = insert_hook(&db, "plain", &non_exec, 30).await;
-    grant(&db, key_id, hook_id, true, false).await;
-    let executed = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
-    assert_eq!(executed.status, StatusCode::BAD_REQUEST);
-    assert!(executed.string("error").contains("not executable"));
+    // Neither can an existing, contained hook be re-pointed outside.
+    let escaped = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{inside_id}"), &manager, Some(json!({ "script_path": outside }))),
+    )
+    .await;
+    assert_eq!(escaped.status, StatusCode::BAD_REQUEST);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_escaping_the_allowed_roots_is_blocked_at_execution() {
+    let allowed = ScriptDir::new();
+    let forbidden = ScriptDir::new();
+    let target = forbidden.write_script("real_target.sh", "echo escaped");
+    // The link's own path is inside the allowed root, so it passes the lexical check at
+    // definition time — only resolving it reveals the escape.
+    let link = allowed.symlink_to("looks_contained.sh", &target);
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state_with_roots(&db, vec![allowed.root()]));
+    let (_, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+
+    let created = send(
+        &app,
+        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "symlinked", "script_path": link }))),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "the link's literal path is inside the root");
+    let hook_id = created.string("id");
+
+    // Execution canonicalizes first, so the escape is caught before anything is spawned.
+    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &manager, None)).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let error = response.string("error");
+    assert!(error.contains("outside the allowed script roots"), "{error}");
+    assert!(error.contains("it resolves to"), "the diagnostic must reveal the real target: {error}");
+    assert_eq!(execution_count(&db).await, 0);
+
+    // A symlink that stays inside the root is fine — containment, not a blanket symlink ban.
+    let contained_target = allowed.write_script("contained_target.sh", "echo contained");
+    let good_link = allowed.symlink_to("good_link.sh", &contained_target);
+    let good = send(
+        &app,
+        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "good_link", "script_path": good_link }))),
+    )
+    .await;
+    assert_eq!(good.status, StatusCode::OK);
+    let good_id = good.string("id");
+    let ran = send(&app, json_request("POST", &format!("/api/hooks/{good_id}/execute"), &manager, None)).await;
+    assert_eq!(ran.status, StatusCode::OK);
+    assert_eq!(ran.string("stdout").trim(), "contained");
 }
 
 #[tokio::test]

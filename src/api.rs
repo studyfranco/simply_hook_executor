@@ -526,7 +526,7 @@ pub async fn create_hook(
         return Err(AppError::InvalidInput("name is required".to_owned()));
     }
 
-    executor::validate_script_path(&payload.script_path)?;
+    executor::validate_script_path(&payload.script_path, &state.config.allowed_script_roots)?;
     let timeout = payload.default_timeout_seconds.unwrap_or(30);
     validate_timeout(timeout)?;
 
@@ -645,7 +645,7 @@ pub async fn update_hook(
     require_manage(&state.db, &key, model.id).await?;
 
     if let Some(script_path) = &payload.script_path {
-        executor::validate_script_path(script_path)?;
+        executor::validate_script_path(script_path, &state.config.allowed_script_roots)?;
     }
     if let Some(timeout) = payload.default_timeout_seconds {
         validate_timeout(timeout)?;
@@ -1078,11 +1078,11 @@ pub async fn test_hook(
             resolved.missing_required.join(", ")
         ))
     } else {
-        match executor::ensure_executable(&hook_model.script_path) {
-            Ok(()) => None,
-            Err(AppError::InvalidInput(msg)) => Some(msg),
-            Err(e) => return Err(e),
-        }
+        // A dry run reports the permission/path diagnostic as data instead of failing: seeing
+        // exactly why a hook would be refused is the whole point of the preview.
+        executor::ensure_executable(&hook_model.script_path, &state.config.allowed_script_roots)
+            .err()
+            .map(|diagnosis| diagnosis.detail)
     };
 
     let resolved_parameters = serde_json::from_str(&resolved.to_json_string())
@@ -1776,6 +1776,8 @@ pub async fn list_audit_logs(
 pub struct SettingsResponse {
     /// Host environment variables passed through to hook sub-processes.
     pub allowed_env_vars: Vec<String>,
+    /// Directories hook scripts are confined to. Empty means any absolute path is permitted.
+    pub allowed_script_roots: Vec<String>,
     /// Age, in days, beyond which execution history is purged (`0` = never).
     pub log_retention_days: i64,
     /// Interval between retention sweeps, in seconds.
@@ -1806,6 +1808,12 @@ pub async fn get_settings(
 
     Ok(Json(SettingsResponse {
         allowed_env_vars: state.config.allowed_env_vars.clone(),
+        allowed_script_roots: state
+            .config
+            .allowed_script_roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         log_retention_days: state.config.log_retention_days,
         retention_sweep_seconds: state.config.retention_sweep_seconds,
         max_output_bytes: state.config.max_output_bytes,

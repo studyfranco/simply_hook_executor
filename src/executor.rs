@@ -204,31 +204,252 @@ pub fn build_command_plan(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Script path validation & permission diagnostics
+// ─────────────────────────────────────────────────────────────
+
+/// Why a hook's script cannot be executed.
+///
+/// Kept as a distinct classification rather than a bare string so callers (and tests) can assert
+/// on *which* failure occurred, and so the operator-facing text can be written once, in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptRejection {
+    /// The path does not exist (`ENOENT`).
+    NotFound,
+    /// A path component denied access (`EACCES`) — a missing execute/search bit somewhere.
+    PermissionDenied,
+    /// The path exists but is a directory, socket, device, ...
+    NotARegularFile,
+    /// The file exists and is readable but carries no execute bit.
+    NotExecutable,
+    /// The path resolves outside every configured `ALLOWED_SCRIPT_ROOTS` entry.
+    OutsideAllowedRoots,
+    /// The path is relative, traverses with `..`, or is otherwise malformed.
+    MalformedPath,
+    /// Anything else the OS reported.
+    Unusable,
+}
+
+/// A classified script failure plus the full operator-facing diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptError {
+    /// What went wrong.
+    pub rejection: ScriptRejection,
+    /// A `[ERROR] Cannot execute '<path>': <cause>. <remedy>` line, written verbatim to the HTTP
+    /// error body, the `tracing` log, and (for spawn-time failures) `executions.stderr`.
+    pub detail: String,
+}
+
+impl ScriptError {
+    fn new(rejection: ScriptRejection, detail: String) -> Self {
+        Self { rejection, detail }
+    }
+}
+
+impl std::fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl From<ScriptError> for AppError {
+    /// Surfaces as `400 Bad Request`: the hook's configuration (or the filesystem it points at) is
+    /// wrong, which the caller must fix — it is not a transient server fault.
+    fn from(error: ScriptError) -> Self {
+        AppError::InvalidInput(error.detail)
+    }
+}
+
+/// Builds the standard diagnostic line: what failed, the precise cause, and what to do about it.
+fn diagnostic(script_path: &str, cause: &str, remedy: &str) -> String {
+    format!("[ERROR] Cannot execute '{script_path}': {cause}. {remedy}")
+}
+
+/// The daemon's effective identity, for permission diagnostics.
+///
+/// `USER`/`LOGNAME` are set by systemd from the unit's `User=`, so this usually renders the actual
+/// service account name (e.g. `hookrunner`); the numeric ids are always available and are what
+/// `ls -n` / `stat` will show when an operator goes looking.
+#[cfg(unix)]
+fn process_identity() -> String {
+    // SAFETY: `geteuid`/`getegid` take no arguments, cannot fail, and only read this process's
+    // own credentials.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    match std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) {
+        Ok(name) if !name.is_empty() => format!("'{name}' (uid={uid} gid={gid})"),
+        _ => format!("uid={uid} gid={gid}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn process_identity() -> String {
+    std::env::var("USERNAME")
+        .map(|name| format!("'{name}'"))
+        .unwrap_or_else(|_| "the service account".to_owned())
+}
+
+/// Finds the shallowest directory the daemon lacks *search* (`x`) permission on.
+///
+/// An `EACCES` on a file almost always means some parent directory lacks the search bit rather
+/// than the file itself — pinpointing which one is the difference between an actionable log line
+/// and a scavenger hunt.
+///
+/// Note the indirection: stat'ing a directory only requires search permission on *its* parents, so
+/// an unsearchable directory stats perfectly well. What fails is stat'ing something *inside* it.
+/// The offender is therefore the parent of the first path in the chain that reports `EACCES`.
+fn first_unsearchable_directory(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    // `ancestors()` yields the path itself first, then each parent up to the root; reversing walks
+    // root-downward, so the first failure encountered is the shallowest one.
+    let mut chain: Vec<_> = path.ancestors().collect();
+    chain.reverse();
+
+    chain
+        .into_iter()
+        .find(|candidate| {
+            matches!(
+                std::fs::metadata(candidate).map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::PermissionDenied)
+            )
+        })
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+}
+
+/// Turns a filesystem/spawn [`std::io::Error`] into a classified, actionable diagnostic.
+///
+/// `context` distinguishes the two moments this can happen: the pre-flight check, and the actual
+/// `execve` (where the same errno can mean something different — a `noexec` mount, for instance,
+/// only shows up at exec time).
+fn classify_io_error(script_path: &str, error: &std::io::Error, at_spawn: bool) -> ScriptError {
+    let identity = process_identity();
+
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ScriptError::new(
+            ScriptRejection::NotFound,
+            diagnostic(
+                script_path,
+                "No such file or directory (ENOENT)",
+                "The path does not exist. Deploy the script there, or correct the hook's \
+                 script_path.",
+            ),
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            let blocked = first_unsearchable_directory(std::path::Path::new(script_path));
+            let remedy = match (&blocked, at_spawn) {
+                (Some(dir), _) => format!(
+                    "Running as {identity}, which cannot search the directory '{}'. Grant traverse \
+                     permission on it and every parent (chmod +x), or adjust ownership.",
+                    dir.display()
+                ),
+                (None, true) => format!(
+                    "Running as {identity}. The file is reachable but exec was refused — check the \
+                     execution bit (chmod +x '{script_path}'), that {identity} owns it or matches \
+                     its group, and that its filesystem is not mounted 'noexec'.",
+                ),
+                (None, false) => format!(
+                    "Running as {identity}. Check the execution bit (chmod +x '{script_path}') and \
+                     the user/group ownership of the script and its parent directories.",
+                ),
+            };
+            ScriptError::new(
+                ScriptRejection::PermissionDenied,
+                diagnostic(script_path, "Permission denied (EACCES)", &remedy),
+            )
+        }
+        _ => ScriptError::new(
+            ScriptRejection::Unusable,
+            diagnostic(
+                script_path,
+                &format!("{error} (os error kind: {:?})", error.kind()),
+                &format!("Running as {identity}. Inspect the path with 'ls -l' and 'stat'."),
+            ),
+        ),
+    }
+}
+
+/// Whether `candidate` lies inside one of `roots`.
+///
+/// Comparison is component-wise via [`std::path::Path::starts_with`], not string-prefix: a root of
+/// `/opt/hooks` must not accidentally admit `/opt/hooks-evil`. An empty root list means
+/// confinement is disabled.
+fn is_within_roots(candidate: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+    roots.is_empty() || roots.iter().any(|root| candidate.starts_with(root))
+}
+
+/// Renders the configured roots for an error message.
+fn describe_roots(roots: &[std::path::PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Rejects a hook whose `script_path` is not a runnable file, before anything is spawned or any
 /// history row is written.
 ///
-/// This is what turns "the hook points at a typo'd path" into a `400 Bad Request` naming the
-/// problem, instead of a `FAILED` execution whose stderr says `No such file or directory`.
-pub fn ensure_executable(script_path: &str) -> Result<(), AppError> {
+/// Performs the *physical* containment check as well: the path is canonicalized first, so a
+/// symlink planted inside an allowed root that points at `/bin/sh` or `/etc/shadow` is caught here
+/// even though its literal path passed [`validate_script_path`] at definition time.
+pub fn ensure_executable(
+    script_path: &str,
+    allowed_roots: &[std::path::PathBuf],
+) -> Result<(), ScriptError> {
     let path = std::path::Path::new(script_path);
 
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        AppError::InvalidInput(format!("Hook script '{script_path}' is not accessible: {e}"))
-    })?;
+    // `canonicalize` resolves symlinks and `.` segments, and reports ENOENT/EACCES precisely —
+    // it is both the existence probe and the input to the containment check.
+    let canonical = std::fs::canonicalize(path).map_err(|e| classify_io_error(script_path, &e, false))?;
+
+    if !is_within_roots(&canonical, allowed_roots) {
+        return Err(ScriptError::new(
+            ScriptRejection::OutsideAllowedRoots,
+            diagnostic(
+                script_path,
+                &format!(
+                    "it resolves to '{}', which is outside the allowed script roots",
+                    canonical.display()
+                ),
+                &format!(
+                    "Allowed roots are: {}. Move the script inside one of them, or extend \
+                     ALLOWED_SCRIPT_ROOTS. (A symlink pointing outside the roots is rejected here \
+                     even when its own path looks contained.)",
+                    describe_roots(allowed_roots)
+                ),
+            ),
+        ));
+    }
+
+    let metadata =
+        std::fs::metadata(&canonical).map_err(|e| classify_io_error(script_path, &e, false))?;
 
     if !metadata.is_file() {
-        return Err(AppError::InvalidInput(format!(
-            "Hook script '{script_path}' is not a regular file"
-        )));
+        return Err(ScriptError::new(
+            ScriptRejection::NotARegularFile,
+            diagnostic(
+                script_path,
+                "not a regular file (it is a directory, socket, or device node)",
+                "Point script_path at an executable file.",
+            ),
+        ));
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(AppError::InvalidInput(format!(
-                "Hook script '{script_path}' is not executable (chmod +x required)"
-            )));
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(ScriptError::new(
+                ScriptRejection::NotExecutable,
+                diagnostic(
+                    script_path,
+                    &format!("the file exists but has no execute bit set (mode {:04o})", mode & 0o7777),
+                    &format!(
+                        "Run 'chmod +x {script_path}' and ensure {} owns it or matches its group.",
+                        process_identity()
+                    ),
+                ),
+            ));
         }
     }
 
@@ -238,21 +459,58 @@ pub fn ensure_executable(script_path: &str) -> Result<(), AppError> {
 /// Validates a `script_path` at hook *definition* time.
 ///
 /// Deliberately stricter than [`ensure_executable`] in one dimension and looser in another: the
-/// path must be absolute and free of `..` traversal (a relative or traversing path would resolve
-/// against whatever working directory the daemon happens to have), but the file need not exist
-/// yet — hooks are routinely declared before the script is deployed alongside them.
-pub fn validate_script_path(script_path: &str) -> Result<(), AppError> {
+/// path must be absolute, free of `..` traversal, and (when `ALLOWED_SCRIPT_ROOTS` is configured)
+/// lexically inside a permitted root — but the file need not exist yet, since hooks are routinely
+/// declared before the script is deployed alongside them. Symlink resolution therefore cannot
+/// happen here; [`ensure_executable`] repeats the containment check physically at execution time.
+pub fn validate_script_path(
+    script_path: &str,
+    allowed_roots: &[std::path::PathBuf],
+) -> Result<(), ScriptError> {
     let path = std::path::Path::new(script_path);
+
+    if script_path.contains('\0') {
+        return Err(ScriptError::new(
+            ScriptRejection::MalformedPath,
+            "script_path must not contain NUL bytes".to_owned(),
+        ));
+    }
+
     if !path.is_absolute() {
-        return Err(AppError::InvalidInput(
-            "script_path must be an absolute path".to_owned(),
+        return Err(ScriptError::new(
+            ScriptRejection::MalformedPath,
+            format!(
+                "script_path must be an absolute path (got '{script_path}'); a relative path would \
+                 resolve against the daemon's working directory, which is not a stable boundary"
+            ),
         ));
     }
+
     if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return Err(AppError::InvalidInput(
-            "script_path must not contain '..' traversal segments".to_owned(),
+        return Err(ScriptError::new(
+            ScriptRejection::MalformedPath,
+            format!("script_path must not contain '..' traversal segments (got '{script_path}')"),
         ));
     }
+
+    // `.` segments are harmless but would defeat the component-wise root comparison below, so
+    // normalize them away before checking containment.
+    let normalized: std::path::PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+
+    if !is_within_roots(&normalized, allowed_roots) {
+        return Err(ScriptError::new(
+            ScriptRejection::OutsideAllowedRoots,
+            format!(
+                "script_path '{script_path}' is outside the allowed script roots ({}). Choose a \
+                 path inside one of them, or extend ALLOWED_SCRIPT_ROOTS.",
+                describe_roots(allowed_roots)
+            ),
+        ));
+    }
+
     Ok(())
 }
 
@@ -465,11 +723,24 @@ pub async fn run_process(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
+            // Reaching here means the pre-flight check passed but `execve` still failed — a
+            // `noexec` mount, a permission or path change in the intervening moment, an exhausted
+            // process table. The classified diagnostic goes to both the system log and the
+            // execution record, so neither an operator tailing journald nor one reading the
+            // dashboard has to guess.
+            let diagnosis = classify_io_error(&plan.program, &e, true);
+            tracing::error!(
+                script = %plan.program,
+                rejection = ?diagnosis.rejection,
+                io_kind = ?e.kind(),
+                "Hook spawn failed: {}",
+                diagnosis.detail
+            );
             return ExecutionOutcome {
                 status: ExecutionStatus::Failed,
                 exit_code: None,
                 stdout: String::new(),
-                stderr: format!("Failed to launch '{}': {e}", plan.program),
+                stderr: diagnosis.detail,
                 duration_ms: elapsed_ms(started),
             };
         }
@@ -552,7 +823,20 @@ pub async fn execute_hook(
     key: &api_key::Model,
     resolved: &ResolvedParameters,
 ) -> Result<execution::Model, AppError> {
-    ensure_executable(&hook.script_path)?;
+    if let Err(diagnosis) = ensure_executable(&hook.script_path, &state.config.allowed_script_roots) {
+        // Logged at WARN with the classification attached, so a misconfigured or tampered-with
+        // hook is greppable in journald (`rejection=PermissionDenied`) and not merely a 400 that
+        // only the caller ever sees.
+        tracing::warn!(
+            hook = %hook.name,
+            key = %key.prefix,
+            script = %hook.script_path,
+            rejection = ?diagnosis.rejection,
+            "Refusing to execute hook: {}",
+            diagnosis.detail
+        );
+        return Err(diagnosis.into());
+    }
 
     let _permit = state.limiter.try_acquire(key)?;
 
@@ -730,9 +1014,101 @@ mod tests {
 
     #[test]
     fn rejects_relative_and_traversing_script_paths() {
-        assert!(validate_script_path("/usr/local/bin/ok.sh").is_ok());
-        assert!(validate_script_path("relative.sh").is_err());
-        assert!(validate_script_path("/usr/local/../../etc/shadow").is_err());
+        let unrestricted: [std::path::PathBuf; 0] = [];
+        assert!(validate_script_path("/usr/local/bin/ok.sh", &unrestricted).is_ok());
+
+        for traversal in [
+            "relative.sh",
+            "./relative.sh",
+            "../escape.sh",
+            "/usr/local/../../etc/shadow",
+            "/opt/hooks/../../../etc/shadow",
+            "/scripts/../../etc/shadow",
+        ] {
+            let err = validate_script_path(traversal, &unrestricted)
+                .expect_err("{traversal} must be rejected");
+            assert_eq!(err.rejection, ScriptRejection::MalformedPath, "for {traversal}");
+        }
+    }
+
+    #[test]
+    fn confines_script_paths_to_allowed_roots() {
+        let roots = [std::path::PathBuf::from("/opt/hooks"), std::path::PathBuf::from("/usr/local/bin")];
+
+        assert!(validate_script_path("/opt/hooks/deploy.sh", &roots).is_ok());
+        assert!(validate_script_path("/opt/hooks/nested/deploy.sh", &roots).is_ok());
+        assert!(validate_script_path("/usr/local/bin/ban.sh", &roots).is_ok());
+        // A `.` segment must not defeat the component-wise comparison.
+        assert!(validate_script_path("/opt/./hooks/deploy.sh", &roots).is_ok());
+
+        for outside in ["/etc/shadow", "/bin/sh", "/opt/other/x.sh", "/tmp/evil.sh"] {
+            let err = validate_script_path(outside, &roots).expect_err("{outside} must be rejected");
+            assert_eq!(err.rejection, ScriptRejection::OutsideAllowedRoots, "for {outside}");
+        }
+
+        // Component-wise, not string-prefix: a sibling directory sharing a name prefix is outside.
+        let err = validate_script_path("/opt/hooks-evil/x.sh", &roots)
+            .expect_err("a name-prefixed sibling is not contained");
+        assert_eq!(err.rejection, ScriptRejection::OutsideAllowedRoots);
+    }
+
+    #[test]
+    fn empty_root_list_disables_confinement() {
+        let unrestricted: [std::path::PathBuf; 0] = [];
+        assert!(is_within_roots(std::path::Path::new("/anywhere/at/all"), &unrestricted));
+        assert!(validate_script_path("/anywhere/at/all.sh", &unrestricted).is_ok());
+    }
+
+    #[test]
+    fn rejects_nul_bytes_in_script_paths() {
+        let unrestricted: [std::path::PathBuf; 0] = [];
+        let err = validate_script_path("/opt/hooks/x\0.sh", &unrestricted)
+            .expect_err("interior NUL must be rejected");
+        assert_eq!(err.rejection, ScriptRejection::MalformedPath);
+    }
+
+    #[test]
+    fn classifies_io_errors_with_actionable_diagnostics() {
+        let not_found = classify_io_error(
+            "/opt/hooks/missing.sh",
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+            false,
+        );
+        assert_eq!(not_found.rejection, ScriptRejection::NotFound);
+        assert!(not_found.detail.starts_with("[ERROR] Cannot execute '/opt/hooks/missing.sh':"));
+        assert!(not_found.detail.contains("ENOENT"));
+
+        let denied = classify_io_error(
+            "/opt/hooks/locked.sh",
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            false,
+        );
+        assert_eq!(denied.rejection, ScriptRejection::PermissionDenied);
+        assert!(denied.detail.contains("EACCES"));
+        // The remedy must name both halves of the usual cause: the bit and the ownership.
+        assert!(denied.detail.contains("chmod +x"));
+        assert!(denied.detail.contains("ownership") || denied.detail.contains("search"));
+
+        // At spawn time the same errno additionally implicates a noexec mount.
+        let at_spawn = classify_io_error(
+            "/opt/hooks/locked.sh",
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            true,
+        );
+        assert!(at_spawn.detail.contains("noexec") || at_spawn.detail.contains("search"));
+
+        let other = classify_io_error(
+            "/opt/hooks/weird.sh",
+            &std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            false,
+        );
+        assert_eq!(other.rejection, ScriptRejection::Unusable);
+    }
+
+    #[test]
+    fn script_errors_surface_as_bad_request() {
+        let error = ScriptError::new(ScriptRejection::NotFound, "[ERROR] boom".to_owned());
+        assert!(matches!(AppError::from(error), AppError::InvalidInput(msg) if msg == "[ERROR] boom"));
     }
 
     #[test]

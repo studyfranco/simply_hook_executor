@@ -1218,6 +1218,9 @@ class HookExecutorClient {
             item('Passthrough env vars', s.allowed_env_vars.length
                 ? `<span class="font-mono text-sm">${escapeHtml(s.allowed_env_vars.join(', '))}</span>`
                 : '<span class="text-muted">(none — full isolation)</span>'),
+            item('Script roots', s.allowed_script_roots.length
+                ? `<span class="font-mono text-sm">${escapeHtml(s.allowed_script_roots.join(', '))}</span>`
+                : '<span class="text-muted">(unrestricted — any absolute path)</span>'),
             item('Log retention', s.log_retention_days > 0 ? `${s.log_retention_days} days` : 'disabled (kept forever)'),
             item('Retention sweep', `every ${s.retention_sweep_seconds}s`),
             item('Max captured output', `${Math.round(s.max_output_bytes / 1024)} KiB per stream`),

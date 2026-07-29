@@ -6,6 +6,7 @@
 //! typo in a unit file should never take the whole service down.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Default environment variables inherited by hook sub-processes, per `AGENT.MD`.
@@ -38,6 +39,14 @@ pub struct RuntimeConfig {
     /// discarded — but still drained, so a chatty hook can never deadlock on a full pipe.
     /// Overridden by `MAX_OUTPUT_BYTES`.
     pub max_output_bytes: usize,
+    /// Directories a hook's `script_path` must live under, from `ALLOWED_SCRIPT_ROOTS`
+    /// (comma-separated absolute paths).
+    ///
+    /// Empty (the default) means "any absolute, non-traversing path", which preserves
+    /// zero-configuration behavior. Setting it is defense in depth: it confines a caller holding
+    /// `can_manage_hooks` to a directory an operator has vetted, so a stolen management key cannot
+    /// turn the daemon into a generic "run any binary as `hookrunner`" service.
+    pub allowed_script_roots: Vec<PathBuf>,
 }
 
 impl Default for RuntimeConfig {
@@ -47,6 +56,7 @@ impl Default for RuntimeConfig {
             log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
             retention_sweep_seconds: DEFAULT_RETENTION_SWEEP_SECONDS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            allowed_script_roots: Vec::new(),
         }
     }
 }
@@ -69,12 +79,29 @@ impl RuntimeConfig {
             Err(_) => defaults.allowed_env_vars,
         };
 
+        let allowed_script_roots = parse_script_roots(
+            std::env::var("ALLOWED_SCRIPT_ROOTS").ok().as_deref().unwrap_or(""),
+        );
+        if allowed_script_roots.is_empty() {
+            tracing::info!(
+                "ALLOWED_SCRIPT_ROOTS is unset: hooks may point at any absolute path. Set it to a \
+                 comma-separated list of directories (e.g. /opt/hooks,/usr/local/bin) to confine \
+                 script_path to vetted locations."
+            );
+        } else {
+            tracing::info!(
+                "Hook scripts are confined to: {}",
+                allowed_script_roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
         Self {
             allowed_env_vars,
             log_retention_days: parse_or_warn("LOG_RETENTION_DAYS", defaults.log_retention_days),
             retention_sweep_seconds: parse_or_warn("RETENTION_SWEEP_SECONDS", defaults.retention_sweep_seconds)
                 .max(1),
             max_output_bytes: parse_or_warn("MAX_OUTPUT_BYTES", defaults.max_output_bytes),
+            allowed_script_roots,
         }
     }
 
@@ -149,6 +176,26 @@ pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
+/// Parses `ALLOWED_SCRIPT_ROOTS` into a list of confinement directories.
+///
+/// Relative entries are discarded with a warning rather than resolved against the daemon's
+/// working directory: a containment boundary that moves with the cwd is not a boundary.
+fn parse_script_roots(raw: &str) -> Vec<PathBuf> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            let path = PathBuf::from(entry);
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                tracing::warn!("Ignoring relative ALLOWED_SCRIPT_ROOTS entry {entry:?}: roots must be absolute");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Splits a comma-separated variable list, trimming blanks and dropping empty entries.
 fn parse_env_var_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -196,6 +243,17 @@ mod tests {
             RuntimeConfig::default().allowed_env_vars,
             vec!["PATH", "LANG", "TERM", "SYSTEMROOT"]
         );
+    }
+
+    #[test]
+    fn parses_script_roots_and_drops_relative_entries() {
+        assert_eq!(
+            parse_script_roots("/opt/hooks, /usr/local/bin ,,"),
+            vec![PathBuf::from("/opt/hooks"), PathBuf::from("/usr/local/bin")]
+        );
+        // A relative root would move with the daemon's working directory, so it is not a boundary.
+        assert_eq!(parse_script_roots("hooks,../escape"), Vec::<PathBuf>::new());
+        assert!(parse_script_roots("").is_empty());
     }
 
     #[test]

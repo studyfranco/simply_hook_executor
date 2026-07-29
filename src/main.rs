@@ -135,6 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // Colour only when stdout is a terminal. Under systemd or any redirect, ANSI escapes would
+        // be written verbatim into journald and log files, which makes them ugly to read and — more
+        // importantly — breaks `grep 'rejection=PermissionDenied'`, since the codes land between the
+        // field name and its value.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let db_url = std::env::var("DATABASE_URL")

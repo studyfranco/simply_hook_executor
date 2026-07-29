@@ -36,6 +36,41 @@ parameters are validated against a declared contract (unknown keys are rejected,
 each key has a `max_concurrent_jobs` budget enforced by a semaphore, and every mutating action is
 recorded in an audit log.
 
+### Script path containment
+
+A hook's `script_path` is validated twice:
+
+1. **At definition time** — it must be absolute and free of `..` segments (a relative or
+   traversing path would resolve against whatever working directory the daemon happens to have),
+   and, when `ALLOWED_SCRIPT_ROOTS` is set, must lie inside one of those directories. Containment
+   is compared component-wise, so a root of `/opt/hooks` never admits `/opt/hooks-evil`.
+2. **At execution time** — the path is canonicalized (resolving symlinks) and re-checked against
+   the roots. A symlink planted *inside* an allowed root that points at `/bin/sh` or `/etc/shadow`
+   passes the first check and is caught by the second, before anything is spawned.
+
+### Permission diagnostics
+
+When a script cannot be run, the failure is classified rather than passed through as a bare OS
+error, and the same message goes to the HTTP response, the `tracing` log (tagged with a
+`rejection=` classification so it is greppable in journald), and — for failures that only surface
+at `execve` time — the execution record's `stderr`:
+
+```
+[ERROR] Cannot execute '/opt/hooks/ban.sh': the file exists but has no execute bit set (mode 0600).
+Run 'chmod +x /opt/hooks/ban.sh' and ensure 'hookrunner' (uid=999 gid=999) owns it or matches its group.
+
+[ERROR] Cannot execute '/opt/hooks/ban.sh': No such file or directory (ENOENT).
+The path does not exist. Deploy the script there, or correct the hook's script_path.
+
+[ERROR] Cannot execute '/opt/secret/ban.sh': Permission denied (EACCES).
+Running as 'hookrunner' (uid=999 gid=999), which cannot search the directory '/opt/secret'.
+Grant traverse permission on it and every parent (chmod +x), or adjust ownership.
+```
+
+`EACCES` on a file almost always means a *parent directory* lacks the search bit, so the daemon
+walks the path and names the specific directory at fault. A refused script never produces an
+execution record — nothing ran, so nothing is logged as having run.
+
 ## Features
 
 - Define **hooks**: a name, an absolute `script_path`, a timeout, and a declared parameter
@@ -101,6 +136,7 @@ automatically if present):
 | :--- | :--- | :--- |
 | `DATABASE_URL` | `sqlite://simply_hook_executor.db?mode=rwc` | SeaORM connection string. |
 | `ALLOWED_ENV_VARS` | `PATH,LANG,TERM,SYSTEMROOT` | Comma-separated allowlist of host variables passed through to hook sub-processes. Everything else is cleared. An empty value means total isolation. |
+| `ALLOWED_SCRIPT_ROOTS` | *(unset — unrestricted)* | Comma-separated absolute directories that a hook's `script_path` must live under. Strongly recommended in production: without it, any key holding `can_manage_hooks` can point a hook at any absolute path. Relative entries are ignored with a warning (a boundary that moves with the working directory is not a boundary). |
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |
 | `MAX_OUTPUT_BYTES` | `1048576` | Per-stream cap on captured stdout/stderr. Excess is discarded (but still drained) and flagged in the stored output. |

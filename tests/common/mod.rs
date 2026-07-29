@@ -44,12 +44,34 @@ pub fn test_config() -> Arc<RuntimeConfig> {
         log_retention_days: 30,
         retention_sweep_seconds: 3600,
         max_output_bytes: 64 * 1024,
+        // Unconfined by default: the suite writes throwaway scripts under the system temp dir.
+        // Confinement is exercised explicitly via `test_state_with_roots`.
+        allowed_script_roots: Vec::new(),
     })
 }
 
 /// Builds application state around a database handle.
 pub fn test_state(db: &DatabaseConnection) -> AppState {
     AppState::new(db.clone(), test_config())
+}
+
+/// Builds application state whose hook scripts are confined to `roots`.
+pub fn test_state_with_roots(db: &DatabaseConnection, roots: Vec<std::path::PathBuf>) -> AppState {
+    AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig {
+            allowed_script_roots: roots,
+            ..(*test_config()).clone()
+        }),
+    )
+}
+
+/// Whether this test process can read a path whose permissions should deny it.
+///
+/// Running the suite as root defeats every filesystem permission check (root bypasses `x` bits),
+/// so tests that depend on a denial must skip rather than fail in that environment.
+pub fn permissions_are_enforced_for_this_user(denied_path: &str) -> bool {
+    std::fs::metadata(denied_path).is_err()
 }
 
 /// The global scopes a seeded key should hold.
@@ -338,6 +360,44 @@ impl ScriptDir {
     /// An absolute path inside this directory that no file occupies yet.
     pub fn path_for(&self, name: &str) -> String {
         self.path.join(name).to_string_lossy().into_owned()
+    }
+
+    /// This directory's own absolute path — used as an `ALLOWED_SCRIPT_ROOTS` entry.
+    pub fn root(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+
+    /// Writes a file with an exact permission mode, returning its absolute path.
+    ///
+    /// Unlike [`ScriptDir::write_script`] this does not force `0o755`, which is the point: it is
+    /// how the suite produces a script that exists and is readable but carries no execute bit.
+    pub fn write_with_mode(&self, name: &str, body: &str, mode: u32) -> String {
+        let path = self.path.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("file is writable");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("permissions are settable");
+        }
+
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Creates a sub-directory, returning its absolute path.
+    pub fn make_dir(&self, name: &str) -> String {
+        let path = self.path.join(name);
+        std::fs::create_dir_all(&path).expect("directory is creatable");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Symlinks `link_name` inside this directory to `target`, returning the link's path.
+    #[cfg(unix)]
+    pub fn symlink_to(&self, link_name: &str, target: &str) -> String {
+        let link = self.path.join(link_name);
+        std::os::unix::fs::symlink(target, &link).expect("symlink is creatable");
+        link.to_string_lossy().into_owned()
     }
 }
 
