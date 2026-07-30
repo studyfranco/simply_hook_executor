@@ -128,7 +128,7 @@ pub struct SeededKey {
     pub id: Uuid,
     /// Bearer credential, sent as `X-API-Key`.
     pub plaintext: String,
-    /// Public identifier, sent as `X-Key-Id`.
+    /// Public identifier, for display and log correlation. Never sent as an auth header.
     pub key_id: String,
     /// HMAC signing secret, in plaintext, for computing test signatures.
     pub signing_secret: String,
@@ -217,17 +217,19 @@ pub fn sign_request(signing_secret: &str, method: &str, path: &str, timestamp: i
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Builds a request authenticated purely by `X-Key-Id` + signature, with no bearer key — the
-/// webhook-sender pattern — stamped at the current time.
-pub fn signed_request(method: &str, uri: &str, key_id: &str, signing_secret: &str, body: &str) -> Request<Body> {
-    signed_request_at(method, uri, key_id, signing_secret, body, now_timestamp())
+/// Builds a CANONICAL_V1-signed request, stamped at the current time.
+///
+/// `X-API-Key` is the only identifying header: it is how every caller — dashboard, script, or
+/// third-party webhook sender — resolves to a key record.
+pub fn signed_request(method: &str, uri: &str, api_key: &str, signing_secret: &str, body: &str) -> Request<Body> {
+    signed_request_at(method, uri, api_key, signing_secret, body, now_timestamp())
 }
 
 /// As [`signed_request`], but stamped at an explicit time so replay-window behavior is testable.
 pub fn signed_request_at(
     method: &str,
     uri: &str,
-    key_id: &str,
+    api_key: &str,
     signing_secret: &str,
     body: &str,
     timestamp: i64,
@@ -236,7 +238,7 @@ pub fn signed_request_at(
         Request::builder()
             .method(method)
             .uri(uri)
-            .header("X-Key-Id", key_id)
+            .header("X-API-Key", api_key)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", timestamp.to_string())
             .header("X-Signature-256", sign_request(signing_secret, method, uri, timestamp, body)),
@@ -258,7 +260,7 @@ pub fn sign_body_only(signing_secret: &str, body: &str) -> String {
 /// timestamp, and a configurable signature header name.
 pub fn body_only_request(
     uri: &str,
-    key_id: &str,
+    api_key: &str,
     signing_secret: &str,
     body: &str,
     header_name: &str,
@@ -267,7 +269,7 @@ pub fn body_only_request(
         Request::builder()
             .method("POST")
             .uri(uri)
-            .header("X-Key-Id", key_id)
+            .header("X-API-Key", api_key)
             .header("Content-Type", "application/json")
             .header(header_name, sign_body_only(signing_secret, body)),
     )

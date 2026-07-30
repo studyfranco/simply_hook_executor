@@ -56,7 +56,7 @@ Every API key carries two further credentials, both returned **once** by `POST /
 | Credential | Secret? | Sent as | Purpose |
 | :--- | :--- | :--- | :--- |
 | `plaintext_key` | yes | `X-API-Key` | Bearer credential. Only its SHA-256 hash is stored. |
-| `key_id` | no | `X-Key-Id` | Public identifier (`shk_<32 hex>`). Selects which signing secret to verify against. |
+| `key_id` | no | *(not sent)* | Public identifier (`shk_<32 hex>`) for display and log correlation. Not a credential. |
 | `signing_secret` | yes | *never sent* | HMAC-SHA256 key. Used to compute `X-Signature-256`. |
 
 Signatures are HMAC-SHA256 over a canonical string of four newline-delimited components:
@@ -73,7 +73,7 @@ TS=$(date +%s)
 PATH_AND_QUERY=/webhook/nftables_ban
 SIG=$(printf '%s\n%s\n%s\n%s' POST "$PATH_AND_QUERY" "$TS" "$BODY" \
         | openssl dgst -sha256 -hmac "$SIGNING_SECRET" -r | cut -d' ' -f1)
-curl -X POST -H "X-Key-Id: $KEY_ID" -H "Content-Type: application/json" \
+curl -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
      -H "X-Timestamp: $TS" -H "X-Signature-256: sha256=$SIG" -d "$BODY" \
      "http://localhost:3000$PATH_AND_QUERY"
 ```
@@ -90,11 +90,10 @@ Details that matter when writing a client:
 - A signed request **must** carry `X-Timestamp`; a missing or malformed one is a `401`, never
   treated as "now".
 
-A `key_id` on its own is not a credential, so a request presenting one **must** carry a valid
-signature. An `X-API-Key` may also be accompanied by a signature, which then adds request integrity
-on top of bearer auth. Unknown key ids and bad signatures return the same `401`, so the endpoint
-cannot be used to enumerate which key ids exist. Set `REQUIRE_SIGNED_REQUESTS=true` to make
-signing mandatory on every authenticated route.
+Every request identifies its key with `X-API-Key` — that is the only key lookup path. A signature
+is optional by default and adds request integrity on top of bearer authentication; set
+`REQUIRE_SIGNED_REQUESTS=true` to make it mandatory on every authenticated route. A missing key, an
+unknown key, and a bad signature all return the same `401`.
 
 The dashboard signs every request it makes using the Web Crypto API, with the signing secret you
 optionally supply at login. **`crypto.subtle` only exists in a secure context**, so the dashboard

@@ -859,3 +859,104 @@ and the downgrade-resistance check.
 `BODY_ONLY` has no replay protection — that is inherent to the scheme, not an implementation gap.
 A captured request stays valid indefinitely. Keys on that mode should be scoped to exactly the hooks
 the third-party sender is meant to trigger, and nothing else.
+
+
+---
+
+## 2026-07-30 (final) — `X-API-Key` standardization and edge-case verification sweep
+
+### One header, one lookup path
+
+`X-Key-Id` is gone. Every request now identifies its key with `X-API-Key`, hashed and matched
+against `api_keys.key_hash` — the single key lookup path in the system. Removed from the middleware,
+`api.rs` and entity docs, the SPA, `README.md`, `AGENT.MD` and `SCHEMA.MD`.
+
+**What this changes, stated plainly.** The retired header allowed signature-only authentication: a
+webhook sender could present a *public* identifier plus a signature and never transmit a bearer
+credential. That property is gone — every caller now sends the secret API key. The upside is a
+single, obvious authentication path with no second lookup to reason about or keep consistent; the
+cost is that a sender's transport must be trusted with the bearer key. Under TLS that is the same
+assumption every bearer-token API makes, but it is a real reduction and worth recording.
+
+`api_keys.key_id` is retained as a **public display/correlation identifier** only — useful in the
+dashboard and logs, never a credential. A regression check in `§12` of the E2E suite fires the
+retired `X-Key-Id` header at the server and asserts it resolves nothing, so the removal cannot
+silently regress.
+
+A consequence that rippled through the tests: with the bearer key as the sole credential, an
+*unsigned* request from a valid key is now **accepted** (signing is optional unless
+`REQUIRE_SIGNED_REQUESTS=true`). Several assertions written for the old model — "an unsigned
+request is rejected" — were true only because a key id alone proved nothing. They were rewritten to
+pin what the modes actually govern: **how a signature is verified**, not whether the key is a
+credential. The `hmac_mode` toggle test now runs against a `REQUIRE_SIGNED_REQUESTS` instance
+precisely so the mode is observable; without that it would have passed while proving nothing.
+
+### Constant-time verification — verified, not assumed
+
+No code change was needed, and deliberately so. The chain was traced through the vendored source
+rather than taken on faith:
+
+```text
+Mac::verify_slice  ->  CtOutput::eq  ->  subtle::ConstantTimeEq::ct_eq
+```
+
+`verify_slice` rejects a wrong-length tag first (leaking only the digest width, a public constant)
+and then compares all 32 bytes in constant time. This is exactly the `subtle::ConstantTimeEq` the
+brief asked for, reached through the RustCrypto `Mac` API. Swapping in `ring` would add a large
+dependency for zero security gain; hand-rolling the comparison with `subtle` directly would be more
+code with more room for error. The reasoning is now a doc comment on `verify_signature` so a future
+"simplification" to `==` is visibly wrong.
+
+**On testing it.** A wall-clock timing assertion was considered and rejected: the HMAC computation
+dominates `verify_signature`'s runtime by orders of magnitude, so a byte-by-byte early exit would be
+buried in noise. Such a test would pass whether or not the comparison were constant-time — false
+assurance, which is worse than none. What was written instead has real detection power:
+
+- **Exhaustive per-byte mutation**: every one of the 32 digest positions, flipped three ways (96
+  cases), must be rejected — the deterministic fingerprint of a *full-width* comparison. A
+  prefix-only, suffix-only or truncated compare would show up as a specific band of positions that
+  wrongly verify.
+- **Wrong-length tags** (1, 31, 33 bytes, empty) rejected, so no truncated comparison slips through.
+- **Response indistinguishability**: first-byte-wrong, last-byte-wrong, all-zeros and all-ones must
+  produce byte-identical status *and* error text. A differing message would itself be an oracle
+  regardless of how the bytes were compared.
+
+### Replay differential
+
+`replay_differs_between_hmac_modes` signs an identical payload dated ten minutes back:
+`CANONICAL_V1` rejects it (the timestamp is inside the signed material, so it cannot be re-dated and
+its own date has aged out), while `BODY_ONLY` accepts it — and accepts three further byte-identical
+replays. That is the documented trade-off of the mode, now demonstrated rather than only asserted in
+prose.
+
+### Live mode toggle
+
+`hmac_mode_toggle_takes_effect_immediately_without_a_restart` flips a key between modes via `PUT`
+and `PATCH` on a single, never-rebuilt app instance and asserts the signature rules invert on the
+very next request, in both directions. The middleware re-reads the key row per request, so there is
+no cache to invalidate. This test found a genuine gap: `PATCH /api/keys/:id` was not routed at all
+(only hooks had it), returning `405`. Added.
+
+### Large payloads
+
+`large_payloads_are_signed_verified_and_executed_within_the_buffer_limit` covers ~512 KB and
+just-under-1-MiB bodies end to end, a single byte flipped in the middle of a large body invalidating
+the signature (the whole body is covered, not a prefix), and an over-limit body refused with an
+explanatory `400` rather than a hang or an OOM. A 64 KiB *parameter* is also round-tripped into the
+child environment — held to 64 KiB deliberately, since argv and environment share `ARG_MAX` and each
+parameter is passed both ways, so a multi-hundred-KB value would risk `E2BIG`. That is a platform
+limit, not a defect here.
+
+**A test-harness bug worth recording.** The first E2E run of this section reported nonsense — a
+0-byte body signed and accepted. Cause: `jq --arg` with a 512 KB value exceeds `ARG_MAX`, so jq died
+with "Argument list too long" and left an empty file behind, which the script then happily signed.
+Fixed by streaming padding through a file and reading it with `jq --rawfile`, plus a guard that
+asserts the generated body is actually large before any signature check runs — so a truncated
+fixture fails loudly instead of quietly making every downstream assertion meaningless.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 49 unit + 59 integration tests pass (three consecutive clean runs).
+- `./scripts/test_e2e.sh` — 382/382 checks pass.

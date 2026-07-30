@@ -53,6 +53,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys", post(api::create_api_key))
         .route("/keys", get(api::list_api_keys))
         .route("/keys/{id}", put(api::update_api_key))
+        // PATCH as a synonym for PUT, matching the hook routes: every `UpdateApiKeyPayload` field
+        // is optional, so the handler is partial-update under either verb.
+        .route("/keys/{id}", axum::routing::patch(api::update_api_key))
         .route("/keys/{id}", delete(api::delete_api_key))
         .route("/keys/{id}/rotate", post(api::rotate_api_key))
         .route("/keys/{id}/permissions", post(api::update_key_hook_permissions))

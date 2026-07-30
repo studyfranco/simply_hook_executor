@@ -48,10 +48,11 @@ pub struct Model {
     pub key_hash: String,
     /// First 8 characters of the plaintext key, kept for display and log correlation.
     pub prefix: String,
-    /// Public, non-secret identifier (`shk_<32 hex>`) sent in the clear as `X-Key-Id` to select
-    /// which signing secret verifies a webhook signature.
+    /// Public, non-secret identifier (`shk_<32 hex>`) used for display and log correlation.
     ///
-    /// `None` only for keys issued before signature auth existed; rotating such a key mints a pair.
+    /// Deliberately *not* a credential and not an authentication header: callers identify
+    /// themselves with `X-API-Key`, which is the single key lookup path. `None` only for keys
+    /// issued before signing secrets existed; rotating such a key mints a pair.
     #[sea_orm(unique)]
     pub key_id: Option<String>,
     /// HMAC-SHA256 signing secret, **encrypted at rest** (see [`crate::crypto`]).

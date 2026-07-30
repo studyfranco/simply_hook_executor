@@ -121,7 +121,7 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
 }
 
 #[tokio::test]
-async fn key_id_and_signature_authenticate_without_a_bearer_key() {
+async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
     let dir = ScriptDir::new();
     let script = dir.write_script("webhook_signed.sh", "echo \"signed:$HOOK_PARAM_TARGET\"");
 
@@ -132,56 +132,76 @@ async fn key_id_and_signature_authenticate_without_a_bearer_key() {
     insert_parameter(&db, hook_id, "target", None, true).await;
     grant(&db, sender.id, hook_id, true, false).await;
 
+    let uri = "/webhook/webhook_signed";
     let body = json!({ "target": "203.0.113.7" }).to_string();
 
-    // The whole point of the signing pair: a third-party sender authenticates with a public
-    // identifier and a signature, never transmitting a bearer credential at all.
+    // A signed request identified by X-API-Key.
     let response = send(
         &app,
-        signed_request("POST", "/webhook/webhook_signed", &sender.key_id, &sender.signing_secret, &body),
+        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &body),
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.string("stdout").trim(), "signed:203.0.113.7");
 
-    // A key id with a signature made from the wrong secret is rejected.
+    // A signature made with the wrong secret is rejected even though the bearer key is valid.
+    let timestamp = now_timestamp();
     let forged = with_connect_info(
         axum::http::Request::builder()
             .method("POST")
-            .uri("/webhook/webhook_signed")
-            .header("X-Key-Id", &sender.key_id)
+            .uri(uri)
+            .header("X-API-Key", &sender.plaintext)
             .header("Content-Type", "application/json")
-            .header("X-Timestamp", now_timestamp().to_string())
-            .header("X-Signature-256", sign_request("not-the-secret", "POST", "/webhook/webhook_signed", now_timestamp(), &body)),
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", sign_request("not-the-secret", "POST", uri, timestamp, &body)),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
     assert_eq!(send(&app, forged).await.status, StatusCode::UNAUTHORIZED);
 
-    // A key id on its own proves nothing — it is public — so it must not authenticate.
-    let unsigned = with_connect_info(
+    // With the bearer key present and no signature, the key itself is the credential, so the
+    // request is accepted. (`REQUIRE_SIGNED_REQUESTS` is what makes signing compulsory; that is
+    // covered by its own test.)
+    let unsigned = json_request("POST", uri, &sender.plaintext, Some(json!({ "target": "1.2.3.4" })));
+    assert_eq!(send(&app, unsigned).await.status, StatusCode::OK);
+
+    // The public key_id is *not* a credential: presenting it in place of the API key — under its
+    // old header name or as the API key itself — resolves nothing.
+    let via_old_header = with_connect_info(
         axum::http::Request::builder()
             .method("POST")
-            .uri("/webhook/webhook_signed")
+            .uri(uri)
             .header("X-Key-Id", &sender.key_id)
-            .header("Content-Type", "application/json"),
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, timestamp, &body)),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
-    let response = send(&app, unsigned).await;
-    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert!(response.string("error").contains("X-Signature-256"));
-
-    // An unknown key id is rejected with the same message as a bad key, so the endpoint cannot be
-    // used to enumerate which key ids exist.
-    let unknown = signed_request(
-        "POST",
-        "/webhook/webhook_signed",
-        "shk_00000000000000000000000000000000",
-        &sender.signing_secret,
-        &body,
+    let response = send(&app, via_old_header).await;
+    assert_eq!(
+        response.status,
+        StatusCode::UNAUTHORIZED,
+        "the retired X-Key-Id header must not resolve a key"
     );
-    assert_eq!(send(&app, unknown).await.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("X-API-Key"));
+
+    let key_id_as_bearer = signed_request("POST", uri, &sender.key_id, &sender.signing_secret, &body);
+    assert_eq!(
+        send(&app, key_id_as_bearer).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the public key_id must not authenticate as a bearer key either"
+    );
+
+    // A missing key is refused with a message naming the one header that works.
+    let anonymous = with_connect_info(
+        axum::http::Request::builder().method("POST").uri(uri).header("Content-Type", "application/json"),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    let response = send(&app, anonymous).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("X-API-Key"));
 }
 
 #[tokio::test]
@@ -208,7 +228,7 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
     for offset in [0, -240, 240, -120, 120] {
         let response = send(
             &app,
-            signed_request_at("POST", uri, &sender.key_id, &sender.signing_secret, &body, now + offset),
+            signed_request_at("POST", uri, &sender.plaintext, &sender.signing_secret, &body, now + offset),
         )
         .await;
         assert_eq!(response.status, StatusCode::OK, "offset {offset}s should be inside the window");
@@ -219,7 +239,7 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
     for offset in [-360, -3600, -86_400, 360, 3600] {
         let response = send(
             &app,
-            signed_request_at("POST", uri, &sender.key_id, &sender.signing_secret, &body, now + offset),
+            signed_request_at("POST", uri, &sender.plaintext, &sender.signing_secret, &body, now + offset),
         )
         .await;
         assert_eq!(
@@ -239,7 +259,7 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
     let stale = signed_request_at(
         "POST",
         uri,
-        &sender.key_id,
+        &sender.plaintext,
         &sender.signing_secret,
         &body,
         now - 400,
@@ -271,7 +291,7 @@ async fn signed_requests_require_a_well_formed_timestamp_header() {
         axum::http::Request::builder()
             .method("POST")
             .uri(uri)
-            .header("X-Key-Id", &sender.key_id)
+            .header("X-API-Key", &sender.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, now, &body)),
     )
@@ -287,7 +307,7 @@ async fn signed_requests_require_a_well_formed_timestamp_header() {
             axum::http::Request::builder()
                 .method("POST")
                 .uri(uri)
-                .header("X-Key-Id", &sender.key_id)
+                .header("X-API-Key", &sender.plaintext)
                 .header("Content-Type", "application/json")
                 .header("X-Timestamp", malformed)
                 .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, now, &body)),
@@ -446,7 +466,7 @@ async fn body_only_mode_accepts_github_style_webhook_signatures() {
     for header in ["X-Signature-256", "X-Hub-Signature-256"] {
         let response = send(
             &app,
-            body_only_request(uri, &sender.key_id, &sender.signing_secret, &body, header),
+            body_only_request(uri, &sender.plaintext, &sender.signing_secret, &body, header),
         )
         .await;
         assert_eq!(response.status, StatusCode::OK, "{header} should be accepted in BODY_ONLY mode");
@@ -458,7 +478,7 @@ async fn body_only_mode_accepts_github_style_webhook_signatures() {
         axum::http::Request::builder()
             .method("POST")
             .uri(uri)
-            .header("X-Key-Id", &sender.key_id)
+            .header("X-API-Key", &sender.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", "1")
             .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
@@ -472,7 +492,7 @@ async fn body_only_mode_accepts_github_style_webhook_signatures() {
         axum::http::Request::builder()
             .method("POST")
             .uri(uri)
-            .header("X-Key-Id", &sender.key_id)
+            .header("X-API-Key", &sender.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
     )
@@ -480,28 +500,18 @@ async fn body_only_mode_accepts_github_style_webhook_signatures() {
     .expect("request builds");
     assert_eq!(send(&app, tampered).await.status, StatusCode::UNAUTHORIZED);
 
-    let wrong_secret = body_only_request(uri, &sender.key_id, "not-the-secret", &body, "X-Hub-Signature-256");
+    let wrong_secret = body_only_request(uri, &sender.plaintext, "not-the-secret", &body, "X-Hub-Signature-256");
     assert_eq!(send(&app, wrong_secret).await.status, StatusCode::UNAUTHORIZED);
 
     // A canonical-style signature is *not* valid for a BODY_ONLY key: the modes are distinct, not
     // a fallback chain.
-    let canonical = signed_request("POST", uri, &sender.key_id, &sender.signing_secret, &body);
+    let canonical = signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &body);
     assert_eq!(send(&app, canonical).await.status, StatusCode::UNAUTHORIZED);
 
-    // A key id with no signature at all is still refused — BODY_ONLY relaxes the *format*, never
-    // the requirement.
-    let unsigned = with_connect_info(
-        axum::http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("X-Key-Id", &sender.key_id)
-            .header("Content-Type", "application/json"),
-    )
-    .body(axum::body::Body::from(body.clone()))
-    .expect("request builds");
-    let response = send(&app, unsigned).await;
-    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert!(response.string("error").contains("X-Hub-Signature-256"));
+    // The bearer key alone still authenticates (signing is optional unless REQUIRE_SIGNED_REQUESTS
+    // is on): BODY_ONLY governs how a signature is *verified*, not whether the key is a credential.
+    let unsigned = json_request("POST", uri, &sender.plaintext, Some(json!({ "ref": "refs/heads/main" })));
+    assert_eq!(send(&app, unsigned).await.status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -526,27 +536,44 @@ async fn canonical_mode_ignores_the_hub_signature_header() {
         axum::http::Request::builder()
             .method("POST")
             .uri(uri)
-            .header("X-Key-Id", &strict.key_id)
+            .header("X-API-Key", &strict.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Hub-Signature-256", sign_body_only(&strict.signing_secret, &body)),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
-    let response = send(&app, hub_only).await;
-    assert_eq!(
-        response.status,
-        StatusCode::UNAUTHORIZED,
-        "X-Hub-Signature-256 must be ignored for a CANONICAL_V1 key"
-    );
-    // It is treated as *no* signature at all, so the error is the missing-signature one.
-    assert!(response.string("error").contains("X-Signature-256"));
+    // For a CANONICAL_V1 key the hub header is not read at all, so this counts as an *unsigned*
+    // request — which a valid bearer key still authenticates. The point being pinned is that the
+    // hub signature is never accepted as proof: it is ignored, not honoured.
+    assert_eq!(send(&app, hub_only).await.status, StatusCode::OK);
+
+    // And with signing made compulsory, the same request is refused outright — proving the hub
+    // header contributed nothing.
+    let strict_app = create_app(AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig { require_signed_requests: true, ..(*test_config()).clone() }),
+        test_cipher(),
+    ));
+    let hub_only_again = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-API-Key", &strict.plaintext)
+            .header("Content-Type", "application/json")
+            .header("X-Hub-Signature-256", sign_body_only(&strict.signing_secret, &body)),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    let response = send(&strict_app, hub_only_again).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("must be signed"));
 
     // A body-only signature sent under the correct header name is still wrong material here.
     let body_only_sig = with_connect_info(
         axum::http::Request::builder()
             .method("POST")
             .uri(uri)
-            .header("X-Key-Id", &strict.key_id)
+            .header("X-API-Key", &strict.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", now_timestamp().to_string())
             .header("X-Signature-256", sign_body_only(&strict.signing_secret, &body)),
@@ -556,7 +583,7 @@ async fn canonical_mode_ignores_the_hub_signature_header() {
     assert_eq!(send(&app, body_only_sig).await.status, StatusCode::UNAUTHORIZED);
 
     // The canonical signature works, confirming the key itself is fine.
-    let canonical = signed_request("POST", uri, &strict.key_id, &strict.signing_secret, &body);
+    let canonical = signed_request("POST", uri, &strict.plaintext, &strict.signing_secret, &body);
     assert_eq!(send(&app, canonical).await.status, StatusCode::OK);
 }
 
@@ -678,6 +705,328 @@ async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
 }
 
 #[tokio::test]
+async fn signature_rejection_leaks_no_oracle_about_the_correct_digest() {
+    let dir = ScriptDir::new();
+    let side_effect = dir.path_for("must-not-run");
+    let script = dir.write_script("oracle.sh", &format!("touch \"{side_effect}\""));
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let signer = insert_key_full(&db, "Signer", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "oracle_hook", &script, 30).await;
+    grant(&db, signer.id, hook_id, true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+    let body = json!({ "parameters": {} }).to_string();
+    let timestamp = now_timestamp();
+    let valid = sign_request(&signer.signing_secret, "POST", &uri, timestamp, &body);
+    let digest = hex::decode(valid.trim_start_matches("sha256=")).expect("valid hex");
+
+    let attempt = |signature: String| {
+        with_connect_info(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("X-API-Key", &signer.plaintext)
+                .header("Content-Type", "application/json")
+                .header("X-Timestamp", timestamp.to_string())
+                .header("X-Signature-256", signature),
+        )
+        .body(axum::body::Body::from(body.clone()))
+        .expect("request builds")
+    };
+
+    // Wrong at the very first byte, wrong at the very last byte, and wrong everywhere. If the
+    // comparison short-circuited, these would be the cases that differ — so they must be
+    // indistinguishable in everything the caller can observe.
+    let mut first_byte_wrong = digest.clone();
+    first_byte_wrong[0] ^= 0xff;
+    let mut last_byte_wrong = digest.clone();
+    last_byte_wrong[31] ^= 0xff;
+
+    let variants = [
+        ("first byte wrong", hex::encode(&first_byte_wrong)),
+        ("last byte wrong", hex::encode(&last_byte_wrong)),
+        ("entirely wrong", hex::encode([0u8; 32])),
+        ("all ones", hex::encode([0xffu8; 32])),
+    ];
+
+    let mut responses = Vec::new();
+    for (label, hex_digest) in &variants {
+        let response = send(&app, attempt(format!("sha256={hex_digest}"))).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{label} must be rejected");
+        responses.push((label, response.status, response.string("error")));
+    }
+
+    // Every rejection must be byte-identical in status and message. A differing message — "close
+    // but wrong" versus "completely wrong" — would itself be an oracle, regardless of how the
+    // bytes were compared.
+    let (_, first_status, first_error) = &responses[0];
+    for (label, status, error) in &responses {
+        assert_eq!(status, first_status, "{label}: status differs from the other rejections");
+        assert_eq!(error, first_error, "{label}: error message differs from the other rejections");
+    }
+    assert_eq!(first_error, "Invalid request signature");
+
+    // No rejected attempt reached the engine.
+    assert!(!std::path::Path::new(&side_effect).exists());
+    assert_eq!(execution_count(&db).await, 0);
+
+    // The genuine signature still works, proving the setup is otherwise sound.
+    assert_eq!(send(&app, attempt(valid)).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn replay_differs_between_hmac_modes() {
+    use simply_hook_executor::entities::api_key::HmacMode;
+
+    let dir = ScriptDir::new();
+    let script = dir.write_script("replay_diff.sh", "echo replayed");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let strict = insert_key_with_mode(&db, "Strict", "0.0.0.0/0", KeyScopes::plain(), HmacMode::CanonicalV1).await;
+    let lenient = insert_key_with_mode(&db, "Lenient", "0.0.0.0/0", KeyScopes::plain(), HmacMode::BodyOnly).await;
+
+    let hook_id = insert_hook(&db, "replay_diff", &script, 30).await;
+    grant(&db, strict.id, hook_id, true, false).await;
+    grant(&db, lenient.id, hook_id, true, false).await;
+
+    let uri = "/webhook/replay_diff";
+    let body = json!({}).to_string();
+    // Ten minutes in the past — comfortably outside the 300s window in either direction.
+    let ten_minutes_ago = now_timestamp() - 600;
+
+    // CANONICAL_V1: the timestamp is part of the signed material, so a captured request cannot be
+    // re-dated, and its original date has aged out. This is the anti-replay property.
+    let stale_canonical = signed_request_at(
+        "POST",
+        uri,
+        &strict.plaintext,
+        &strict.signing_secret,
+        &body,
+        ten_minutes_ago,
+    );
+    let response = send(&app, stale_canonical).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("window"));
+
+    // The same key with a fresh timestamp works, so the rejection above is about age, not the key.
+    let fresh_canonical = signed_request("POST", uri, &strict.plaintext, &strict.signing_secret, &body);
+    assert_eq!(send(&app, fresh_canonical).await.status, StatusCode::OK);
+
+    // BODY_ONLY: the signature covers the body alone, so age is not expressible and the identical
+    // payload stays valid indefinitely. This is the documented trade-off of the mode, demonstrated
+    // rather than merely asserted in prose.
+    let replayed = body_only_request(uri, &lenient.plaintext, &lenient.signing_secret, &body, "X-Hub-Signature-256");
+    assert_eq!(send(&app, replayed).await.status, StatusCode::OK);
+
+    // Replaying the byte-identical request again also succeeds — the actual replay exposure.
+    for attempt in 0..3 {
+        let again = body_only_request(uri, &lenient.plaintext, &lenient.signing_secret, &body, "X-Hub-Signature-256");
+        assert_eq!(
+            send(&app, again).await.status,
+            StatusCode::OK,
+            "BODY_ONLY replay attempt {attempt} should still be accepted"
+        );
+    }
+
+    // Two accepted canonical runs would be wrong; count what actually executed: 1 fresh canonical
+    // + 4 body-only = 5, and zero from the stale canonical attempt.
+    assert_eq!(execution_count(&db).await, 5);
+}
+
+#[tokio::test]
+async fn hmac_mode_toggle_takes_effect_immediately_without_a_restart() {
+    use simply_hook_executor::entities::api_key::HmacMode;
+
+    let dir = ScriptDir::new();
+    let script = dir.write_script("toggle.sh", "echo toggled");
+
+    let db = setup_test_db().await;
+    // One app instance for the whole test: nothing is rebuilt, so anything that takes effect here
+    // took effect without a restart.
+    //
+    // Signing is made mandatory so the mode is *observable*. With signatures optional, a valid
+    // bearer key authenticates under either mode and the two would look identical from outside —
+    // the test would pass without proving anything.
+    let app = create_app(AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig { require_signed_requests: true, ..(*test_config()).clone() }),
+        test_cipher(),
+    ));
+    let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let subject = insert_key_with_mode(&db, "Subject", "0.0.0.0/0", KeyScopes::plain(), HmacMode::CanonicalV1).await;
+
+    let hook_id = insert_hook(&db, "toggle_hook", &script, 30).await;
+    grant(&db, subject.id, hook_id, true, false).await;
+
+    let uri = "/webhook/toggle_hook";
+    let body = json!({}).to_string();
+
+    let canonical = || signed_request("POST", uri, &subject.plaintext, &subject.signing_secret, &body);
+    let body_only = || body_only_request(uri, &subject.plaintext, &subject.signing_secret, &body, "X-Hub-Signature-256");
+
+    // Starting state: canonical accepted, body-only refused.
+    assert_eq!(send(&app, canonical()).await.status, StatusCode::OK);
+    assert_eq!(send(&app, body_only()).await.status, StatusCode::UNAUTHORIZED);
+
+    // Flip to BODY_ONLY through the API (itself signed, since signing is mandatory here).
+    let to_body_only = send(
+        &app,
+        signed_bearer_request(
+            "PUT",
+            &format!("/api/keys/{}", subject.id),
+            &master.plaintext,
+            &master.signing_secret,
+            &json!({ "hmac_mode": "BODY_ONLY" }).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(to_body_only.status, StatusCode::OK);
+    assert_eq!(to_body_only.field("hmac_mode"), &json!("BODY_ONLY"));
+
+    // The very next request already follows the new rules, in both directions.
+    assert_eq!(send(&app, body_only()).await.status, StatusCode::OK, "BODY_ONLY should now be accepted");
+    assert_eq!(
+        send(&app, canonical()).await.status,
+        StatusCode::UNAUTHORIZED,
+        "canonical signatures should now be refused"
+    );
+
+    // Flip back via PATCH, which routes to the same handler.
+    let back = send(
+        &app,
+        signed_bearer_request(
+            "PATCH",
+            &format!("/api/keys/{}", subject.id),
+            &master.plaintext,
+            &master.signing_secret,
+            &json!({ "hmac_mode": "CANONICAL_V1" }).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(back.status, StatusCode::OK);
+    assert_eq!(back.field("hmac_mode"), &json!("CANONICAL_V1"));
+
+    assert_eq!(send(&app, canonical()).await.status, StatusCode::OK, "canonical should be accepted again");
+    assert_eq!(send(&app, body_only()).await.status, StatusCode::UNAUTHORIZED, "BODY_ONLY should be refused again");
+
+    // The key's own identity endpoint reflects the live mode too, which is what the SPA signs with.
+    let me = send(
+        &app,
+        signed_bearer_request("GET", "/api/auth/me", &subject.plaintext, &subject.signing_secret, ""),
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK);
+    assert_eq!(me.field("hmac_mode"), &json!("CANONICAL_V1"));
+
+    // Three accepted executions: the two canonical runs and the one body-only run.
+    assert_eq!(execution_count(&db).await, 3);
+}
+
+#[tokio::test]
+async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit() {
+    let dir = ScriptDir::new();
+    // Reports only lengths, so a multi-hundred-KB payload cannot blow the captured-output cap.
+    let script = dir.write_script("large.sh", "echo \"marker=${HOOK_PARAM_MARKER} blob_len=${#HOOK_PARAM_BLOB}\"");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_full(&db, "Bulk", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "large_hook", &script, 30).await;
+    insert_parameter(&db, hook_id, "marker", Some("none"), true).await;
+    insert_parameter(&db, hook_id, "blob", Some(""), true).await;
+    grant(&db, sender.id, hook_id, true, false).await;
+
+    let uri = "/webhook/large_hook";
+
+    // A ~512 KB body whose *parameters* stay small: the padding is a top-level sibling of
+    // `parameters`, so it is ignored for parameter resolution but is still fully covered by the
+    // signature. That isolates "can we HMAC a large body" from argv/environment size limits.
+    let padding = "x".repeat(512 * 1024);
+    let large_body = json!({ "parameters": { "marker": "big" }, "padding": padding }).to_string();
+    assert!(large_body.len() > 512 * 1024, "the test payload should really be large");
+
+    let response = send(
+        &app,
+        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &large_body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "a ~512 KB signed body should verify and execute");
+    assert_eq!(response.field("status"), &json!("SUCCESS"));
+    assert!(response.string("stdout").contains("marker=big"));
+
+    // Tampering with one byte deep inside the padding must still invalidate the signature — the
+    // whole body is covered, not a prefix of it.
+    let mut tampered = large_body.clone();
+    let midpoint = tampered.len() / 2;
+    tampered.replace_range(midpoint..midpoint + 1, "y");
+    let timestamp = now_timestamp();
+    let stale_signature = sign_request(&sender.signing_secret, "POST", uri, timestamp, &large_body);
+    let tampered_request = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-API-Key", &sender.plaintext)
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", stale_signature),
+    )
+    .body(axum::body::Body::from(tampered))
+    .expect("request builds");
+    assert_eq!(
+        send(&app, tampered_request).await.status,
+        StatusCode::UNAUTHORIZED,
+        "a single altered byte in the middle of a large body must invalidate the signature"
+    );
+
+    // Just under the 1 MiB buffer bound: still accepted.
+    let near_limit_padding = "z".repeat(1024 * 1024 - 4096);
+    let near_limit_body = json!({ "parameters": { "marker": "near" }, "padding": near_limit_padding }).to_string();
+    assert!(near_limit_body.len() < 1024 * 1024, "must stay under the buffer limit");
+    let response = send(
+        &app,
+        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &near_limit_body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "a body just under the limit should be accepted");
+
+    // Over the bound: refused before any hashing or execution, with an explanatory error rather
+    // than a hang or an OOM.
+    let oversized_padding = "w".repeat(2 * 1024 * 1024);
+    let oversized_body = json!({ "parameters": { "marker": "over" }, "padding": oversized_padding }).to_string();
+    let response = send(
+        &app,
+        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &oversized_body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "an oversized body must be refused");
+    assert!(response.string("error").contains("too large"));
+
+    // A genuinely large *parameter* also survives the round trip into the child's environment.
+    // Kept to 64 KiB: argv plus environment share a per-process limit (ARG_MAX), and each resolved
+    // parameter is passed both ways, so a multi-hundred-KB value would risk E2BIG on some systems
+    // — a platform limit, not a defect in this daemon.
+    let blob = "b".repeat(64 * 1024);
+    let blob_body = json!({ "parameters": { "marker": "blob", "blob": blob } }).to_string();
+    let response = send(
+        &app,
+        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &blob_body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert!(
+        response.string("stdout").contains(&format!("blob_len={}", 64 * 1024)),
+        "the full parameter should reach the process environment intact: {}",
+        response.string("stdout")
+    );
+
+    // Only the accepted requests produced history rows.
+    assert_eq!(execution_count(&db).await, 3);
+}
+
+#[tokio::test]
 async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     use sea_orm::EntityTrait as _;
     use simply_hook_executor::{crypto::SecretCipher, entities::prelude::ApiKey};
@@ -698,6 +1047,7 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     assert_eq!(created.status, StatusCode::OK);
     let signing_secret = created.string("signing_secret");
     let key_id = created.string("key_id");
+    let created_api_key = created.string("plaintext_key");
     assert!(key_id.starts_with("shk_"));
     assert!(!signing_secret.is_empty());
 
@@ -734,7 +1084,11 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     .await;
 
     let body = json!({}).to_string();
-    let response = send(&app, signed_request("POST", "/webhook/sealed_hook", &key_id, &signing_secret, &body)).await;
+    let response = send(
+        &app,
+        signed_request("POST", "/webhook/sealed_hook", &created_api_key, &signing_secret, &body),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.string("stdout").trim(), "sealed-ok");
 

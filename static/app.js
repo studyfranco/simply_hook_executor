@@ -1543,7 +1543,7 @@ class HookExecutorClient {
         document.getElementById('secret-reveal-title').textContent = title;
         document.getElementById('secret-reveal-body').innerHTML = [
             field('API Key', res.plaintext_key, 'Send as the X-API-Key header.'),
-            field('Key ID', res.key_id, 'Public identifier. Send as X-Key-Id when authenticating by signature.'),
+            field('Key ID', res.key_id, 'Public identifier, for display and log correlation. Not a credential.'),
             field('Signing Secret', res.signing_secret, 'Secret. Compute HMAC-SHA256 over the raw JSON body and send it as X-Signature-256: sha256=<hex>.')
         ].join('');
         document.getElementById('secret-reveal-modal').classList.remove('hidden');

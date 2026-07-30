@@ -12,10 +12,9 @@ use crate::entities::prelude::ApiKey;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Header carrying the caller's secret key.
+/// Header carrying the caller's secret key. The single, canonical way a caller identifies itself —
+/// every request resolves its key record by hashing this value and matching `api_keys.key_hash`.
 const API_KEY_HEADER: &str = "X-API-Key";
-/// Header carrying the caller's public key identifier, for signature-only authentication.
-const KEY_ID_HEADER: &str = "X-Key-Id";
 /// Header carrying the `sha256=<hex>` request signature.
 const SIGNATURE_HEADER: &str = "X-Signature-256";
 /// Alternate signature header used by GitHub-style webhook senders. Accepted only in
@@ -117,8 +116,24 @@ fn verify_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
 /// signature — the standard webhook-sender pattern, where the sender never transmits a bearer
 /// credential at all.
 ///
-/// Comparison goes through [`Mac::verify_slice`], which is constant-time; comparing hex strings
-/// with `==` would leak the correct signature one byte at a time.
+/// # Constant-time comparison
+///
+/// The digest comparison goes through [`Mac::verify_slice`], whose implementation chain was
+/// verified against the vendored source rather than assumed:
+///
+/// ```text
+/// Mac::verify_slice  ->  CtOutput::eq  ->  subtle::ConstantTimeEq::ct_eq
+/// ```
+///
+/// `verify_slice` first rejects a tag of the wrong length — that leaks only the digest width, which
+/// is a public constant — and then compares all 32 bytes in constant time. Comparing the hex
+/// strings with `==` instead would let an attacker recover a valid signature one byte at a time by
+/// measuring response latency.
+///
+/// This is why the function must keep using `verify_slice` and must never be "simplified" to a
+/// `==` on the decoded bytes or the hex text. `subtle` is reached through the RustCrypto `Mac` API
+/// rather than depended on directly: the API already provides the guarantee, and hand-rolling the
+/// comparison would be more code for no benefit.
 fn verify_signature(header_value: &str, secret: &str, base: &[u8]) -> Result<(), AppError> {
     let hex_signature = header_value
         .strip_prefix("sha256=")
@@ -191,44 +206,25 @@ pub async fn auth_middleware(
         .unwrap_or(addr.ip());
     let client_ip = normalize_ip(client_ip);
 
-    // Two ways to name yourself: a bearer API key, or a public key id backed by a signature.
-    let presented_key = headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok());
-    let presented_key_id = headers.get(KEY_ID_HEADER).and_then(|h| h.to_str().ok());
+    // One canonical way to name yourself: the bearer API key. It is hashed and matched against
+    // `api_keys.key_hash`, which is the only key lookup path in the system.
+    let presented_key = headers
+        .get(API_KEY_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| {
+            AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header"))
+        })?;
 
-    let (key_record, signature_required) = match (presented_key, presented_key_id) {
-        (Some(plaintext), _) => {
-            let mut hasher = Sha256::new();
-            hasher.update(plaintext.as_bytes());
-            let key_hash = hex::encode(hasher.finalize());
+    let mut hasher = Sha256::new();
+    hasher.update(presented_key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
 
-            let record = ApiKey::find()
-                .filter(crate::entities::api_key::Column::KeyHash.eq(key_hash))
-                .one(&state.db)
-                .await
-                .map_err(AppError::DbError)?
-                .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
-            // The bearer key is itself the credential, so a signature is optional here — when
-            // present it still has to verify (below), adding body integrity on top.
-            (record, false)
-        }
-        (None, Some(key_id)) => {
-            let record = ApiKey::find()
-                .filter(crate::entities::api_key::Column::KeyId.eq(key_id))
-                .one(&state.db)
-                .await
-                .map_err(AppError::DbError)?
-                // Deliberately the same message as a bad API key: distinguishing "no such key id"
-                // from "bad signature" would turn the endpoint into a key-id oracle.
-                .ok_or(AppError::Unauthorized("Invalid credentials".to_owned()))?;
-            // A key id is public. On its own it proves nothing, so a valid signature is mandatory.
-            (record, true)
-        }
-        (None, None) => {
-            return Err(AppError::Unauthorized(
-                "Missing credentials: provide X-API-Key, or X-Key-Id with X-Signature-256".to_owned(),
-            ));
-        }
-    };
+    let key_record = ApiKey::find()
+        .filter(crate::entities::api_key::Column::KeyHash.eq(key_hash))
+        .one(&state.db)
+        .await
+        .map_err(AppError::DbError)?
+        .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
 
     // Validate the client IP against the bound CIDRs.
     let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
@@ -269,9 +265,10 @@ pub async fn auth_middleware(
         })
         .map(str::to_owned);
 
-    // A signature is mandatory when the caller identified itself with a public key id (which is
-    // not a credential), and globally when the operator has switched on REQUIRE_SIGNED_REQUESTS.
-    let signature_required = signature_required || state.config.require_signed_requests;
+    // The bearer key is itself the credential, so a signature is optional by default — when
+    // present it must still verify, adding request integrity on top. `REQUIRE_SIGNED_REQUESTS`
+    // promotes it to mandatory across every authenticated route.
+    let signature_required = state.config.require_signed_requests;
 
     let mut req = match signature {
         Some(signature) => {
@@ -427,6 +424,55 @@ mod tests {
         let listing = base("GET", "/api/executions?limit=10", "1700000000", b"");
         let listing_sig = sign("secret", &listing);
         assert!(verify_signature(&listing_sig, "secret", &base("GET", "/api/executions?limit=1000", "1700000000", b"")).is_err());
+    }
+
+    #[test]
+    fn every_single_byte_mutation_of_a_valid_signature_is_rejected() {
+        let b = base("POST", "/api/hooks/x/execute", "1700000000", br#"{"parameters":{}}"#);
+        let valid = sign("secret", &b);
+        let digest = hex::decode(valid.trim_start_matches("sha256=")).expect("valid hex");
+        assert_eq!(digest.len(), 32, "SHA-256 tags are 32 bytes");
+
+        // Flipping any bit at any position must fail. This is the deterministic fingerprint of a
+        // full-width comparison: a prefix-only, suffix-only, or truncated compare would let
+        // mutations outside the compared region slip through, and would show up here as a specific
+        // range of positions that wrongly verify.
+        for position in 0..digest.len() {
+            for mask in [0x01u8, 0x80, 0xff] {
+                let mut mutated = digest.clone();
+                mutated[position] ^= mask;
+                let signature = format!("sha256={}", hex::encode(&mutated));
+                assert!(
+                    verify_signature(&signature, "secret", &b).is_err(),
+                    "a signature differing at byte {position} (mask {mask:#04x}) must be rejected"
+                );
+            }
+        }
+
+        // ...while the unmutated signature still verifies, so the loop above is not passing simply
+        // because everything fails.
+        assert!(verify_signature(&valid, "secret", &b).is_ok());
+    }
+
+    #[test]
+    fn tags_of_the_wrong_length_are_rejected() {
+        let b = base("POST", "/api/hooks/x/execute", "1700000000", b"{}");
+        let valid = sign("secret", &b);
+        let hex_digest = valid.trim_start_matches("sha256=").to_owned();
+
+        // A truncated tag must not verify against a truncated comparison, and an over-long one
+        // must not be silently trimmed.
+        for wrong in [
+            &hex_digest[..62],                      // 31 bytes
+            &hex_digest[..2],                       // 1 byte
+            "",                                     // empty
+            &format!("{hex_digest}00"),             // 33 bytes
+        ] {
+            assert!(
+                verify_signature(&format!("sha256={wrong}"), "secret", &b).is_err(),
+                "a {}-char tag must be rejected", wrong.len()
+            );
+        }
     }
 
     #[test]

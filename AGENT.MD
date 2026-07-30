@@ -36,10 +36,10 @@ To keep this context clean and modular, responsibilities are split across three 
 ### 1. Security & Network (Zero-Trust)
 
 - **Middleware Protection:** All `/api/*` and `/webhook/*` routes pass through custom authentication middleware (`src/middleware.rs`). There are no unauthenticated API routes; only the static SPA is public.
-- **Authentication Modes:** a caller identifies itself with exactly one of:
-  - **API Key (bearer):** `X-API-Key`, matched against `api_keys.key_hash` (SHA-256). A signature may accompany it, and is then verified as well.
-  - **Key ID + Signature:** `X-Key-Id` (public, non-secret) plus a valid signature. Since a key id proves nothing on its own, a signature is **mandatory** in this mode. This is what lets a webhook sender authenticate without ever transmitting a bearer credential.
-  - An unknown key id and a bad signature return the same `401`, so the endpoint cannot be used to enumerate key ids.
+- **Authentication:** there is exactly **one** way a caller identifies itself — the `X-API-Key` header, matched against `api_keys.key_hash` (SHA-256). This is the single key lookup path in the system; no other header resolves a key record.
+  - A signature (`X-Signature-256`) may accompany it and is then always verified, adding request integrity on top of bearer authentication. `REQUIRE_SIGNED_REQUESTS=true` makes it mandatory.
+  - `api_keys.key_id` is a public display/correlation identifier only. It is **not** a credential and **not** an authentication header.
+  - A missing `X-API-Key`, an unknown key, and a bad signature all return `401`.
 
 #### HMAC Signature Protocol
 
@@ -62,7 +62,7 @@ The rest of this section describes `CANONICAL_V1`. Signatures are HMAC-SHA256, k
 | :--- | :--- | :--- |
 | `X-Signature-256` | when signing | `sha256=<hex digest>` |
 | `X-Timestamp` | with any signature | Unix seconds the signature was computed at |
-| `X-API-Key` *or* `X-Key-Id` | always | identifies which key's `signing_secret` verifies the signature |
+| `X-API-Key` | always | identifies the key, and hence which `signing_secret` verifies the signature |
 
 Rules the implementation MUST hold to:
 

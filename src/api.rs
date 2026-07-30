@@ -61,8 +61,8 @@ pub fn hash_key(key: &str) -> String {
 
 /// Generates a public key identifier (`shk_<32 hex>`).
 ///
-/// Non-secret by design: it travels in the clear as `X-Key-Id` and appears in logs, so it only
-/// needs to be unique and unguessable enough not to invite enumeration — never to authenticate.
+/// Non-secret by design: it is shown in the dashboard and appears in logs, so it only needs to be
+/// unique — it never authenticates anything. Callers identify themselves with `X-API-Key` alone.
 pub fn generate_key_id() -> String {
     let bytes: [u8; 16] = rand::rng().random();
     format!("shk_{}", hex::encode(bytes))
@@ -1428,8 +1428,8 @@ pub struct CreateApiKeyResponse {
     pub id: Uuid,
     /// The raw key string. Shown once; only its hash is stored.
     pub plaintext_key: String,
-    /// Public key identifier, sent as `X-Key-Id` when authenticating by signature. Not a secret —
-    /// it stays retrievable from `GET /api/keys` afterwards.
+    /// Public key identifier, for display and log correlation. Not a secret, and not a credential:
+    /// it stays retrievable from `GET /api/keys` afterwards and is never sent as an auth header.
     pub key_id: String,
     /// The HMAC signing secret. Shown **once**; only its encrypted form is stored, and no endpoint
     /// will ever return it again. Rotating the key is the only way to obtain a new one.

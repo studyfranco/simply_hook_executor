@@ -748,7 +748,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     # Issues a fully-signed request. Usage: signed_call METHOD PATH BODY [AUTH_HEADER...] via globals
     #   $SIGN_SECRET  — signing secret
-    #   $SIGN_AUTH    — the identifying header, e.g. "X-API-Key: ..." or "X-Key-Id: ..."
+    #   $SIGN_AUTH    — the identifying header, always "X-API-Key: <key>"
     #   $SIGN_TS      — optional timestamp override (defaults to now)
     signed_call() {
         local method="$1" path="$2" body="${3:-}"
@@ -893,11 +893,11 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     # --- Key ID + signature, with no bearer credential at all (the webhook-sender pattern) ---
     curl_signed() {
-        local path="$1" key_id="$2" secret="$3" body="$4"
+        local path="$1" api_key="$2" secret="$3" body="$4"
         local ts; ts=$(date +%s)
         local sig; sig=$(sign_canonical "$secret" "POST" "$path" "$ts" "$body")
         RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-            -H "X-Key-Id: $key_id" -H "Content-Type: application/json" \
+            -H "X-API-Key: $api_key" -H "Content-Type: application/json" \
             -H "X-Timestamp: $ts" -H "X-Signature-256: sha256=$sig" -d "$body" "$BASE_URL$path")
         RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
         local color; color=$(status_color "$RESP_STATUS")
@@ -905,23 +905,24 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
         print_response_body
     }
 
-    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "$EXEC_SIGNING_SECRET" '{"target":"via-key-id"}'
-    check "200" "X-Key-Id plus a valid signature authenticates without any API key"
-    check_jq ".stdout | rtrimstr(\"\n\")" "hello via-key-id" "the signed webhook executed"
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY" "$EXEC_SIGNING_SECRET" '{"target":"via-signature"}'
+    check "200" "a signed webhook request authenticates via X-API-Key"
+    check_jq ".stdout | rtrimstr(\"\n\")" "hello via-signature" "the signed webhook executed"
 
-    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "definitely-not-the-secret" '{"target":"forged"}'
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY" "definitely-not-the-secret" '{"target":"forged"}'
     check "401" "a signature made with the wrong secret is rejected"
 
-    curl_signed "/webhook/echo_hook" "shk_00000000000000000000000000000000" "$EXEC_SIGNING_SECRET" '{"target":"x"}'
-    check "401" "an unknown key id is rejected"
+    # The public key_id is not a credential: it must not resolve a key record.
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "$EXEC_SIGNING_SECRET" '{"target":"x"}'
+    check "401" "the public key_id cannot be used as a bearer key"
 
-    # A key id alone is public and must not authenticate anything.
+    # The retired X-Key-Id header must resolve nothing at all.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
         -H "X-Key-Id: $EXEC_KEY_ID" -H "Content-Type: application/json" \
-        -d '{"target":"unsigned"}' "$BASE_URL/webhook/echo_hook")
+        -d '{"target":"legacy"}' "$BASE_URL/webhook/echo_hook")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a key id without a signature is rejected"
-    check_true '.error | contains("X-Signature-256")' "the error explains that a signature is required"
+    check "401" "the retired X-Key-Id header does not authenticate"
+    check_true '.error | contains("X-API-Key")' "the error names the one header that works"
 
     # Rotation issues a new pair and invalidates the old secret immediately. All three credentials
     # are captured here, before any later call overwrites $RESP_BODY.
@@ -933,11 +934,11 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     ROTATED_KEY_ID=$(echo "$RESP_BODY" | jq -r '.key_id')
     ROTATED_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
 
-    curl_signed "/webhook/echo_hook" "$EXEC_KEY_ID" "$EXEC_SIGNING_SECRET" '{"target":"stale"}'
-    check "401" "the pre-rotation key id and secret no longer authenticate"
+    curl_signed "/webhook/echo_hook" "$EXEC_KEY" "$EXEC_SIGNING_SECRET" '{"target":"stale"}'
+    check "401" "the pre-rotation key and secret no longer authenticate"
 
-    curl_signed "/webhook/echo_hook" "$ROTATED_KEY_ID" "$ROTATED_SECRET" '{"target":"rotated"}'
-    check "200" "the rotated pair authenticates"
+    curl_signed "/webhook/echo_hook" "$ROTATED_KEY" "$ROTATED_SECRET" '{"target":"rotated"}'
+    check "200" "the rotated credentials authenticate"
 
     # Later sections keep using this key, so adopt the rotated credentials wholesale.
     EXEC_KEY="$ROTATED_KEY"
@@ -1523,7 +1524,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     # X-Hub-Signature-256 is the header GitHub and Forgejo actually send.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
         -H "X-Hub-Signature-256: sha256=$GH_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "200" "a GitHub-style X-Hub-Signature-256 body-only signature is accepted"
@@ -1531,7 +1532,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     # The same signature under the other accepted header name.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
         -H "X-Signature-256: sha256=$GH_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "200" "X-Signature-256 is accepted in BODY_ONLY mode too"
@@ -1541,7 +1542,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     # Tampering with the body still fails.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
         -H "X-Hub-Signature-256: sha256=$GH_SIG" -d '{"ref":"refs/heads/evil"}' "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "a body-only signature over an altered body is rejected"
@@ -1549,27 +1550,33 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     # ...as does the wrong secret.
     BAD_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "not-the-secret" -r | cut -d' ' -f1)
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
         -H "X-Hub-Signature-256: sha256=$BAD_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "a body-only signature made with the wrong secret is rejected"
 
-    # ...and so does no signature at all: BODY_ONLY relaxes the format, never the requirement.
+    # An unsigned request still authenticates on the bearer key alone — the mode governs how a
+    # signature is verified, not whether the key is a credential. (REQUIRE_SIGNED_REQUESTS is what
+    # makes signing compulsory.)
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
         -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a BODY_ONLY key still requires a signature"
+    check "200" "an unsigned request still authenticates on the bearer key"
 
     # A CANONICAL_V1 key must NOT be downgradeable by sending the hub header instead.
     api_call POST "/api/keys/$EXEC_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$GH_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
     check "200" "grant the canonical-mode key rights on the same hook"
+    # A body-only signature offered to a CANONICAL_V1 key under the *recognised* header must fail:
+    # the mode decides what material is signed, and body-only material is not canonical material.
     STRICT_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "$EXEC_SIGNING_SECRET" -r | cut -d' ' -f1)
+    STRICT_TS=$(date +%s)
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Key-Id: $EXEC_KEY_ID" -H "Content-Type: application/json" \
-        -H "X-Hub-Signature-256: sha256=$STRICT_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $STRICT_TS" -H "X-Signature-256: sha256=$STRICT_SIG" \
+        -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a CANONICAL_V1 key cannot be downgraded via X-Hub-Signature-256"
+    check "401" "a body-only signature is rejected for a CANONICAL_V1 key"
 
     # Mode is switchable after the fact, and the switch is audited.
     api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"BODY_ONLY"}'
@@ -1594,6 +1601,104 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     check_true '[.[] | select(.name == "bogus_mode")] | length == 0' "no key was created with an invalid mode"
 else
     warn "Skipping §24: openssl is not available to compute body-only signatures."
+fi
+
+# ── 25. Large signed payloads & buffer limits ───────────────────────────────
+
+log_section "25. Large Signed Payloads"
+
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    BIG_SCRIPT=$(make_hook_script "big_payload.sh" 'echo "marker=${HOOK_PARAM_MARKER} blob_len=${#HOOK_PARAM_BLOB}"')
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"big_payload\",\"script_path\":\"$BIG_SCRIPT\",\"parameters\":[{\"param_key\":\"marker\",\"default_value\":\"none\",\"is_required\":true},{\"param_key\":\"blob\",\"default_value\":\"\",\"is_required\":true}]}"
+    check "200" "create a hook for large-payload testing"
+    BIG_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    # Signs a file's exact bytes over the canonical string, avoiding any shell-argument size limit
+    # by streaming the body from disk for both the HMAC and the request itself.
+    signed_file_call() {
+        local method="$1" path="$2" file="$3" secret="$4" auth="$5"
+        local ts; ts=$(date +%s)
+        local canon="$WORK_DIR/canon.bin"
+        { printf '%s\n%s\n%s\n' "$method" "$path" "$ts"; cat "$file"; } > "$canon"
+        local sig; sig=$(openssl dgst -sha256 -hmac "$secret" -r "$canon" | cut -d' ' -f1)
+        RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method" \
+            -H "$auth" -H "Content-Type: application/json" \
+            -H "X-Timestamp: $ts" -H "X-Signature-256: sha256=$sig" \
+            --data-binary "@$file" "$BASE_URL$path")
+        RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+        local color; color=$(status_color "$RESP_STATUS")
+        printf "%s ${color}[%s]${RESET} %-6s %s ${DIM}(signed, %s bytes)${RESET}\n" \
+            "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" "$(wc -c < "$file")" >&2
+        print_response_body
+    }
+
+    BIG_PATH="/api/hooks/$BIG_HOOK_ID/execute"
+    # These must be a matching pair: $SIGNING_MASTER_KEY is the key whose creation returned
+    # $MASTER_SIGNING_SECRET. Pairing it with the bootstrap $MASTER_KEY would sign with the wrong
+    # secret and every request would 401.
+    BIG_AUTH="X-API-Key: $SIGNING_MASTER_KEY"
+    BIG_SECRET="$MASTER_SIGNING_SECRET"
+
+    # ~512 KB body whose parameters stay small: the padding is a sibling of `parameters`, so it is
+    # ignored for resolution but fully covered by the signature.
+    # Padding is streamed through a file and read with --rawfile: passing half a megabyte as a
+    # shell argument exceeds ARG_MAX and jq dies with "Argument list too long", silently leaving an
+    # empty body behind.
+    head -c 524288 /dev/zero | tr '\0' 'x' > "$WORK_DIR/pad_512k.txt"
+    jq -nc --rawfile p "$WORK_DIR/pad_512k.txt" '{parameters:{marker:"big"},padding:$p}' > "$WORK_DIR/big_body.json"
+    check_local "$([ "$(wc -c < "$WORK_DIR/big_body.json")" -gt 524288 ] && echo large || echo empty)" "large" \
+        "the ~512 KB test body was generated (not truncated by ARG_MAX)"
+    signed_file_call POST "$BIG_PATH" "$WORK_DIR/big_body.json" "$BIG_SECRET" "$BIG_AUTH"
+    check "200" "a ~512 KB signed payload verifies and executes"
+    check_jq ".status" "SUCCESS" "the large-payload execution succeeded"
+    check_true '.stdout | contains("marker=big")' "parameters resolved correctly from a large body"
+
+    # One byte flipped deep inside the padding must invalidate the signature: the whole body is
+    # covered, not a prefix of it.
+    TS_BIG=$(date +%s)
+    { printf '%s\n%s\n%s\n' "POST" "$BIG_PATH" "$TS_BIG"; cat "$WORK_DIR/big_body.json"; } > "$WORK_DIR/canon_big.bin"
+    SIG_BIG=$(openssl dgst -sha256 -hmac "$BIG_SECRET" -r "$WORK_DIR/canon_big.bin" | cut -d' ' -f1)
+    # Rewrite one padding character in the middle of the file.
+    python3 - "$WORK_DIR/big_body.json" "$WORK_DIR/big_body_tampered.json" <<'PYEOF' 2>/dev/null || cp "$WORK_DIR/big_body.json" "$WORK_DIR/big_body_tampered.json"
+import sys
+data = bytearray(open(sys.argv[1], 'rb').read())
+mid = len(data) // 2
+data[mid] = ord('y') if data[mid] != ord('y') else ord('z')
+open(sys.argv[2], 'wb').write(data)
+PYEOF
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "$BIG_AUTH" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $TS_BIG" -H "X-Signature-256: sha256=$SIG_BIG" \
+        --data-binary "@$WORK_DIR/big_body_tampered.json" "$BASE_URL$BIG_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "one altered byte in the middle of a large body invalidates the signature"
+
+    # Just under the 1 MiB verification buffer: still accepted.
+    head -c 1040000 /dev/zero | tr '\0' 'z' > "$WORK_DIR/pad_near.txt"
+    jq -nc --rawfile p "$WORK_DIR/pad_near.txt" '{parameters:{marker:"near"},padding:$p}' > "$WORK_DIR/near_body.json"
+    signed_file_call POST "$BIG_PATH" "$WORK_DIR/near_body.json" "$BIG_SECRET" "$BIG_AUTH"
+    check "200" "a payload just under the 1 MiB buffer limit is accepted"
+
+    # Over the bound: refused with an explanatory error rather than a hang or an OOM.
+    head -c 2097152 /dev/zero | tr '\0' 'w' > "$WORK_DIR/pad_over.txt"
+    jq -nc --rawfile p "$WORK_DIR/pad_over.txt" '{parameters:{marker:"over"},padding:$p}' > "$WORK_DIR/over_body.json"
+    signed_file_call POST "$BIG_PATH" "$WORK_DIR/over_body.json" "$BIG_SECRET" "$BIG_AUTH"
+    check "400" "a payload over the buffer limit is refused"
+    check_true '.error | contains("too large")' "the refusal explains why"
+
+    # A large parameter value survives the trip into the child's environment. Held to 64 KiB:
+    # argv and environment share ARG_MAX, and each parameter is passed both ways.
+    head -c 65536 /dev/zero | tr '\0' 'b' > "$WORK_DIR/blob.txt"
+    jq -nc --rawfile b "$WORK_DIR/blob.txt" '{parameters:{marker:"blob",blob:($b | rtrimstr("\n"))}}' > "$WORK_DIR/blob_body.json"
+    signed_file_call POST "$BIG_PATH" "$WORK_DIR/blob_body.json" "$BIG_SECRET" "$BIG_AUTH"
+    check "200" "a 64 KiB parameter value is accepted"
+    check_true '.stdout | contains("blob_len=65536")' "the full parameter reached the process environment intact"
+
+    api_call GET "/api/executions?hook=big_payload&limit=20" "$MASTER_KEY"
+    check "200" "query the large-payload hook's history"
+    check_jq "length" "3" "only the accepted payloads produced execution records"
+else
+    warn "Skipping §25: openssl is not available to sign large payloads."
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

@@ -46,7 +46,7 @@ Stores authentication keys, global scopes, and network restrictions.
 | `name` | String | NOT NULL | Human-readable label (e.g., "Vault Webhook Client"). |
 | `plaintext_prefix`| String | NOT NULL | First 8 characters of plaintext key for display/logs. |
 | `key_hash` | String | NOT NULL, UNIQUE | Argon2id or SHA-256 hash of the secret key. |
-| `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`). Safe to log and to send in the clear as `X-Key-Id`; selects which `signing_secret` verifies a request signature. `NULL` only for keys issued before signature auth existed — rotate such a key to mint a pair. |
+| `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`) for display and log correlation. Safe to log. **Not a credential and not an authentication header** — callers identify themselves with `X-API-Key`, which is the only key lookup path. `NULL` only for keys issued before signing secrets existed; rotate such a key to mint a pair. |
 | `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret — see the storage model below. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
 | `hmac_mode` | String | NOT NULL, DEFAULT `'CANONICAL_V1'` | Signature verification scheme: `CANONICAL_V1` or `BODY_ONLY`. See the enumeration section below. |
 | `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. |
