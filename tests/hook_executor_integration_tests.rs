@@ -425,6 +425,259 @@ async fn require_signed_requests_makes_the_protocol_mandatory() {
 }
 
 #[tokio::test]
+async fn body_only_mode_accepts_github_style_webhook_signatures() {
+    use simply_hook_executor::entities::api_key::HmacMode;
+
+    let dir = ScriptDir::new();
+    let script = dir.write_script("gh.sh", "echo \"pushed:$HOOK_PARAM_REF\"");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_with_mode(&db, "Forgejo", "0.0.0.0/0", KeyScopes::plain(), HmacMode::BodyOnly).await;
+    let hook_id = insert_hook(&db, "on_push", &script, 30).await;
+    insert_parameter(&db, hook_id, "ref", Some("refs/heads/main"), true).await;
+    grant(&db, sender.id, hook_id, true, false).await;
+
+    let uri = "/webhook/on_push";
+    let body = json!({ "ref": "refs/heads/release" }).to_string();
+
+    // Both header spellings are honoured in this mode: GitHub and Forgejo send
+    // `X-Hub-Signature-256`, while other senders use `X-Signature-256`.
+    for header in ["X-Signature-256", "X-Hub-Signature-256"] {
+        let response = send(
+            &app,
+            body_only_request(uri, &sender.key_id, &sender.signing_secret, &body, header),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{header} should be accepted in BODY_ONLY mode");
+        assert_eq!(response.string("stdout").trim(), "pushed:refs/heads/release");
+    }
+
+    // No timestamp is required, and one supplied anyway is simply not part of the signed material.
+    let with_stray_timestamp = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", &sender.key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", "1")
+            .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    assert_eq!(send(&app, with_stray_timestamp).await.status, StatusCode::OK);
+
+    // A tampered body still fails, and so does the wrong secret.
+    let tampered = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", &sender.key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
+    )
+    .body(axum::body::Body::from(json!({ "ref": "refs/heads/evil" }).to_string()))
+    .expect("request builds");
+    assert_eq!(send(&app, tampered).await.status, StatusCode::UNAUTHORIZED);
+
+    let wrong_secret = body_only_request(uri, &sender.key_id, "not-the-secret", &body, "X-Hub-Signature-256");
+    assert_eq!(send(&app, wrong_secret).await.status, StatusCode::UNAUTHORIZED);
+
+    // A canonical-style signature is *not* valid for a BODY_ONLY key: the modes are distinct, not
+    // a fallback chain.
+    let canonical = signed_request("POST", uri, &sender.key_id, &sender.signing_secret, &body);
+    assert_eq!(send(&app, canonical).await.status, StatusCode::UNAUTHORIZED);
+
+    // A key id with no signature at all is still refused — BODY_ONLY relaxes the *format*, never
+    // the requirement.
+    let unsigned = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", &sender.key_id)
+            .header("Content-Type", "application/json"),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    let response = send(&app, unsigned).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("X-Hub-Signature-256"));
+}
+
+#[tokio::test]
+async fn canonical_mode_ignores_the_hub_signature_header() {
+    use simply_hook_executor::entities::api_key::HmacMode;
+
+    let dir = ScriptDir::new();
+    let script = dir.write_script("strict.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let strict = insert_key_with_mode(&db, "Strict", "0.0.0.0/0", KeyScopes::plain(), HmacMode::CanonicalV1).await;
+    let hook_id = insert_hook(&db, "strict_hook", &script, 30).await;
+    grant(&db, strict.id, hook_id, true, false).await;
+
+    let uri = "/webhook/strict_hook";
+    let body = json!({}).to_string();
+
+    // A CANONICAL_V1 key must not be downgradeable to body-only verification just by choosing the
+    // other header name — otherwise the per-key mode would be advisory rather than enforced.
+    let hub_only = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", &strict.key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Hub-Signature-256", sign_body_only(&strict.signing_secret, &body)),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    let response = send(&app, hub_only).await;
+    assert_eq!(
+        response.status,
+        StatusCode::UNAUTHORIZED,
+        "X-Hub-Signature-256 must be ignored for a CANONICAL_V1 key"
+    );
+    // It is treated as *no* signature at all, so the error is the missing-signature one.
+    assert!(response.string("error").contains("X-Signature-256"));
+
+    // A body-only signature sent under the correct header name is still wrong material here.
+    let body_only_sig = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", &strict.key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", now_timestamp().to_string())
+            .header("X-Signature-256", sign_body_only(&strict.signing_secret, &body)),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    assert_eq!(send(&app, body_only_sig).await.status, StatusCode::UNAUTHORIZED);
+
+    // The canonical signature works, confirming the key itself is fine.
+    let canonical = signed_request("POST", uri, &strict.key_id, &strict.signing_secret, &body);
+    assert_eq!(send(&app, canonical).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn hmac_mode_is_settable_through_the_api_and_defaults_to_canonical() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    // Omitted -> the strict default, never the relaxed one.
+    let defaulted = send(
+        &app,
+        json_request("POST", "/api/keys", &master, Some(json!({ "name": "defaulted", "bound_ips": "0.0.0.0/0" }))),
+    )
+    .await;
+    assert_eq!(defaulted.status, StatusCode::OK);
+    let defaulted_id = defaulted.string("id");
+
+    let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+    let rows = listed.json.as_array().cloned().unwrap_or_default();
+    let defaulted_row = rows.iter().find(|k| k["id"] == json!(defaulted_id)).expect("the key is listed");
+    assert_eq!(defaulted_row["hmac_mode"], json!("CANONICAL_V1"));
+
+    // Explicitly requested at creation.
+    let body_only = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "webhook_sender", "bound_ips": "0.0.0.0/0", "hmac_mode": "BODY_ONLY" })),
+        ),
+    )
+    .await;
+    assert_eq!(body_only.status, StatusCode::OK);
+    let body_only_id = body_only.string("id");
+
+    // Choosing the weaker mode is recorded in the audit trail, since it is a security decision.
+    let audit = send(&app, json_request("GET", "/api/audit-logs?action=KEY_CREATE&limit=5", &master, None)).await;
+    let details = audit.json.as_array().cloned().unwrap_or_default();
+    assert!(
+        details.iter().any(|e| e["details"].as_str().unwrap_or_default().contains("BODY_ONLY")
+            && e["details"].as_str().unwrap_or_default().contains("no replay protection")),
+        "creating a BODY_ONLY key must be audited as such: {details:?}"
+    );
+
+    // Switchable both ways through the update endpoint.
+    let switched = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{defaulted_id}"), &master, Some(json!({ "hmac_mode": "BODY_ONLY" }))),
+    )
+    .await;
+    assert_eq!(switched.status, StatusCode::OK);
+    assert_eq!(switched.field("hmac_mode"), &json!("BODY_ONLY"));
+
+    let back = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{body_only_id}"), &master, Some(json!({ "hmac_mode": "CANONICAL_V1" }))),
+    )
+    .await;
+    assert_eq!(back.status, StatusCode::OK);
+    assert_eq!(back.field("hmac_mode"), &json!("CANONICAL_V1"));
+
+    // Omitting the field on an update leaves the mode untouched.
+    let untouched = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{defaulted_id}"), &master, Some(json!({ "name": "renamed" }))),
+    )
+    .await;
+    assert_eq!(untouched.field("hmac_mode"), &json!("BODY_ONLY"));
+
+    // An unrecognized mode is rejected by deserialization rather than silently defaulting.
+    let invalid = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "bogus", "bound_ips": "0.0.0.0/0", "hmac_mode": "NO_SUCH_MODE" })),
+        ),
+    )
+    .await;
+    assert!(
+        invalid.status.is_client_error(),
+        "an unknown hmac_mode must not be accepted, got {}",
+        invalid.status
+    );
+
+    // The key's own identity endpoint reports its mode, which is what the SPA signs with.
+    let me = send(&app, json_request("GET", "/api/auth/me", &master, None)).await;
+    assert_eq!(me.field("hmac_mode"), &json!("CANONICAL_V1"));
+}
+
+#[tokio::test]
+async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
+    use sea_orm_migration::MigratorTrait;
+    use simply_hook_executor::{entities::api_key::HmacMode, migration::Migrator};
+
+    let db = sea_orm::Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory SQLite is available");
+
+    // Stop just before the hmac_mode migration: this is what a database from the previous release
+    // looks like.
+    Migrator::up(&db, Some(3)).await.expect("earlier migrations apply");
+    Migrator::up(&db, None).await.expect("the hmac_mode migration applies to an existing schema");
+
+    // An existing row must come out on the *strict* mode. Defaulting an upgrade to BODY_ONLY would
+    // silently strip replay protection from every deployed key.
+    let seeded = insert_key_full(&db, "Legacy", "0.0.0.0/0", KeyScopes::plain()).await;
+    let stored = simply_hook_executor::entities::prelude::ApiKey::find_by_id(seeded.id)
+        .one(&db)
+        .await
+        .expect("query succeeds")
+        .expect("the key exists");
+    assert_eq!(stored.hmac_mode, HmacMode::CanonicalV1);
+
+    Migrator::up(&db, None).await.expect("migrations are idempotent");
+}
+
+#[tokio::test]
 async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     use sea_orm::EntityTrait as _;
     use simply_hook_executor::{crypto::SecretCipher, entities::prelude::ApiKey};

@@ -7,6 +7,7 @@ use ipnetwork::IpNetwork;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 
+use crate::entities::api_key::HmacMode;
 use crate::entities::prelude::ApiKey;
 use crate::error::AppError;
 use crate::state::AppState;
@@ -17,6 +18,9 @@ const API_KEY_HEADER: &str = "X-API-Key";
 const KEY_ID_HEADER: &str = "X-Key-Id";
 /// Header carrying the `sha256=<hex>` request signature.
 const SIGNATURE_HEADER: &str = "X-Signature-256";
+/// Alternate signature header used by GitHub-style webhook senders. Accepted only in
+/// [`HmacMode::BodyOnly`], which is the mode that exists to accommodate them.
+const HUB_SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
 /// Header carrying the Unix-seconds timestamp a signature was computed at.
 const TIMESTAMP_HEADER: &str = "X-Timestamp";
 /// Largest request body that will be buffered in order to verify a signature. Signed payloads are
@@ -253,9 +257,16 @@ pub async fn auth_middleware(
     // Signature verification requires the raw body, which means buffering it and rebuilding the
     // request. That only happens when a signature is actually presented — unsigned requests keep
     // streaming through untouched.
+    // Which signature header applies depends on the key's mode: `X-Hub-Signature-256` is only
+    // honoured for BODY_ONLY keys, so a CANONICAL_V1 key cannot be downgraded to the weaker scheme
+    // simply by sending the other header name.
     let signature = headers
         .get(SIGNATURE_HEADER)
         .and_then(|h| h.to_str().ok())
+        .or_else(|| match key_record.hmac_mode {
+            HmacMode::BodyOnly => headers.get(HUB_SIGNATURE_HEADER).and_then(|h| h.to_str().ok()),
+            HmacMode::CanonicalV1 => None,
+        })
         .map(str::to_owned);
 
     // A signature is mandatory when the caller identified itself with a public key id (which is
@@ -264,19 +275,29 @@ pub async fn auth_middleware(
 
     let mut req = match signature {
         Some(signature) => {
-            let timestamp = headers
-                .get(TIMESTAMP_HEADER)
-                .and_then(|h| h.to_str().ok())
-                .ok_or_else(|| {
-                    AppError::Unauthorized(format!(
-                        "A signed request must include an {TIMESTAMP_HEADER} header"
-                    ))
-                })?
-                .to_owned();
+            // CANONICAL_V1 binds the timestamp into the signed material and enforces the replay
+            // window. BODY_ONLY signs the body alone, which is what GitHub-style senders produce —
+            // it cannot resist replay, and deliberately does not pretend to by demanding a
+            // timestamp it would not actually cover.
+            let timestamp = match key_record.hmac_mode {
+                HmacMode::CanonicalV1 => {
+                    let timestamp = headers
+                        .get(TIMESTAMP_HEADER)
+                        .and_then(|h| h.to_str().ok())
+                        .ok_or_else(|| {
+                            AppError::Unauthorized(format!(
+                                "A signed request must include an {TIMESTAMP_HEADER} header"
+                            ))
+                        })?
+                        .to_owned();
 
-            // Checked before the HMAC: a stale request is rejected without spending the work of
-            // recovering the secret and hashing the body.
-            verify_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
+                    // Checked before the HMAC: a stale request is rejected without spending the
+                    // work of recovering the secret and hashing the body.
+                    verify_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
+                    Some(timestamp)
+                }
+                HmacMode::BodyOnly => None,
+            };
 
             let secret = recover_signing_secret(&state, &key_record)?;
 
@@ -285,33 +306,44 @@ pub async fn auth_middleware(
                 .await
                 .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
 
-            // The signature covers the method and full request target as well as the timestamp and
-            // body, so a captured signature cannot be replayed against a different route — a signed
-            // `GET /api/hooks` cannot become a `DELETE /api/hooks/{id}`.
-            //
-            // `OriginalUri` is essential here, not a nicety: `Router::nest("/api", ..)` strips the
-            // prefix from the URI inner layers observe, so `parts.uri` would read `/hooks/x` while
-            // the client signed `/api/hooks/x`. Signing must use the target the client actually
-            // requested, which is exactly what `OriginalUri` preserves.
-            let original_uri = parts
-                .extensions
-                .get::<axum::extract::OriginalUri>()
-                .map(|original| &original.0)
-                .unwrap_or(&parts.uri);
-            let path_and_query = original_uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or_else(|| original_uri.path());
-            let base = signature_base(parts.method.as_str(), path_and_query, &timestamp, &bytes);
+            let base = match &timestamp {
+                Some(timestamp) => {
+                    // The signature covers the method and full request target as well as the
+                    // timestamp and body, so a captured signature cannot be replayed against a
+                    // different route — a signed `GET /api/hooks` cannot become a
+                    // `DELETE /api/hooks/{id}`.
+                    //
+                    // `OriginalUri` is essential here, not a nicety: `Router::nest("/api", ..)`
+                    // strips the prefix from the URI inner layers observe, so `parts.uri` would
+                    // read `/hooks/x` while the client signed `/api/hooks/x`. Signing must use the
+                    // target the client actually requested, which is what `OriginalUri` preserves.
+                    let original_uri = parts
+                        .extensions
+                        .get::<axum::extract::OriginalUri>()
+                        .map(|original| &original.0)
+                        .unwrap_or(&parts.uri);
+                    let path_and_query = original_uri
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or_else(|| original_uri.path());
+                    signature_base(parts.method.as_str(), path_and_query, timestamp, &bytes)
+                }
+                None => bytes.to_vec(),
+            };
 
             verify_signature(&signature, &secret, &base)?;
 
             Request::from_parts(parts, Body::from(bytes))
         }
         None if signature_required => {
-            return Err(AppError::Unauthorized(format!(
-                "This request must be signed: send {SIGNATURE_HEADER} and {TIMESTAMP_HEADER}"
-            )));
+            return Err(AppError::Unauthorized(match key_record.hmac_mode {
+                HmacMode::CanonicalV1 => format!(
+                    "This request must be signed: send {SIGNATURE_HEADER} and {TIMESTAMP_HEADER}"
+                ),
+                HmacMode::BodyOnly => format!(
+                    "This request must be signed: send {SIGNATURE_HEADER} or {HUB_SIGNATURE_HEADER}"
+                ),
+            }));
         }
         None => req,
     };

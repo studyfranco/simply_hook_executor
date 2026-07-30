@@ -4,6 +4,36 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// How a key's `X-Signature-256` is verified.
+///
+/// Stored as a plain string rather than a native database enum so the schema stays portable across
+/// SQLite/PostgreSQL/MySQL without vendor-specific DDL.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumIter, DeriveActiveEnum, Serialize, Deserialize,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HmacMode {
+    /// Signature covers `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY`, with a mandatory
+    /// `X-Timestamp` inside the anti-replay window.
+    ///
+    /// The default, and the only mode that resists replay: because the timestamp is *inside* the
+    /// signed material, a captured request cannot be re-dated, and because the method and target
+    /// are too, it cannot be aimed at a different route.
+    #[default]
+    #[sea_orm(string_value = "CANONICAL_V1")]
+    CanonicalV1,
+    /// Signature covers the raw body only, accepted from either `X-Signature-256` or
+    /// `X-Hub-Signature-256`, with no timestamp required.
+    ///
+    /// This is the GitHub/Forgejo/GitLab webhook convention, and exists solely for compatibility
+    /// with senders whose signature format cannot be changed. It provides **no replay protection**
+    /// — an intercepted request stays valid forever — so it must be opted into per key, and only
+    /// for keys scoped to the hooks that third party is meant to trigger.
+    #[sea_orm(string_value = "BODY_ONLY")]
+    BodyOnly,
+}
+
 /// A single API key: its identity, global RBAC scopes, execution budget, and network binding rule.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "api_keys")]
@@ -31,6 +61,8 @@ pub struct Model {
     /// server exactly once, in the creation/rotation response, and only as plaintext.
     #[sea_orm(column_type = "Text", nullable)]
     pub signing_secret: Option<String>,
+    /// Which signature scheme this key's requests are verified under. See [`HmacMode`].
+    pub hmac_mode: HmacMode,
     /// Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`). An empty
     /// value means no CIDR restriction is enforced.
     pub bound_ips: Option<String>,

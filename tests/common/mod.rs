@@ -16,7 +16,7 @@ use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
     config::RuntimeConfig,
     crypto::SecretCipher,
-    entities::{api_key, api_key_hook_permission, execution, hook, hook_parameter},
+    entities::{api_key, api_key::HmacMode, api_key_hook_permission, execution, hook, hook_parameter},
     migration,
     state::AppState,
 };
@@ -158,6 +158,17 @@ pub async fn insert_key_full(
     bound_ips: &str,
     scopes: KeyScopes,
 ) -> SeededKey {
+    insert_key_with_mode(db, name, bound_ips, scopes, HmacMode::CanonicalV1).await
+}
+
+/// Inserts an API key pinned to a specific signature verification mode.
+pub async fn insert_key_with_mode(
+    db: &DatabaseConnection,
+    name: &str,
+    bound_ips: &str,
+    scopes: KeyScopes,
+    hmac_mode: HmacMode,
+) -> SeededKey {
     let id = Uuid::new_v4();
     let plaintext = simply_hook_executor::api::generate_random_key();
     let key_id = simply_hook_executor::api::generate_key_id();
@@ -175,6 +186,7 @@ pub async fn insert_key_full(
                 .seal(&signing_secret)
                 .expect("sealing a test secret succeeds"),
         )),
+        hmac_mode: Set(hmac_mode),
         bound_ips: Set(Some(bound_ips.to_owned())),
         max_concurrent_jobs: Set(scopes.max_concurrent_jobs.max(1)),
         is_master: Set(scopes.is_master),
@@ -228,6 +240,36 @@ pub fn signed_request_at(
             .header("Content-Type", "application/json")
             .header("X-Timestamp", timestamp.to_string())
             .header("X-Signature-256", sign_request(signing_secret, method, uri, timestamp, body)),
+    )
+    .body(Body::from(body.to_owned()))
+    .expect("request builds")
+}
+
+/// Computes a BODY_ONLY signature: HMAC over the raw body alone, with no canonical prefix.
+pub fn sign_body_only(signing_secret: &str, body: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(body.as_bytes());
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Builds a request signed the way a GitHub/Forgejo webhook would: body-only signature, no
+/// timestamp, and a configurable signature header name.
+pub fn body_only_request(
+    uri: &str,
+    key_id: &str,
+    signing_secret: &str,
+    body: &str,
+    header_name: &str,
+) -> Request<Body> {
+    with_connect_info(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", key_id)
+            .header("Content-Type", "application/json")
+            .header(header_name, sign_body_only(signing_secret, body)),
     )
     .body(Body::from(body.to_owned()))
     .expect("request builds")

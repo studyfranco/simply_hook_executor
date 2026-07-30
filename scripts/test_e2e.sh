@@ -1486,6 +1486,116 @@ check "403" "...but still cannot modify the hook"
 api_call DELETE "/api/hooks/$TL_HOOK_ID" "$NOACCESS_KEY"
 check "403" "...nor delete it"
 
+# ── 24. Per-key HMAC modes (CANONICAL_V1 vs BODY_ONLY) ──────────────────────
+
+log_section "24. Per-Key HMAC Modes"
+
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    GH_SCRIPT=$(make_hook_script "gh_push.sh" 'echo "pushed:${HOOK_PARAM_REF}"')
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"on_push\",\"script_path\":\"$GH_SCRIPT\",\"parameters\":[{\"param_key\":\"ref\",\"default_value\":\"refs/heads/main\",\"is_required\":true}]}"
+    check "200" "create a hook for third-party push webhooks"
+    GH_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    # A key created without hmac_mode must default to the strict scheme.
+    create_scoped_key "Default Mode Key"
+    check_jq ".key_id | startswith(\"shk_\")" "true" "the new key has a key id"
+    DEFAULT_MODE_ID="$CREATED_ID"
+    api_call GET "/api/keys" "$MASTER_KEY"
+    check "200" "list keys to inspect modes"
+    check_true "[.[] | select(.id == \"$DEFAULT_MODE_ID\") | .hmac_mode == \"CANONICAL_V1\"] | all" \
+        "an omitted hmac_mode defaults to CANONICAL_V1"
+
+    # A key explicitly created in BODY_ONLY mode.
+    create_scoped_key "Forgejo Webhook Key" ',"hmac_mode":"BODY_ONLY"'
+    GH_KEY="$CREATED_KEY"; GH_KEY_ID_VAL="$CREATED_KEY_ID"; GH_SECRET="$CREATED_SIGNING_SECRET"; GH_ID="$CREATED_ID"
+
+    api_call GET "/api/keys" "$MASTER_KEY"
+    check "200" "list keys again"
+    check_true "[.[] | select(.id == \"$GH_ID\") | .hmac_mode == \"BODY_ONLY\"] | all" \
+        "the requested BODY_ONLY mode is stored and reported"
+
+    api_call POST "/api/keys/$GH_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$GH_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+    check "200" "grant the webhook key execute rights on the hook"
+
+    # Body-only signature, exactly as GitHub/Forgejo compute it: HMAC over the raw body, nothing else.
+    GH_BODY='{"ref":"refs/heads/release"}'
+    GH_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "$GH_SECRET" -r | cut -d' ' -f1)
+
+    # X-Hub-Signature-256 is the header GitHub and Forgejo actually send.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$GH_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "a GitHub-style X-Hub-Signature-256 body-only signature is accepted"
+    check_jq ".stdout | rtrimstr(\"\n\")" "pushed:refs/heads/release" "the third-party webhook executed"
+
+    # The same signature under the other accepted header name.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-Signature-256: sha256=$GH_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "X-Signature-256 is accepted in BODY_ONLY mode too"
+
+    # No X-Timestamp is required in this mode — that is the whole point of it.
+    check_true '.status == "SUCCESS"' "the body-only request needed no timestamp"
+
+    # Tampering with the body still fails.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$GH_SIG" -d '{"ref":"refs/heads/evil"}' "$BASE_URL/webhook/on_push")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a body-only signature over an altered body is rejected"
+
+    # ...as does the wrong secret.
+    BAD_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "not-the-secret" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$BAD_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a body-only signature made with the wrong secret is rejected"
+
+    # ...and so does no signature at all: BODY_ONLY relaxes the format, never the requirement.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $GH_KEY_ID_VAL" -H "Content-Type: application/json" \
+        -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a BODY_ONLY key still requires a signature"
+
+    # A CANONICAL_V1 key must NOT be downgradeable by sending the hub header instead.
+    api_call POST "/api/keys/$EXEC_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$GH_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+    check "200" "grant the canonical-mode key rights on the same hook"
+    STRICT_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "$EXEC_SIGNING_SECRET" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-Key-Id: $EXEC_KEY_ID" -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$STRICT_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a CANONICAL_V1 key cannot be downgraded via X-Hub-Signature-256"
+
+    # Mode is switchable after the fact, and the switch is audited.
+    api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"BODY_ONLY"}'
+    check "200" "switch a key to BODY_ONLY"
+    check_jq ".hmac_mode" "BODY_ONLY" "the new mode is returned"
+    api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"CANONICAL_V1"}'
+    check "200" "switch it back to CANONICAL_V1"
+    check_jq ".hmac_mode" "CANONICAL_V1" "the strict mode is restored"
+
+    api_call GET "/api/audit-logs?action=KEY_CREATE&limit=20" "$MASTER_KEY"
+    check "200" "fetch key-creation audit entries"
+    check_true '[.[] | select(.target_resource == "Forgejo Webhook Key") | .details | test("BODY_ONLY.*no replay protection")] | length == 1' \
+        "choosing BODY_ONLY is audited as removing replay protection"
+
+    # An unknown variant is refused by deserialization before the handler runs, so this is Axum's
+    # own 422 with a plain-text body — not the JSON `{"error": ...}` shape our handlers emit.
+    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"bogus_mode","bound_ips":"0.0.0.0/0","hmac_mode":"NO_SUCH_MODE"}'
+    check "422" "an unrecognized hmac_mode is rejected rather than silently defaulted"
+
+    api_call GET "/api/keys" "$MASTER_KEY"
+    check "200" "list keys after the rejected creation"
+    check_true '[.[] | select(.name == "bogus_mode")] | length == 0' "no key was created with an invalid mode"
+else
+    warn "Skipping §24: openssl is not available to compute body-only signatures."
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

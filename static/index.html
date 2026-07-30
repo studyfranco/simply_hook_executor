@@ -258,6 +258,18 @@
                                 <input type="number" id="apikey-max-jobs" value="10" min="1" max="1000" required class="input-field">
                             </div>
                             <div class="form-group col-span-2">
+                                <label for="apikey-hmac-mode">Signature Mode</label>
+                                <select id="apikey-hmac-mode" class="input-field select-field">
+                                    <option value="CANONICAL_V1" selected>CANONICAL_V1 — method + path + timestamp + body (anti-replay)</option>
+                                    <option value="BODY_ONLY">BODY_ONLY — body only, for GitHub/Forgejo/GitLab senders</option>
+                                </select>
+                                <span class="text-muted text-sm">
+                                    <code>BODY_ONLY</code> also accepts <code>X-Hub-Signature-256</code> and needs no
+                                    <code>X-Timestamp</code> — but it has <strong>no replay protection</strong>. Use it only for
+                                    third-party senders whose signature format you cannot change.
+                                </span>
+                            </div>
+                            <div class="form-group col-span-2">
                                 <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
                                 <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
                             </div>
@@ -298,6 +310,7 @@
                                     <th><input type="checkbox" id="select-all-keys" title="Select all"></th>
                                     <th>Name</th>
                                     <th>Key ID</th>
+                                    <th>Mode</th>
                                     <th>Bound IPs</th>
                                     <th>Jobs</th>
                                     <th>Scopes &amp; Hook Permissions</th>
@@ -306,7 +319,7 @@
                             </thead>
                             <tbody id="apikeys-table-body">
                                 <tr>
-                                    <td colspan="7" class="text-center text-muted">No API keys loaded.</td>
+                                    <td colspan="8" class="text-center text-muted">No API keys loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -525,6 +538,13 @@
                 <div class="form-group">
                     <label for="edit-key-max-jobs">Max Concurrent Jobs</label>
                     <input type="number" id="edit-key-max-jobs" min="1" max="1000" class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-key-hmac-mode">Signature Mode</label>
+                    <select id="edit-key-hmac-mode" class="input-field select-field">
+                        <option value="CANONICAL_V1">CANONICAL_V1 (anti-replay)</option>
+                        <option value="BODY_ONLY">BODY_ONLY (no replay protection)</option>
+                    </select>
                 </div>
                 <div class="permissions-grid mt-2 mb-4">
                     <label class="checkbox-container">

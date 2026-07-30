@@ -766,3 +766,96 @@ Verified with six consecutive runs of the isolated test and three of the full su
 combination, by construction: the browser will not expose `crypto.subtle` outside a secure context,
 so the SPA cannot sign. Terminate TLS in front of the daemon (the unit file already recommends a
 reverse proxy) before enabling mandatory signing. Non-browser clients are unaffected.
+
+
+---
+
+## 2026-07-30 (later) — Per-key HMAC modes, pure-JS crypto fallback, spec lock
+
+### Per-key `hmac_mode`
+
+`api_keys.hmac_mode` (`CANONICAL_V1` | `BODY_ONLY`) selects how a key's signatures are verified.
+`BODY_ONLY` exists for one reason: GitHub, Forgejo and GitLab compute HMAC over the raw body alone
+and send it as `X-Hub-Signature-256`, and their format cannot be changed. Four decisions shape it:
+
+1. **The default is the strict mode, everywhere.** The column is `NOT NULL DEFAULT 'CANONICAL_V1'`,
+   which every supported backend applies to existing rows during the `ALTER TABLE` — so the upgrade
+   backfills correctly with no separate `UPDATE` pass and, critically, cannot silently strip replay
+   protection from a deployed key. A test stops before this migration, applies it, and asserts the
+   resulting mode.
+2. **`X-Hub-Signature-256` is honoured only in `BODY_ONLY`.** Accepting it unconditionally would let
+   anyone downgrade a strict key to body-only verification by choosing a different header name,
+   making the per-key setting advisory rather than enforced. For a `CANONICAL_V1` key the header is
+   not merely rejected — it is not read at all, so such a request is treated as *unsigned*.
+3. **`BODY_ONLY` relaxes the format, never the requirement.** A key-id request with no signature is
+   still `401`; the mode changes what is signed, not whether.
+4. **It is audited as a security decision.** Creating or switching to `BODY_ONLY` writes
+   "BODY_ONLY — body-only, no replay protection" into the audit trail, and the UI badges it in the
+   warning colour. Someone reviewing keys later should not have to know what the value implies.
+
+### Pure-JS HMAC-SHA256 fallback
+
+`crypto.subtle` only exists in a secure context, so a dashboard on a plain-HTTP LAN address could
+not sign at all. AGENT.MD forbids external dependencies, so `PureCrypto` is a self-contained
+FIPS 180-4 SHA-256 plus RFC 2104 HMAC embedded in `app.js`.
+
+**Hand-written crypto needs verification, not confidence.** There is no JS runtime in this
+environment, so it was validated three ways:
+
+- The `K` and `H0` tables were parsed **out of the shipped `app.js`** and checked against the cube
+  and square roots of the first 64/8 primes derived from first principles — that validates the
+  actual artifact, not a copy of it.
+- The round logic was transliterated to Python and checked against `hashlib` on nine SHA-256 vectors
+  chosen to straddle every padding boundary (55/56/63/64/65 bytes, plus multi-block), and against
+  four RFC 4231 HMAC vectors including the longer-than-block-size key path.
+- `PureCrypto.selfTest()` runs **in the browser** before the fallback is ever trusted, reproducing
+  RFC 4231 case 2. If it fails, the signer reports itself unavailable and logs loudly rather than
+  emitting wrong signatures — a broken hash would otherwise surface as an inexplicable stream of
+  401s. The vector embedded in `app.js` was itself checked against `hmac`/`hashlib`.
+
+`crypto.subtle` remains preferred wherever it exists (native, and the imported key is
+non-extractable); the pure path is strictly the insecure-context fallback. The SPA also adopts the
+key's server-reported `hmac_mode` from `/auth/me`, so a `BODY_ONLY` key signs the body alone rather
+than a canonical string the server would not verify.
+
+### Specification lock
+
+- **`SCHEMA.MD`**: `hmac_mode` added to the `api_keys` table with a full `HmacMode` enumeration
+  section (signed material, accepted headers, timestamp requirement, replay protection per mode).
+  `signing_secret`, `run_as_user` and derived `can_read` were already documented and were verified
+  against the code rather than re-asserted.
+- **`AGENT.MD`**: the `hmac_mode` table and its four invariants, plus the exact `sudo` invocation
+  (`/usr/bin/sudo -n -u <user> --`) with the reasoning for each element — hard-coded path, `-n`,
+  the mandatory `--` placement, username validation, master-only assignment, and the `env_keep`
+  caveat.
+
+While locking the schema I found and fixed a **markdown defect I had introduced earlier**: the
+`signing_secret` storage-model prose had been inserted *inside* the `api_keys` table, orphaning
+`bound_ips` and everything after it into a second, header-less table. The prose now follows the
+complete table, and a checker validates that no blank line splits any table in either document.
+
+### Test coverage
+
+Unit 47, integration 51 → 55, E2E 342 → 369.
+
+New integration tests: body-only acceptance under both header spellings; a stray `X-Timestamp`
+being ignored rather than verified; tampered body and wrong secret still rejected; a canonical
+signature refused for a `BODY_ONLY` key and vice versa; `X-Hub-Signature-256` ignored for a
+`CANONICAL_V1` key; mode settable at creation and switchable both ways, defaulting to strict;
+unknown variants refused at deserialization; and the migration defaulting existing rows.
+
+E2E §24 mirrors this black-box, including a real Forgejo-shaped `X-Hub-Signature-256` invocation
+and the downgrade-resistance check.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 47 unit + 55 integration tests pass.
+- `./scripts/test_e2e.sh` — 369/369 checks pass.
+
+### Standing caveat
+
+`BODY_ONLY` has no replay protection — that is inherent to the scheme, not an implementation gap.
+A captured request stays valid indefinitely. Keys on that mode should be scoped to exactly the hooks
+the third-party sender is meant to trigger, and nothing else.

@@ -188,6 +188,140 @@ class PagedCache {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Pure-JS HMAC-SHA256 fallback (FIPS 180-4 SHA-256 + RFC 2104 HMAC)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Web Crypto's `crypto.subtle` is only exposed in a secure context (HTTPS or localhost). A
+// dashboard reached over plain HTTP on a LAN address therefore cannot use it at all. Rather than
+// silently dropping to unsigned requests — or pulling in a CDN dependency, which AGENT.MD forbids
+// outright — this is a self-contained implementation used only when `crypto.subtle` is absent.
+//
+// It is deliberately written against the specification's own structure so it can be checked line
+// by line, and `PureCrypto.selfTest()` verifies it against an RFC 4231 vector before it is ever
+// trusted with a real request.
+const PureCrypto = (() => {
+    // First 32 bits of the fractional parts of the cube roots of the first 64 primes.
+    const K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+
+    // First 32 bits of the fractional parts of the square roots of the first 8 primes.
+    const H0 = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    ];
+
+    // `>>> 0` after every arithmetic step: JS numbers are doubles, and without it intermediate
+    // sums exceed 2^32 and lose the wrap-around the algorithm depends on.
+    const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+    // SHA-256 over a byte array, returning 32 bytes.
+    function sha256(bytes) {
+        const length = bytes.length;
+        // Padding: 0x80, then zeros, then the 64-bit big-endian bit length.
+        const withPadding = new Uint8Array((((length + 8) >> 6) + 1) << 6);
+        withPadding.set(bytes);
+        withPadding[length] = 0x80;
+
+        // Bit length as a 64-bit big-endian value. The high word is computed by division rather
+        // than a shift, because `<<` in JS is 32-bit and would silently truncate.
+        const bitLength = length * 8;
+        const view = new DataView(withPadding.buffer);
+        view.setUint32(withPadding.length - 8, Math.floor(bitLength / 0x100000000), false);
+        view.setUint32(withPadding.length - 4, bitLength >>> 0, false);
+
+        const h = H0.slice();
+        const w = new Uint32Array(64);
+
+        for (let offset = 0; offset < withPadding.length; offset += 64) {
+            for (let i = 0; i < 16; i++) {
+                w[i] = view.getUint32(offset + i * 4, false);
+            }
+            for (let i = 16; i < 64; i++) {
+                const s0 = (rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0;
+                const s1 = (rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0;
+                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+            }
+
+            let [a, b, c, d, e, f, g, hh] = h;
+
+            for (let i = 0; i < 64; i++) {
+                const S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+                const ch = ((e & f) ^ (~e & g)) >>> 0;
+                const temp1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
+                const S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+                const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+                const temp2 = (S0 + maj) >>> 0;
+
+                hh = g;
+                g = f;
+                f = e;
+                e = (d + temp1) >>> 0;
+                d = c;
+                c = b;
+                b = a;
+                a = (temp1 + temp2) >>> 0;
+            }
+
+            h[0] = (h[0] + a) >>> 0;
+            h[1] = (h[1] + b) >>> 0;
+            h[2] = (h[2] + c) >>> 0;
+            h[3] = (h[3] + d) >>> 0;
+            h[4] = (h[4] + e) >>> 0;
+            h[5] = (h[5] + f) >>> 0;
+            h[6] = (h[6] + g) >>> 0;
+            h[7] = (h[7] + hh) >>> 0;
+        }
+
+        const out = new Uint8Array(32);
+        const outView = new DataView(out.buffer);
+        h.forEach((word, i) => outView.setUint32(i * 4, word, false));
+        return out;
+    }
+
+    // RFC 2104 HMAC-SHA256. Block size is 64 bytes; a key longer than that is hashed first, and a
+    // shorter one is zero-padded.
+    function hmacSha256(keyBytes, messageBytes) {
+        const BLOCK = 64;
+        let key = keyBytes;
+        if (key.length > BLOCK) key = sha256(key);
+
+        const padded = new Uint8Array(BLOCK);
+        padded.set(key);
+
+        const inner = new Uint8Array(BLOCK + messageBytes.length);
+        const outer = new Uint8Array(BLOCK + 32);
+        for (let i = 0; i < BLOCK; i++) {
+            inner[i] = padded[i] ^ 0x36;
+            outer[i] = padded[i] ^ 0x5c;
+        }
+        inner.set(messageBytes, BLOCK);
+        outer.set(sha256(inner), BLOCK);
+
+        return sha256(outer);
+    }
+
+    const toHex = bytes => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // RFC 4231 test case 2 ("Jefe" / "what do ya want for nothing?"). Chosen because its key is
+    // shorter than the block size and its message spans a padding boundary, so a mistake in either
+    // the padding or the ipad/opad construction shows up here.
+    function selfTest() {
+        const enc = new TextEncoder();
+        const digest = toHex(hmacSha256(enc.encode('Jefe'), enc.encode('what do ya want for nothing?')));
+        return digest === '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843';
+    }
+
+    return { sha256, hmacSha256, toHex, selfTest };
+})();
+
 // Signs a request the way the backend expects: HMAC-SHA256 over the canonical string
 //
 //     METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY
@@ -200,13 +334,40 @@ class PagedCache {
 // return as "signing unavailable" and fall back to bearer-only auth rather than sending a
 // half-formed signature.
 class RequestSigner {
-    constructor(signingSecret) {
+    constructor(signingSecret, hmacMode = 'CANONICAL_V1') {
         this.signingSecret = signingSecret || '';
+        this.hmacMode = hmacMode;
         this.cryptoKey = null;
+        // Memoized once: 'subtle' | 'pure' | 'none'.
+        this._backend = null;
+    }
+
+    // Which implementation will actually be used. `crypto.subtle` is preferred wherever it exists
+    // (native, constant-time, non-extractable key); the pure-JS path is the plain-HTTP fallback and
+    // is only trusted after it reproduces a known RFC 4231 digest — a subtly broken hash would
+    // otherwise show up as an inexplicable stream of 401s.
+    get backend() {
+        if (this._backend === null) {
+            if (!this.signingSecret) {
+                this._backend = 'none';
+            } else if (globalThis.crypto?.subtle) {
+                this._backend = 'subtle';
+            } else if (PureCrypto.selfTest()) {
+                console.info(
+                    'Web Crypto is unavailable (insecure context); using the built-in pure-JS ' +
+                    'HMAC-SHA256 implementation, which passed its RFC 4231 self-test.'
+                );
+                this._backend = 'pure';
+            } else {
+                console.error('Pure-JS HMAC self-test FAILED; refusing to sign with it.');
+                this._backend = 'none';
+            }
+        }
+        return this._backend;
     }
 
     get available() {
-        return Boolean(this.signingSecret) && Boolean(globalThis.crypto?.subtle);
+        return this.backend !== 'none';
     }
 
     // Imports the secret once and caches the non-extractable CryptoKey.
@@ -223,23 +384,37 @@ class RequestSigner {
         return this.cryptoKey;
     }
 
-    // Returns { 'X-Timestamp', 'X-Signature-256' }, or null when signing is unavailable.
+    // Hex HMAC-SHA256 of `message` under the signing secret, via whichever backend is active.
+    async digest(message) {
+        const enc = new TextEncoder();
+        if (this.backend === 'subtle') {
+            const signature = await crypto.subtle.sign('HMAC', await this.key(), enc.encode(message));
+            return [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+        return PureCrypto.toHex(
+            PureCrypto.hmacSha256(enc.encode(this.signingSecret), enc.encode(message))
+        );
+    }
+
+    // Returns the signature headers for a request, or null when signing is unavailable.
+    //
+    // The signed material depends on the key's own `hmac_mode`, mirroring the backend exactly:
+    // CANONICAL_V1 signs METHOD/PATH/TIMESTAMP/BODY and sends X-Timestamp; BODY_ONLY signs the raw
+    // body alone and sends no timestamp, because none would be covered by that signature.
     async headers(method, pathAndQuery, body) {
         if (!this.available) return null;
 
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${body ?? ''}`;
-
+        const payload = body ?? '';
         try {
-            const signature = await crypto.subtle.sign(
-                'HMAC',
-                await this.key(),
-                new TextEncoder().encode(canonical)
-            );
-            const hex = [...new Uint8Array(signature)]
-                .map(b => b.toString(16).padStart(2, '0'))
-                .join('');
-            return { 'X-Timestamp': timestamp, 'X-Signature-256': `sha256=${hex}` };
+            if (this.hmacMode === 'BODY_ONLY') {
+                return { 'X-Signature-256': `sha256=${await this.digest(payload)}` };
+            }
+            const timestamp = Math.floor(Date.now() / 1000).toString();
+            const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${payload}`;
+            return {
+                'X-Timestamp': timestamp,
+                'X-Signature-256': `sha256=${await this.digest(canonical)}`
+            };
         } catch (e) {
             // Never fall through to an unsigned request silently under a wrong assumption; the
             // caller decides, and the console records why.
@@ -382,6 +557,11 @@ class HookExecutorClient {
     async verifyAuth() {
         try {
             this.state.profile = await this.apiFetch('/auth/me');
+            // The server is authoritative about how this key's signatures are verified, so adopt
+            // its mode rather than assuming CANONICAL_V1. A BODY_ONLY key signs the body alone.
+            if (this.state.profile.hmac_mode && this.state.profile.hmac_mode !== this.signer.hmacMode) {
+                this.signer = new RequestSigner(this.signer.signingSecret, this.state.profile.hmac_mode);
+            }
             this.showDashboard();
             this.enforceRBACUI();
             this.loadInitialData();
@@ -398,10 +578,10 @@ class HookExecutorClient {
         if (signingSecret) {
             localStorage.setItem('simply_hook_executor_signing_secret', signingSecret);
             if (!this.signer.available) {
-                // crypto.subtle only exists in a secure context. Say so plainly instead of letting
-                // every request quietly go out unsigned.
+                // Both backends are out: no secure context *and* the pure-JS fallback failed its
+                // self-test. Say so plainly instead of letting every request quietly go unsigned.
                 this.showToast(
-                    'Signing unavailable: the Web Crypto API needs HTTPS (or localhost). Requests will use the API key only.',
+                    'Signing unavailable: no Web Crypto and the built-in fallback failed its self-test. Requests will use the API key only.',
                     'error'
                 );
             }
@@ -1254,7 +1434,7 @@ class HookExecutorClient {
     renderKeysTable() {
         const tbody = document.getElementById('apikeys-table-body');
         if (this.state.apiKeys.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No API keys.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No API keys.</td></tr>';
         } else {
             tbody.innerHTML = this.state.apiKeys.map(k => `
                 <tr>
@@ -1264,6 +1444,7 @@ class HookExecutorClient {
                         ${k.key_id ? escapeHtml(k.key_id) : '<span class="text-muted">none — rotate to mint</span>'}
                         ${k.key_id && !k.has_signing_secret ? '<div class="text-muted text-sm">no signing secret</div>' : ''}
                     </td>
+                    <td>${this.hmacModeBadge(k.hmac_mode)}</td>
                     <td class="font-mono text-sm">${escapeHtml(k.bound_ips || '-')}</td>
                     <td class="text-sm">${k.max_concurrent_jobs}</td>
                     <td>${this.renderKeyScopes(k)}</td>
@@ -1284,6 +1465,15 @@ class HookExecutorClient {
             selectedSet: this.state.selectedKeyIds,
             onDeleteSelected: () => this.batchDeleteKeys()
         });
+    }
+
+    // BODY_ONLY is visually flagged: it is the mode without replay protection, and an operator
+    // scanning the key list should be able to see at a glance which keys are on it.
+    hmacModeBadge(mode) {
+        if (mode === 'BODY_ONLY') {
+            return '<span class="badge badge-timeout" title="Body-only signatures: no replay protection">BODY_ONLY</span>';
+        }
+        return '<span class="badge badge-scope" title="Signs method + path + timestamp + body">CANONICAL_V1</span>';
     }
 
     // Global scope badges plus per-hook permission badges, each carrying a "×" to revoke that
@@ -1323,6 +1513,7 @@ class HookExecutorClient {
             name: document.getElementById('apikey-name').value,
             bound_ips: document.getElementById('apikey-bound-ips').value,
             max_concurrent_jobs: parseInt(document.getElementById('apikey-max-jobs').value, 10),
+            hmac_mode: document.getElementById('apikey-hmac-mode').value,
             is_master: document.getElementById('apikey-is-master').checked,
             can_manage_keys: document.getElementById('apikey-can-manage-keys').checked,
             can_manage_hooks: document.getElementById('apikey-can-manage-hooks').checked
@@ -1333,6 +1524,7 @@ class HookExecutorClient {
             this.revealCredentials('API Key Created', res);
             document.getElementById('form-create-apikey').reset();
             document.getElementById('apikey-max-jobs').value = 10;
+            document.getElementById('apikey-hmac-mode').value = 'CANONICAL_V1';
             this.loadKeys();
         } catch (err) {}
     }
@@ -1404,6 +1596,7 @@ class HookExecutorClient {
         document.getElementById('edit-key-name').value = k.name;
         document.getElementById('edit-key-bound-ips').value = k.bound_ips || '';
         document.getElementById('edit-key-max-jobs').value = k.max_concurrent_jobs;
+        document.getElementById('edit-key-hmac-mode').value = k.hmac_mode || 'CANONICAL_V1';
         document.getElementById('edit-key-can-manage-keys').checked = k.can_manage_keys;
         document.getElementById('edit-key-can-manage-hooks').checked = k.can_manage_hooks;
         document.getElementById('edit-key-modal').classList.remove('hidden');
@@ -1416,6 +1609,7 @@ class HookExecutorClient {
             name: document.getElementById('edit-key-name').value,
             bound_ips: document.getElementById('edit-key-bound-ips').value,
             max_concurrent_jobs: parseInt(document.getElementById('edit-key-max-jobs').value, 10),
+            hmac_mode: document.getElementById('edit-key-hmac-mode').value,
             can_manage_keys: document.getElementById('edit-key-can-manage-keys').checked,
             can_manage_hooks: document.getElementById('edit-key-can-manage-hooks').checked
         };

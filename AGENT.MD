@@ -43,7 +43,16 @@ To keep this context clean and modular, responsibilities are split across three 
 
 #### HMAC Signature Protocol
 
-Signatures are HMAC-SHA256, keyed on the API key's `signing_secret` (**never** the bearer key), over a canonical string built from four newline-delimited components:
+Each API key carries an `hmac_mode` selecting how its signatures are verified:
+
+| Mode | Signed material | Headers | Replay protection |
+| :--- | :--- | :--- | :--- |
+| `CANONICAL_V1` *(default)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` | `X-Signature-256` + `X-Timestamp` | yes (300s window) |
+| `BODY_ONLY` | `RAW_BODY` only | `X-Signature-256` **or** `X-Hub-Signature-256`, no timestamp | **none** |
+
+`BODY_ONLY` exists only to accept GitHub/Forgejo/GitLab-style webhooks whose format cannot be changed. It MUST remain opt-in per key, `X-Hub-Signature-256` MUST be ignored for `CANONICAL_V1` keys (so the stricter mode cannot be downgraded by header choice), and it MUST still require *a* signature — it relaxes the format, never the requirement.
+
+The rest of this section describes `CANONICAL_V1`. Signatures are HMAC-SHA256, keyed on the API key's `signing_secret` (**never** the bearer key), over a canonical string built from four newline-delimited components:
 
 ```text
 <METHOD>\n<PATH_AND_QUERY>\n<TIMESTAMP>\n<RAW_BODY>
@@ -98,6 +107,19 @@ Listing endpoints narrow by these rules rather than rejecting: `GET /api/hooks` 
 ### 3. Safe Script Execution Engine
 
 - **Strict Injection Prevention:** NEVER evaluate commands inside a shell string (e.g., `sh -c "script.sh $VAR"` is FORBIDDEN). Always use `tokio::process::Command::new(script_path).args(arg_list)`.
+- **Privileged execution (`hooks.run_as_user`):** when set, the command becomes exactly:
+
+  ```text
+  /usr/bin/sudo -n -u <run_as_user> -- <script_path> <param1> <param2> ...
+  ```
+
+  - `/usr/bin/sudo` is **hard-coded**, never resolved through `PATH` — `PATH` is an operator-configurable passthrough, and an elevation path that followed it would be an escalation vector.
+  - `-n` keeps sudo non-interactive, so a missing `NOPASSWD` rule fails immediately instead of blocking on a prompt nothing can answer until the hook's timeout kills it.
+  - `--` is **mandatory** and must sit immediately before the script path, so a script path or parameter beginning with `-` is passed as data rather than absorbed as a sudo option.
+  - `run_as_user` MUST be validated against the POSIX-portable username shape (`[A-Za-z_][A-Za-z0-9_-]*`, optional trailing `$`, max 32 chars), which makes an option-shaped value such as `-i` unrepresentable rather than relying on sudo to be defensive.
+  - Assigning a non-empty `run_as_user` is **master-only**, checked before any field validation (see the permission matrix above).
+  - This field *requests* elevation; `sudoers` remains the sole authority over whether it is granted.
+  - **Environment caveat:** `env_clear()` and `HOOK_PARAM_*` injection are applied to the `sudo` process identically to a direct spawn, but sudo's own `env_reset` strips them before `execve`. Positional parameters always survive; preserving the variables additionally requires `Defaults:<user> env_keep += "HOOK_PARAM_*"` in sudoers.
 - **Environment Variable Isolation & Controlled Inheritance:**
   - By default, clear all inherited environment variables using `.env_clear()`.
   - Preserve only essential system variables defined in a global passthrough whitelist (configurable via `ALLOWED_ENV_VARS`, defaulting to `PATH,LANG,TERM,SYSTEMROOT`).

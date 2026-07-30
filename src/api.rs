@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::entities::{
-    api_key, api_key_hook_permission, audit_log, execution, execution::ExecutionStatus, hook,
-    hook_parameter, prelude::*,
+    api_key, api_key::HmacMode, api_key_hook_permission, audit_log, execution,
+    execution::ExecutionStatus, hook, hook_parameter, prelude::*,
 };
 use crate::crypto::SecretCipher;
 use crate::error::AppError;
@@ -290,6 +290,17 @@ fn normalize_run_as_user(
     }
 }
 
+/// Renders a key's signature mode for an audit log entry.
+///
+/// `BODY_ONLY` is called out as replay-vulnerable rather than merely named: choosing it is a
+/// security-relevant decision, and the audit trail should say so where an operator will read it.
+fn describe_hmac_mode(mode: HmacMode) -> &'static str {
+    match mode {
+        HmacMode::CanonicalV1 => "signatures: CANONICAL_V1",
+        HmacMode::BodyOnly => "signatures: BODY_ONLY — body-only, no replay protection",
+    }
+}
+
 /// Renders a hook's elevation setting for an audit log entry.
 ///
 /// Privileged hooks are the highest-value thing in this system to be able to reconstruct after the
@@ -393,6 +404,8 @@ pub struct MeResponse {
     pub prefix: String,
     /// Public key identifier used for signature auth, if this key has one.
     pub key_id: Option<String>,
+    /// Signature verification mode this key's requests are checked under.
+    pub hmac_mode: HmacMode,
     /// Bound CIDRs.
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget.
@@ -443,6 +456,7 @@ pub async fn get_me(
         name: key.name,
         prefix: key.prefix,
         key_id: key.key_id,
+        hmac_mode: key.hmac_mode,
         bound_ips: key.bound_ips,
         max_concurrent_jobs: key.max_concurrent_jobs,
         is_master: key.is_master,
@@ -1396,6 +1410,9 @@ pub struct CreateApiKeyPayload {
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget. Defaults to 10.
     pub max_concurrent_jobs: Option<i32>,
+    /// Signature verification mode. Defaults to `CANONICAL_V1`; `BODY_ONLY` opts out of replay
+    /// protection for third-party webhook senders whose format cannot be changed.
+    pub hmac_mode: Option<HmacMode>,
     /// Master flag.
     pub is_master: Option<bool>,
     /// Global key-management scope.
@@ -1439,6 +1456,8 @@ pub struct ApiKeySummary {
     /// Whether a signing secret exists for this key. The secret itself is deliberately absent:
     /// it left the server once, at creation, and no listing will ever hand it back.
     pub has_signing_secret: bool,
+    /// Signature verification mode.
+    pub hmac_mode: HmacMode,
     /// Bound CIDRs.
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget.
@@ -1468,6 +1487,7 @@ async fn build_api_key_summary(
         prefix: model.prefix,
         key_id: model.key_id,
         has_signing_secret: model.signing_secret.is_some(),
+        hmac_mode: model.hmac_mode,
         bound_ips: model.bound_ips,
         max_concurrent_jobs: model.max_concurrent_jobs,
         is_master: model.is_master,
@@ -1514,6 +1534,7 @@ pub async fn create_api_key(
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     let (key_id, signing_secret, sealed_secret) = mint_signing_pair(&state.cipher)?;
+    let hmac_mode = payload.hmac_mode.unwrap_or_default();
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
@@ -1524,6 +1545,7 @@ pub async fn create_api_key(
         prefix: Set(prefix),
         key_id: Set(Some(key_id.clone())),
         signing_secret: Set(Some(sealed_secret)),
+        hmac_mode: Set(hmac_mode),
         bound_ips: Set(payload.bound_ips.clone()),
         max_concurrent_jobs: Set(max_concurrent_jobs),
         is_master: Set(payload.is_master.unwrap_or(false)),
@@ -1540,7 +1562,11 @@ pub async fn create_api_key(
         client_ip.0,
         "KEY_CREATE",
         Some(payload.name.clone()),
-        Some(format!("Created key {}", format_reference(&payload.name, id))),
+        Some(format!(
+            "Created key {} ({})",
+            format_reference(&payload.name, id),
+            describe_hmac_mode(hmac_mode)
+        )),
     )
     .await?;
 
@@ -1581,6 +1607,8 @@ pub struct UpdateApiKeyPayload {
     pub bound_ips: Option<String>,
     /// New concurrency budget.
     pub max_concurrent_jobs: Option<i32>,
+    /// New signature verification mode.
+    pub hmac_mode: Option<HmacMode>,
     /// New key-management scope.
     pub can_manage_keys: Option<bool>,
     /// New hook-creation scope.
@@ -1608,6 +1636,9 @@ pub async fn update_api_key(
         validate_concurrency(jobs)?;
     }
 
+    // Captured before `payload` is consumed field-by-field below.
+    let payload_hmac_mode = payload.hmac_mode;
+
     let mut active: api_key::ActiveModel = target.into();
     if let Some(name) = payload.name {
         active.name = Set(name);
@@ -1617,6 +1648,9 @@ pub async fn update_api_key(
     }
     if let Some(jobs) = payload.max_concurrent_jobs {
         active.max_concurrent_jobs = Set(jobs);
+    }
+    if let Some(mode) = payload.hmac_mode {
+        active.hmac_mode = Set(mode);
     }
     if let Some(v) = payload.can_manage_keys {
         active.can_manage_keys = Set(v);
@@ -1636,7 +1670,10 @@ pub async fn update_api_key(
         client_ip.0,
         "KEY_UPDATE",
         Some(updated.name.clone()),
-        Some(format!("Updated key {reference}")),
+        Some(match payload_hmac_mode {
+            Some(mode) => format!("Updated key {reference} ({})", describe_hmac_mode(mode)),
+            None => format!("Updated key {reference}"),
+        }),
     )
     .await?;
 

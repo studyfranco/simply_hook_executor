@@ -48,6 +48,14 @@ Stores authentication keys, global scopes, and network restrictions.
 | `key_hash` | String | NOT NULL, UNIQUE | Argon2id or SHA-256 hash of the secret key. |
 | `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`). Safe to log and to send in the clear as `X-Key-Id`; selects which `signing_secret` verifies a request signature. `NULL` only for keys issued before signature auth existed — rotate such a key to mint a pair. |
 | `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret — see the storage model below. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
+| `hmac_mode` | String | NOT NULL, DEFAULT `'CANONICAL_V1'` | Signature verification scheme: `CANONICAL_V1` or `BODY_ONLY`. See the enumeration section below. |
+| `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. |
+| `max_concurrent_jobs`| Integer | NOT NULL, DEFAULT `10` | Maximum simultaneous script executions allowed for this key. |
+| `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all RBAC checks if `true`. |
+| `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage other API keys. |
+| `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create and manage hooks. |
+| `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
+| `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
 
 #### `signing_secret` storage model
 
@@ -73,13 +81,6 @@ It is therefore **encrypted at rest** with XChaCha20-Poly1305 (`src/crypto.rs`):
 - Even the unencrypted mode hex-encodes, so a raw secret is never a substring of the stored column.
 - A fresh random nonce is generated per seal, so identical secrets never produce identical
   ciphertexts.
-| `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. |
-| `max_concurrent_jobs`| Integer | NOT NULL, DEFAULT `10` | Maximum simultaneous script executions allowed for this key. |
-| `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all RBAC checks if `true`. |
-| `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage other API keys. |
-| `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create and manage hooks. |
-| `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
-| `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
 
 ---
 
@@ -186,6 +187,26 @@ System-wide audit trail for configuration changes.
 - `SUCCESS`: Process completed with exit code `0`.
 - `FAILED`: Process completed with non-zero exit code or failed to launch.
 - `TIMEOUT`: Process exceeded maximum runtime and was terminated.
+
+### `HmacMode`
+
+Stored as a plain string (portable across SQLite/PostgreSQL/MySQL), selected **per API key**.
+
+| Value | Signed material | Accepted headers | `X-Timestamp` | Replay protection |
+| :--- | :--- | :--- | :--- | :--- |
+| `CANONICAL_V1` *(default)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` | `X-Signature-256` | **required** | **yes** — 300s window, and the timestamp is inside the signed material so it cannot be re-dated |
+| `BODY_ONLY` | `RAW_BODY` | `X-Signature-256` **or** `X-Hub-Signature-256` | not required, ignored if sent | **none** |
+
+- `BODY_ONLY` exists solely for third-party senders (GitHub, Forgejo, GitLab) whose signature format
+  cannot be changed. An intercepted request in this mode stays replayable indefinitely, so it should
+  be scoped to a key that can execute only the hooks that sender is meant to trigger.
+- `X-Hub-Signature-256` is honoured **only** in `BODY_ONLY`. A `CANONICAL_V1` key cannot be
+  downgraded to body-only verification by sending the other header name — the per-key mode is
+  enforced, not advisory.
+- The column defaults to `CANONICAL_V1`, including for rows backfilled by the migration that adds
+  it: an upgrade must never silently strip replay protection from an existing key.
+- Selecting `BODY_ONLY` at creation or switching to it later is recorded in the audit trail,
+  explicitly labelled as removing replay protection.
 
 ---
 
