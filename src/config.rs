@@ -23,6 +23,8 @@ const DEFAULT_RETENTION_SWEEP_SECONDS: u64 = 3600;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Fallback timeout applied when a hook stores a non-positive `default_timeout_seconds`.
 const FALLBACK_TIMEOUT_SECONDS: u64 = 30;
+/// Default anti-replay window for signed requests, in seconds (5 minutes each way).
+const DEFAULT_SIGNATURE_MAX_AGE_SECONDS: i64 = 300;
 
 /// Immutable runtime configuration shared by every handler and background worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +41,19 @@ pub struct RuntimeConfig {
     /// discarded — but still drained, so a chatty hook can never deadlock on a full pipe.
     /// Overridden by `MAX_OUTPUT_BYTES`.
     pub max_output_bytes: usize,
+    /// How far a request's `X-Timestamp` may be from the server's clock, in seconds, before the
+    /// signature is rejected as a replay. Overridden by `SIGNATURE_MAX_AGE_SECONDS`.
+    ///
+    /// Applied symmetrically — a timestamp too far in the *future* is refused as well, since a
+    /// forward-dated request would otherwise stay replayable for as long as the skew allows.
+    pub signature_max_age_seconds: i64,
+    /// Whether every authenticated request must carry a valid signature, from
+    /// `REQUIRE_SIGNED_REQUESTS`.
+    ///
+    /// Defaults to `false` so a bearer-only client keeps working after an upgrade. Turning it on
+    /// makes the HMAC protocol mandatory across the whole API — the intended end state once every
+    /// client signs.
+    pub require_signed_requests: bool,
     /// Directories a hook's `script_path` must live under, from `ALLOWED_SCRIPT_ROOTS`
     /// (comma-separated absolute paths).
     ///
@@ -56,6 +71,8 @@ impl Default for RuntimeConfig {
             log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
             retention_sweep_seconds: DEFAULT_RETENTION_SWEEP_SECONDS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            signature_max_age_seconds: DEFAULT_SIGNATURE_MAX_AGE_SECONDS,
+            require_signed_requests: false,
             allowed_script_roots: Vec::new(),
         }
     }
@@ -101,6 +118,18 @@ impl RuntimeConfig {
             retention_sweep_seconds: parse_or_warn("RETENTION_SWEEP_SECONDS", defaults.retention_sweep_seconds)
                 .max(1),
             max_output_bytes: parse_or_warn("MAX_OUTPUT_BYTES", defaults.max_output_bytes),
+            // Clamped to at least 1s: a zero or negative window would reject every request,
+            // including correctly-signed ones, which is a configuration foot-gun rather than a
+            // security posture anyone intends.
+            signature_max_age_seconds: parse_or_warn(
+                "SIGNATURE_MAX_AGE_SECONDS",
+                defaults.signature_max_age_seconds,
+            )
+            .max(1),
+            require_signed_requests: parse_bool_or_warn(
+                "REQUIRE_SIGNED_REQUESTS",
+                defaults.require_signed_requests,
+            ),
             allowed_script_roots,
         }
     }
@@ -203,6 +232,21 @@ fn parse_env_var_list(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned())
         .collect()
+}
+
+/// Reads a boolean environment variable, accepting the usual spellings.
+fn parse_bool_or_warn(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => {
+                tracing::warn!("Invalid boolean for {name}: {other:?} — falling back to {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 /// Reads and parses an environment variable, warning and falling back on a malformed value.

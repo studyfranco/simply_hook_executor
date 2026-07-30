@@ -607,6 +607,15 @@ pub async fn create_hook(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    // The escalation guard runs before *any* payload validation. A non-master requesting
+    // `run_as_user` must get its `403` regardless of whether the rest of the request happens to be
+    // well-formed — otherwise a malformed script_path would mask the real reason for the refusal,
+    // and the response would leak which other fields passed validation.
+    //
+    // Normalized to `None` when blank, so an empty text field from the UI stores NULL rather than
+    // an empty string that later has to be re-interpreted everywhere.
+    let run_as_user = normalize_run_as_user(&key, payload.run_as_user.as_deref())?;
+
     let name = payload.name.trim().to_owned();
     if name.is_empty() {
         return Err(AppError::InvalidInput("name is required".to_owned()));
@@ -615,10 +624,6 @@ pub async fn create_hook(
     executor::validate_script_path(&payload.script_path, &state.config.allowed_script_roots)?;
     let timeout = payload.default_timeout_seconds.unwrap_or(30);
     validate_timeout(timeout)?;
-
-    // Normalized to `None` when blank, so an empty text field from the UI stores NULL rather than
-    // an empty string that later has to be re-interpreted everywhere.
-    let run_as_user = normalize_run_as_user(&key, payload.run_as_user.as_deref())?;
 
     // Validated before the hook row is written, so a bad parameter can't leave a half-created
     // hook behind.
@@ -740,6 +745,14 @@ pub async fn update_hook(
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
 
+    // Checked immediately after authorization and before any field validation, for the same reason
+    // as in `create_hook`: an escalation attempt must surface as `403`, never be masked by a `400`
+    // about some other field in the same payload.
+    let requested_run_as_user = match payload.run_as_user.as_deref() {
+        Some(raw) => Some(normalize_run_as_user(&key, Some(raw))?),
+        None => None,
+    };
+
     if let Some(script_path) = &payload.script_path {
         executor::validate_script_path(script_path, &state.config.allowed_script_roots)?;
     }
@@ -771,10 +784,9 @@ pub async fn update_hook(
         changes.push(format!("default_timeout_seconds={timeout}"));
         active.default_timeout_seconds = Set(timeout);
     }
-    if let Some(raw) = payload.run_as_user {
+    if let Some(normalized) = requested_run_as_user {
         // Present-but-blank is a deliberate "drop elevation", distinct from the field being
         // absent, which leaves the current setting alone.
-        let normalized = normalize_run_as_user(&key, Some(&raw))?;
         changes.push(describe_privilege(normalized.as_deref()));
         active.run_as_user = Set(normalized);
     }
@@ -1921,6 +1933,12 @@ pub struct SettingsResponse {
     pub retention_sweep_seconds: u64,
     /// Per-stream cap on captured output, in bytes.
     pub max_output_bytes: usize,
+    /// Anti-replay window applied to `X-Timestamp` on signed requests, in seconds.
+    pub signature_max_age_seconds: i64,
+    /// Whether every authenticated request must carry a valid signature.
+    pub require_signed_requests: bool,
+    /// Whether signing secrets are encrypted at rest (i.e. `SIGNING_SECRET_KEY` is configured).
+    pub signing_secrets_encrypted: bool,
     /// Total hooks defined.
     pub hook_count: u64,
     /// Total API keys.
@@ -1954,6 +1972,9 @@ pub async fn get_settings(
         log_retention_days: state.config.log_retention_days,
         retention_sweep_seconds: state.config.retention_sweep_seconds,
         max_output_bytes: state.config.max_output_bytes,
+        signature_max_age_seconds: state.config.signature_max_age_seconds,
+        require_signed_requests: state.config.require_signed_requests,
+        signing_secrets_encrypted: state.cipher.is_encrypting(),
         hook_count: Hook::find().count(&state.db).await?,
         api_key_count: ApiKey::find().count(&state.db).await?,
         execution_count: Execution::find().count(&state.db).await?,

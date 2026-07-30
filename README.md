@@ -59,21 +59,47 @@ Every API key carries two further credentials, both returned **once** by `POST /
 | `key_id` | no | `X-Key-Id` | Public identifier (`shk_<32 hex>`). Selects which signing secret to verify against. |
 | `signing_secret` | yes | *never sent* | HMAC-SHA256 key. Used to compute `X-Signature-256`. |
 
-A webhook sender authenticates with the *public* id plus a signature, transmitting no bearer
-credential at all:
+Signatures are HMAC-SHA256 over a canonical string of four newline-delimited components:
+
+```text
+<METHOD>\n<PATH_AND_QUERY>\n<TIMESTAMP>\n<RAW_BODY>
+```
+
+sent alongside `X-Timestamp` (Unix seconds, must be within **300 seconds** of server time):
 
 ```bash
 BODY='{"target_address":"203.0.113.7"}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SIGNING_SECRET" -r | cut -d' ' -f1)
+TS=$(date +%s)
+PATH_AND_QUERY=/webhook/nftables_ban
+SIG=$(printf '%s\n%s\n%s\n%s' POST "$PATH_AND_QUERY" "$TS" "$BODY" \
+        | openssl dgst -sha256 -hmac "$SIGNING_SECRET" -r | cut -d' ' -f1)
 curl -X POST -H "X-Key-Id: $KEY_ID" -H "Content-Type: application/json" \
-     -H "X-Signature-256: sha256=$SIG" -d "$BODY" \
-     http://localhost:3000/webhook/nftables_ban
+     -H "X-Timestamp: $TS" -H "X-Signature-256: sha256=$SIG" -d "$BODY" \
+     "http://localhost:3000$PATH_AND_QUERY"
 ```
 
+Details that matter when writing a client:
+
+- The **newline delimiters are required** — they stop a signature being replayed across a different
+  method/path split.
+- **`PATH_AND_QUERY` is the full request target** the client used, `/api` prefix and query string
+  included. Altering `?limit=5` to `?limit=1000` invalidates the signature.
+- **`RAW_BODY` is the exact bytes sent**; an absent body signs as the empty string.
+- The **window is symmetric** — a far-future timestamp is rejected just like a stale one. Tune it
+  with `SIGNATURE_MAX_AGE_SECONDS`.
+- A signed request **must** carry `X-Timestamp`; a missing or malformed one is a `401`, never
+  treated as "now".
+
 A `key_id` on its own is not a credential, so a request presenting one **must** carry a valid
-signature. An `X-API-Key` may also be accompanied by a signature, which then adds body integrity on
-top of bearer auth. Unknown key ids and bad signatures return the same `401`, so the endpoint
-cannot be used to enumerate which key ids exist.
+signature. An `X-API-Key` may also be accompanied by a signature, which then adds request integrity
+on top of bearer auth. Unknown key ids and bad signatures return the same `401`, so the endpoint
+cannot be used to enumerate which key ids exist. Set `REQUIRE_SIGNED_REQUESTS=true` to make
+signing mandatory on every authenticated route.
+
+The dashboard signs every request it makes using the Web Crypto API, with the signing secret you
+optionally supply at login. **`crypto.subtle` only exists in a secure context**, so the dashboard
+can only sign over HTTPS or on localhost; over plain HTTP it falls back to bearer-only auth and
+says so. Serve the dashboard behind TLS before enabling `REQUIRE_SIGNED_REQUESTS`.
 
 **Storage.** Unlike the API key, the signing secret cannot be hashed — verifying a signature means
 recomputing it, which needs the original bytes. It is therefore stored **encrypted at rest** with
@@ -221,7 +247,9 @@ automatically if present):
 | :--- | :--- | :--- |
 | `DATABASE_URL` | `sqlite://simply_hook_executor.db?mode=rwc` | SeaORM connection string. |
 | `ALLOWED_ENV_VARS` | `PATH,LANG,TERM,SYSTEMROOT` | Comma-separated allowlist of host variables passed through to hook sub-processes. Everything else is cleared. An empty value means total isolation. |
-| `SIGNING_SECRET_KEY` | *(unset — no encryption)* | 64 hex characters (32 bytes) used to encrypt `api_keys.signing_secret` at rest. Strongly recommended: without it, database read access is enough to forge webhook signatures. A malformed value aborts startup rather than silently storing secrets in the clear. |
+| `SIGNING_SECRET_KEY` (or `VAULT_ENCRYPTION_KEY`) | *(unset — no encryption)* | 64 hex characters (32 bytes) used to encrypt `api_keys.signing_secret` at rest. Strongly recommended: without it, database read access is enough to forge webhook signatures. A malformed value aborts startup rather than silently storing secrets in the clear. `SIGNING_SECRET_KEY` wins if both are set. |
+| `SIGNATURE_MAX_AGE_SECONDS` | `300` | Anti-replay window for `X-Timestamp`, applied symmetrically (past *and* future). |
+| `REQUIRE_SIGNED_REQUESTS` | `false` | When `true`, every authenticated request must carry a valid signature — bearer-only auth is refused. Requires an HTTPS-served dashboard, since the browser cannot sign otherwise. |
 | `ALLOWED_SCRIPT_ROOTS` | *(unset — unrestricted)* | Comma-separated absolute directories that a hook's `script_path` must live under. Strongly recommended in production: without it, any key holding `can_manage_hooks` can point a hook at any absolute path. Relative entries are ignored with a warning (a boundary that moves with the working directory is not a boundary). |
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |

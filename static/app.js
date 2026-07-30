@@ -188,9 +188,71 @@ class PagedCache {
     }
 }
 
+// Signs a request the way the backend expects: HMAC-SHA256 over the canonical string
+//
+//     METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY
+//
+// The newline delimiters, the query string, and the exact raw body all matter — see
+// `signature_base` in src/middleware.rs for why each component is covered.
+//
+// Web Crypto only exposes `crypto.subtle` in a secure context (HTTPS, or localhost). A dashboard
+// served over plain HTTP on a LAN address therefore *cannot* sign, so callers must treat a null
+// return as "signing unavailable" and fall back to bearer-only auth rather than sending a
+// half-formed signature.
+class RequestSigner {
+    constructor(signingSecret) {
+        this.signingSecret = signingSecret || '';
+        this.cryptoKey = null;
+    }
+
+    get available() {
+        return Boolean(this.signingSecret) && Boolean(globalThis.crypto?.subtle);
+    }
+
+    // Imports the secret once and caches the non-extractable CryptoKey.
+    async key() {
+        if (!this.cryptoKey) {
+            this.cryptoKey = await crypto.subtle.importKey(
+                'raw',
+                new TextEncoder().encode(this.signingSecret),
+                { name: 'HMAC', hash: 'SHA-256' },
+                false, // non-extractable: the imported key cannot be read back out
+                ['sign']
+            );
+        }
+        return this.cryptoKey;
+    }
+
+    // Returns { 'X-Timestamp', 'X-Signature-256' }, or null when signing is unavailable.
+    async headers(method, pathAndQuery, body) {
+        if (!this.available) return null;
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${body ?? ''}`;
+
+        try {
+            const signature = await crypto.subtle.sign(
+                'HMAC',
+                await this.key(),
+                new TextEncoder().encode(canonical)
+            );
+            const hex = [...new Uint8Array(signature)]
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+            return { 'X-Timestamp': timestamp, 'X-Signature-256': `sha256=${hex}` };
+        } catch (e) {
+            // Never fall through to an unsigned request silently under a wrong assumption; the
+            // caller decides, and the console records why.
+            console.error('Request signing failed:', e);
+            return null;
+        }
+    }
+}
+
 class HookExecutorClient {
     constructor() {
         this.apiKey = localStorage.getItem('simply_hook_executor_key') || '';
+        this.signer = new RequestSigner(localStorage.getItem('simply_hook_executor_signing_secret') || '');
         this.apiBase = '/api';
         this.state = {
             profile: null,
@@ -247,14 +309,25 @@ class HookExecutorClient {
     // Fetch Wrapper (Global 401 interceptor)
     // ───────────────────────────────────────────────────────
     async apiFetch(endpoint, options = {}) {
+        const method = (options.method || 'GET').toUpperCase();
+        // The signature covers the path the server actually receives, including the /api prefix
+        // and any query string — so it must be built from the full request target, not `endpoint`.
+        const pathAndQuery = `${this.apiBase}${endpoint}`;
+        // `body` is signed byte-for-byte as sent; an absent body signs as the empty string, which
+        // is what the backend uses for GET/DELETE without a payload.
+        const body = options.body ?? '';
+
+        const signatureHeaders = await this.signer.headers(method, pathAndQuery, body);
+
         const headers = {
             'Content-Type': 'application/json',
             ...(this.apiKey ? { 'X-API-Key': this.apiKey } : {}),
+            ...(signatureHeaders || {}),
             ...(options.headers || {})
         };
 
         try {
-            const res = await fetch(`${this.apiBase}${endpoint}`, { ...options, headers });
+            const res = await fetch(pathAndQuery, { ...options, headers });
 
             // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
             // out. 403 means the key IS valid but lacks permission for this one action; it must
@@ -298,7 +371,11 @@ class HookExecutorClient {
     // ───────────────────────────────────────────────────────
     handleAuthFailure() {
         this.apiKey = '';
+        this.signer = new RequestSigner('');
         localStorage.removeItem('simply_hook_executor_key');
+        // Cleared alongside the key: leaving a signing secret behind after logout would keep a
+        // forgeable credential in the browser for the next person at that machine.
+        localStorage.removeItem('simply_hook_executor_signing_secret');
         this.showLogin();
     }
 
@@ -313,9 +390,25 @@ class HookExecutorClient {
         }
     }
 
-    async login(key) {
+    async login(key, signingSecret) {
         this.apiKey = key;
         localStorage.setItem('simply_hook_executor_key', key);
+
+        this.signer = new RequestSigner(signingSecret);
+        if (signingSecret) {
+            localStorage.setItem('simply_hook_executor_signing_secret', signingSecret);
+            if (!this.signer.available) {
+                // crypto.subtle only exists in a secure context. Say so plainly instead of letting
+                // every request quietly go out unsigned.
+                this.showToast(
+                    'Signing unavailable: the Web Crypto API needs HTTPS (or localhost). Requests will use the API key only.',
+                    'error'
+                );
+            }
+        } else {
+            localStorage.removeItem('simply_hook_executor_signing_secret');
+        }
+
         document.getElementById('login-error').classList.add('hidden');
         await this.verifyAuth();
     }
@@ -1402,6 +1495,13 @@ class HookExecutorClient {
             item('Log retention', s.log_retention_days > 0 ? `${s.log_retention_days} days` : 'disabled (kept forever)'),
             item('Retention sweep', `every ${s.retention_sweep_seconds}s`),
             item('Max captured output', `${Math.round(s.max_output_bytes / 1024)} KiB per stream`),
+            item('Signature window', `±${s.signature_max_age_seconds}s (anti-replay)`),
+            item('Signed requests', s.require_signed_requests
+                ? '<span class="badge badge-success">required</span>'
+                : '<span class="text-muted">optional</span>'),
+            item('Signing secrets at rest', s.signing_secrets_encrypted
+                ? '<span class="badge badge-success">encrypted</span>'
+                : '<span class="badge badge-timeout">unencrypted</span>'),
             item('Hooks defined', s.hook_count),
             item('API keys', s.api_key_count),
             item('Executions stored', s.execution_count)
@@ -1463,7 +1563,10 @@ class HookExecutorClient {
     bindEvents() {
         document.getElementById('login-form').addEventListener('submit', (e) => {
             e.preventDefault();
-            this.login(document.getElementById('login-key').value);
+            this.login(
+                document.getElementById('login-key').value,
+                document.getElementById('login-signing-secret').value.trim()
+            );
         });
 
         document.getElementById('logout-btn').addEventListener('click', () => this.logout());

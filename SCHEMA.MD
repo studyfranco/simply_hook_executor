@@ -46,8 +46,33 @@ Stores authentication keys, global scopes, and network restrictions.
 | `name` | String | NOT NULL | Human-readable label (e.g., "Vault Webhook Client"). |
 | `plaintext_prefix`| String | NOT NULL | First 8 characters of plaintext key for display/logs. |
 | `key_hash` | String | NOT NULL, UNIQUE | Argon2id or SHA-256 hash of the secret key. |
-| `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`). Safe to log and to send in the clear as `X-Key-Id`; selects which `signing_secret` verifies a webhook signature. `NULL` only for keys issued before signature auth existed — rotate such a key to mint a pair. |
-| `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret. **Cannot be hashed** — verifying a signature means recomputing it, which needs the original bytes — so it is stored *encrypted at rest* (XChaCha20-Poly1305 under `SIGNING_SECRET_KEY`) rather than digested. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
+| `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`). Safe to log and to send in the clear as `X-Key-Id`; selects which `signing_secret` verifies a request signature. `NULL` only for keys issued before signature auth existed — rotate such a key to mint a pair. |
+| `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret — see the storage model below. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
+
+#### `signing_secret` storage model
+
+Unlike `key_hash`, this column is **not** a digest, and cannot be: verifying an `X-Signature-256`
+header means *recomputing* the HMAC, which requires the original secret bytes. Hashing it would make
+signature verification impossible.
+
+It is therefore **encrypted at rest** with XChaCha20-Poly1305 (`src/crypto.rs`):
+
+| Storage mode | Trigger | Column contents |
+| :--- | :--- | :--- |
+| Sealed | `SIGNING_SECRET_KEY` (or alias `VAULT_ENCRYPTION_KEY`) set to 64 hex chars | `v1.xchacha20poly1305.<nonce_hex>.<ciphertext_hex>` |
+| Unencrypted | neither variable set | `v1.plain.<secret_hex>` |
+
+- `SIGNING_SECRET_KEY` wins when both variables are set.
+- A **malformed** key aborts startup. It never falls back to plaintext: an operator who set the
+  variable believes their secrets are encrypted, and silently writing them in the clear would betray
+  that at exactly the wrong moment.
+- Running with **no** key is supported (zero-config) but logs a startup warning — database read
+  access alone would then be enough to forge signatures for every key.
+- The version prefixes make enabling encryption on a live deployment safe: previously-written
+  `v1.plain.` rows stay readable, and newly-written secrets are sealed from then on.
+- Even the unencrypted mode hex-encodes, so a raw secret is never a substring of the stored column.
+- A fresh random nonce is generated per seal, so identical secrets never produce identical
+  ciphertexts.
 | `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. |
 | `max_concurrent_jobs`| Integer | NOT NULL, DEFAULT `10` | Maximum simultaneous script executions allowed for this key. |
 | `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all RBAC checks if `true`. |
@@ -97,11 +122,26 @@ Junction table managing M:N permissions between API Keys and Hooks.
 | `id` | UUID / String | PRIMARY KEY | Unique identifier for the permission entry. |
 | `api_key_id` | UUID / String | NOT NULL, FOREIGN KEY (`api_keys.id` ON DELETE CASCADE) | Target API key. |
 | `hook_id` | UUID / String | NOT NULL, FOREIGN KEY (`hooks.id` ON DELETE CASCADE) | Target hook. |
-| `can_execute` | Boolean | NOT NULL, DEFAULT `true` | Permission to invoke `POST /api/hooks/:id/execute`. |
-| `can_manage` | Boolean | NOT NULL, DEFAULT `false` | Permission to edit or delete this hook configuration. |
+| `can_execute` | Boolean | NOT NULL, DEFAULT `true` | Permission to invoke `POST /api/hooks/:id/execute`, `POST /api/hooks/:id/test`, and `POST /webhook/:id`. |
+| `can_manage` | Boolean | NOT NULL, DEFAULT `false` | Permission to edit or delete this hook configuration, its parameters, and its execution records. |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 
 *Unique Index:* `(api_key_id, hook_id)`
+
+#### Derived read access (there is no `can_read` column)
+
+This table stores exactly **two** flags. Read access is *derived* rather than stored:
+
+> A key may read a hook's details, its parameter contract, and its execution history if it is
+> `is_master`, **or** holds `can_execute = true`, **or** holds `can_manage = true` on that hook.
+
+A key with no mapping for a hook can read nothing about it — `GET /api/hooks/{id}` returns `403`,
+and `GET /api/hooks` / `GET /api/executions` simply omit it rather than erroring.
+
+Deriving read access this way keeps the two natural roles coherent with two columns: an executor can
+inspect what it runs, and a manager can inspect what it configures. A stored `can_read` flag would
+only add expressiveness for a "may read but may neither run nor edit" auditor role, which nothing
+currently requires; introducing it would be a schema change, not an implementation detail.
 
 ---
 

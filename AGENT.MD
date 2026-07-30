@@ -35,10 +35,39 @@ To keep this context clean and modular, responsibilities are split across three 
 
 ### 1. Security & Network (Zero-Trust)
 
-- **Middleware Protection:** All `/api/*` and `/webhook/*` routes pass through custom authentication middleware (`src/middleware.rs`).
-- **Authentication Modes:**
-  - **API Key:** Verified via `X-API-Key` header.
-  - **HMAC SHA-256 Signature:** Verified via `X-Signature-256: sha256=<hex_hmac>` calculated over the raw JSON body using the API Key's secret or a hook-specific secret.
+- **Middleware Protection:** All `/api/*` and `/webhook/*` routes pass through custom authentication middleware (`src/middleware.rs`). There are no unauthenticated API routes; only the static SPA is public.
+- **Authentication Modes:** a caller identifies itself with exactly one of:
+  - **API Key (bearer):** `X-API-Key`, matched against `api_keys.key_hash` (SHA-256). A signature may accompany it, and is then verified as well.
+  - **Key ID + Signature:** `X-Key-Id` (public, non-secret) plus a valid signature. Since a key id proves nothing on its own, a signature is **mandatory** in this mode. This is what lets a webhook sender authenticate without ever transmitting a bearer credential.
+  - An unknown key id and a bad signature return the same `401`, so the endpoint cannot be used to enumerate key ids.
+
+#### HMAC Signature Protocol
+
+Signatures are HMAC-SHA256, keyed on the API key's `signing_secret` (**never** the bearer key), over a canonical string built from four newline-delimited components:
+
+```text
+<METHOD>\n<PATH_AND_QUERY>\n<TIMESTAMP>\n<RAW_BODY>
+```
+
+| Header | Required | Content |
+| :--- | :--- | :--- |
+| `X-Signature-256` | when signing | `sha256=<hex digest>` |
+| `X-Timestamp` | with any signature | Unix seconds the signature was computed at |
+| `X-API-Key` *or* `X-Key-Id` | always | identifies which key's `signing_secret` verifies the signature |
+
+Rules the implementation MUST hold to:
+
+- **Newline delimiters are mandatory.** Plain concatenation is ambiguous (`POST` + `/api/x` collides with `POS` + `T/api/x`), which would let a signature be replayed across a different method/path split.
+- **`PATH_AND_QUERY` is the target the *client* requested**, including the `/api` prefix and any query string. Because `Router::nest` strips the prefix from the URI inner layers observe, the middleware MUST read `OriginalUri`, not `parts.uri`. Signing only the path would leave `?older_than_days=0` freely rewritable on an otherwise-valid signed request.
+- **`RAW_BODY` is the bytes as received**, never a re-serialized form. An absent body signs as the empty string.
+- **Anti-replay:** `X-Timestamp` must be within **300 seconds** (`SIGNATURE_MAX_AGE_SECONDS`) of server time. The window is applied **symmetrically** — a forward-dated request is refused too, since it would otherwise stay replayable for the length of its skew. A missing or malformed timestamp on a signed request is a `401`; it is never coerced to "now".
+- **Constant-time comparison** via `Mac::verify_slice`. Comparing hex strings with `==` would leak the signature one byte at a time.
+- **Timestamp before HMAC:** a stale request is rejected before the secret is decrypted and the body hashed.
+- **`REQUIRE_SIGNED_REQUESTS=true`** makes signatures mandatory on every authenticated route, bearer or not. It defaults to `false` so existing bearer-only clients keep working across an upgrade.
+
+#### Signing Secret Storage
+
+`signing_secret` **cannot** be hashed: verification means recomputing the HMAC, which requires the original bytes. It is therefore encrypted at rest with XChaCha20-Poly1305 under `SIGNING_SECRET_KEY` (alias: `VAULT_ENCRYPTION_KEY`), and returned in plaintext exactly once, at key creation or rotation. If no key is configured the daemon still runs but stores secrets verbatim and says so loudly at startup; a malformed key aborts startup rather than silently downgrading.
 - **CIDR Restriction:** API Keys are bound to CIDR network ranges (`bound_ips`, supporting comma-separated IPv4/IPv6 ranges like `127.0.0.1/32, 10.0.0.0/8, ::/0`). Middleware MUST validate the client's IP against these bounds.
 - **Resilient IP Extraction:** Do NOT use external IP extraction crates. Extract the rightmost IP from `X-Forwarded-For` or `X-Real-IP`, falling back safely to `axum::extract::ConnectInfo`.
 
@@ -48,6 +77,23 @@ To keep this context clean and modular, responsibilities are split across three 
 - **Hook Rights:** Managed via junction table `ApiKeyHookPermission` linking keys to `Hook` with explicit flags (`can_execute`, `can_manage`).
 - **Least Privilege:** `can_execute` or `can_manage` require valid key mapping unless `is_master`.
 - **Auto-Provisioning:** When an API Key creates a new `Hook`, the backend MUST automatically generate full execute/manage permissions for that key on the new hook.
+
+#### Effective permission matrix
+
+`can_read` is **derived, not stored** — the schema carries only `can_execute` and `can_manage`. Read access is granted when a key is `is_master` **or** holds *either* flag on the hook; a key with no mapping at all sees nothing.
+
+| Operation | Required |
+| :--- | :--- |
+| `POST /api/hooks/{id}/execute`, `POST /webhook/{id}` | `can_execute` |
+| `POST /api/hooks/{id}/test` (dry run) | `can_execute` — the preview reveals the fully-resolved command line and child environment, which is execution-shaped knowledge even though nothing is spawned |
+| `GET /api/hooks`, `GET /api/hooks/{id}`, `GET .../parameters`, `GET /api/executions*` | derived read: `can_execute` **or** `can_manage` |
+| `PUT`/`PATCH`/`DELETE /api/hooks/{id}`, parameter CRUD, `DELETE /api/executions/{id}` | `can_manage` |
+| `POST /api/hooks` (create) | global `can_manage_hooks` (creation auto-provisions full rights on the new hook) |
+| `POST`/`GET`/`PUT`/`DELETE /api/keys*` | global `can_manage_keys` |
+| `GET /api/audit-logs`, `GET /api/settings`, `DELETE /api/executions` (purge) | `is_master` |
+| Assigning a non-empty `run_as_user` | `is_master` — checked **immediately after** the endpoint's authorization check and **before any field validation**, so an escalation attempt always surfaces as `403` and can never be masked by a `400` about some other field in the same payload |
+
+Listing endpoints narrow by these rules rather than rejecting: `GET /api/hooks` and `GET /api/executions` return only what the caller may read.
 
 ### 3. Safe Script Execution Engine
 

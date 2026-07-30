@@ -76,16 +76,19 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
     let hook_id = insert_hook(&db, "signed_hook", &script, 30).await;
     grant(&db, signer.id, hook_id, true, false).await;
 
+    let uri = format!("/api/hooks/{hook_id}/execute");
     let body = json!({ "parameters": {} }).to_string();
-    let signature = sign_body(&signer.signing_secret, &body);
+    let timestamp = now_timestamp();
+    let signature = sign_request(&signer.signing_secret, "POST", &uri, timestamp, &body);
 
     let bearer_and_signature = |sig: &str, payload: &str| {
         with_connect_info(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/api/hooks/{hook_id}/execute"))
+                .uri(&uri)
                 .header("X-API-Key", &signer.plaintext)
                 .header("Content-Type", "application/json")
+                .header("X-Timestamp", timestamp.to_string())
                 .header("X-Signature-256", sig),
         )
         .body(axum::body::Body::from(payload.to_owned()))
@@ -110,7 +113,7 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
 
     // The signature is keyed on the *signing secret*, not the bearer key: signing with the API key
     // itself must no longer authenticate.
-    let wrong_key_material = sign_body(&signer.plaintext, &body);
+    let wrong_key_material = sign_request(&signer.plaintext, "POST", &uri, timestamp, &body);
     assert_eq!(
         send(&app, bearer_and_signature(&wrong_key_material, &body)).await.status,
         StatusCode::UNAUTHORIZED
@@ -148,7 +151,8 @@ async fn key_id_and_signature_authenticate_without_a_bearer_key() {
             .uri("/webhook/webhook_signed")
             .header("X-Key-Id", &sender.key_id)
             .header("Content-Type", "application/json")
-            .header("X-Signature-256", sign_body("not-the-secret", &body)),
+            .header("X-Timestamp", now_timestamp().to_string())
+            .header("X-Signature-256", sign_request("not-the-secret", "POST", "/webhook/webhook_signed", now_timestamp(), &body)),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -178,6 +182,246 @@ async fn key_id_and_signature_authenticate_without_a_bearer_key() {
         &body,
     );
     assert_eq!(send(&app, unknown).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
+    let dir = ScriptDir::new();
+    let side_effect = dir.path_for("replayed");
+    let script = dir.write_script("replay.sh", &format!("touch \"{side_effect}\""));
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_full(&db, "Sender", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "replay_hook", &script, 30).await;
+    grant(&db, sender.id, hook_id, true, false).await;
+
+    let uri = "/webhook/replay_hook";
+    let body = json!({}).to_string();
+    let now = now_timestamp();
+
+    // Offsets are kept well clear of the ±300s boundary in both directions. `now` is sampled once
+    // but each iteration below spawns a real process, so by the last request several seconds of
+    // wall clock have passed: an offset of -299 would drift past the boundary and a +299 would
+    // drift *inside* it, making this test fail intermittently either way. Exact boundary behaviour
+    // is asserted in `middleware::tests::timestamps_*`, where there is no I/O to skew it.
+    for offset in [0, -240, 240, -120, 120] {
+        let response = send(
+            &app,
+            signed_request_at("POST", uri, &sender.key_id, &sender.signing_secret, &body, now + offset),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "offset {offset}s should be inside the window");
+    }
+
+    // Outside it, in both directions. A stale capture is the replay case; a forward-dated request
+    // would otherwise stay replayable for as long as its skew allowed.
+    for offset in [-360, -3600, -86_400, 360, 3600] {
+        let response = send(
+            &app,
+            signed_request_at("POST", uri, &sender.key_id, &sender.signing_secret, &body, now + offset),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "offset {offset}s should be outside the window"
+        );
+        assert!(
+            response.string("error").contains("window"),
+            "the error should explain the window: {}",
+            response.string("error")
+        );
+    }
+
+    // A correctly-signed request replayed *later* is refused once its timestamp ages out — which
+    // is the whole point of binding the timestamp into the signature.
+    let stale = signed_request_at(
+        "POST",
+        uri,
+        &sender.key_id,
+        &sender.signing_secret,
+        &body,
+        now - 400,
+    );
+    assert_eq!(send(&app, stale).await.status, StatusCode::UNAUTHORIZED);
+
+    // Only the requests inside the window ran; the rejected ones never reached the engine.
+    assert_eq!(execution_count(&db).await, 5);
+}
+
+#[tokio::test]
+async fn signed_requests_require_a_well_formed_timestamp_header() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("ts.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_full(&db, "Sender", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "ts_hook", &script, 30).await;
+    grant(&db, sender.id, hook_id, true, false).await;
+
+    let uri = "/webhook/ts_hook";
+    let body = json!({}).to_string();
+    let now = now_timestamp();
+
+    // A signature with no timestamp at all cannot be replay-checked, so it is refused outright
+    // rather than verified against an assumed "now".
+    let no_timestamp = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-Key-Id", &sender.key_id)
+            .header("Content-Type", "application/json")
+            .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, now, &body)),
+    )
+    .body(axum::body::Body::from(body.clone()))
+    .expect("request builds");
+    let response = send(&app, no_timestamp).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(response.string("error").contains("X-Timestamp"));
+
+    // Malformed timestamps are rejected rather than coerced.
+    for malformed in ["", "not-a-number", "1700000000.5", "17e9", "-"] {
+        let request = with_connect_info(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("X-Key-Id", &sender.key_id)
+                .header("Content-Type", "application/json")
+                .header("X-Timestamp", malformed)
+                .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, now, &body)),
+        )
+        .body(axum::body::Body::from(body.clone()))
+        .expect("request builds");
+        assert_eq!(
+            send(&app, request).await.status,
+            StatusCode::UNAUTHORIZED,
+            "timestamp {malformed:?} must be rejected"
+        );
+    }
+
+    assert_eq!(execution_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn signatures_cover_every_http_method_and_the_query_string() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("methods.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let hook_id = insert_hook(&db, "methods_hook", &script, 30).await;
+
+    // GET, POST, PUT, PATCH and DELETE all sign the same way — this mirrors what the SPA does for
+    // every request it makes.
+    let get = signed_bearer_request("GET", "/api/hooks", &master.plaintext, &master.signing_secret, "");
+    assert_eq!(send(&app, get).await.status, StatusCode::OK);
+
+    let post_body = json!({ "name": "signed_created", "script_path": script }).to_string();
+    let post = signed_bearer_request("POST", "/api/hooks", &master.plaintext, &master.signing_secret, &post_body);
+    let created = send(&app, post).await;
+    assert_eq!(created.status, StatusCode::OK);
+
+    let put_uri = format!("/api/hooks/{hook_id}");
+    let put_body = json!({ "description": "signed update" }).to_string();
+    let put = signed_bearer_request("PUT", &put_uri, &master.plaintext, &master.signing_secret, &put_body);
+    assert_eq!(send(&app, put).await.status, StatusCode::OK);
+
+    let patch = signed_bearer_request("PATCH", &put_uri, &master.plaintext, &master.signing_secret, &put_body);
+    assert_eq!(send(&app, patch).await.status, StatusCode::OK);
+
+    // A GET whose query string is covered: re-signing for a different query must not validate.
+    let listing_uri = "/api/executions?limit=5";
+    let listing = signed_bearer_request("GET", listing_uri, &master.plaintext, &master.signing_secret, "");
+    assert_eq!(send(&app, listing).await.status, StatusCode::OK);
+
+    let timestamp = now_timestamp();
+    let swapped_query = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/executions?limit=1000")
+            .header("X-API-Key", &master.plaintext)
+            .header("X-Timestamp", timestamp.to_string())
+            .header(
+                "X-Signature-256",
+                // Signed for limit=5, sent for limit=1000.
+                sign_request(&master.signing_secret, "GET", listing_uri, timestamp, ""),
+            ),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(
+        send(&app, swapped_query).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the query string is part of the signed material"
+    );
+
+    let delete_uri = format!("/api/hooks/{}", created.string("id"));
+    let delete = signed_bearer_request("DELETE", &delete_uri, &master.plaintext, &master.signing_secret, "");
+    assert_eq!(send(&app, delete).await.status, StatusCode::NO_CONTENT);
+
+    // A signature minted for the DELETE must not be replayable against a different hook.
+    let ts = now_timestamp();
+    let cross_route = with_connect_info(
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(&put_uri)
+            .header("X-API-Key", &master.plaintext)
+            .header("X-Timestamp", ts.to_string())
+            .header("X-Signature-256", sign_request(&master.signing_secret, "DELETE", &delete_uri, ts, "")),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(send(&app, cross_route).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn require_signed_requests_makes_the_protocol_mandatory() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("mandatory.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let state = AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig {
+            require_signed_requests: true,
+            ..(*test_config()).clone()
+        }),
+        test_cipher(),
+    );
+    let app = create_app(state);
+    let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let hook_id = insert_hook(&db, "mandatory_hook", &script, 30).await;
+
+    // A valid bearer key on its own is no longer sufficient.
+    let unsigned = send(&app, json_request("GET", "/api/hooks", &master.plaintext, None)).await;
+    assert_eq!(unsigned.status, StatusCode::UNAUTHORIZED);
+    assert!(unsigned.string("error").contains("must be signed"));
+
+    // The same request, signed, succeeds.
+    let signed = signed_bearer_request("GET", "/api/hooks", &master.plaintext, &master.signing_secret, "");
+    assert_eq!(send(&app, signed).await.status, StatusCode::OK);
+
+    // Enforcement is global, not per-route: execution and the webhook alias are covered too.
+    let exec_uri = format!("/api/hooks/{hook_id}/execute");
+    assert_eq!(
+        send(&app, json_request("POST", &exec_uri, &master.plaintext, None)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&app, json_request("GET", "/api/settings", &master.plaintext, None)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&app, json_request("GET", "/api/keys", &master.plaintext, None)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(execution_count(&db).await, 0);
+
+    let signed_exec = signed_bearer_request("POST", &exec_uri, &master.plaintext, &master.signing_secret, "");
+    assert_eq!(send(&app, signed_exec).await.status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -263,30 +507,36 @@ async fn hmac_signature_failures_are_rejected_without_executing_anything() {
     let hook_id = insert_hook(&db, "signed_fail", &script, 30).await;
     grant(&db, signer.id, hook_id, true, false).await;
 
+    let uri = format!("/api/hooks/{hook_id}/execute");
+    let body = json!({ "parameters": {} }).to_string();
+    let timestamp = now_timestamp();
+    let valid = sign_request(&signer.signing_secret, "POST", &uri, timestamp, &body);
+
     let request = |sig: &str, payload: &str| {
         with_connect_info(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/api/hooks/{hook_id}/execute"))
+                .uri(&uri)
                 .header("X-API-Key", &signer.plaintext)
                 .header("Content-Type", "application/json")
+                .header("X-Timestamp", timestamp.to_string())
                 .header("X-Signature-256", sig),
         )
         .body(axum::body::Body::from(payload.to_owned()))
         .expect("request builds")
     };
 
-    let body = json!({ "parameters": {} }).to_string();
-    let valid = sign_body(&signer.signing_secret, &body);
-
     // Every one of these presents a *valid* API key — only the signature is wrong, so each must
     // still be rejected at the authentication layer.
     let rejected: Vec<(&str, String, String)> = vec![
         ("tampered body", valid.clone(), json!({ "parameters": { "x": "1" } }).to_string()),
         ("body with trailing whitespace", valid.clone(), format!("{body} ")),
-        ("signature from another valid key", sign_body(&other.signing_secret, &body), body.clone()),
-        ("signature of a different payload", sign_body(&signer.signing_secret, "{}"), body.clone()),
-        ("signature keyed on the bearer key instead of the signing secret", sign_body(&signer.plaintext, &body), body.clone()),
+        ("signature from another valid key", sign_request(&other.signing_secret, "POST", &uri, timestamp, &body), body.clone()),
+        ("signature of a different payload", sign_request(&signer.signing_secret, "POST", &uri, timestamp, "{}"), body.clone()),
+        ("signature keyed on the bearer key instead of the signing secret", sign_request(&signer.plaintext, "POST", &uri, timestamp, &body), body.clone()),
+        ("signature computed for a different method", sign_request(&signer.signing_secret, "DELETE", &uri, timestamp, &body), body.clone()),
+        ("signature computed for a different path", sign_request(&signer.signing_secret, "POST", "/api/hooks/other/execute", timestamp, &body), body.clone()),
+        ("signature computed for a different timestamp", sign_request(&signer.signing_secret, "POST", &uri, timestamp - 60, &body), body.clone()),
         ("missing sha256= prefix", valid.trim_start_matches("sha256=").to_owned(), body.clone()),
         ("wrong algorithm prefix", format!("sha1={}", &valid[7..]), body.clone()),
         ("non-hex digest", "sha256=zzzz".to_owned(), body.clone()),
@@ -1232,6 +1482,48 @@ async fn only_master_keys_may_assign_run_as_user() {
     )
     .await;
     assert_eq!(probe.status, StatusCode::FORBIDDEN);
+
+    // The escalation check must fire *before* any other field is validated. Each of these payloads
+    // is invalid in some additional way that would otherwise produce a 400 first; the 403 has to
+    // win, or an attacker could distinguish "my run_as_user was accepted" from "it was refused"
+    // by observing which complaint came back.
+    let masked = [
+        ("relative script_path", json!({ "name": "m1", "script_path": "relative.sh", "run_as_user": "root" })),
+        ("traversing script_path", json!({ "name": "m2", "script_path": "/opt/../etc/shadow", "run_as_user": "root" })),
+        ("invalid timeout", json!({ "name": "m3", "script_path": script, "default_timeout_seconds": 0, "run_as_user": "root" })),
+        ("empty name", json!({ "name": "   ", "script_path": script, "run_as_user": "root" })),
+        ("bad param_key", json!({ "name": "m4", "script_path": script, "run_as_user": "root", "parameters": [{ "param_key": "9bad" }] })),
+    ];
+    for (label, payload) in masked {
+        let response = send(&app, json_request("POST", "/api/hooks", &manager, Some(payload))).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "{label}: the escalation refusal must precede field validation"
+        );
+        assert_eq!(
+            response.string("error"),
+            "Only master API keys can assign run_as_user privileges",
+            "{label}: the 403 must not be masked by a 400 about another field"
+        );
+    }
+
+    // The same ordering holds on update.
+    let masked_update = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{}", ordinary.string("id")),
+            &manager,
+            Some(json!({ "script_path": "relative.sh", "run_as_user": "root" })),
+        ),
+    )
+    .await;
+    assert_eq!(masked_update.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        masked_update.string("error"),
+        "Only master API keys can assign run_as_user privileges"
+    );
 
     // Explicitly *not* elevating is fine for a non-master, in both spellings.
     for null_ish in [json!(null), json!("")] {

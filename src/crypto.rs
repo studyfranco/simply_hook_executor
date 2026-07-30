@@ -15,6 +15,9 @@ use rand::RngExt;
 
 /// Environment variable holding the 32-byte (64 hex character) encryption key.
 const KEY_ENV_VAR: &str = "SIGNING_SECRET_KEY";
+/// Accepted alias for [`KEY_ENV_VAR`], for deployments that already provision a general-purpose
+/// vault key. `SIGNING_SECRET_KEY` wins when both are set.
+const KEY_ENV_VAR_ALIAS: &str = "VAULT_ENCRYPTION_KEY";
 /// Prefix marking a value stored without encryption.
 const PLAINTEXT_PREFIX: &str = "v1.plain.";
 /// Prefix marking a value sealed with XChaCha20-Poly1305.
@@ -76,9 +79,18 @@ impl SecretCipher {
     /// the variable believes their secrets are encrypted, and silently writing them in the clear
     /// would betray that belief at exactly the wrong moment.
     pub fn from_env() -> Result<Self, CryptoError> {
-        match std::env::var(KEY_ENV_VAR) {
-            Ok(raw) if !raw.trim().is_empty() => Self::from_hex_key(raw.trim()),
-            _ => Ok(Self::Plaintext),
+        let configured = std::env::var(KEY_ENV_VAR)
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .or_else(|| {
+                std::env::var(KEY_ENV_VAR_ALIAS)
+                    .ok()
+                    .filter(|raw| !raw.trim().is_empty())
+            });
+
+        match configured {
+            Some(raw) => Self::from_hex_key(raw.trim()),
+            None => Ok(Self::Plaintext),
         }
     }
 

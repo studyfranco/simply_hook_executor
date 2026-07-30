@@ -737,39 +737,168 @@ check "200" "the slot is released once the process exits"
 log_section "12. HMAC-SHA256 Body Signing"
 
 if [ "$HAVE_OPENSSL" -eq 1 ]; then
-    # Signatures are keyed on the key's *signing secret*, not on the bearer API key.
-    sign_body() { printf '%s' "$2" | openssl dgst -sha256 -hmac "$1" -r | cut -d' ' -f1; }
+    # The canonical string is METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY, keyed on the
+    # key's *signing secret* (never the bearer API key). printf '%b' is not used: the components
+    # must be joined with real newlines and nothing else interpreted.
+    sign_canonical() {
+        local secret="$1" method="$2" path="$3" ts="$4" body="$5"
+        printf '%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$body" \
+            | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1
+    }
+
+    # Issues a fully-signed request. Usage: signed_call METHOD PATH BODY [AUTH_HEADER...] via globals
+    #   $SIGN_SECRET  — signing secret
+    #   $SIGN_AUTH    — the identifying header, e.g. "X-API-Key: ..." or "X-Key-Id: ..."
+    #   $SIGN_TS      — optional timestamp override (defaults to now)
+    signed_call() {
+        local method="$1" path="$2" body="${3:-}"
+        local ts="${SIGN_TS:-$(date +%s)}"
+        local sig; sig=$(sign_canonical "$SIGN_SECRET" "$method" "$path" "$ts" "$body")
+        local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method"
+                    -H "$SIGN_AUTH" -H "X-Timestamp: $ts" -H "X-Signature-256: sha256=$sig")
+        [ -n "$body" ] && args+=(-H "Content-Type: application/json" -d "$body")
+        RESP_STATUS=$(curl "${args[@]}" "$BASE_URL$path")
+        RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+        local color; color=$(status_color "$RESP_STATUS")
+        printf "%s ${color}[%s]${RESET} %-6s %s ${DIM}(signed, ts=%s)${RESET}\n" \
+            "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" "$ts" >&2
+        print_response_body
+    }
+
+    # A dedicated master key, so the all-methods checks below can sign master-only routes without
+    # scraping the bootstrap banner for its randomly-generated secret.
+    create_scoped_key "Signing Master" ',"is_master":true'
+    SIGNING_MASTER_KEY="$CREATED_KEY"
+    MASTER_SIGNING_SECRET="$CREATED_SIGNING_SECRET"
+
+    SIGN_SECRET="$EXEC_SIGNING_SECRET"
+    SIGN_AUTH="X-API-Key: $EXEC_KEY"
+    SIGN_TS=""
 
     SIGNED_BODY='{"parameters":{"target":"signed"}}'
-    SIGNATURE=$(sign_body "$EXEC_SIGNING_SECRET" "$SIGNED_BODY")
+    EXEC_PATH="/api/hooks/$ECHO_HOOK_ID/execute"
 
-    api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: sha256=$SIGNATURE"
-    check "200" "a correctly signed body is accepted alongside a bearer key"
+    signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "200" "a correctly signed request is accepted alongside a bearer key"
     check_jq ".status" "SUCCESS" "the signed request executed"
 
-    TAMPERED_BODY='{"parameters":{"target":"tampered"}}'
-    api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$TAMPERED_BODY" "" "X-Signature-256: sha256=$SIGNATURE"
-    check "401" "the same signature over an altered body is rejected"
+    # --- Negative cases, one broken component at a time ---
+    NOW=$(date +%s)
+    GOOD_SIG=$(sign_canonical "$EXEC_SIGNING_SECRET" "POST" "$EXEC_PATH" "$NOW" "$SIGNED_BODY")
 
-    api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: sha256=00ff"
-    check "401" "a bogus signature is rejected"
+    # Tampered body, valid signature and timestamp.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $NOW" -H "X-Signature-256: sha256=$GOOD_SIG" \
+        -d '{"parameters":{"target":"tampered"}}' "$BASE_URL$EXEC_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a signature over an altered body is rejected"
 
-    api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: notprefixed"
-    check "401" "a malformed signature header is rejected"
+    # Signature computed for a different method.
+    WRONG_METHOD_SIG=$(sign_canonical "$EXEC_SIGNING_SECRET" "DELETE" "$EXEC_PATH" "$NOW" "$SIGNED_BODY")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $NOW" -H "X-Signature-256: sha256=$WRONG_METHOD_SIG" \
+        -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a signature computed for a different HTTP method is rejected"
 
-    # Signing with the bearer key instead of the signing secret must NOT authenticate: the two are
-    # deliberately distinct credentials.
-    WRONG_MATERIAL=$(sign_body "$EXEC_KEY" "$SIGNED_BODY")
-    api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$EXEC_KEY" "$SIGNED_BODY" "" "X-Signature-256: sha256=$WRONG_MATERIAL"
+    # Signature computed for a different path.
+    WRONG_PATH_SIG=$(sign_canonical "$EXEC_SIGNING_SECRET" "POST" "/api/hooks/other/execute" "$NOW" "$SIGNED_BODY")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $NOW" -H "X-Signature-256: sha256=$WRONG_PATH_SIG" \
+        -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a signature computed for a different path is rejected"
+
+    # Wrong secret, and the classic mistake of signing with the bearer key.
+    SIGN_SECRET="definitely-not-the-secret"; signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "401" "a signature made with the wrong secret is rejected"
+    SIGN_SECRET="$EXEC_KEY"; signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
     check "401" "a signature keyed on the API key rather than the signing secret is rejected"
+    SIGN_SECRET="$EXEC_SIGNING_SECRET"
+
+    # Malformed signature headers.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $NOW" -H "X-Signature-256: sha256=00ff" \
+        -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a bogus signature digest is rejected"
+
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $NOW" -H "X-Signature-256: notprefixed" \
+        -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a signature header without the sha256= prefix is rejected"
+
+    # --- Anti-replay window ---
+    # Offsets stay well clear of the ±300s boundary: $NOW is sampled once but several signed
+    # requests (each executing a script) run in between, so a ±299 offset would drift across the
+    # boundary and fail intermittently. Exact boundary behaviour is unit-tested instead.
+    SIGN_TS=$((NOW - 240)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "200" "a timestamp inside the window is accepted"
+    SIGN_TS=$((NOW + 240)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "200" "modest forward clock skew is tolerated"
+    SIGN_TS=$((NOW - 360)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "401" "an expired timestamp is rejected (replay window)"
+    check_true '.error | contains("window")' "the error names the replay window"
+    SIGN_TS=$((NOW - 86400)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "401" "a day-old capture is rejected"
+    SIGN_TS=$((NOW + 3600)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
+    check "401" "a far-future timestamp is rejected"
+    SIGN_TS=""
+
+    # A signature with no timestamp at all cannot be replay-checked.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+        -H "X-Signature-256: sha256=$GOOD_SIG" -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a signed request with no X-Timestamp is rejected"
+    check_true '.error | contains("X-Timestamp")' "the error names the missing header"
+
+    # Malformed timestamps are rejected rather than coerced to 'now'.
+    for BAD_TS in "not-a-number" "1700000000.5" ""; do
+        RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+            -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
+            -H "X-Timestamp: $BAD_TS" -H "X-Signature-256: sha256=$GOOD_SIG" \
+            -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
+        RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+        check "401" "a malformed X-Timestamp ('$BAD_TS') is rejected"
+    done
+
+    # --- Signing across every HTTP method, as the SPA does ---
+    SIGN_AUTH="X-API-Key: $SIGNING_MASTER_KEY"; SIGN_SECRET="$MASTER_SIGNING_SECRET"
+    signed_call GET "/api/hooks" ""
+    check "200" "a signed GET is accepted"
+    signed_call GET "/api/executions?limit=5" ""
+    check "200" "a signed GET with a query string is accepted"
+    signed_call PUT "/api/hooks/$ECHO_HOOK_ID" '{"description":"signed put"}'
+    check "200" "a signed PUT is accepted"
+    signed_call PATCH "/api/hooks/$ECHO_HOOK_ID" '{"description":"signed patch"}'
+    check "200" "a signed PATCH is accepted"
+
+    # The query string is signed material: re-pointing it invalidates the signature.
+    QS_TS=$(date +%s)
+    QS_SIG=$(sign_canonical "$MASTER_SIGNING_SECRET" "GET" "/api/executions?limit=5" "$QS_TS" "")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X GET \
+        -H "X-API-Key: $SIGNING_MASTER_KEY" -H "X-Timestamp: $QS_TS" -H "X-Signature-256: sha256=$QS_SIG" \
+        "$BASE_URL/api/executions?limit=1000")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "altering the query string invalidates the signature"
+
+    SIGN_AUTH="X-API-Key: $EXEC_KEY"; SIGN_SECRET="$EXEC_SIGNING_SECRET"
 
     # --- Key ID + signature, with no bearer credential at all (the webhook-sender pattern) ---
     curl_signed() {
         local path="$1" key_id="$2" secret="$3" body="$4"
-        local sig; sig=$(sign_body "$secret" "$body")
+        local ts; ts=$(date +%s)
+        local sig; sig=$(sign_canonical "$secret" "POST" "$path" "$ts" "$body")
         RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
             -H "X-Key-Id: $key_id" -H "Content-Type: application/json" \
-            -H "X-Signature-256: sha256=$sig" -d "$body" "$BASE_URL$path")
+            -H "X-Timestamp: $ts" -H "X-Signature-256: sha256=$sig" -d "$body" "$BASE_URL$path")
         RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
         local color; color=$(status_color "$RESP_STATUS")
         printf "%s ${color}[%s]${RESET} %-6s %s\n" "$(ts)" "$RESP_STATUS" "POST" "$BASE_URL$path" >&2

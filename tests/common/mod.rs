@@ -45,6 +45,8 @@ pub fn test_config() -> Arc<RuntimeConfig> {
         log_retention_days: 30,
         retention_sweep_seconds: 3600,
         max_output_bytes: 64 * 1024,
+        signature_max_age_seconds: 300,
+        require_signed_requests: false,
         // Unconfined by default: the suite writes throwaway scripts under the system temp dir.
         // Confinement is exercised explicitly via `test_state_with_roots`.
         allowed_script_roots: Vec::new(),
@@ -188,25 +190,66 @@ pub async fn insert_key_full(
     SeededKey { id, plaintext, key_id, signing_secret }
 }
 
-/// Computes the `X-Signature-256` header value a well-behaved client would send.
-pub fn sign_body(signing_secret: &str, body: &str) -> String {
+/// The current Unix timestamp, as a client would stamp a request.
+pub fn now_timestamp() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Computes an `X-Signature-256` value over the canonical
+/// `METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY` string.
+pub fn sign_request(signing_secret: &str, method: &str, path: &str, timestamp: i64, body: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
         .expect("HMAC accepts any key length");
-    mac.update(body.as_bytes());
+    mac.update(format!("{method}\n{path}\n{timestamp}\n{body}").as_bytes());
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Builds a request authenticated purely by `X-Key-Id` + `X-Signature-256`, with no bearer key —
-/// the webhook-sender pattern.
+/// Builds a request authenticated purely by `X-Key-Id` + signature, with no bearer key — the
+/// webhook-sender pattern — stamped at the current time.
 pub fn signed_request(method: &str, uri: &str, key_id: &str, signing_secret: &str, body: &str) -> Request<Body> {
+    signed_request_at(method, uri, key_id, signing_secret, body, now_timestamp())
+}
+
+/// As [`signed_request`], but stamped at an explicit time so replay-window behavior is testable.
+pub fn signed_request_at(
+    method: &str,
+    uri: &str,
+    key_id: &str,
+    signing_secret: &str,
+    body: &str,
+    timestamp: i64,
+) -> Request<Body> {
     with_connect_info(
         Request::builder()
             .method(method)
             .uri(uri)
             .header("X-Key-Id", key_id)
             .header("Content-Type", "application/json")
-            .header("X-Signature-256", sign_body(signing_secret, body)),
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", sign_request(signing_secret, method, uri, timestamp, body)),
+    )
+    .body(Body::from(body.to_owned()))
+    .expect("request builds")
+}
+
+/// Builds a bearer-authenticated request that additionally carries a valid signature.
+pub fn signed_bearer_request(
+    method: &str,
+    uri: &str,
+    api_key: &str,
+    signing_secret: &str,
+    body: &str,
+) -> Request<Body> {
+    let timestamp = now_timestamp();
+    with_connect_info(
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-API-Key", api_key)
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", sign_request(signing_secret, method, uri, timestamp, body)),
     )
     .body(Body::from(body.to_owned()))
     .expect("request builds")

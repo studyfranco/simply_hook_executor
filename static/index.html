@@ -24,6 +24,16 @@
                     <label for="login-key">API Key</label>
                     <input type="password" id="login-key" placeholder="Enter X-API-Key..." required class="input-field">
                 </div>
+                <div class="form-group">
+                    <label for="login-signing-secret">Signing Secret (optional)</label>
+                    <input type="password" id="login-signing-secret" placeholder="Enables HMAC request signing" class="input-field" autocomplete="off">
+                    <span class="text-muted text-sm">
+                        If provided, every request is signed with HMAC-SHA256 over
+                        <code>METHOD + PATH + TIMESTAMP + BODY</code>. Requires HTTPS (or localhost)
+                        for the Web Crypto API, and is required when the server runs with
+                        <code>REQUIRE_SIGNED_REQUESTS</code>.
+                    </span>
+                </div>
                 <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
             </form>
             <div id="login-error" class="message error hidden"></div>

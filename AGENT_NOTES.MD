@@ -622,3 +622,147 @@ Unit 35 → 42, integration 43 → 47, E2E 267 → 322.
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - `cargo test` — 42 unit + 47 integration tests pass.
 - `./scripts/test_e2e.sh` — 322/322 checks pass.
+
+---
+
+## 2026-07-30 — HMAC anti-replay flow, doc alignment, RBAC finalization
+
+This round was framed as "document and audit", but three of the behaviours the brief described did
+not exist yet. Writing documentation asserting them would have been worse than writing none, so
+they were **implemented first, then documented**:
+
+| Described | Was | Now |
+| :--- | :--- | :--- |
+| Signature over `METHOD + PATH + TIMESTAMP + RAW_BODY` | covered the body only | canonical four-part string |
+| `X-Timestamp`, 5-minute anti-replay window | did not exist | enforced, symmetric, configurable |
+| SPA signs every request via Web Crypto | SPA never signed | `RequestSigner`, all methods |
+
+### The canonical signature string
+
+```text
+<METHOD>\n<PATH_AND_QUERY>\n<TIMESTAMP>\n<RAW_BODY>
+```
+
+Three choices in there are load-bearing, and each has a test pinning it:
+
+1. **Newline delimiters.** The brief said "`METHOD + PATH + TIMESTAMP + RAW_BODY`". Literal
+   concatenation is ambiguous — `POST` + `/api/x` and `POS` + `T/api/x` hash identically — so a
+   captured signature could be replayed across a different method/path split. Delimiting removes
+   the class entirely (`delimiters_prevent_component_boundary_shifting`).
+2. **`PATH_AND_QUERY`, not just the path.** Signing only the path would leave
+   `?older_than_days=0` freely rewritable to `?older_than_days=1000` on an otherwise-valid signed
+   request.
+3. **`OriginalUri`, not `parts.uri`.** This one was a genuine bug, caught by the first
+   end-to-end run: `Router::nest("/api", …)` *strips the prefix* from the URI inner layers see, so
+   the server was signing `/hooks/x/execute` while every client signed `/api/hooks/x/execute`. Every
+   signed request failed with `401`. The middleware now reads `OriginalUri`, which preserves the
+   target the client actually requested. Worth remembering: **any** middleware inside a `nest` that
+   cares about the path has this trap.
+
+### Anti-replay
+
+`X-Timestamp` (Unix seconds) must be within `SIGNATURE_MAX_AGE_SECONDS` (default 300) of server
+time, checked **before** the HMAC so a stale request never costs a secret decryption and a body
+hash. Two deliberate properties:
+
+- **Symmetric window.** A forward-dated timestamp is rejected as firmly as a stale one — otherwise
+  a request dated an hour ahead would stay replayable for that entire hour.
+- **No coercion.** A signed request with a missing or malformed `X-Timestamp` is `401`, never
+  treated as "now". Silently defaulting would disable the whole mechanism for any client that
+  simply forgot the header.
+
+`REQUIRE_SIGNED_REQUESTS=true` promotes signing from optional to mandatory across every
+authenticated route. It defaults to `false` deliberately: flipping it on by default would break
+every existing bearer-only integration on upgrade. This is the migration path to the end state the
+brief describes, not a permanent opt-out.
+
+### `run_as_user` guard ordering
+
+Previously the master-only check ran *after* `validate_script_path` and `validate_timeout`. A
+non-master submitting `{run_as_user: "root", script_path: "relative.sh"}` therefore got a `400`
+about the path — which leaks that the escalation itself was not the objection. The guard now fires
+immediately after the endpoint's authorization check and before any field validation, in both
+`create_hook` and `update_hook`. Five payloads, each invalid in a *different* additional way, assert
+the `403` always wins.
+
+### Frontend signing
+
+`RequestSigner` signs every request `apiFetch` makes — GET, POST, PUT, PATCH, DELETE — with the
+`signing_secret` the operator supplies at login. Two honest constraints:
+
+- **`crypto.subtle` requires a secure context.** Over plain HTTP on a LAN address it is simply
+  `undefined`. The signer reports itself unavailable, the SPA falls back to bearer-only auth and
+  **says so in a toast** rather than silently sending unsigned requests. Deployments running with
+  `REQUIRE_SIGNED_REQUESTS` therefore need HTTPS (or localhost) for the dashboard — that is a real
+  constraint, not an oversight.
+- **The secret lives in `localStorage`**, as specified. That is XSS-reachable; the SPA has no
+  inline scripts and escapes all interpolated output, but the exposure is real and the field is
+  optional for exactly that reason. It is cleared on logout alongside the API key.
+
+The imported `CryptoKey` is non-extractable, so it cannot be read back out of the browser once
+imported.
+
+### Documentation alignment
+
+- **`AGENT.MD`** gained the full protocol (canonical string, header table, the `OriginalUri`
+  requirement, constant-time comparison, the 300s window) and an **effective permission matrix**
+  mapping every endpoint to the flag it needs.
+- **`SCHEMA.MD`** gained the `signing_secret` storage model (sealed vs plaintext prefixes, the
+  `VAULT_ENCRYPTION_KEY` alias, why hashing is impossible, why a malformed key aborts startup) and
+  an explicit note that **`can_read` is derived, not stored**, with the reasoning for keeping two
+  columns rather than three.
+
+### Audit results (task 2)
+
+Verified by inspection and by test, not assumed:
+
+- **Middleware coverage** — `create_app` has exactly three route trees: `/api` and `/webhook`, both
+  wrapped in `auth_middleware`, plus the `ServeDir` fallback serving the public SPA. There is no
+  unauthenticated API surface.
+- **`/test` is side-effect free** — it contains no call to `execute_hook`, `run_process`, or any
+  `insert`; it requires `can_execute`; and a test asserts a canary file is never created and
+  `execution_count == 0` afterwards, while `/execute` produces both.
+- **Per-handler RBAC** — every handler carries an explicit guard: `require_execute` (execute/test/
+  webhook), `require_visibility` (reads), `require_manage` (mutations), `is_master` (settings, audit
+  logs, purge), and the global scope checks on key/hook creation. Listing endpoints narrow via
+  `visible_hook_ids` rather than rejecting.
+
+### Test coverage
+
+Unit 42 → 47, integration 47 → 51, E2E 322 → 342.
+
+New: canonical-base construction and the delimiter-collision case; replay across method, path,
+timestamp and query string; the symmetric window at ±299s/±301s and at day-scale; missing and
+malformed `X-Timestamp`; signing across GET/POST/PUT/PATCH/DELETE; query-string tampering;
+`REQUIRE_SIGNED_REQUESTS` enforcement across `/api/hooks`, `/api/keys`, `/api/settings` and
+`/execute`; and the `run_as_user` 403-before-validation ordering.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 47 unit + 51 integration tests pass.
+- `./scripts/test_e2e.sh` — 342/342 checks pass.
+
+### A flaky test, root-caused rather than re-rolled
+
+The first full-suite run after adding the replay tests failed once, then passed three times. Chasing
+it down: `the_anti_replay_window_rejects_stale_and_future_timestamps` sampled `now` **once** and
+then issued five requests that each spawn a real process. By the last iteration several seconds of
+wall clock had elapsed, so an offset of `-299` against a 300s window drifted *past* the boundary —
+and, symmetrically, `+299` drifted *inside* it. Either direction produces an intermittent failure.
+
+Offsets were widened to ±240 (inside) and ±360 (outside), well clear of the boundary, with the same
+fix applied to the E2E script, which had the identical hazard. Exact boundary behaviour (±299/±301)
+is asserted in `middleware::tests::timestamps_*`, where `verify_timestamp` is called directly with
+no I/O in between and drift is measured in microseconds. That is the right split: integration tests
+prove the window is *wired up*, unit tests prove it is *exact*.
+
+Verified with six consecutive runs of the isolated test and three of the full suite.
+
+### Known constraint
+
+`REQUIRE_SIGNED_REQUESTS=true` plus a dashboard served over plain HTTP is a non-working
+combination, by construction: the browser will not expose `crypto.subtle` outside a secure context,
+so the SPA cannot sign. Terminate TLS in front of the daemon (the unit file already recommends a
+reverse proxy) before enabling mandatory signing. Non-browser clients are unaffected.
