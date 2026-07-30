@@ -7,11 +7,31 @@
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
 use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
+
+/// Hard ceiling on the size of any request body this daemon will buffer, in bytes (1 MiB).
+///
+/// Applied as an explicit [`DefaultBodyLimit`] over the whole router rather than left to Axum's
+/// implicit 2 MiB default, for three reasons:
+///
+/// - **It is a security boundary, so it should be stated.** Every execute/webhook handler takes the
+///   body as [`axum::body::Bytes`] and every admin handler as `Json<T>`; both buffer the entire
+///   payload in memory before a handler ever runs. Without a bound, `max_concurrent_jobs` limits
+///   concurrent *processes* while doing nothing about concurrent *allocations*.
+/// - **It must agree with the signature verification buffer.** `middleware::auth_middleware` reads
+///   the raw body to recompute the HMAC and refuses anything larger than this same constant. Two
+///   independently-chosen limits would mean a band of sizes accepted by one layer and refused by
+///   the other, which is exactly the kind of gap that turns into a parser-differential bug.
+/// - **The default is version-dependent.** Axum's built-in limit is a documented default, not a
+///   guarantee; pinning it here means an upgrade cannot silently widen the exposure.
+///
+/// A body over the limit is rejected with `413 Payload Too Large` before it is read to completion.
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 pub mod api;
 pub mod config;
@@ -86,6 +106,11 @@ pub fn create_app(state: AppState) -> Router {
         .fallback_service(ServeDir::new("static"))
         .nest("/api", api_routes)
         .nest("/webhook", webhook_routes)
+        // Applied outside the nests so it covers `/api/*`, `/webhook/*`, and the static fallback
+        // alike — an unauthenticated POST at the SPA's own path is bounded by the same ceiling as
+        // an authenticated one, so the limit cannot be sidestepped by aiming at a route that never
+        // reaches the auth middleware.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

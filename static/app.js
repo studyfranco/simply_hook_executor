@@ -963,9 +963,76 @@ class HookExecutorClient {
         return parameters;
     }
 
+    // Builds the node for one captured stream. Returns a DOM *element*, never an HTML string.
+    //
+    // Hook `stdout`/`stderr`, resolved parameter values, and the dry-run command preview are the
+    // one class of data in this UI an attacker controls end to end: whoever can execute a hook
+    // chooses what the script prints, it is persisted verbatim in `executions.stdout`, and every
+    // operator who later opens that record re-renders it. A payload such as
+    // `<img src=x onerror=...>` would then run in a master key holder's session.
+    //
+    // `textContent` assigns rather than parses, so the payload is displayed as the literal text the
+    // script emitted. Escaping into `innerHTML` would also be correct today, but it stays correct
+    // only as long as nobody edits the template — assignment cannot be made unsafe by a later edit.
     outputBlock(label, content) {
-        const body = content && content.length > 0 ? escapeHtml(content) : '<span class="text-muted">(empty)</span>';
-        return `<div class="output-group"><span class="output-label">${escapeHtml(label)}</span><pre class="output-block">${body}</pre></div>`;
+        const group = document.createElement('div');
+        group.className = 'output-group';
+
+        const caption = document.createElement('span');
+        caption.className = 'output-label';
+        caption.textContent = label;
+
+        const pre = document.createElement('pre');
+        pre.className = 'output-block';
+        if (content !== null && content !== undefined && content.length > 0) {
+            pre.textContent = content;
+        } else {
+            const empty = document.createElement('span');
+            empty.className = 'text-muted';
+            empty.textContent = '(empty)';
+            pre.appendChild(empty);
+        }
+
+        group.append(caption, pre);
+        return group;
+    }
+
+    // Renders a result view (run panel or modal) into `container`.
+    //
+    // The split is deliberate and is the invariant worth keeping: `headerHtml` is markup this file
+    // builds from its own literals plus already-escaped badge helpers, while everything the server
+    // hands back — the blocking reason, the captured streams — arrives as pre-built nodes or plain
+    // text and is assigned, never parsed. A caller therefore cannot accidentally route hook output
+    // through the HTML path.
+    renderResultView(container, { headerHtml = '', headerClass = 'result-header', noteText = null, errorText = null, blocks = [] }) {
+        container.replaceChildren();
+
+        if (headerHtml) {
+            const header = document.createElement('div');
+            header.className = headerClass;
+            header.innerHTML = headerHtml;
+            container.appendChild(header);
+        }
+
+        if (noteText) {
+            const note = document.createElement('p');
+            note.className = 'subtitle';
+            note.textContent = noteText;
+            container.appendChild(note);
+        }
+
+        // Server-supplied diagnostic text (`blocking_reason`, and the `[ERROR] Cannot execute
+        // '<path>': ...` lines the executor produces), which embeds an operator-chosen script path.
+        if (errorText) {
+            const message = document.createElement('p');
+            message.className = 'message error';
+            message.textContent = errorText;
+            container.appendChild(message);
+        }
+
+        for (const block of blocks) {
+            container.appendChild(block);
+        }
     }
 
     async executeHook(e) {
@@ -987,14 +1054,16 @@ class HookExecutorClient {
 
             const panel = document.getElementById('run-hook-result');
             panel.classList.remove('hidden');
-            panel.innerHTML = `
-                <div class="result-header">
+            this.renderResultView(panel, {
+                headerHtml: `
                     ${this.statusBadge(res.status)}
-                    <span class="text-sm text-muted">exit ${res.exit_code === null ? '–' : res.exit_code} · ${formatDuration(res.duration_ms)}</span>
-                </div>
-                ${this.outputBlock('stdout', res.stdout)}
-                ${this.outputBlock('stderr', res.stderr)}
-            `;
+                    <span class="text-sm text-muted">exit ${escapeHtml(res.exit_code === null ? '–' : res.exit_code)} · ${escapeHtml(formatDuration(res.duration_ms))}</span>
+                `,
+                blocks: [
+                    this.outputBlock('stdout', res.stdout),
+                    this.outputBlock('stderr', res.stderr)
+                ]
+            });
             this.showToast(`Execution finished: ${res.status}`, res.status === 'SUCCESS' ? 'success' : 'error');
             this.loadExecutions();
         } catch (err) {
@@ -1025,19 +1094,21 @@ class HookExecutorClient {
 
             const panel = document.getElementById('run-hook-result');
             panel.classList.remove('hidden');
-            panel.innerHTML = `
-                <div class="result-header">
+            this.renderResultView(panel, {
+                headerHtml: `
                     <span class="badge ${res.would_execute ? 'badge-success' : 'badge-failed'}">
                         ${res.would_execute ? 'DRY RUN OK' : 'BLOCKED'}
                     </span>
-                    <span class="text-sm text-muted">timeout ${res.timeout_seconds}s</span>
+                    <span class="text-sm text-muted">timeout ${escapeHtml(res.timeout_seconds)}s</span>
                     ${res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
-                </div>
-                ${res.blocking_reason ? `<p class="message error">${escapeHtml(res.blocking_reason)}</p>` : ''}
-                ${this.outputBlock('command', res.command.program)}
-                ${this.outputBlock('positional arguments', argList)}
-                ${this.outputBlock('environment', envRows)}
-            `;
+                `,
+                errorText: res.blocking_reason || null,
+                blocks: [
+                    this.outputBlock('command', res.command.program),
+                    this.outputBlock('positional arguments', argList),
+                    this.outputBlock('environment', envRows)
+                ]
+            });
             this.showToast(res.would_execute ? 'Dry run resolved successfully' : 'Dry run blocked', res.would_execute ? 'success' : 'error');
         } catch (err) {}
     }
@@ -1049,19 +1120,22 @@ class HookExecutorClient {
                 ? Object.entries(e.parameters).map(([k, v]) => `${k} = ${v}`).join('\n')
                 : '(none)';
 
-            document.getElementById('execution-modal-body').innerHTML = `
-                <div class="kv-grid">
+            this.renderResultView(document.getElementById('execution-modal-body'), {
+                headerClass: 'kv-grid',
+                headerHtml: `
                     <div class="kv-item"><span class="kv-key">Hook</span><span class="kv-value">${escapeHtml(e.hook_name)}</span></div>
                     <div class="kv-item"><span class="kv-key">Status</span><span class="kv-value">${this.statusBadge(e.status)}</span></div>
-                    <div class="kv-item"><span class="kv-key">Exit code</span><span class="kv-value font-mono">${e.exit_code === null ? '–' : e.exit_code}</span></div>
-                    <div class="kv-item"><span class="kv-key">Duration</span><span class="kv-value">${formatDuration(e.duration_ms)}</span></div>
-                    <div class="kv-item"><span class="kv-key">Started</span><span class="kv-value">${new Date(e.timestamp + 'Z').toLocaleString()}</span></div>
+                    <div class="kv-item"><span class="kv-key">Exit code</span><span class="kv-value font-mono">${escapeHtml(e.exit_code === null ? '–' : e.exit_code)}</span></div>
+                    <div class="kv-item"><span class="kv-key">Duration</span><span class="kv-value">${escapeHtml(formatDuration(e.duration_ms))}</span></div>
+                    <div class="kv-item"><span class="kv-key">Started</span><span class="kv-value">${escapeHtml(new Date(e.timestamp + 'Z').toLocaleString())}</span></div>
                     <div class="kv-item"><span class="kv-key">Execution ID</span><span class="kv-value font-mono text-sm">${escapeHtml(e.id)}</span></div>
-                </div>
-                ${this.outputBlock('parameters', paramRows)}
-                ${this.outputBlock('stdout', e.stdout)}
-                ${this.outputBlock('stderr', e.stderr)}
-            `;
+                `,
+                blocks: [
+                    this.outputBlock('parameters', paramRows),
+                    this.outputBlock('stdout', e.stdout),
+                    this.outputBlock('stderr', e.stderr)
+                ]
+            });
             document.getElementById('execution-modal').classList.remove('hidden');
         } catch (err) {}
     }
@@ -1153,20 +1227,22 @@ class HookExecutorClient {
                 ? res.command.args.map((a, i) => `argv[${i + 1}] = ${a}`).join('\n')
                 : '(none)';
 
-            this.showHookResultModal(`Dry Run — ${hook.name}`, `
-                <div class="result-header">
+            this.showHookResultModal(`Dry Run — ${hook.name}`, {
+                headerHtml: `
                     <span class="badge ${res.would_execute ? 'badge-success' : 'badge-failed'}">
                         ${res.would_execute ? 'WOULD EXECUTE' : 'BLOCKED'}
                     </span>
-                    <span class="text-sm text-muted">timeout ${res.timeout_seconds}s</span>
+                    <span class="text-sm text-muted">timeout ${escapeHtml(res.timeout_seconds)}s</span>
                     ${res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
-                </div>
-                <p class="subtitle">Nothing was executed — this is the command that would run.</p>
-                ${res.blocking_reason ? `<p class="message error">${escapeHtml(res.blocking_reason)}</p>` : ''}
-                ${this.outputBlock('program', res.command.program)}
-                ${this.outputBlock('positional arguments', argList)}
-                ${this.outputBlock('environment', envRows)}
-            `);
+                `,
+                noteText: 'Nothing was executed — this is the command that would run.',
+                errorText: res.blocking_reason || null,
+                blocks: [
+                    this.outputBlock('program', res.command.program),
+                    this.outputBlock('positional arguments', argList),
+                    this.outputBlock('environment', envRows)
+                ]
+            });
         } catch (e) {}
     }
 
@@ -1195,15 +1271,17 @@ class HookExecutorClient {
                 body: JSON.stringify({ parameters: {} })
             });
 
-            this.showHookResultModal(`Execution — ${hook.name}`, `
-                <div class="result-header">
+            this.showHookResultModal(`Execution — ${hook.name}`, {
+                headerHtml: `
                     ${this.statusBadge(res.status)}
-                    <span class="text-sm text-muted">exit ${res.exit_code === null ? '–' : res.exit_code} · ${formatDuration(res.duration_ms)}</span>
+                    <span class="text-sm text-muted">exit ${escapeHtml(res.exit_code === null ? '–' : res.exit_code)} · ${escapeHtml(formatDuration(res.duration_ms))}</span>
                     ${hook.run_as_user ? this.privilegeBadge(hook.run_as_user) : ''}
-                </div>
-                ${this.outputBlock('stdout', res.stdout)}
-                ${this.outputBlock('stderr', res.stderr)}
-            `);
+                `,
+                blocks: [
+                    this.outputBlock('stdout', res.stdout),
+                    this.outputBlock('stderr', res.stderr)
+                ]
+            });
             this.showToast(`Execution finished: ${res.status}`, res.status === 'SUCCESS' ? 'success' : 'error');
             this.loadExecutions();
         } catch (e) {}
@@ -1218,9 +1296,11 @@ class HookExecutorClient {
         this.loadExecutions();
     }
 
-    showHookResultModal(title, bodyHtml) {
+    // `view` is the descriptor [`renderResultView`] takes, not an HTML string: the modal cannot be
+    // handed raw markup, which is what keeps hook output off the parsing path by construction.
+    showHookResultModal(title, view) {
         document.getElementById('hook-result-title').textContent = title;
-        document.getElementById('hook-result-body').innerHTML = bodyHtml;
+        this.renderResultView(document.getElementById('hook-result-body'), view);
         document.getElementById('hook-result-modal').classList.remove('hidden');
     }
 

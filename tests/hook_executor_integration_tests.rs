@@ -3159,3 +3159,594 @@ async fn hook_parameter_crud_is_guarded_by_manage_rights() {
         Some(0)
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+// Hostile payloads: stored XSS, argument injection, process escape, body limits
+// ─────────────────────────────────────────────────────────────
+
+/// The canonical stored-XSS probe: valid HTML, no quoting tricks, fires without user interaction.
+const XSS_PAYLOAD: &str = "<img src=x onerror=alert(1)>";
+
+/// A second payload that closes an attribute and a tag first, so a renderer that interpolates into
+/// an attribute (rather than into element content) is caught too.
+const XSS_BREAKOUT_PAYLOAD: &str = r#""><script>alert(document.domain)</script>"#;
+
+/// Hook output containing live markup must survive the round trip byte-for-byte and be labelled
+/// `application/json`.
+///
+/// Both halves matter. Verbatim storage is what makes the *renderer* solely responsible for safety
+/// — if the server silently stripped tags, the UI's escaping would be untested in production and
+/// the first payload that evaded the stripper would land in an unprotected sink. The content type
+/// is what stops the raw API response from being rendered as a document if an operator opens the
+/// URL directly.
+#[tokio::test]
+async fn hook_output_containing_live_markup_round_trips_verbatim_as_json() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    // Emits the payload on stdout and the breakout variant on stderr, so both streams are covered.
+    let script = scripts.write_script(
+        "xss.sh",
+        &format!("printf '%s' '{XSS_PAYLOAD}'\nprintf '%s' '{XSS_BREAKOUT_PAYLOAD}' >&2"),
+    );
+    let hook_id = insert_hook(&db, "xss_hook", &script, 30).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let res = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Verbatim: not stripped, not entity-encoded, not truncated at the first '<'.
+    assert_eq!(res.field("stdout"), &json!(XSS_PAYLOAD));
+    assert_eq!(res.field("stderr"), &json!(XSS_BREAKOUT_PAYLOAD));
+
+    // Inert on the wire: a browser told `application/json` will not parse the payload as markup.
+    assert_eq!(
+        res.content_type.as_deref(),
+        Some("application/json"),
+        "an endpoint echoing attacker-controlled bytes must never be served as a document"
+    );
+
+    // The breakout payload's double quote must be JSON-escaped in the raw body, or the response
+    // itself would be malformed JSON — which is how a client could be pushed into a lenient,
+    // HTML-ish parse.
+    assert!(
+        res.raw.contains(r#"\"><script>"#),
+        "the quote must be escaped in the serialized body: {}",
+        res.raw
+    );
+
+    // And it must still be retrievable, unchanged, from the persisted history.
+    let execution_id = res.string("id");
+    let stored = send(&app, json_request("GET", &format!("/api/executions/{execution_id}"), &master, None)).await;
+    assert_eq!(stored.status, StatusCode::OK);
+    assert_eq!(stored.field("stdout"), &json!(XSS_PAYLOAD));
+    assert_eq!(stored.field("stderr"), &json!(XSS_BREAKOUT_PAYLOAD));
+}
+
+/// A hook *name* and *script path* containing markup must also round-trip verbatim, since both are
+/// rendered into the hooks table and the audit log.
+#[tokio::test]
+async fn hook_metadata_containing_markup_round_trips_verbatim() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("meta.sh", "echo ok");
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let hostile_name = format!("hook{XSS_PAYLOAD}");
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": hostile_name, "script_path": script, "description": XSS_BREAKOUT_PAYLOAD })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK);
+    assert_eq!(created.field("name"), &json!(hostile_name));
+    assert_eq!(created.field("description"), &json!(XSS_BREAKOUT_PAYLOAD));
+
+    // The audit trail embeds the name in a human-readable `details` string; it must be stored as
+    // written rather than interpreted.
+    let logs = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_CREATE", &master, None)).await;
+    assert_eq!(logs.status, StatusCode::OK);
+    assert!(
+        logs.raw.contains("onerror=alert(1)"),
+        "the hook name should appear in the audit details verbatim: {}",
+        logs.raw
+    );
+    assert_eq!(logs.content_type.as_deref(), Some("application/json"));
+}
+
+/// Guards the SPA invariant that captured output and server error text are *assigned* to the DOM,
+/// never parsed as HTML.
+///
+/// This is a source-level assertion rather than a rendered-DOM one, and the reason is worth stating
+/// plainly: the project has no JavaScript runtime and no headless browser (`AGENT.MD` forbids
+/// frontend dependencies), so nothing here can mount `static/app.js` and inspect the resulting
+/// nodes. What it *can* do is fail the build the moment someone routes hook output back through the
+/// HTML-parsing sink, which is the regression this exists to catch. The companion API-level tests
+/// above pin the other half: the bytes reaching the renderer really are attacker-controlled.
+#[test]
+fn spa_renders_captured_output_through_text_nodes_only() {
+    let source = std::fs::read_to_string("static/app.js").expect("the SPA source is readable");
+
+    // The single sink every captured stream flows through must assign, not parse.
+    assert!(
+        source.contains("pre.textContent = content;"),
+        "outputBlock must write stream content with textContent"
+    );
+    assert!(
+        source.contains("message.textContent = errorText;"),
+        "server-supplied error text must be written with textContent"
+    );
+    assert!(
+        source.contains("caption.textContent = label;"),
+        "output labels must be written with textContent"
+    );
+
+    // The result modal must take a descriptor, not raw markup — the old `bodyHtml` parameter made
+    // it possible to hand it a string built by concatenation.
+    assert!(
+        !source.contains("bodyHtml"),
+        "showHookResultModal must not accept a raw HTML string"
+    );
+
+    // No line that assigns innerHTML may mention a field carrying attacker-controlled content.
+    // Deliberately field names, not free text: `renderResultView` legitimately assigns trusted
+    // header markup, and this check must not forbid that.
+    const TAINTED_FIELDS: [&str; 6] = [
+        "stdout",
+        "stderr",
+        "blocking_reason",
+        "res.command.program",
+        "argList",
+        "envRows",
+    ];
+    for (number, line) in source.lines().enumerate() {
+        if !line.contains("innerHTML") {
+            continue;
+        }
+        for field in TAINTED_FIELDS {
+            assert!(
+                !line.contains(field),
+                "static/app.js:{}: '{field}' must not reach innerHTML — use outputBlock()/textContent:\n{}",
+                number + 1,
+                line.trim()
+            );
+        }
+    }
+
+    // Every remaining innerHTML assignment must be escaped or a self-contained literal. Catching
+    // the shape here is what keeps the audit above from silently rotting as new fields are added.
+    assert!(
+        source.contains("header.innerHTML = headerHtml;"),
+        "renderResultView is the one place trusted header markup is parsed"
+    );
+}
+
+/// Values shaped like CLI options must reach the script as inert positional data.
+///
+/// The threat is not shell metacharacters — there is no shell — but *argument* interpretation: a
+/// value like `--version` or `-rf` is a perfectly ordinary string until something re-parses the
+/// argument vector. Passing an explicit `args` vector to `execve` is what makes that impossible,
+/// and this pins it end to end rather than trusting the plan builder in isolation.
+#[tokio::test]
+async fn cli_flag_shaped_parameters_stay_literal_in_argv_and_environment() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let canary = scripts.path_for("argv_canary");
+    // Echoes every positional argument inside delimiters, then the matching environment injection.
+    // `"$@"` preserves argument boundaries, so a value containing spaces or newlines shows up as
+    // one argv entry rather than several.
+    let script = scripts.write_script(
+        "argv.sh",
+        "i=0\nfor a in \"$@\"; do i=$((i+1)); printf 'argv[%s]=<%s>\\n' \"$i\" \"$a\"; done\n\
+         printf 'env_flag=<%s>\\n' \"$HOOK_PARAM_P1_FLAG\"\n\
+         printf 'env_target=<%s>\\n' \"$HOOK_PARAM_P2_TARGET\"\n\
+         printf 'env_extra=<%s>\\n' \"$HOOK_PARAM_P3_EXTRA\"",
+    );
+
+    let hook_id = insert_hook(&db, "argv_hook", &script, 30).await;
+    // Positional order is `created_at` with `param_key` as the tie-break. Numbering the keys makes
+    // alphabetical order already agree with declaration order, so the argv slots asserted below are
+    // deterministic even if two rows land in the same timestamp tick.
+    insert_parameter(&db, hook_id, "p1_flag", None, true).await;
+    insert_parameter(&db, hook_id, "p2_target", None, true).await;
+    insert_parameter(&db, hook_id, "p3_extra", None, true).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // Every value here is chosen to be dangerous to a *different* consumer: getopt, rm, sudo, and
+    // a shell respectively.
+    let touch_canary = format!("; touch {canary}");
+    let hostile: [(&str, &str, &str); 6] = [
+        ("--help", "--version", "-rf"),
+        ("-rf", "/", "--no-preserve-root"),
+        ("--", "--login", "-u"),
+        ("; rm -rf /", touch_canary.as_str(), "&& id"),
+        ("$(id)", "`id`", "${IFS}id"),
+        ("-u root", "--user=root", "\n--login"),
+    ];
+
+    for (flag, target, extra) in hostile {
+        let res = send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook_id}/execute"),
+                &master,
+                Some(json!({ "parameters": { "p1_flag": flag, "p2_target": target, "p3_extra": extra } })),
+            ),
+        )
+        .await;
+
+        assert_eq!(res.status, StatusCode::OK, "hostile payload {flag:?} should execute inertly");
+        assert_eq!(res.field("status"), &json!("SUCCESS"), "for {flag:?}");
+
+        let stdout = res.string("stdout");
+        // Positional: exactly the bytes supplied, in declaration order, one argv slot each.
+        assert!(stdout.contains(&format!("argv[1]=<{flag}>")), "argv[1] for {flag:?} in:\n{stdout}");
+        assert!(stdout.contains(&format!("argv[2]=<{target}>")), "argv[2] for {target:?} in:\n{stdout}");
+        assert!(stdout.contains(&format!("argv[3]=<{extra}>")), "argv[3] for {extra:?} in:\n{stdout}");
+        // Environment: same bytes again, prefixed and uppercased.
+        assert!(stdout.contains(&format!("env_flag=<{flag}>")), "env for {flag:?} in:\n{stdout}");
+        assert!(stdout.contains(&format!("env_target=<{target}>")), "env for {target:?} in:\n{stdout}");
+        assert!(stdout.contains(&format!("env_extra=<{extra}>")), "env for {extra:?} in:\n{stdout}");
+        // No argument absorbed another: three declared parameters, three argv slots.
+        assert!(!stdout.contains("argv[4]="), "no extra argv entry appeared for {flag:?}:\n{stdout}");
+    }
+
+    assert!(
+        !std::path::Path::new(&canary).exists(),
+        "a payload was interpreted rather than passed as data"
+    );
+}
+
+/// A hostile parameter cannot escape the `sudo -n -u <user> --` boundary into sudo's own options.
+///
+/// Verified through the dry-run endpoint, which reports the exact vector that would be handed to
+/// `execve` — so the assertion is about the real argument list, not a reimplementation of it, and
+/// it needs no `sudoers` entry or elevated test runner to hold.
+#[tokio::test]
+async fn hostile_parameters_cannot_escape_the_sudo_argument_boundary() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("privileged.sh", "echo ok");
+    let hook_id = insert_hook_as(&db, "sudo_hook", &script, 30, Some("root")).await;
+    insert_parameter(&db, hook_id, "first", None, true).await;
+    insert_parameter(&db, hook_id, "second", None, true).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // Each of these would change *who* the command runs as, or what sudo does, if it were parsed
+    // as an option rather than as an argument to the script.
+    let escapes = ["-u", "-u root", "--user=root", "-i", "--login", "-E", "--preserve-env", "--", "-s"];
+
+    for payload in escapes {
+        let res = send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook_id}/test"),
+                &master,
+                Some(json!({ "parameters": { "first": payload, "second": "-i" } })),
+            ),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "for {payload:?}");
+
+        let args: Vec<String> = res.json["command"]["args"]
+            .as_array()
+            .expect("the plan reports an argument vector")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_owned())
+            .collect();
+
+        assert_eq!(res.json["command"]["program"], json!("/usr/bin/sudo"), "for {payload:?}");
+        assert_eq!(res.json["command"]["run_as_user"], json!("root"), "for {payload:?}");
+
+        // The prefix is fixed and complete: nothing attacker-supplied can appear before `--`.
+        assert_eq!(&args[..4], &["-n", "-u", "root", "--"], "sudo prefix intact for {payload:?}");
+        assert_eq!(args[4], script, "the script path follows the separator for {payload:?}");
+
+        // Both hostile values land strictly after the separator, where sudo treats them as
+        // arguments to the script.
+        let separator = args.iter().position(|a| a == "--").expect("separator present");
+        for (index, value) in args.iter().enumerate().skip(5) {
+            assert!(index > separator, "{value:?} must sit after the separator for {payload:?}");
+        }
+        assert_eq!(args[5], payload, "the payload is passed through verbatim for {payload:?}");
+        assert_eq!(args[6], "-i", "the second payload is passed through verbatim for {payload:?}");
+        assert_eq!(args.len(), 7, "no extra arguments were synthesized for {payload:?}");
+    }
+}
+
+/// A `run_as_user` that is option-shaped is refused at definition time, so the vector above can
+/// never be built with a hostile account name in the `-u` slot.
+#[tokio::test]
+async fn option_shaped_run_as_user_is_refused_at_definition_time() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("elevated.sh", "echo ok");
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    for hostile in ["-i", "--login", "-u", "root -i", "root;id", "--user=root", "-E"] {
+        let res = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/hooks",
+                &master,
+                Some(json!({
+                    "name": format!("elevated_{}", Uuid::new_v4()),
+                    "script_path": script,
+                    "run_as_user": hostile
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "run_as_user {hostile:?} must be refused");
+    }
+}
+
+/// A backgrounded grandchild shares the child's process group, so the timeout's `killpg` reaches it.
+#[tokio::test]
+async fn timeout_kills_backgrounded_grandchildren_in_the_same_process_group() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let marker = scripts.path_for("group_child_survived");
+    // Output is redirected so the grandchild does not hold the captured pipe open past the kill,
+    // which would otherwise cost the reader-drain grace period on every run.
+    // The grandchild sleeps 3s against a 1s timeout. The margin is load-bearing: with a sleep close
+    // to the timeout the `touch` races the kill and can land first, which would read as a
+    // containment failure when it is really a test-timing artifact.
+    let script = scripts.write_script(
+        "group_escape.sh",
+        &format!("( sleep 3; touch {marker} ) >/dev/null 2>&1 &\nsleep 30"),
+    );
+
+    let hook_id = insert_hook(&db, "group_escape", &script, 1).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let res = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.field("status"), &json!("TIMEOUT"));
+    assert_eq!(res.field("exit_code"), &json!(137), "SIGKILL is recorded as 128+9");
+
+    // Outlive the grandchild's own sleep: if it were still alive it would create the marker.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "a backgrounded grandchild in the same process group must not survive the timeout"
+    );
+}
+
+/// Documents the exact boundary of `libc::killpg`: a child that calls `setsid` becomes the leader
+/// of a *new* process group and is therefore out of reach.
+///
+/// This test asserts the escape happens. That is deliberate, and it is not an endorsement — it is
+/// the honest shape of the guarantee. `killpg(pgid, SIGKILL)` signals one process group; a process
+/// that has left that group is, by POSIX definition, no longer a member. Containing it would
+/// require a kernel-level accounting boundary the daemon does not create (a cgroup, a PID
+/// namespace, or a session-wide sweep), and pretending otherwise in a test would leave an operator
+/// believing in an isolation property that does not exist. If a future change adds cgroup
+/// confinement, this test failing is precisely the signal that the boundary moved.
+#[tokio::test]
+async fn a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill() {
+    // `setsid(1)` is util-linux, not POSIX; without it there is nothing to measure.
+    let has_setsid = std::process::Command::new("sh")
+        .args(["-c", "command -v setsid >/dev/null 2>&1"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !has_setsid {
+        eprintln!("skipping: setsid(1) is not available on this system");
+        return;
+    }
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let escaped = scripts.path_for("setsid_child_survived");
+    let contained = scripts.path_for("plain_child_survived");
+    // Two grandchildren, identical but for the process group they end up in. Running both in one
+    // execution is what makes the comparison airtight: same kill, same timing, same machine.
+    // Both sleep well past the 1s timeout so neither can win a race against the kill and produce a
+    // misleading result; output is redirected so neither holds the captured pipe open either.
+    let script = scripts.write_script(
+        "setsid_escape.sh",
+        &format!(
+            "( sleep 3; touch {contained} ) >/dev/null 2>&1 &\n\
+             setsid sh -c 'sleep 3; touch {escaped}' >/dev/null 2>&1 &\n\
+             sleep 30"
+        ),
+    );
+
+    let hook_id = insert_hook(&db, "setsid_escape", &script, 1).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let res = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.field("status"), &json!("TIMEOUT"));
+    assert_eq!(res.field("exit_code"), &json!(137));
+
+    // Both grandchildren sleep 3s; the hook is killed at 1s. Wait well past their wake-up.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+
+    assert!(
+        !std::path::Path::new(&contained).exists(),
+        "the same-group grandchild must be killed — if this fails, killpg itself regressed"
+    );
+    assert!(
+        std::path::Path::new(&escaped).exists(),
+        "a setsid child is expected to escape killpg; if it no longer does, the daemon gained a \
+         stronger containment boundary and AGENT_NOTES.MD must be updated to match"
+    );
+}
+
+/// Nothing a hook leaves behind may become a zombie held open by the daemon.
+///
+/// The timeout path reaps explicitly (`child.kill().await` then `child.wait().await`), so the
+/// direct child is collected even when the group kill found nothing to do. A leaked zombie would
+/// accumulate one PID per timed-out execution and eventually exhaust the process table.
+#[tokio::test]
+async fn timed_out_executions_do_not_leave_zombie_children() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("zombie.sh", "sleep 30");
+    let hook_id = insert_hook(&db, "zombie_hook", &script, 1).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    for _ in 0..3 {
+        let res = send(
+            &app,
+            json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+        )
+        .await;
+        assert_eq!(res.field("status"), &json!("TIMEOUT"));
+    }
+
+    // Count this process's own defunct children rather than the machine's: a shared CI host may
+    // well have unrelated zombies, and blaming them on this daemon would make the test flaky.
+    let pid = std::process::id();
+    let zombies = std::process::Command::new("sh")
+        .args(["-c", &format!("ps -o stat=,ppid= -A 2>/dev/null | awk '$1 ~ /^Z/ && $2 == {pid}'")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+
+    assert!(zombies.is_empty(), "timed-out hooks left zombie children behind:\n{zombies}");
+}
+
+/// A body past [`simply_hook_executor::MAX_REQUEST_BODY_BYTES`] is refused before a handler runs.
+///
+/// Covers both extractor shapes, because they reject through different code paths: the execute and
+/// webhook routes take raw `Bytes`, while the admin routes take `Json<T>`. A limit that held for
+/// only one of them would leave the other as an unbounded allocation.
+#[tokio::test]
+async fn oversized_request_bodies_are_rejected_before_a_handler_runs() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("small.sh", "echo ok");
+    let hook_id = insert_hook(&db, "limit_hook", &script, 30).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // 10 MiB, an order of magnitude past the 1 MiB ceiling.
+    let oversized = vec![b'a'; 10 * 1024 * 1024];
+
+    for (method, uri) in [
+        ("POST", format!("/api/hooks/{hook_id}/execute")),
+        ("POST", "/webhook/limit_hook".to_owned()),
+        ("POST", "/api/hooks".to_owned()),
+        ("POST", "/api/keys".to_owned()),
+        ("PUT", format!("/api/hooks/{hook_id}")),
+    ] {
+        let res = send(&app, raw_request(method, &uri, &master, oversized.clone())).await;
+        assert_eq!(
+            res.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{method} {uri} must refuse a 10 MiB body"
+        );
+    }
+
+    // The refusal is the *limit*, not the content: the same route accepts a well-formed body.
+    let accepted = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::OK);
+}
+
+/// An unauthenticated caller cannot use a huge body to force work either: the key check runs first,
+/// so the body is never buffered at all.
+#[tokio::test]
+async fn an_unauthenticated_oversized_body_is_refused_without_being_buffered() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    let oversized = vec![b'a'; 10 * 1024 * 1024];
+
+    // No `X-API-Key` at all: the middleware rejects before it ever reads the body.
+    let anonymous = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/hooks")
+            .header("Content-Type", "application/json"),
+    )
+    .body(axum::body::Body::from(oversized.clone()))
+    .expect("request builds");
+    let res = send(&app, anonymous).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+
+    // An unknown key is the same story: still 401, still no buffering.
+    let unknown = send(&app, raw_request("POST", "/api/hooks", "not-a-real-key", oversized)).await;
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
+}
+
+/// A body just under the ceiling is still accepted, so the limit is a ceiling rather than an
+/// off-by-one that quietly breaks large-but-legitimate webhook payloads.
+#[tokio::test]
+async fn a_body_just_under_the_ceiling_is_accepted() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("under.sh", "echo ok");
+    let hook_id = insert_hook(&db, "under_hook", &script, 30).await;
+    insert_parameter(&db, hook_id, "blob", None, true).await;
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // A JSON document a few KiB below the limit. The parameter value itself is held to 64 KiB:
+    // argv and the environment share ARG_MAX and each parameter is passed both ways, so a
+    // megabyte-scale value would fail with E2BIG for reasons unrelated to the HTTP limit.
+    let padding = "b".repeat(64 * 1024);
+    let filler = "c".repeat(simply_hook_executor::MAX_REQUEST_BODY_BYTES - (96 * 1024));
+    let body = json!({ "parameters": { "blob": padding }, "ignored_padding": filler });
+    let encoded = serde_json::to_vec(&body).expect("payload serializes");
+    assert!(
+        encoded.len() < simply_hook_executor::MAX_REQUEST_BODY_BYTES,
+        "the fixture must actually be under the limit, not merely intended to be"
+    );
+
+    let res = send(
+        &app,
+        raw_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, encoded),
+    )
+    .await;
+    // A top-level `parameters` object wins, so the ~1 MiB of sibling padding is read and parsed but
+    // contributes no parameters — which is exactly the proof wanted here: the request was consumed
+    // end to end and executed, so the size limit did not intervene just below its own ceiling.
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.field("status"), &json!("SUCCESS"));
+    // The declared parameter still made the trip intact alongside all that padding.
+    assert_eq!(res.json["parameters"]["blob"], json!(padding));
+}

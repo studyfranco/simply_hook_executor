@@ -13,8 +13,11 @@
 # concurrency throttling (429), per-hook timeouts with process-group SIGKILL (137), HMAC-SHA256
 # body signing, the /webhook/{name} alias, bound-IP CIDR enforcement, key lifecycle
 # (create/update/rotate/delete), execution history filtering/detail/deletion/purge, audit log
-# generation + pagination + enrichment, and the master-only settings endpoint. Every request is
-# logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
+# generation + pagination + enrichment, the master-only settings endpoint, stored-XSS payload
+# round-tripping (plus the SPA's text-node rendering invariant), CLI-flag-shaped argument injection
+# against both argv and the sudo boundary, the killpg process-escape boundary (in-group vs setsid),
+# and the 1 MiB request body ceiling. Every request is logged with a timestamp, method, full URL,
+# color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq, cargo.
@@ -169,6 +172,24 @@ check_true() {
     else
         FAIL_COUNT=$((FAIL_COUNT + 1))
         echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (jq expr '$expr' was not true)" >&2
+    fi
+}
+
+# Usage: check_stdout_contains "literal substring" "description"
+#
+# Separate from check_true because the substring is a *literal*, not a jq expression: the hostile
+# payloads in §27 contain `$`, backticks, quotes and angle brackets, all of which would be
+# reinterpreted if they were spliced into a filter string. `--arg` binds them as data instead.
+check_stdout_contains() {
+    local needle="$1" description="$2"
+    local actual
+    actual=$(echo "$RESP_BODY" | jq -e --arg n "$needle" '.stdout | contains($n)' 2>/dev/null)
+    if [ "$actual" == "true" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (stdout lacked '$needle')" >&2
     fi
 }
 
@@ -1700,6 +1721,242 @@ PYEOF
 else
     warn "Skipping §25: openssl is not available to sign large payloads."
 fi
+
+# ── 26. Stored XSS payloads ─────────────────────────────────────────────────
+
+log_section "26. Stored XSS Payloads (hook output & metadata)"
+
+# The canonical probe: valid HTML, no quoting tricks, fires with no user interaction.
+XSS_PAYLOAD='<img src=x onerror=alert(1)>'
+# Breaks out of an attribute and a tag first, catching a renderer that interpolates into an
+# attribute rather than into element content.
+XSS_BREAKOUT='"><script>alert(document.domain)</script>'
+
+XSS_SCRIPT=$(make_hook_script "xss_hook.sh" 'printf "%s" "$1"
+printf "%s" "$2" >&2')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$XSS_SCRIPT" '{name:"xss_hook",script_path:$p,parameters:[{param_key:"p1_out",is_required:true},{param_key:"p2_err",is_required:true}]}')"
+check "200" "create a hook that echoes attacker-chosen bytes to both streams"
+XSS_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$XSS_HOOK_ID/execute" "$MASTER_KEY" \
+    "$(jq -nc --arg o "$XSS_PAYLOAD" --arg e "$XSS_BREAKOUT" '{parameters:{p1_out:$o,p2_err:$e}}')"
+check "200" "execute the hook with a live-markup payload"
+# Verbatim storage is the point: if the server stripped tags, the UI's escaping would be untested
+# in production and the first payload that evaded the stripper would land in an unprotected sink.
+check_jq ".stdout" "$XSS_PAYLOAD" "the stdout payload is stored and returned byte-for-byte"
+check_jq ".stderr" "$XSS_BREAKOUT" "the stderr payload is stored and returned byte-for-byte"
+XSS_EXEC_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/executions/$XSS_EXEC_ID" "$MASTER_KEY"
+check "200" "re-read the stored execution"
+check_jq ".stdout" "$XSS_PAYLOAD" "the payload survives persistence unchanged"
+
+# A JSON document containing <script> is inert only while the browser is told it is JSON. If any
+# of these ever answered text/html, opening the API URL directly would render the payload.
+XSS_CT=$(curl -s -o /dev/null -w '%{content_type}' -H "X-API-Key: $MASTER_KEY" \
+    "$BASE_URL/api/executions/$XSS_EXEC_ID")
+check_local "$XSS_CT" "application/json" "the execution endpoint is served as application/json"
+
+# Hook metadata is rendered into the hooks table and the audit log, so it is a sink too.
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$XSS_SCRIPT" --arg n "hook$XSS_PAYLOAD" --arg d "$XSS_BREAKOUT" '{name:$n,script_path:$p,description:$d}')"
+check "200" "create a hook whose name and description contain live markup"
+check_jq ".name" "hook$XSS_PAYLOAD" "the hook name round-trips verbatim"
+check_jq ".description" "$XSS_BREAKOUT" "the hook description round-trips verbatim"
+
+api_call GET "/api/audit-logs?action=HOOK_CREATE" "$MASTER_KEY"
+check "200" "read the audit trail"
+check_true '[.[] | select(.details | contains("onerror=alert(1)"))] | length > 0' \
+    "the markup reaches the audit details verbatim rather than being interpreted"
+
+# The renderer is the layer that must neutralize all of the above. There is no JS runtime or
+# headless browser here (AGENT.MD forbids frontend dependencies), so the assertion is on the
+# source invariant: captured output must never reach an innerHTML sink.
+SPA_JS="$PROJECT_ROOT/static/app.js"
+if grep -qF 'pre.textContent = content;' "$SPA_JS"; then
+    check_local "textContent" "textContent" "the SPA writes captured stream content with textContent"
+else
+    check_local "missing" "textContent" "the SPA writes captured stream content with textContent"
+fi
+if grep -qF 'message.textContent = errorText;' "$SPA_JS"; then
+    check_local "textContent" "textContent" "the SPA writes server error text with textContent"
+else
+    check_local "missing" "textContent" "the SPA writes server error text with textContent"
+fi
+# No innerHTML assignment may mention a field carrying attacker-controlled content.
+TAINTED_HITS=$(grep -n 'innerHTML' "$SPA_JS" | grep -E 'stdout|stderr|blocking_reason|argList|envRows' || true)
+if [ -z "$TAINTED_HITS" ]; then
+    check_local "none" "none" "no captured-output field reaches innerHTML"
+else
+    err "innerHTML sinks receiving tainted data:"; echo "$TAINTED_HITS" >&2
+    check_local "found" "none" "no captured-output field reaches innerHTML"
+fi
+
+# ── 27. Argument injection / hostile CLI flags ──────────────────────────────
+
+log_section "27. Argument Injection (CLI-flag-shaped payloads)"
+
+ARGV_CANARY="$WORK_DIR/argv_canary"
+# Echoes each positional argument inside delimiters, then the matching environment injection.
+# "$@" preserves argument boundaries, so a value containing spaces or newlines stays one entry.
+ARGV_SCRIPT=$(make_hook_script "argv_hook.sh" 'i=0
+for a in "$@"; do i=$((i+1)); printf "argv[%s]=<%s>\n" "$i" "$a"; done
+printf "env_flag=<%s>\n" "$HOOK_PARAM_P1_FLAG"
+printf "env_target=<%s>\n" "$HOOK_PARAM_P2_TARGET"')
+# Parameter keys are numbered because positional order is `created_at` with `param_key` as the
+# tie-break: naming them so that alphabetical order already matches declaration order makes the
+# argv positions deterministic even if two rows land in the same timestamp tick.
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ARGV_SCRIPT" '{name:"argv_hook",script_path:$p,parameters:[{param_key:"p1_flag",is_required:true},{param_key:"p2_target",is_required:true}]}')"
+check "200" "create a hook that reports its argument vector"
+ARGV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# Each pair is dangerous to a different consumer: getopt, rm, sudo, a shell.
+run_argv_case() {
+    local flag="$1" target="$2"
+    api_call POST "/api/hooks/$ARGV_HOOK_ID/execute" "$MASTER_KEY" \
+        "$(jq -nc --arg f "$flag" --arg t "$target" '{parameters:{p1_flag:$f,p2_target:$t}}')"
+    check "200" "hostile payload [$flag] executes inertly"
+    check_jq ".status" "SUCCESS" "the process ran and exited cleanly for [$flag]"
+    check_stdout_contains "argv[1]=<$flag>" "[$flag] reached argv[1] verbatim"
+    check_stdout_contains "argv[2]=<$target>" "[$target] reached argv[2] verbatim"
+    check_stdout_contains "env_flag=<$flag>" "[$flag] reached HOOK_PARAM_P1_FLAG verbatim"
+    check_stdout_contains "env_target=<$target>" "[$target] reached HOOK_PARAM_P2_TARGET verbatim"
+    check_true '.stdout | contains("argv[3]=") | not' "no third argument was synthesized for [$flag]"
+}
+
+run_argv_case '--help' '--version'
+run_argv_case '-rf' '/'
+run_argv_case '--' '--login'
+run_argv_case '; rm -rf /' "; touch $ARGV_CANARY"
+run_argv_case '$(id)' '`id`'
+run_argv_case '-u root' '--user=root'
+
+if [ -e "$ARGV_CANARY" ]; then
+    check_local "canary created" "canary absent" "no payload was interpreted as a command"
+else
+    check_local "canary absent" "canary absent" "no payload was interpreted as a command"
+fi
+
+# The sudo boundary: hostile values must land after `--`, where sudo can only treat them as
+# arguments to the script. Checked via the dry run, so no sudoers entry is needed.
+SUDO_ARGV_SCRIPT=$(make_hook_script "sudo_argv.sh" 'echo ok')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$SUDO_ARGV_SCRIPT" '{name:"sudo_argv_hook",script_path:$p,run_as_user:"root",parameters:[{param_key:"first",is_required:true}]}')"
+check "200" "create a privileged hook taking one parameter"
+SUDO_ARGV_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+for ESCAPE in '-u' '-u root' '--user=root' '-i' '--login' '--preserve-env' '--'; do
+    api_call POST "/api/hooks/$SUDO_ARGV_ID/test" "$MASTER_KEY" \
+        "$(jq -nc --arg e "$ESCAPE" '{parameters:{first:$e}}')"
+    check "200" "dry-run the privileged hook with [$ESCAPE]"
+    check_jq ".command.program" "/usr/bin/sudo" "the program is the hard-coded sudo path for [$ESCAPE]"
+    check_true '.command.args[0:4] == ["-n","-u","root","--"]' "the sudo prefix is intact for [$ESCAPE]"
+    check_true '(.command.args | index("--")) < ((.command.args | length) - 1)' \
+        "[$ESCAPE] sits after the -- separator"
+    check_jq ".command.args[5]" "$ESCAPE" "[$ESCAPE] is passed through verbatim as script data"
+    check_true '.command.args | length == 6' "no extra arguments were synthesized for [$ESCAPE]"
+done
+
+# An option-shaped run_as_user is unrepresentable, so the -u slot can never hold one.
+for BAD_USER in '-i' '--login' '-u' 'root -i' 'root;id'; do
+    api_call POST "/api/hooks" "$MASTER_KEY" \
+        "$(jq -nc --arg p "$SUDO_ARGV_SCRIPT" --arg u "$BAD_USER" '{name:"bad_user_hook",script_path:$p,run_as_user:$u}')"
+    check "400" "run_as_user [$BAD_USER] is refused at definition time"
+done
+
+# ── 28. Process escape (killpg boundary) ────────────────────────────────────
+
+log_section "28. Process Escape Boundary (killpg vs setsid)"
+
+GROUP_MARKER="$WORK_DIR/group_child_survived"
+ESCAPED_MARKER="$WORK_DIR/setsid_child_survived"
+
+if command -v setsid >/dev/null 2>&1; then
+    # Two grandchildren, identical but for the process group they land in. Running both under one
+    # execution makes the comparison airtight: same kill, same timing, same machine. Output is
+    # redirected so neither holds the captured pipe open past the kill.
+    #
+    # Each grandchild sleeps 3s against the hook's 1s timeout. The margin is load-bearing: with a
+    # 1s sleep the in-group child races the kill and can land its `touch` first, which reads as a
+    # containment failure when it is really a test-timing artifact.
+    ESCAPE_SCRIPT=$(make_hook_script "escape_hook.sh" "( sleep 3; touch $GROUP_MARKER ) >/dev/null 2>&1 &
+setsid sh -c 'sleep 3; touch $ESCAPED_MARKER' >/dev/null 2>&1 &
+sleep 30")
+    api_call POST "/api/hooks" "$MASTER_KEY" \
+        "$(jq -nc --arg p "$ESCAPE_SCRIPT" '{name:"escape_hook",script_path:$p,default_timeout_seconds:1}')"
+    check "200" "create a hook that spawns one in-group and one setsid grandchild"
+    ESCAPE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/hooks/$ESCAPE_HOOK_ID/execute" "$MASTER_KEY" '{}'
+    check "200" "the request returns once the timeout fires"
+    check_jq ".status" "TIMEOUT" "the execution is recorded as TIMEOUT"
+    check_jq ".exit_code" "137" "the SIGKILL is reported as 128+9"
+
+    log "Waiting past both grandchildren's sleep to see which survived..."
+    sleep 5
+
+    if [ -e "$GROUP_MARKER" ]; then
+        check_local "survived" "killed" "the same-process-group grandchild is killed by killpg"
+    else
+        check_local "killed" "killed" "the same-process-group grandchild is killed by killpg"
+    fi
+
+    # Asserted as an escape on purpose. killpg signals exactly one process group; a process that
+    # called setsid has left it and is, by POSIX definition, no longer a member. Containing it
+    # would need a cgroup or PID namespace the daemon does not create. See AGENT_NOTES.MD §28.
+    if [ -e "$ESCAPED_MARKER" ]; then
+        check_local "escaped" "escaped" "a setsid child escapes killpg (documented OS-level limit)"
+    else
+        check_local "contained" "escaped" "a setsid child escapes killpg (documented OS-level limit)"
+        warn "setsid no longer escapes the kill group — containment improved; update AGENT_NOTES.MD §28."
+    fi
+else
+    warn "Skipping §28 setsid checks: setsid(1) is not available."
+fi
+
+# ── 29. Request body size limit ─────────────────────────────────────────────
+
+log_section "29. Request Body Size Limit (413)"
+
+# 10 MiB, an order of magnitude past the 1 MiB ceiling. Written to a file and streamed so this
+# script never puts it on a command line (ARG_MAX), which is the bug §25 already learned the hard way.
+head -c 10485760 /dev/zero | tr '\0' 'a' > "$WORK_DIR/oversized.bin"
+OVERSIZED_LEN=$(wc -c < "$WORK_DIR/oversized.bin" | tr -d ' ')
+check_local "$OVERSIZED_LEN" "10485760" "the oversized fixture really is 10 MiB"
+
+oversized_call() {
+    local method="$1" path="$2" key="${3:-}"
+    local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method" -H "Content-Type: application/json")
+    [ -n "$key" ] && args+=(-H "X-API-Key: $key")
+    args+=(--data-binary "@$WORK_DIR/oversized.bin")
+    RESP_STATUS=$(curl "${args[@]}" "$BASE_URL$path")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    local color; color=$(status_color "$RESP_STATUS")
+    printf "%s ${color}[%s]${RESET} %-6s %s (10 MiB body)\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" >&2
+}
+
+# Bytes-extractor routes.
+oversized_call POST "/api/hooks/$ARGV_HOOK_ID/execute" "$MASTER_KEY"
+check "413" "a 10 MiB body is refused on the execute route"
+oversized_call POST "/webhook/argv_hook" "$MASTER_KEY"
+check "413" "a 10 MiB body is refused on the webhook route"
+# Json<T>-extractor routes reject through a different code path, so both shapes are covered.
+oversized_call POST "/api/hooks" "$MASTER_KEY"
+check "413" "a 10 MiB body is refused on the hook creation route"
+oversized_call POST "/api/keys" "$MASTER_KEY"
+check "413" "a 10 MiB body is refused on the key creation route"
+
+# Unauthenticated: the key check runs first, so the body is never buffered at all.
+oversized_call POST "/api/hooks" ""
+check "401" "an unauthenticated 10 MiB body is refused before it is read"
+oversized_call POST "/api/hooks" "not-a-real-key"
+check "401" "an unknown-key 10 MiB body is refused before it is read"
+
+# The limit is a ceiling, not a blanket refusal: normal traffic still works afterwards.
+api_call POST "/api/hooks/$ARGV_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"p1_flag":"ok","p2_target":"fine"}}'
+check "200" "an ordinary request still succeeds after the oversized ones"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

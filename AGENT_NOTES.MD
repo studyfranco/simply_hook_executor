@@ -960,3 +960,200 @@ fixture fails loudly instead of quietly making every downstream assertion meanin
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - `cargo test` — 49 unit + 59 integration tests pass (three consecutive clean runs).
 - `./scripts/test_e2e.sh` — 382/382 checks pass.
+
+---
+
+## 2026-07-30 (hardening) — XSS sinks, hostile payloads, process-escape limits, body ceiling
+
+Red-team pass over the areas the earlier audits had *not* reached: the rendering layer, argument
+interpretation by downstream consumers, the OS boundary around process termination, and memory
+exhaustion via request size.
+
+### 1. Frontend XSS audit (`static/app.js`)
+
+**Audit result: no exploitable stored XSS was found.** Every one of the 23 interpolations reaching an
+`innerHTML` sink already passed through `escapeHtml()`, which escapes `& < > " '` — complete for both
+element-content and quoted-attribute contexts. This is recorded plainly because "we found nothing"
+is a result, and overstating it would be worse than useless.
+
+The renderer was nonetheless **restructured**, because escaping-into-markup is a property of the
+current text of each template, not of the design. The data flowing through these sinks is the most
+attacker-controlled in the system: whoever can execute a hook chooses what the script prints, it is
+persisted verbatim in `executions.stdout`, and every operator who later opens that record re-renders
+it — a payload lands in a *master* key holder's session. One future edit that drops an `escapeHtml()`
+call turns that into account takeover.
+
+What changed:
+
+| Before | After |
+| :--- | :--- |
+| `outputBlock()` returned an HTML **string** built with `escapeHtml()` | returns a DOM **element**; content is assigned via `pre.textContent` |
+| Result panels/modals assembled one big template and assigned `innerHTML` | `renderResultView()` builds a header from trusted markup, then **appends** pre-built nodes |
+| `showHookResultModal(title, bodyHtml)` accepted raw markup | takes a descriptor `{headerHtml, noteText, errorText, blocks}` — the modal *cannot* be handed a concatenated string |
+| `blocking_reason` interpolated into a `<p>` template | assigned via `message.textContent` |
+
+The invariant is now structural: `headerHtml` is markup this file builds from its own literals plus
+already-escaped badge helpers, while everything the server returns arrives as a node or as text and
+is assigned, never parsed. A caller cannot accidentally route hook output through the HTML path,
+because the only parameter that reaches `innerHTML` is one no server value is ever passed to.
+
+Numeric server fields (`exit_code`, `timeout_seconds`, `duration_ms`) that were previously
+interpolated bare are now escaped too. They are `i32`/`u64` server-side and cannot carry markup, so
+this is belt-and-braces — but it removes the need for a reader to prove that to themselves.
+
+**Testing constraint, stated honestly.** The task asked for an E2E test asserting the UI does not
+render the payload as DOM nodes. This project has no JavaScript runtime and no headless browser, and
+`AGENT.MD` forbids frontend dependencies — so nothing here can mount `app.js` and inspect the
+resulting node tree. That assertion is therefore split into the two halves that *are* verifiable:
+
+- **API-level** (`hook_output_containing_live_markup_round_trips_verbatim_as_json`,
+  `hook_metadata_containing_markup_round_trips_verbatim`, E2E §26): `<img src=x onerror=alert(1)>`
+  and `"><script>alert(document.domain)</script>` survive execution, persistence, and re-read
+  byte-for-byte, and are served as `application/json`. Verbatim storage is deliberate — a server
+  that stripped tags would leave the renderer's escaping untested in production, so the first
+  payload that evaded the stripper would land in an unprotected sink.
+- **Source-invariant** (`spa_renders_captured_output_through_text_nodes_only`, E2E §26): fails the
+  build if `stdout`, `stderr`, `blocking_reason`, `argList`, `envRows`, or `res.command.program`
+  ever appears on a line that assigns `innerHTML`, and asserts the three `textContent` assignments
+  are still present.
+
+A real DOM assertion would need a browser in CI. That is the honest gap; the guard above catches the
+regression this refactor exists to prevent.
+
+### 2. Argument injection — the threat is `getopt`, not `sh`
+
+There is no shell in the execution path, so `; rm -rf /` was never the interesting payload. The real
+one is a value shaped like an *option*: `--help`, `-rf`, `--version`, `-u root`, `--preserve-env`.
+Those are ordinary strings until something re-parses the argument vector — and for a privileged hook
+there *is* such a parser, namely `sudo`.
+
+`cli_flag_shaped_parameters_stay_literal_in_argv_and_environment` runs six payload triples through a
+real sub-process and asserts each value arrives in its exact argv slot **and** its `HOOK_PARAM_*`
+variable, with no slot absorbed or synthesized, plus a filesystem canary that stays absent.
+
+`hostile_parameters_cannot_escape_the_sudo_argument_boundary` covers the elevation case through the
+dry-run endpoint, which reports the vector that would reach `execve` — so the assertion is about the
+real argument list rather than a reimplementation of it, and it needs no `sudoers` entry. For each of
+nine sudo-meaningful payloads (`-u`, `-u root`, `--user=root`, `-i`, `--login`, `-E`,
+`--preserve-env`, `--`, `-s`) it pins:
+
+- `program == /usr/bin/sudo` (hard-coded, never `PATH`-resolved),
+- `args[0..4] == ["-n", "-u", "root", "--"]` — the prefix is complete and nothing attacker-supplied
+  precedes the separator,
+- every supplied value sits at an index strictly greater than the `--` position,
+- the vector is exactly 7 entries, so nothing was synthesized.
+
+Note the payload `--` specifically: a second `--` in the data position is inert, because sudo stops
+option parsing at the *first* one.
+
+`option_shaped_run_as_user_is_refused_at_definition_time` closes the other half — the `-u` slot
+itself. `validate_run_as_user` makes a leading `-` unrepresentable, so a hostile account name is
+rejected with `400` at hook definition rather than relying on sudo to be defensive at spawn time.
+
+E2E §27 mirrors all three. A helper `check_stdout_contains` was added: the payloads contain `$`,
+backticks and quotes, which would be reinterpreted if spliced into a jq filter string, so they are
+bound with `--arg` as data.
+
+**Parameter-ordering determinism (found while writing these).** Positional order is
+`ORDER BY created_at, param_key`. Tests that declared `flag, target, extra` were relying on
+`created_at` resolving them, since alphabetical order (`extra, flag, target`) disagrees — two rows
+landing in the same timestamp tick would have silently permuted argv. Test parameters are now named
+`p1_*, p2_*, p3_*` so both orderings agree. This is a test-robustness fix, not a product defect: the
+tie-break is documented and deterministic, it simply is not declaration order.
+
+### 3. Process escape — the exact limits of `libc::killpg`
+
+**What `killpg` guarantees.** The child is spawned with `process_group(0)`, making it the leader of a
+new group; on timeout `killpg(pgid, SIGKILL)` signals every member of *that* group. This reliably
+covers the direct child and any descendant that inherited the group — including one backgrounded with
+`&`, and including a double-fork, since `fork(2)` inherits the process group. `child.kill()` and
+`child.wait()` then run unconditionally, so the direct child is reaped even when the group signal
+found nothing to do.
+
+**What it cannot cover.** A process that calls `setsid(2)` becomes leader of a **new session and a
+new process group**. It is, by POSIX definition, no longer a member of the group being signalled, so
+`killpg` cannot reach it — not through a bug, but because the identifier being signalled no longer
+names it. `a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill` **asserts the
+escape happens**, and E2E §28 does the same. Both run an in-group grandchild and a `setsid`
+grandchild under a single execution — same kill, same timing, same machine — and assert the first
+dies while the second survives.
+
+Asserting a limitation as a passing test is a deliberate choice. The alternative is a test suite that
+is silent about the boundary, which leaves an operator believing in isolation the daemon does not
+provide. If a future change adds cgroup or PID-namespace confinement, that test failing is exactly
+the signal that the boundary moved, and this section must be rewritten.
+
+**Why this is not fixed here.** Containing a `setsid` escapee requires a kernel-level accounting
+boundary the daemon does not create:
+
+| Mechanism | Effect | Cost |
+| :--- | :--- | :--- |
+| cgroup v2 per execution | complete: `cgroup.kill` terminates every member regardless of session | needs a writable `cgroup2` mount and delegation to the daemon user; systemd-specific setup |
+| PID namespace (`unshare`) | complete: killing PID 1 of the namespace reaps everything | needs `CAP_SYS_ADMIN` or user namespaces; interacts badly with `sudo` elevation |
+| session-wide `kill(-sid)` | partial and dangerous: would reach unrelated processes in the daemon's own session | unacceptable |
+
+Each is a deployment-shaped change rather than a code change. The honest posture is: **hook timeouts
+bound the process group, not the machine.** An operator who runs hooks that deliberately daemonize
+should confine the unit with systemd's own `KillMode=control-group` and a per-unit slice.
+
+`timed_out_executions_do_not_leave_zombie_children` additionally asserts that three consecutive
+timeouts leave no defunct children *parented to this test process* — scoped to `$PPID` rather than
+the machine, so an unrelated zombie on a shared CI host cannot make it flaky.
+
+### 4. Request body ceiling
+
+**Finding: the limit was implicit.** Every handler buffers its whole body before running — the
+execute and webhook routes via `Bytes`, the admin routes via `Json<T>` — and the only bound was
+Axum's built-in 2 MiB default. `max_concurrent_jobs` throttles concurrent *processes* and did nothing
+about concurrent *allocations*, so N simultaneous large POSTs were bounded only by a framework
+default that is documented behaviour, not a guarantee.
+
+Mitigation: `MAX_REQUEST_BODY_BYTES` (1 MiB) is now declared in `lib.rs` and applied as an explicit
+`DefaultBodyLimit` layered **outside** both nests, so it covers `/api/*`, `/webhook/*`, and the
+static fallback alike — the ceiling cannot be sidestepped by aiming at a route that never reaches
+the auth middleware. `middleware::MAX_SIGNED_BODY_BYTES` now *is* that same constant rather than an
+independently-chosen 1 MiB: two separately-maintained limits would eventually drift into a band of
+sizes one layer accepts and the other refuses, which is how parser-differential bugs start.
+
+Behaviour, all covered by tests and E2E §29:
+
+| Request | Result |
+| :--- | :--- |
+| 10 MiB, authenticated, `Bytes` route (`/execute`, `/webhook/{name}`) | `413 Payload Too Large` |
+| 10 MiB, authenticated, `Json<T>` route (`/api/hooks`, `/api/keys`) | `413 Payload Too Large` |
+| 10 MiB, missing or unknown key | `401` — the key check precedes the body read, so nothing is buffered |
+| >1 MiB **and signed** | `400` with "too large" from the signature buffer (pre-existing, unchanged) |
+| just under 1 MiB | accepted, parsed, executed |
+
+The signed path answering `400` rather than `413` is intentional and left alone: the refusal happens
+in the middleware while deciding whether it can verify the request at all, which is a different
+statement from the extractor's "this body exceeds the route's limit".
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 49 unit + 71 integration pass (was 49 + 59; 12 added).
+- `./scripts/test_e2e.sh` — 503/503 checks pass (was 382; §26–§29 added).
+
+### ⚠ Outstanding — NOT addressed by this pass
+
+A prior audit of the RBAC engine (commit `e9c3c5d`, verified by running exploits against the real
+router) found five confirmed privilege-escalation paths that remain **open**. They are out of scope
+for this task list but must not be lost:
+
+1. **`can_manage_keys` can mint a master key** — `create_api_key` reads `is_master` straight from the
+   payload (`api.rs:1551`) while gating only on `is_master || can_manage_keys`. Escalation to master
+   in one request, then `run_as_user: root`.
+2. **`can_manage_keys` can rotate any key, including a master key**, and the new plaintext is
+   returned in the response (`rotate_api_key`) — direct credential theft plus lockout.
+3. **`can_manage_keys` can self-grant `can_execute`/`can_manage` on any hook** —
+   `update_key_hook_permissions` checks nothing about the caller's rights over the target hook.
+4. **`can_manage` on an already-elevated hook allows repointing `script_path` while `run_as_user`
+   survives** — the master-only guard fires only when the payload *contains* `run_as_user`. With
+   `ALLOWED_SCRIPT_ROOTS` unset (the default) this is arbitrary root execution.
+5. **`X-Forwarded-For` is trusted from any peer**, so the `bound_ips` CIDR allowlist is bypassable
+   with one header, and `audit_logs.client_ip` is attacker-controlled.
+
+Net effect: **`can_manage_keys` is currently equivalent to `is_master`.** The XSS, argument-injection
+and payload-limit work above does not touch any of it.

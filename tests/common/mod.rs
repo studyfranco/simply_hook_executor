@@ -461,10 +461,35 @@ pub fn json_request(method: &str, uri: &str, key: &str, body: Option<serde_json:
     builder.body(body).expect("request builds")
 }
 
-/// The status and decoded JSON body of a response.
+/// Builds a request carrying an API key and an arbitrary raw body.
+///
+/// Distinct from [`json_request`], which takes a `serde_json::Value`: the payload-limit tests need
+/// to put megabytes of bytes on the wire without first materializing them as a JSON tree.
+pub fn raw_request(method: &str, uri: &str, key: &str, body: Vec<u8>) -> Request<Body> {
+    with_connect_info(
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-API-Key", key)
+            .header("Content-Type", "application/json"),
+    )
+    .body(Body::from(body))
+    .expect("request builds")
+}
+
+/// The status, headers, and decoded JSON body of a response.
 pub struct TestResponse {
     pub status: StatusCode,
     pub json: serde_json::Value,
+    /// The `Content-Type` header, if any.
+    ///
+    /// Worth asserting on for any endpoint that echoes attacker-controlled bytes back: a JSON
+    /// document containing `<script>` is inert only while the browser is told it is JSON. Were a
+    /// handler ever to answer `text/html`, navigating straight to the API URL would render it.
+    pub content_type: Option<String>,
+    /// The undecoded response body, for assertions about the exact bytes on the wire rather than
+    /// about the parsed value.
+    pub raw: String,
 }
 
 impl TestResponse {
@@ -492,7 +517,12 @@ pub async fn send(app: &axum::Router, request: Request<Body>) -> TestResponse {
         .await
         .expect("the router is infallible");
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
         .await
         .expect("response body is readable");
     let json = if bytes.is_empty() {
@@ -500,7 +530,8 @@ pub async fn send(app: &axum::Router, request: Request<Body>) -> TestResponse {
     } else {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     };
-    TestResponse { status, json }
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+    TestResponse { status, json, content_type, raw }
 }
 
 /// A temporary directory holding executable test scripts, removed on drop.

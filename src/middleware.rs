@@ -25,7 +25,13 @@ const TIMESTAMP_HEADER: &str = "X-Timestamp";
 /// Largest request body that will be buffered in order to verify a signature. Signed payloads are
 /// small JSON documents; the bound stops an attacker from forcing unbounded buffering just by
 /// attaching a signature header.
-const MAX_SIGNED_BODY_BYTES: usize = 1024 * 1024;
+///
+/// Deliberately the *same* constant the router enforces via `DefaultBodyLimit`
+/// ([`crate::MAX_REQUEST_BODY_BYTES`]) rather than an independently-chosen number. If this were the
+/// larger of the two, a body between the limits would be fully buffered and HMAC'd here only to be
+/// rejected by the extractor afterwards — paying the memory cost of a payload the daemon had
+/// already decided not to accept.
+const MAX_SIGNED_BODY_BYTES: usize = crate::MAX_REQUEST_BODY_BYTES;
 
 /// The resolved client IP for the current request (rightmost `X-Forwarded-For` hop, `X-Real-IP`,
 /// or raw TCP peer address — see [`auth_middleware`]). Inserted into request extensions so
