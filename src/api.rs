@@ -290,6 +290,108 @@ fn normalize_run_as_user(
     }
 }
 
+/// Rejects a non-master caller trying to hand out a global scope.
+///
+/// `can_manage_keys` is the right to administer *credentials*, not the right to invent authority
+/// that outranks your own. Without this gate the scope was self-amplifying: a `can_manage_keys` key
+/// could mint a key with `is_master: true`, authenticate as it, and from there assign
+/// `run_as_user: root` — so the scope was operationally identical to `is_master`, just less
+/// obviously so in the dashboard.
+///
+/// Only *granting* is restricted. Clearing a scope is left to any key manager: removing authority
+/// is not an escalation, and requiring master to revoke would make an over-provisioned key harder
+/// to contain than it was to create.
+fn require_master_to_grant_scopes(
+    key: &api_key::Model,
+    is_master: Option<bool>,
+    can_manage_keys: Option<bool>,
+    can_manage_hooks: Option<bool>,
+) -> Result<(), AppError> {
+    if key.is_master {
+        return Ok(());
+    }
+
+    let requested: [(&str, bool); 3] = [
+        ("is_master", is_master.unwrap_or(false)),
+        ("can_manage_keys", can_manage_keys.unwrap_or(false)),
+        ("can_manage_hooks", can_manage_hooks.unwrap_or(false)),
+    ];
+    let Some((scope, _)) = requested.into_iter().find(|(_, wanted)| *wanted) else {
+        return Ok(());
+    };
+
+    tracing::warn!(
+        key = %key.prefix,
+        scope,
+        "Non-master key attempted to grant a global scope"
+    );
+    Err(AppError::Forbidden(format!(
+        "Only master API keys can grant '{scope}'"
+    )))
+}
+
+/// Rejects a non-master caller acting on a key that is itself master.
+///
+/// Rotation returns the new plaintext secret in its response, so "rotate the master key" was a
+/// one-request credential theft that also locked out the legitimate holder. Deletion and update are
+/// gated for the same reason: the master key is the system's root of trust, and administering it is
+/// reserved to a peer.
+fn require_master_to_administer(
+    key: &api_key::Model,
+    target: &api_key::Model,
+    action: &str,
+) -> Result<(), AppError> {
+    if !target.is_master || key.is_master {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        key = %key.prefix,
+        target = %target.prefix,
+        action,
+        "Non-master key attempted to administer a master key"
+    );
+    Err(AppError::Forbidden(format!(
+        "Only master API keys can {action} a master key"
+    )))
+}
+
+/// Rejects a non-master caller mutating a hook that already runs elevated.
+///
+/// A hook carrying `run_as_user` is a standing grant of someone else's privileges, and *every* part
+/// of its definition decides what runs with them: `script_path` names the binary, the parameter
+/// contract supplies its argv, and the timeout bounds it. Guarding only the `run_as_user` field
+/// itself — as the previous code did — left a `can_manage` holder able to repoint an existing root
+/// hook at a different script, or to declare a defaulted parameter that becomes an argument to it,
+/// without ever touching the field that was being protected.
+///
+/// Clearing the elevation is covered too. It is a modification of a privileged hook like any other,
+/// and exempting it would just add a step to the same attack: drop the elevation, repoint the
+/// script, and leave an operator's vetted configuration silently downgraded.
+fn require_master_for_privileged_hook(
+    key: &api_key::Model,
+    hook: &hook::Model,
+    action: &str,
+) -> Result<(), AppError> {
+    if key.is_master {
+        return Ok(());
+    }
+    let Some(user) = executor::effective_run_as_user(hook.run_as_user.as_deref()) else {
+        return Ok(());
+    };
+
+    tracing::warn!(
+        key = %key.prefix,
+        hook = %hook.name,
+        run_as_user = %user,
+        action,
+        "Non-master key attempted to modify a privileged hook"
+    );
+    Err(AppError::Forbidden(format!(
+        "Only master API keys can {action} a hook that runs as '{user}'"
+    )))
+}
+
 /// Renders a key's signature mode for an audit log entry.
 ///
 /// `BODY_ONLY` is called out as replay-vulnerable rather than merely named: choosing it is a
@@ -758,6 +860,10 @@ pub async fn update_hook(
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
+    // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
+    // elevate. `script_path`, the timeout, and the name all decide what executes with the borrowed
+    // privileges, so guarding one field while leaving the rest writable protected nothing.
+    require_master_for_privileged_hook(&key, &model, "modify")?;
 
     // Checked immediately after authorization and before any field validation, for the same reason
     // as in `create_hook`: an escalation attempt must surface as `403`, never be masked by a `400`
@@ -902,6 +1008,9 @@ pub async fn create_hook_parameter(
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
+    // A parameter is argv for the elevated command: a defaulted parameter on a root hook running
+    // `/bin/sh` supplies `-c` and a command string without the caller ever editing `script_path`.
+    require_master_for_privileged_hook(&key, &model, "declare parameters on")?;
 
     if !executor::is_valid_param_key(&payload.param_key) {
         return Err(AppError::InvalidInput(format!(
@@ -962,6 +1071,9 @@ pub async fn update_hook_parameter(
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
+    // Changing a `default_value` rewrites what the elevated command receives, so this needs the
+    // same gate as declaring one.
+    require_master_for_privileged_hook(&key, &model, "modify parameters on")?;
 
     let param = HookParameter::find_by_id(param_id)
         .one(&state.db)
@@ -1007,6 +1119,9 @@ pub async fn delete_hook_parameter(
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     require_manage(&state.db, &key, model.id).await?;
+    // Removing a required parameter shifts every positional argument after it, which changes the
+    // elevated command just as surely as editing one.
+    require_master_for_privileged_hook(&key, &model, "remove parameters from")?;
 
     let param = HookParameter::find_by_id(param_id)
         .one(&state.db)
@@ -1524,6 +1639,16 @@ pub async fn create_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    // Checked before any field validation, for the same reason `run_as_user` is in the hook
+    // handlers: an escalation attempt must surface as `403` rather than be masked by a `400` about
+    // some unrelated field in the same payload.
+    require_master_to_grant_scopes(
+        &key,
+        payload.is_master,
+        payload.can_manage_keys,
+        payload.can_manage_hooks,
+    )?;
+
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
     }
@@ -1629,6 +1754,13 @@ pub async fn update_api_key(
 
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
 
+    // Editing a master key is master-only: `bound_ips` alone would otherwise let a key manager
+    // widen (or strand) the network binding of the system's root credential.
+    require_master_to_administer(&key, &target, "update")?;
+    // `UpdateApiKeyPayload` deliberately carries no `is_master` field, so promotion is impossible
+    // through this route regardless; the other two global scopes still need the gate.
+    require_master_to_grant_scopes(&key, None, payload.can_manage_keys, payload.can_manage_hooks)?;
+
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
     }
@@ -1697,6 +1829,7 @@ pub async fn delete_api_key(
     // Fetched before deleting (rather than relying on rows_affected) so the name is still
     // available for the audit entry below.
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    require_master_to_administer(&key, &target, "delete")?;
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
 
@@ -1744,6 +1877,9 @@ pub async fn rotate_api_key(
     }
 
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    // The response hands back the new plaintext secret, so rotating someone else's master key is
+    // credential theft with a lockout attached rather than mere administration.
+    require_master_to_administer(&key, &target, "rotate")?;
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
 
@@ -1815,6 +1951,19 @@ pub async fn update_key_hook_permissions(
         ));
     }
 
+    // Granting rights to yourself is not administration, it is escalation: a `can_manage_keys` key
+    // could otherwise walk up to any hook — including one running as root — and write itself an
+    // `can_execute` row. Administering *other* keys stays available, which is what the scope is for.
+    if !key.is_master && id == key.id {
+        tracing::warn!(
+            key = %key.prefix,
+            "Non-master key attempted to grant itself hook permissions"
+        );
+        return Err(AppError::Forbidden(
+            "Only master API keys can modify their own hook permissions".to_owned(),
+        ));
+    }
+
     let identifier = match (payload.hook_id.as_deref(), payload.hook_name.as_deref()) {
         (Some(_), Some(_)) => {
             return Err(AppError::InvalidInput(
@@ -1829,6 +1978,16 @@ pub async fn update_key_hook_permissions(
         (Some(v), None) | (None, Some(v)) => v,
     };
     let hook_model = resolve_hook(&state.db, identifier).await?;
+
+    // You cannot hand out authority over a hook you do not yourself manage. Without this, holding
+    // `can_manage_keys` was enough to distribute execute rights on every hook in the system to any
+    // key — a cross-tenant hole in what is meant to be a per-hook M:N model.
+    if !key.is_master {
+        require_manage(&state.db, &key, hook_model.id).await?;
+        // Rights over a *privileged* hook are the elevation itself, so distributing them stays
+        // master-only even for a caller who legitimately manages the hook.
+        require_master_for_privileged_hook(&key, &hook_model, "grant permissions on")?;
+    }
 
     let perm = api_key_hook_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -1882,6 +2041,13 @@ pub async fn revoke_key_hook_permission(
     }
 
     let hook_model = resolve_hook(&state.db, &hook_identifier).await?;
+
+    // Symmetric with granting. Revoking is not an escalation, but leaving it ungated would mean a
+    // key manager could strip access to hooks it has no relationship with — cross-tenant tampering,
+    // and an odd asymmetry where a grant you could not create is one you could still destroy.
+    if !key.is_master {
+        require_manage(&state.db, &key, hook_model.id).await?;
+    }
 
     let result = ApiKeyHookPermission::delete_many()
         .filter(
@@ -1964,6 +2130,11 @@ pub struct SettingsResponse {
     pub allowed_env_vars: Vec<String>,
     /// Directories hook scripts are confined to. Empty means any absolute path is permitted.
     pub allowed_script_roots: Vec<String>,
+    /// Peers whose forwarding headers are believed. Empty means the TCP peer address is always
+    /// authoritative — surfaced because "is my proxy actually trusted?" is otherwise only
+    /// answerable by reading the daemon's environment, and getting it wrong silently changes which
+    /// address every `bound_ips` check is evaluated against.
+    pub trusted_proxies: Vec<String>,
     /// Age, in days, beyond which execution history is purged (`0` = never).
     pub log_retention_days: i64,
     /// Interval between retention sweeps, in seconds.
@@ -2005,6 +2176,12 @@ pub async fn get_settings(
             .allowed_script_roots
             .iter()
             .map(|p| p.display().to_string())
+            .collect(),
+        trusted_proxies: state
+            .config
+            .trusted_proxies
+            .iter()
+            .map(ToString::to_string)
             .collect(),
         log_retention_days: state.config.log_retention_days,
         retention_sweep_seconds: state.config.retention_sweep_seconds,

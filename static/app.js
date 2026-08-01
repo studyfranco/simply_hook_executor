@@ -1766,6 +1766,12 @@ class HookExecutorClient {
             item('Script roots', s.allowed_script_roots.length
                 ? `<span class="font-mono text-sm">${escapeHtml(s.allowed_script_roots.join(', '))}</span>`
                 : '<span class="text-muted">(unrestricted — any absolute path)</span>'),
+            // Which peers may speak for a client decides what every bound_ips check compares
+            // against, so an operator should be able to read it off the dashboard rather than the
+            // daemon's environment.
+            item('Trusted proxies', (s.trusted_proxies || []).length
+                ? `<span class="font-mono text-sm">${escapeHtml(s.trusted_proxies.join(', '))}</span>`
+                : '<span class="text-muted">(none — forwarding headers ignored, TCP peer is authoritative)</span>'),
             item('Log retention', s.log_retention_days > 0 ? `${s.log_retention_days} days` : 'disabled (kept forever)'),
             item('Retention sweep', `every ${s.retention_sweep_seconds}s`),
             item('Max captured output', `${Math.round(s.max_output_bytes / 1024)} KiB per stream`),

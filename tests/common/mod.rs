@@ -50,6 +50,10 @@ pub fn test_config() -> Arc<RuntimeConfig> {
         // Unconfined by default: the suite writes throwaway scripts under the system temp dir.
         // Confinement is exercised explicitly via `test_state_with_roots`.
         allowed_script_roots: Vec::new(),
+        // No trusted proxies, matching the production default. Every test therefore exercises the
+        // secure path — forwarding headers ignored, `bound_ips` evaluated against the TCP peer —
+        // and a test that wants headers honoured must opt in via `test_state_with_trusted_proxies`.
+        trusted_proxies: Vec::new(),
     })
 }
 
@@ -71,6 +75,24 @@ pub fn test_state_with_roots(db: &DatabaseConnection, roots: Vec<std::path::Path
         db.clone(),
         Arc::new(RuntimeConfig {
             allowed_script_roots: roots,
+            ..(*test_config()).clone()
+        }),
+        test_cipher(),
+    )
+}
+
+/// Builds application state that believes forwarding headers from `proxies`.
+///
+/// `with_connect_info` simulates a `127.0.0.1` peer, so passing `"127.0.0.1"` here is what puts a
+/// test on the "behind a trusted reverse proxy" path.
+pub fn test_state_with_trusted_proxies(db: &DatabaseConnection, proxies: &[&str]) -> AppState {
+    AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig {
+            trusted_proxies: proxies
+                .iter()
+                .map(|p| p.parse().expect("test trusted proxy is a valid IP or CIDR"))
+                .collect(),
             ..(*test_config()).clone()
         }),
         test_cipher(),

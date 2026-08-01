@@ -78,7 +78,12 @@ Rules the implementation MUST hold to:
 
 `signing_secret` **cannot** be hashed: verification means recomputing the HMAC, which requires the original bytes. It is therefore encrypted at rest with XChaCha20-Poly1305 under `SIGNING_SECRET_KEY` (alias: `VAULT_ENCRYPTION_KEY`), and returned in plaintext exactly once, at key creation or rotation. If no key is configured the daemon still runs but stores secrets verbatim and says so loudly at startup; a malformed key aborts startup rather than silently downgrading.
 - **CIDR Restriction:** API Keys are bound to CIDR network ranges (`bound_ips`, supporting comma-separated IPv4/IPv6 ranges like `127.0.0.1/32, 10.0.0.0/8, ::/0`). Middleware MUST validate the client's IP against these bounds.
-- **Resilient IP Extraction:** Do NOT use external IP extraction crates. Extract the rightmost IP from `X-Forwarded-For` or `X-Real-IP`, falling back safely to `axum::extract::ConnectInfo`.
+  - The check applies to **every** key, including `is_master`. `is_master` bypasses *RBAC* checks; it does not bypass the *network* boundary. An empty `bound_ips` is the only way to express "from anywhere" — a master key whose binding was silently ignored while the dashboard displayed it as enforced was the worst possible combination.
+- **Trusted-Proxy IP Extraction:** Do NOT use external IP extraction crates. A forwarding header is a **claim by the sender**, not an observation, and becomes evidence only when the sender is a proxy the operator put there:
+  - `X-Forwarded-For` / `X-Real-IP` MUST be parsed **only** when the TCP peer (`axum::extract::ConnectInfo`) matches `TRUSTED_PROXIES` (comma-separated CIDRs or bare IPs). From a trusted peer, take the **rightmost** `X-Forwarded-For` hop — the one that proxy appended itself; entries to its left came from whatever called it and are not verifiable.
+  - Otherwise the TCP peer address is authoritative and the headers MUST be ignored entirely.
+  - The trust decision MUST come from the socket **before** any header is consulted. Reading the header first and validating afterwards still lets an untrusted client choose the address the allowlist sees.
+  - `TRUSTED_PROXIES` defaults to **empty** (trust nothing). Honouring these headers unconditionally lets any client pick its own apparent source address, which defeats `bound_ips` outright and forges `audit_logs.client_ip` at the same time.
 
 ### 2. Granular Multi-Tenant RBAC (M:N)
 
@@ -101,6 +106,11 @@ Rules the implementation MUST hold to:
 | `POST`/`GET`/`PUT`/`DELETE /api/keys*` | global `can_manage_keys` |
 | `GET /api/audit-logs`, `GET /api/settings`, `DELETE /api/executions` (purge) | `is_master` |
 | Assigning a non-empty `run_as_user` | `is_master` — checked **immediately after** the endpoint's authorization check and **before any field validation**, so an escalation attempt always surfaces as `403` and can never be masked by a `400` about some other field in the same payload |
+| **Granting** `is_master`, `can_manage_keys`, or `can_manage_hooks` (create *or* update) | `is_master`. `can_manage_keys` is the right to administer credentials, not to invent authority outranking your own — without this the scope is self-amplifying and therefore identical to `is_master`. **Revoking** a scope stays available to any key manager: removing authority is not an escalation |
+| `PUT`/`DELETE /api/keys/{id}`, `POST /api/keys/{id}/rotate` where the **target** is `is_master` | `is_master`. Rotation returns the new plaintext secret, so rotating someone else's master key is credential theft with a lockout attached |
+| `POST /api/keys/{id}/permissions` where `{id}` is the **caller's own key** | `is_master` — granting rights to yourself is escalation, not administration |
+| `POST`/`DELETE /api/keys/{id}/permissions*` on a hook the caller does not `can_manage` | `is_master` — you cannot hand out (or strip) authority over a hook you do not manage |
+| **Any** mutation of a hook whose `run_as_user` is non-empty — `PUT`/`PATCH /api/hooks/{id}`, all parameter CRUD, granting permissions on it | `is_master`. Every part of a privileged hook's definition decides what runs with the borrowed privileges: `script_path` names the binary, the parameter contract supplies its argv, the timeout bounds it. Guarding only the `run_as_user` field protects nothing. **Clearing** the elevation is covered too, or the attack simply gains a step |
 
 Listing endpoints narrow by these rules rather than rejecting: `GET /api/hooks` and `GET /api/executions` return only what the caller may read.
 

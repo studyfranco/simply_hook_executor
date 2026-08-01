@@ -43,26 +43,42 @@ async fn missing_or_invalid_api_key_is_rejected() {
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
 }
 
+/// Builds a GET request carrying an API key and a forwarding header.
+fn forwarded_request(uri: &str, key: &str, header: &str, value: &str) -> axum::http::Request<axum::body::Body> {
+    with_connect_info(
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("X-API-Key", key)
+            .header(header, value),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds")
+}
+
 #[tokio::test]
 async fn bound_cidr_is_enforced_against_the_resolved_client_ip() {
     let db = setup_test_db().await;
-    let app = create_app(test_state(&db));
+    // Behind a trusted proxy: the simulated peer is 127.0.0.1, which is on the trust list, so its
+    // forwarding headers are evidence rather than a claim.
+    let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1"]));
     let (_, key) = insert_key(&db, "Bound Key", "192.168.1.1/32", KeyScopes::plain()).await;
 
-    // ConnectInfo says 127.0.0.1, which is outside the bound range.
+    // No header at all: the peer is 127.0.0.1, which is outside the bound range.
     let response = send(&app, json_request("GET", "/api/hooks", &key, None)).await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
 
-    // A matching forwarded hop is accepted.
-    let request = with_connect_info(
-        axum::http::Request::builder()
-            .uri("/api/hooks")
-            .header("X-API-Key", &key)
-            .header("X-Forwarded-For", "10.0.0.1, 192.168.1.1"),
-    )
-    .body(axum::body::Body::empty())
-    .expect("request builds");
+    // A matching forwarded hop is accepted — the rightmost entry is the one the proxy appended.
+    let request = forwarded_request("/api/hooks", &key, "X-Forwarded-For", "10.0.0.1, 192.168.1.1");
     assert_eq!(send(&app, request).await.status, StatusCode::OK);
+
+    // X-Real-IP is honoured from a trusted proxy too.
+    let request = forwarded_request("/api/hooks", &key, "X-Real-IP", "192.168.1.1");
+    assert_eq!(send(&app, request).await.status, StatusCode::OK);
+
+    // A forwarded hop outside the range is still refused: trusting the proxy means believing what
+    // it reports, not waiving the allowlist.
+    let request = forwarded_request("/api/hooks", &key, "X-Forwarded-For", "192.168.9.9");
+    assert_eq!(send(&app, request).await.status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -2178,26 +2194,46 @@ async fn only_master_keys_may_assign_run_as_user() {
     assert_eq!(elevated.status, StatusCode::OK);
     assert_eq!(elevated.field("run_as_user"), &json!("root"));
 
-    // And a non-master may still edit other fields of that now-elevated hook without tripping the
-    // guard, since omitting run_as_user leaves it untouched. (The manager already holds full
-    // rights here: creating the hook auto-provisioned them.)
+    // Once the hook is elevated, the non-master creator loses the ability to edit it *at all* —
+    // even fields that look harmless, and even though it created the hook and holds full rights on
+    // it. This assertion is the inverse of what it was before finding #4: the old expectation was
+    // that omitting `run_as_user` left an edit permissible, which is exactly what let a
+    // `can_manage` holder repoint a root hook's `script_path` while the elevation survived.
     let unrelated = send(
         &app,
         json_request("PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "description": "edited" }))),
     )
     .await;
-    assert_eq!(unrelated.status, StatusCode::OK);
-    assert_eq!(unrelated.field("run_as_user"), &json!("root"), "the elevation is preserved");
+    assert_eq!(
+        unrelated.status,
+        StatusCode::FORBIDDEN,
+        "a privileged hook is master-only to modify, whichever field the payload names"
+    );
 
-    // But it cannot clear the elevation either — that is still a change to a privileged field.
-    // (An empty string is "no elevation", which the guard permits.)
+    // Nor can it drop the elevation. Permitting that would only add a step to the same attack:
+    // clear `run_as_user`, then repoint the script freely.
     let cleared = send(
         &app,
         json_request("PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "" }))),
     )
     .await;
-    assert_eq!(cleared.status, StatusCode::OK, "dropping elevation is not an escalation");
-    assert_eq!(cleared.field("run_as_user"), &json!(null));
+    assert_eq!(cleared.status, StatusCode::FORBIDDEN, "clearing elevation is master-only too");
+
+    // A master clears it, and the hook becomes an ordinary one the manager can edit again.
+    let by_master = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{owned_id}"), &master, Some(json!({ "run_as_user": "" }))),
+    )
+    .await;
+    assert_eq!(by_master.status, StatusCode::OK);
+    assert_eq!(by_master.field("run_as_user"), &json!(null));
+
+    let now_editable = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "description": "edited" }))),
+    )
+    .await;
+    assert_eq!(now_editable.status, StatusCode::OK, "an unelevated hook is manageable again");
 }
 
 #[tokio::test]
@@ -3749,4 +3785,393 @@ async fn a_body_just_under_the_ceiling_is_accepted() {
     assert_eq!(res.field("status"), &json!("SUCCESS"));
     // The declared parameter still made the trip intact alongside all that padding.
     assert_eq!(res.json["parameters"]["blob"], json!(padding));
+}
+
+// ─────────────────────────────────────────────────────────────
+// Security regressions — the five confirmed privilege-escalation findings
+//
+// Each test is the exploit that previously *succeeded*, inverted into an assertion that it is now
+// refused. They are written against the HTTP surface rather than the guard functions on purpose:
+// a unit test of `require_master_to_grant_scopes` would keep passing if a handler stopped calling
+// it, which is precisely the regression worth catching.
+// ─────────────────────────────────────────────────────────────
+
+/// Seeds a non-master key holding the `can_manage_keys` scope — the credential every finding in
+/// this group started from.
+async fn seed_key_manager(db: &sea_orm::DatabaseConnection) -> (Uuid, String) {
+    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    insert_key(db, "key-manager", "", scopes).await
+}
+
+/// Finding #1 — `can_manage_keys` could mint a key with `is_master: true` and become master.
+#[tokio::test]
+async fn regression_non_master_cannot_mint_a_master_key() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_id, manager) = seed_key_manager(&db).await;
+
+    let res = send(
+        &app,
+        json_request("POST", "/api/keys", &manager, Some(json!({ "name": "escalated", "is_master": true }))),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "minting a master key must be refused");
+    assert!(res.string("error").contains("is_master"), "the refusal names the offending scope");
+
+    // The other two global scopes are self-amplifying in the same way and are gated identically.
+    for scope in ["can_manage_keys", "can_manage_hooks"] {
+        let res = send(
+            &app,
+            json_request("POST", "/api/keys", &manager, Some(json!({ "name": "escalated", scope: true }))),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "granting {scope} must be refused");
+    }
+
+    // Nothing was created by any of the refused attempts.
+    let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let keys = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+    let names: Vec<&str> = keys.json.as_array().map(|rows| {
+        rows.iter().filter_map(|k| k.get("name").and_then(|n| n.as_str())).collect()
+    }).unwrap_or_default();
+    assert!(!names.contains(&"escalated"), "a refused creation must not persist a row: {names:?}");
+
+    // An ordinary, scope-free key is still creatable — the gate is about escalation, not about
+    // disabling the scope the caller legitimately holds.
+    let ok = send(
+        &app,
+        json_request("POST", "/api/keys", &manager, Some(json!({ "name": "ordinary" }))),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert_eq!(ok.field("name"), &json!("ordinary"));
+}
+
+/// Finding #1b — the update route must not become the back door the create route just closed.
+#[tokio::test]
+async fn regression_non_master_cannot_grant_global_scopes_by_update() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_id, manager) = seed_key_manager(&db).await;
+    let (victim_id, _victim) = insert_key(&db, "ordinary", "", KeyScopes::plain()).await;
+
+    for scope in ["can_manage_keys", "can_manage_hooks"] {
+        let res = send(
+            &app,
+            json_request("PUT", &format!("/api/keys/{victim_id}"), &manager, Some(json!({ scope: true }))),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "granting {scope} by update must be refused");
+    }
+
+    // Revoking a scope is not an escalation and stays available to a key manager.
+    let revoke = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{victim_id}"), &manager, Some(json!({ "can_manage_hooks": false }))),
+    )
+    .await;
+    assert_eq!(revoke.status, StatusCode::OK, "removing authority is not an escalation");
+}
+
+/// Finding #2 — `can_manage_keys` could rotate a master key and read its new plaintext secret.
+#[tokio::test]
+async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (master_id, master) = insert_key(&db, "system-master", "", KeyScopes::master()).await;
+    let (_id, manager) = seed_key_manager(&db).await;
+
+    let rotate = send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &manager, None)).await;
+    assert_eq!(rotate.status, StatusCode::FORBIDDEN, "rotating a master key must be refused");
+    assert!(rotate.json.get("plaintext_key").is_none(), "no secret may leak in the refusal body");
+
+    let update = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{master_id}"), &manager, Some(json!({ "bound_ips": "0.0.0.0/0" }))),
+    )
+    .await;
+    assert_eq!(update.status, StatusCode::FORBIDDEN, "editing a master key must be refused");
+
+    let delete = send(&app, json_request("DELETE", &format!("/api/keys/{master_id}"), &manager, None)).await;
+    assert_eq!(delete.status, StatusCode::FORBIDDEN, "deleting a master key must be refused");
+
+    // The master credential still works, so none of the refused calls partially applied.
+    let me = send(&app, json_request("GET", "/api/auth/me", &master, None)).await;
+    assert_eq!(me.status, StatusCode::OK);
+    assert_eq!(me.field("is_master"), &json!(true));
+
+    // A master peer may still administer it — the gate is "master only", not "nobody".
+    let by_master = send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &master, None)).await;
+    assert_eq!(by_master.status, StatusCode::OK);
+}
+
+/// Finding #3 — `can_manage_keys` could write itself an execute grant on any hook, including one
+/// running as root.
+#[tokio::test]
+async fn regression_non_master_cannot_self_grant_hook_permissions() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("root.sh", "echo ok");
+    let privileged = insert_hook_as(&db, "root_hook", &script, 30, Some("root")).await;
+    let ordinary = insert_hook(&db, "ordinary_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    let (victim_id, _victim) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+
+    // Self-grant on the privileged hook: the original exploit.
+    let self_grant = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{manager_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(self_grant.status, StatusCode::FORBIDDEN, "self-granting must be refused");
+
+    // Still refused for an unprivileged hook: the rule is about granting to yourself, not about
+    // which hook you picked.
+    let self_grant_plain = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{manager_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(self_grant_plain.status, StatusCode::FORBIDDEN);
+
+    // Granting to somebody else on a hook the caller does not manage is refused too — otherwise the
+    // exploit is one extra key away.
+    let third_party = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(third_party.status, StatusCode::FORBIDDEN, "granting on an unmanaged hook must be refused");
+
+    // The grant never landed: the manager still cannot reach the privileged hook.
+    let probe = send(&app, json_request("POST", &format!("/api/hooks/{privileged}/test"), &manager, None)).await;
+    assert_eq!(probe.status, StatusCode::FORBIDDEN);
+
+    // A caller who *does* manage the hook may still delegate it — the scope keeps working.
+    grant(&db, manager_id, ordinary, true, true).await;
+    let delegated = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(delegated.status, StatusCode::OK, "delegating a hook you manage is still allowed");
+
+    // ...but never on a privileged one, even with a legitimate manage grant.
+    grant(&db, manager_id, privileged, true, true).await;
+    let delegated_privileged = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(delegated_privileged.status, StatusCode::FORBIDDEN);
+}
+
+/// Finding #4 — a non-master with `can_manage` on a root hook could repoint its `script_path`, the
+/// elevation surviving the swap. With `ALLOWED_SCRIPT_ROOTS` unset that is arbitrary root execution.
+#[tokio::test]
+async fn regression_non_master_cannot_repoint_a_privileged_hook() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let safe = scripts.write_script("safe.sh", "echo safe");
+    let attacker = scripts.write_script("attacker.sh", "echo pwned");
+    let hook_id = insert_hook_as(&db, "root_hook", &safe, 30, Some("root")).await;
+    let (key_id, editor) = insert_key(&db, "hook-editor", "", KeyScopes::plain()).await;
+    grant(&db, key_id, hook_id, true, true).await;
+
+    // The original exploit: swap the binary, leave `run_as_user` untouched.
+    let repoint = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &editor, Some(json!({ "script_path": attacker }))),
+    )
+    .await;
+    assert_eq!(repoint.status, StatusCode::FORBIDDEN, "repointing a privileged hook must be refused");
+    assert!(repoint.string("error").contains("root"), "the refusal names the account: {}", repoint.string("error"));
+
+    // Every other field is gated too — the guard is on the hook's privileged status, not on which
+    // field the payload happened to mention.
+    for payload in [
+        json!({ "name": "renamed" }),
+        json!({ "default_timeout_seconds": 600 }),
+        json!({ "description": "harmless" }),
+        // Including clearing the elevation, which would otherwise just add a step to the attack.
+        json!({ "run_as_user": "" }),
+    ] {
+        let res = send(&app, json_request("PUT", &format!("/api/hooks/{hook_id}"), &editor, Some(payload.clone()))).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "modifying {payload} must be refused");
+    }
+
+    // Parameters are argv for the elevated command, so the parameter routes are gated as well —
+    // a defaulted parameter is how you feed `-c <command>` to a root hook without touching
+    // script_path at all.
+    let param_uri = format!("/api/hooks/{hook_id}/parameters");
+    let declare = send(
+        &app,
+        json_request("POST", &param_uri, &editor, Some(json!({ "param_key": "injected", "default_value": "-c" }))),
+    )
+    .await;
+    assert_eq!(declare.status, StatusCode::FORBIDDEN, "declaring a parameter on a root hook must be refused");
+
+    // The hook is untouched: still the safe script, still elevated.
+    let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let after = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    assert_eq!(after.field("script_path"), &json!(safe));
+    assert_eq!(after.field("run_as_user"), &json!("root"));
+
+    // An *unprivileged* hook is still freely manageable by the same key: the guard is scoped to
+    // elevation, and did not just turn `can_manage` into a decoration.
+    let plain_id = insert_hook(&db, "plain_hook", &safe, 30).await;
+    grant(&db, key_id, plain_id, true, true).await;
+    let plain_edit = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{plain_id}"), &editor, Some(json!({ "script_path": attacker }))),
+    )
+    .await;
+    assert_eq!(plain_edit.status, StatusCode::OK);
+    assert_eq!(plain_edit.field("script_path"), &json!(attacker));
+
+    // And a master may still administer the privileged hook.
+    let by_master = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "script_path": attacker }))),
+    )
+    .await;
+    assert_eq!(by_master.status, StatusCode::OK);
+}
+
+/// Finding #5 — a forged `X-Forwarded-For` from an untrusted peer defeated the `bound_ips` CIDR
+/// allowlist entirely.
+#[tokio::test]
+async fn regression_forged_forwarding_headers_cannot_defeat_bound_ips() {
+    let db = setup_test_db().await;
+    // No trusted proxies: the production default, and the configuration under which the bypass
+    // must be impossible.
+    let app = create_app(test_state(&db));
+    let (_id, scoped) = insert_key(&db, "lan-only", "10.0.0.0/8", KeyScopes::plain()).await;
+
+    // Honest request: the simulated peer is 127.0.0.1, outside the bound range.
+    let honest = send(&app, json_request("GET", "/api/auth/me", &scoped, None)).await;
+    assert_eq!(honest.status, StatusCode::FORBIDDEN);
+
+    // Every spoofing shape is now inert, because the header is never consulted at all.
+    for (header, value) in [
+        ("X-Forwarded-For", "10.1.2.3"),
+        ("X-Forwarded-For", "203.0.113.9, 10.1.2.3"),
+        ("X-Forwarded-For", "10.1.2.3, 10.4.5.6"),
+        ("X-Real-IP", "10.1.2.3"),
+        ("X-Forwarded-For", "::ffff:10.1.2.3"),
+    ] {
+        let res = send(&app, forwarded_request("/api/auth/me", &scoped, header, value)).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "a forged {header}: {value} must not satisfy the CIDR allowlist"
+        );
+    }
+
+    // The audit trail must record the real peer, not the claim: a spoofable client_ip would make
+    // the trail worse than useless during an incident.
+    let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("noop.sh", "echo ok");
+    let created = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "audited", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK);
+
+    let spoofed_audit = send(
+        &app,
+        forwarded_request("/api/audit-logs", &master, "X-Forwarded-For", "203.0.113.77"),
+    )
+    .await;
+    assert_eq!(spoofed_audit.status, StatusCode::OK);
+    assert!(
+        !spoofed_audit.raw.contains("203.0.113.77"),
+        "a forged address must never be recorded as client_ip: {}",
+        spoofed_audit.raw
+    );
+    assert!(spoofed_audit.raw.contains("127.0.0.1"), "the real TCP peer is what gets recorded");
+}
+
+/// A trusted proxy's headers are believed — the fix must not break real reverse-proxy deployments.
+#[tokio::test]
+async fn a_trusted_proxy_can_still_present_the_real_client_address() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1/32", "10.0.0.0/8"]));
+    let (_id, scoped) = insert_key(&db, "lan-only", "192.168.0.0/16", KeyScopes::plain()).await;
+
+    // Without a header the peer itself is used, and 127.0.0.1 is outside the key's range.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &scoped, None)).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // With one, the rightmost hop is taken as the client.
+    let res = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "203.0.113.1, 192.168.4.4")).await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // An IPv4-mapped IPv6 hop still matches an IPv4 CIDR.
+    let mapped = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Real-IP", "::ffff:192.168.4.4")).await;
+    assert_eq!(mapped.status, StatusCode::OK);
+
+    // A garbage header falls back to the peer rather than failing open.
+    let garbage = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "not-an-ip")).await;
+    assert_eq!(garbage.status, StatusCode::FORBIDDEN);
+}
+
+/// `bound_ips` now binds master keys too. Previously `is_master` skipped the CIDR check entirely,
+/// so the most valuable credential in the system was the only one whose network restriction was
+/// decorative — while the dashboard displayed it as enforced.
+#[tokio::test]
+async fn bound_ips_restricts_master_keys_as_well() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    let (_id, bound_master) = insert_key(&db, "bound-master", "10.0.0.0/8", KeyScopes::master()).await;
+    let res = send(&app, json_request("GET", "/api/auth/me", &bound_master, None)).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "a bound master key is held to its own allowlist");
+
+    // A master key that should reach the API from anywhere says so by leaving bound_ips empty...
+    let (_id, free_master) = insert_key(&db, "free-master", "", KeyScopes::master()).await;
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &free_master, None)).await.status,
+        StatusCode::OK
+    );
+
+    // ...or by naming ranges that actually include the caller.
+    let (_id, local_master) = insert_key(&db, "local-master", "127.0.0.0/8,::1/128", KeyScopes::master()).await;
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &local_master, None)).await.status,
+        StatusCode::OK
+    );
 }

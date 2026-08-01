@@ -55,6 +55,10 @@ SERVER_LOG="$WORK_DIR/server.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
 HOOK_DIR="$WORK_DIR/hooks"
 SERVER_PID=""
+# Second, short-lived instance booted by §30 with TRUSTED_PROXIES unset, so the suite can cover
+# both sides of the forwarding-header trust decision in one run.
+STRICT_SERVER_PID=""
+STRICT_BASE_URL=""
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -258,6 +262,11 @@ pick_port() {
 }
 
 cleanup() {
+    if [ -n "$STRICT_SERVER_PID" ] && kill -0 "$STRICT_SERVER_PID" 2>/dev/null; then
+        log "Stopping strict-proxy server (pid $STRICT_SERVER_PID)..."
+        kill "$STRICT_SERVER_PID" 2>/dev/null || true
+        wait "$STRICT_SERVER_PID" 2>/dev/null || true
+    fi
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
         log "Stopping server (pid $SERVER_PID)..."
         kill "$SERVER_PID" 2>/dev/null || true
@@ -320,9 +329,14 @@ log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping neede
 # ALLOWED_SCRIPT_ROOTS is pinned to the throwaway hook directory, so every hook the suite creates
 # exercises the containment check on the happy path, and §21 can prove a path outside it is
 # refused without needing a second server instance.
+# TRUSTED_PROXIES names the loopback address the suite connects from, which is what puts this
+# instance on the "behind a reverse proxy" path so §15 can drive bound_ips with X-Forwarded-For.
+# It is deliberately NOT the default: §30 boots a second instance without it to prove that an
+# unconfigured daemon ignores forwarding headers entirely.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     ALLOWED_ENV_VARS="PATH" LOG_RETENTION_DAYS=30 \
     ALLOWED_SCRIPT_ROOTS="$HOOK_DIR" \
+    TRUSTED_PROXIES="$BIND_HOST" \
     BIND_HOST="$BIND_HOST" PORT="$SERVER_PORT" \
     "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -1155,6 +1169,9 @@ api_call GET "/api/settings" "$MASTER_KEY"
 check "200" "master reads the runtime configuration"
 check_jq ".allowed_env_vars | join(\",\")" "PATH" "the configured passthrough allowlist is reported"
 check_jq ".log_retention_days" "30" "the configured retention window is reported"
+# Which peers may speak for a client decides what every bound_ips check compares against, so an
+# operator must be able to read it back rather than infer it from the daemon's environment.
+check_jq ".trusted_proxies | join(\",\")" "$BIND_HOST/32" "the configured trusted proxy is reported"
 check_true '.hook_count >= 8' "the hook counter reflects everything created above"
 check_true '.execution_count >= 1' "the execution counter is populated"
 
@@ -1422,13 +1439,22 @@ api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$MASTER_KEY" '{"run_as_user":"root"}'
 check "200" "a master can elevate the same hook"
 check_jq ".run_as_user" "root" "the elevation took effect"
 
+# Once elevated, the hook is master-only to touch at all — even for the non-master that created it
+# and holds full auto-provisioned rights on it. These three checks are the inverse of what they
+# asserted before finding #4: the old expectation was that an edit omitting `run_as_user` stayed
+# permissible, which is exactly what let a can_manage holder repoint a root hook's script_path.
 api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"description":"unrelated"}'
-check "200" "a non-master may still edit other fields of an elevated hook"
-check_jq ".run_as_user" "root" "the elevation is preserved by an unrelated edit"
+check "403" "a non-master cannot edit any field of a now-elevated hook"
 
 api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"run_as_user":""}'
-check "200" "dropping elevation is not an escalation, so a non-master may do it"
+check "403" "nor drop the elevation, which would only add a step to the same attack"
+
+api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$MASTER_KEY" '{"run_as_user":""}'
+check "200" "a master can drop the elevation"
 check_jq ".run_as_user" "null" "the hook is unelevated again"
+
+api_call PUT "/api/hooks/$NOELEV_HOOK_ID" "$NOELEV_KEY" '{"description":"unrelated"}'
+check "200" "and the now-ordinary hook is editable by its non-master owner again"
 
 # --- The elevation is auditable ---
 api_call GET "/api/audit-logs?action=HOOK_CREATE&limit=50" "$MASTER_KEY"
@@ -1957,6 +1983,219 @@ check "401" "an unknown-key 10 MiB body is refused before it is read"
 # The limit is a ceiling, not a blanket refusal: normal traffic still works afterwards.
 api_call POST "/api/hooks/$ARGV_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"p1_flag":"ok","p2_target":"fine"}}'
 check "200" "an ordinary request still succeeds after the oversized ones"
+
+# ── 30. Security regressions: the five privilege-escalation findings ────────
+
+log_section "30. Security Regressions (PrivEsc findings #1-#5)"
+
+# A non-master key holding only can_manage_keys — the credential findings #1-#3 started from.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Key Manager","can_manage_keys":true}'
+check "200" "create a non-master key holding can_manage_keys"
+KEYMGR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+KEYMGR_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# ── Finding #1: minting a master key ───────────────────────────────────────
+api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"escalated","is_master":true}'
+check "403" "#1 a non-master cannot mint a master key"
+check_true '.error | contains("is_master")' "the refusal names the offending scope"
+
+api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"escalated","can_manage_keys":true}'
+check "403" "#1 a non-master cannot grant can_manage_keys"
+api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"escalated","can_manage_hooks":true}'
+check "403" "#1 a non-master cannot grant can_manage_hooks"
+
+# The scope it does hold still works for ordinary keys.
+api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"Ordinary Sub-Key"}'
+check "200" "#1 a scope-free key is still creatable by a key manager"
+ORDINARY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call PUT "/api/keys/$ORDINARY_ID" "$KEYMGR_KEY" '{"can_manage_hooks":true}'
+check "403" "#1 a non-master cannot grant a global scope by update either"
+api_call PUT "/api/keys/$ORDINARY_ID" "$KEYMGR_KEY" '{"can_manage_hooks":false}'
+check "200" "#1 revoking a scope is not an escalation and stays allowed"
+
+# ── Finding #2: taking over an existing master key ─────────────────────────
+api_call GET "/api/keys" "$MASTER_KEY"
+check "200" "list keys to locate the bootstrap master"
+BOOTSTRAP_ID=$(echo "$RESP_BODY" | jq -r '.[] | select(.is_master == true) | .id' | head -1)
+
+api_call POST "/api/keys/$BOOTSTRAP_ID/rotate" "$KEYMGR_KEY"
+check "403" "#2 a non-master cannot rotate a master key"
+check_true '.plaintext_key == null' "no secret leaks in the refusal body"
+api_call PUT "/api/keys/$BOOTSTRAP_ID" "$KEYMGR_KEY" '{"bound_ips":"0.0.0.0/0"}'
+check "403" "#2 a non-master cannot edit a master key"
+api_call DELETE "/api/keys/$BOOTSTRAP_ID" "$KEYMGR_KEY"
+check "403" "#2 a non-master cannot delete a master key"
+
+# The master credential is untouched by any of the refused calls.
+api_call GET "/api/auth/me" "$MASTER_KEY"
+check "200" "#2 the master key still authenticates"
+check_jq ".is_master" "true" "#2 the master key is still master"
+
+# ── Finding #3: self-granting hook permissions ─────────────────────────────
+PRIV_SCRIPT=$(make_hook_script "privesc_hook.sh" 'echo running')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$PRIV_SCRIPT" '{name:"privesc_root_hook",script_path:$p,run_as_user:"root"}')"
+check "200" "create a root-running hook as master"
+PRIVESC_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$PRIV_SCRIPT" '{name:"privesc_plain_hook",script_path:$p}')"
+check "200" "create an ordinary hook as master"
+PLAIN_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys/$KEYMGR_ID/permissions" "$KEYMGR_KEY" \
+    "$(jq -nc --arg h "$PRIVESC_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "403" "#3 a non-master cannot self-grant rights on a root hook"
+
+api_call POST "/api/keys/$KEYMGR_ID/permissions" "$KEYMGR_KEY" \
+    "$(jq -nc --arg h "$PLAIN_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "403" "#3 self-granting is refused for an ordinary hook too"
+
+api_call POST "/api/keys/$ORDINARY_ID/permissions" "$KEYMGR_KEY" \
+    "$(jq -nc --arg h "$PLAIN_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "403" "#3 granting on a hook the caller does not manage is refused"
+
+# The grant never landed, so the root hook is still out of reach.
+api_call POST "/api/hooks/$PRIVESC_HOOK_ID/test" "$KEYMGR_KEY" '{}'
+check "403" "#3 the root hook remains unreachable to the key manager"
+
+# ── Finding #4: repointing an elevated hook ────────────────────────────────
+create_scoped_key "Hook Editor"
+EDITOR_KEY="$CREATED_KEY"; EDITOR_ID="$CREATED_ID"
+api_call POST "/api/keys/$EDITOR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$PRIVESC_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "grant the editor full rights on the root hook (as master)"
+
+ATTACKER_SCRIPT=$(make_hook_script "attacker_hook.sh" 'echo pwned')
+api_call PUT "/api/hooks/$PRIVESC_HOOK_ID" "$EDITOR_KEY" \
+    "$(jq -nc --arg p "$ATTACKER_SCRIPT" '{script_path:$p}')"
+check "403" "#4 a non-master cannot repoint a root hook's script_path"
+check_true '.error | contains("root")' "the refusal names the account the hook runs as"
+
+api_call PUT "/api/hooks/$PRIVESC_HOOK_ID" "$EDITOR_KEY" '{"description":"harmless"}'
+check "403" "#4 every field of a privileged hook is gated, not just script_path"
+api_call PUT "/api/hooks/$PRIVESC_HOOK_ID" "$EDITOR_KEY" '{"default_timeout_seconds":600}'
+check "403" "#4 the timeout is gated too"
+api_call PUT "/api/hooks/$PRIVESC_HOOK_ID" "$EDITOR_KEY" '{"run_as_user":""}'
+check "403" "#4 clearing the elevation is master-only as well"
+
+# Parameters are argv for the elevated command, so those routes are gated too.
+api_call POST "/api/hooks/$PRIVESC_HOOK_ID/parameters" "$EDITOR_KEY" '{"param_key":"injected","default_value":"-c"}'
+check "403" "#4 declaring a parameter on a root hook is refused"
+
+# The hook is unchanged.
+api_call GET "/api/hooks/$PRIVESC_HOOK_ID" "$MASTER_KEY"
+check "200" "#4 re-read the root hook"
+check_jq ".script_path" "$PRIV_SCRIPT" "#4 the script path was not repointed"
+check_jq ".run_as_user" "root" "#4 the elevation is intact"
+
+# An unprivileged hook is still freely manageable: the guard is scoped to elevation.
+api_call POST "/api/keys/$EDITOR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$PLAIN_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "grant the editor rights on the ordinary hook"
+api_call PUT "/api/hooks/$PLAIN_HOOK_ID" "$EDITOR_KEY" \
+    "$(jq -nc --arg p "$ATTACKER_SCRIPT" '{script_path:$p}')"
+check "200" "#4 an ordinary hook is still editable by a can_manage holder"
+
+# ── Finding #5: X-Forwarded-For spoofing, on a daemon with no trusted proxies ──
+STRICT_PORT=$((SERVER_PORT + 1))
+while port_in_use "$STRICT_PORT"; do STRICT_PORT=$((STRICT_PORT + 1)); done
+STRICT_DB="$WORK_DIR/strict.db"
+STRICT_LOG="$WORK_DIR/strict_server.log"
+STRICT_BASE_URL="http://$BIND_HOST:$STRICT_PORT"
+STRICT_MASTER="e2e_strict_master_key_for_testing_987654321"
+
+log "Booting a second instance on port $STRICT_PORT with TRUSTED_PROXIES unset..."
+DATABASE_URL="sqlite://$STRICT_DB?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$STRICT_MASTER" \
+    ALLOWED_ENV_VARS="PATH" ALLOWED_SCRIPT_ROOTS="$HOOK_DIR" \
+    BIND_HOST="$BIND_HOST" PORT="$STRICT_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$STRICT_LOG" 2>&1 &
+STRICT_SERVER_PID=$!
+
+STRICT_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$STRICT_SERVER_PID" 2>/dev/null; then
+        err "Strict-proxy server exited during startup. Log:"; cat "$STRICT_LOG" >&2; break
+    fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "$STRICT_BASE_URL/api/hooks" 2>/dev/null)
+    case "$SC" in 200|401|404) STRICT_READY=1; break ;; esac
+    sleep 0.5
+done
+
+if [ "$STRICT_READY" != "1" ]; then
+    err "Strict-proxy server never became ready; skipping §30 finding #5 checks."
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+else
+    check_local "ready" "ready" "#5 the no-trusted-proxy instance is up"
+
+    # Requests to this instance go to a different base URL, so they bypass api_call's $BASE_URL.
+    strict_call() {
+        local method="$1" path="$2" key="$3" xff="${4:-}" hdr="${5:-}"
+        local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method" -H "X-API-Key: $key")
+        [ -n "$xff" ] && args+=(-H "${hdr:-X-Forwarded-For}: $xff")
+        RESP_STATUS=$(curl "${args[@]}" "$STRICT_BASE_URL$path")
+        RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+        local color; color=$(status_color "$RESP_STATUS")
+        printf "%s ${color}[%s]${RESET} %-6s %s%s\n" "$(ts)" "$RESP_STATUS" "$method" \
+            "$STRICT_BASE_URL$path" "${xff:+ (${hdr:-X-Forwarded-For}: $xff)}" >&2
+        print_response_body
+    }
+
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $STRICT_MASTER" -H "Content-Type: application/json" \
+        -d '{"name":"LAN Only","bound_ips":"10.0.0.0/8"}' "$STRICT_BASE_URL/api/keys")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "#5 create a key bound to 10.0.0.0/8 on the strict instance"
+    LAN_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+    # The real peer is 127.0.0.1, outside 10.0.0.0/8.
+    strict_call GET "/api/auth/me" "$LAN_KEY"
+    check "403" "#5 an honest request from outside the bound range is rejected"
+
+    # Every spoofing shape is inert: the header is never consulted from an untrusted peer.
+    strict_call GET "/api/auth/me" "$LAN_KEY" "10.1.2.3"
+    check "403" "#5 a forged X-Forwarded-For cannot satisfy the CIDR allowlist"
+    strict_call GET "/api/auth/me" "$LAN_KEY" "203.0.113.9, 10.1.2.3"
+    check "403" "#5 a forged multi-hop X-Forwarded-For is refused"
+    strict_call GET "/api/auth/me" "$LAN_KEY" "::ffff:10.1.2.3"
+    check "403" "#5 an IPv4-mapped forged hop is refused"
+    strict_call GET "/api/auth/me" "$LAN_KEY" "10.1.2.3" "X-Real-IP"
+    check "403" "#5 a forged X-Real-IP is refused"
+
+    # The audit trail records the real peer, never the claim.
+    strict_call GET "/api/audit-logs" "$STRICT_MASTER" "203.0.113.77"
+    check "200" "#5 read the strict instance's audit trail"
+    check_true '[.[] | select(.client_ip == "203.0.113.77")] | length == 0' \
+        "#5 a forged address is never recorded as client_ip"
+    check_true '[.[] | select(.client_ip == "127.0.0.1")] | length > 0' \
+        "#5 the real TCP peer is what gets recorded"
+
+    # A key bound to the real peer works, proving the check is evaluated rather than always denying.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $STRICT_MASTER" -H "Content-Type: application/json" \
+        -d "{\"name\":\"Loopback Only\",\"bound_ips\":\"$BIND_HOST/32\"}" "$STRICT_BASE_URL/api/keys")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "#5 create a key bound to the real peer address"
+    LOOPBACK_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    strict_call GET "/api/auth/me" "$LOOPBACK_KEY"
+    check "200" "#5 a key bound to the true peer is accepted"
+
+    log "Stopping the strict-proxy instance..."
+    kill "$STRICT_SERVER_PID" 2>/dev/null || true
+    wait "$STRICT_SERVER_PID" 2>/dev/null || true
+    STRICT_SERVER_PID=""
+fi
+
+# bound_ips now applies to master keys too — previously is_master skipped the check entirely.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Bound Master","is_master":true,"bound_ips":"10.10.10.0/24"}'
+check "200" "create a master key bound to a range that excludes the caller"
+BOUND_MASTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+api_call GET "/api/auth/me" "$BOUND_MASTER_KEY"
+check "403" "a master key is held to its own bound_ips rather than bypassing them"
+# ...and honouring the trusted proxy's header brings it back inside the range.
+api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "10.10.10.5"
+check "200" "the same master key is accepted from inside its bound range"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

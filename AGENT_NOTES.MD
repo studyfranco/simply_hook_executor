@@ -1157,3 +1157,168 @@ for this task list but must not be lost:
 
 Net effect: **`can_manage_keys` is currently equivalent to `is_master`.** The XSS, argument-injection
 and payload-limit work above does not touch any of it.
+
+---
+
+## 2026-07-30 (PrivEsc patch) — Closing the five RBAC escalation findings
+
+Patches the five confirmed privilege-escalation paths carried forward from the previous section.
+All five were verified as *exploitable* against the real router before the fix and are now pinned by
+regression tests that assert the `403`.
+
+The unifying defect: **`can_manage_keys` was operationally equivalent to `is_master`**, by four
+independent routes. A scope meant to say "you may administer credentials" was read by the code as
+"you may create authority", which is a different and much larger claim.
+
+### #1 — Minting a master key (`create_api_key`, `update_api_key`)
+
+`is_master` was read straight from the request payload while the only gate was
+`is_master || can_manage_keys`. A key manager could mint a master key, authenticate as it, and
+assign `run_as_user: root` — three requests from scoped key to arbitrary root execution.
+
+`require_master_to_grant_scopes` now gates `is_master`, `can_manage_keys` and `can_manage_hooks` on
+both create and update. It runs **before any field validation**, matching the existing `run_as_user`
+convention: an escalation attempt must surface as `403` and never be masked by a `400` about some
+unrelated field in the same payload.
+
+Only *granting* is restricted. Clearing a scope stays available to any key manager — removing
+authority is not an escalation, and requiring master to revoke would make an over-provisioned key
+harder to contain than it was to create. `UpdateApiKeyPayload` still carries no `is_master` field, so
+promotion via update remains impossible by construction as well as by check.
+
+### #2 — Taking over an existing master key (`rotate`, `update`, `delete`)
+
+`rotate_api_key` accepted any key id and returned the new plaintext secret in its response body, so
+"rotate the master key" was a single-request credential theft that also locked out the legitimate
+holder. `require_master_to_administer` now gates rotate, update and delete whenever the **target** is
+`is_master`. Update is included because `bound_ips` alone would let a key manager strand or widen the
+network binding of the system's root credential.
+
+### #3 — Self-granting hook permissions (`update_key_hook_permissions`)
+
+The handler checked that the *target* was not a master key, but never that the caller had any
+relationship to the hook being granted. A `can_manage_keys` key could write itself a `can_execute`
+row on any hook in the system, including one running as root.
+
+Two gates now apply to non-masters: the target key may not be the caller's own (`id == key.id`), and
+the caller must already hold `can_manage` on the hook. Granting rights over a *privileged* hook is
+master-only regardless, since those rights are the elevation itself.
+
+`revoke_key_hook_permission` received the same "must manage the hook" rule. Revocation is not an
+escalation, so this is a deliberate extension beyond the reported finding: leaving it open would mean
+a key manager could strip access to hooks it has no relationship with, and would leave the odd
+asymmetry where a grant you could not create is one you could still destroy.
+
+### #4 — Repointing an elevated hook (`update_hook` + all parameter routes)
+
+The `run_as_user` guard fired only when a payload *contained* that field. A payload omitting it left
+every other field writable, so a `can_manage` holder could repoint a root hook's `script_path` at a
+different binary while the elevation survived the swap. With `ALLOWED_SCRIPT_ROOTS` unset (the
+default) that is arbitrary root execution.
+
+`require_master_for_privileged_hook` now gates **any** mutation of a hook whose `run_as_user` is
+non-empty. The scope is wider than "script_path" on purpose — every part of a privileged hook's
+definition decides what runs with the borrowed privileges:
+
+| Route | Why it is gated |
+| :--- | :--- |
+| `PUT`/`PATCH /api/hooks/{id}` | `script_path` names the binary; the timeout bounds it; the name is how operators identify it |
+| `POST .../parameters` | a parameter is argv. A defaulted parameter on a root hook pointing at `/bin/sh` supplies `-c` and a command string **without touching `script_path` at all** — this was the sharpest edge of the finding |
+| `PUT .../parameters/{id}` | changing a `default_value` rewrites what the elevated command receives |
+| `DELETE .../parameters/{id}` | removing a required parameter shifts every positional argument after it |
+| `POST /api/keys/{id}/permissions` | distributing rights over a privileged hook distributes the elevation |
+
+**Clearing the elevation is gated too**, which is the one judgement call worth spelling out. The task
+text allowed reading it as "a non-master may clear `run_as_user`, then edit freely". That reading is
+not exploitable — re-adding elevation is master-only, so the hook cannot be re-armed — but it would
+let a non-master silently downgrade an operator's vetted configuration, and it turns the attack into
+two requests rather than blocking it. The strict reading ("modifying ANY field requires master") was
+implemented. A master clears the elevation; the hook then becomes ordinary and its manager can edit
+it again, which the tests assert end to end.
+
+### #5 — Forged `X-Forwarded-For` (`middleware.rs`, `config.rs`)
+
+`X-Forwarded-For` and `X-Real-IP` were parsed from every peer, so the `bound_ips` CIDR allowlist was
+bypassable with one header and `audit_logs.client_ip` was attacker-chosen. A stolen LAN-restricted
+key worked from anywhere.
+
+New `TRUSTED_PROXIES` config (comma-separated CIDRs **or** bare IPs, which are widened to `/32`
+or `/128`). `resolve_client_ip` consults forwarding headers only when the TCP peer matches that list;
+otherwise the peer address is authoritative and the headers are ignored outright.
+
+The **ordering is the fix**, not the list: the trust decision is taken from the socket *before* any
+header is read. Reading the header first and validating afterwards would still let an untrusted
+client choose the address the allowlist sees. Peer normalization happens before the trust match too,
+so a dual-stack listener surfacing an IPv4 proxy as `::ffff:10.0.0.9` still matches a `10.0.0.0/8`
+entry — otherwise a correct `TRUSTED_PROXIES` value would silently stop applying.
+
+Default is empty (trust nothing). For a directly-exposed daemon that is correct; for a proxied one it
+is safe but visible — every key appears to connect from the proxy, which an operator notices at once,
+rather than the allowlist silently accepting anything. A malformed entry is dropped with a warning,
+which fails in the safe direction: not-trusted.
+
+**`bound_ips` now applies to every key, including `is_master`.** The old `!is_allowed && !is_master`
+condition meant the single most valuable credential in the system was also the only one whose network
+restriction was decorative — while the dashboard displayed it as enforced. `is_master` bypasses
+*RBAC*; a network boundary is not a permission. A master key that should reach the API from anywhere
+now says so by leaving `bound_ips` empty rather than by having the check skipped behind its back.
+
+Consequence worth flagging: `BOOTSTRAP_SUBNET` defaulted to `0.0.0.0/0` (IPv4 only) while
+`SCHEMA.MD` and the migration both specify `0.0.0.0/0,::/0`. Harmless while master keys bypassed the
+check; a first-request lockout on a dual-stack deployment once they no longer do. Corrected to match
+the schema.
+
+### Tests
+
+Nine integration tests (`regression_*`, plus `bound_ips_restricts_master_keys_as_well` and
+`a_trusted_proxy_can_still_present_the_real_client_address`) and E2E §30. Each is the exploit that
+previously *succeeded*, inverted into an assertion that it is refused. They drive the HTTP surface
+rather than the guard functions directly: a unit test of `require_master_to_grant_scopes` would keep
+passing if a handler stopped calling it, which is precisely the regression worth catching.
+
+Every one also asserts the **negative space** — that the legitimate capability still works. A gate
+that turns `can_manage_keys` into a decoration would pass a test suite that only checks for `403`.
+So: a scope-free key is still creatable, revoking a scope still works, a master peer can still
+administer a master key, a caller who manages a hook can still delegate it, and an unprivileged hook
+is still editable by a `can_manage` holder.
+
+E2E §30 boots a **second daemon instance** on its own port with `TRUSTED_PROXIES` unset, because the
+main instance sets it to loopback so §15 can drive `bound_ips` with `X-Forwarded-For`. One process
+cannot demonstrate both sides of a startup-time trust decision; two can, and the suite tears the
+second one down in `cleanup` alongside the first.
+
+**Two existing test groups asserted the vulnerable behaviour and were inverted, not extended:**
+`only_master_keys_may_assign_run_as_user` and E2E §22 both claimed "a non-master may still edit other
+fields of an elevated hook" and "dropping elevation is not an escalation". Finding #4 had been
+written down as expected behaviour and locked in by a passing test — worth remembering that a green
+suite is only as good as the expectations encoded in it.
+
+### Documentation
+
+`AGENT.MD` contained the directive that *produced* finding #5 — "Extract the rightmost IP from
+`X-Forwarded-For` or `X-Real-IP`, falling back safely to `ConnectInfo`". That section is rewritten
+around the trusted-proxy rule, and the effective-permission matrix gained five rows for the new
+master-only operations. `SCHEMA.MD`'s `is_master`, `can_manage_keys`, `can_manage_hooks` and
+`bound_ips` descriptions were corrected to state what each flag does and does *not* confer. Leaving
+either document as it stood would have instructed the next agent to reintroduce the bug.
+
+`GET /api/settings` (master-only) now reports `trusted_proxies`, and the dashboard renders it: which
+peers may speak for a client decides what every `bound_ips` check compares against, and that should
+be readable from the UI rather than only from the daemon's environment.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 54 unit + 79 integration pass (was 49 + 71).
+- `./scripts/test_e2e.sh` — 553/553 checks pass (was 503).
+
+### Residual risk
+
+- `TRUSTED_PROXIES` is only as tight as the operator makes it. A range wider than the real proxy
+  fleet re-opens the bypass for every host inside it; the README says so at the point of use.
+- `delete_hook` on a privileged hook is still available to a `can_manage` holder. Destructive, but
+  not an escalation: recreating the hook with `run_as_user` requires master, so there is no path back
+  up. Left alone deliberately rather than overlooked.
+- A non-master key manager can still edit `bound_ips` on *non-master* keys. Lateral within the set of
+  keys it already administers, and inherent to what `can_manage_keys` is for.

@@ -9,6 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ipnetwork::IpNetwork;
+
 /// Default environment variables inherited by hook sub-processes, per `AGENT.MD`.
 const DEFAULT_ALLOWED_ENV_VARS: &str = "PATH,LANG,TERM,SYSTEMROOT";
 /// Default listen address: every interface.
@@ -62,6 +64,19 @@ pub struct RuntimeConfig {
     /// `can_manage_hooks` to a directory an operator has vetted, so a stolen management key cannot
     /// turn the daemon into a generic "run any binary as `hookrunner`" service.
     pub allowed_script_roots: Vec<PathBuf>,
+    /// Peers whose `X-Forwarded-For` / `X-Real-IP` headers are believed, from `TRUSTED_PROXIES`
+    /// (comma-separated CIDRs or bare IPs, e.g. `127.0.0.1,10.0.0.0/8`).
+    ///
+    /// **Empty is the secure default and means "believe no forwarding header".** A forwarding
+    /// header is a claim made by whoever sent the request; it is evidence only when the sender is
+    /// a proxy the operator controls. Honouring it unconditionally — as this daemon previously did
+    /// — lets any client choose its own apparent source address, which defeats the `bound_ips`
+    /// CIDR allowlist outright and forges `audit_logs.client_ip` at the same time.
+    ///
+    /// Set this to the address of the reverse proxy actually sitting in front of the daemon, and
+    /// nothing else. A range wider than the real proxy fleet re-opens the bypass for every host
+    /// inside it.
+    pub trusted_proxies: Vec<IpNetwork>,
 }
 
 impl Default for RuntimeConfig {
@@ -74,6 +89,7 @@ impl Default for RuntimeConfig {
             signature_max_age_seconds: DEFAULT_SIGNATURE_MAX_AGE_SECONDS,
             require_signed_requests: false,
             allowed_script_roots: Vec::new(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -112,8 +128,24 @@ impl RuntimeConfig {
             );
         }
 
+        let trusted_proxies =
+            parse_trusted_proxies(std::env::var("TRUSTED_PROXIES").ok().as_deref().unwrap_or(""));
+        if trusted_proxies.is_empty() {
+            tracing::info!(
+                "TRUSTED_PROXIES is unset: X-Forwarded-For and X-Real-IP are ignored and bound_ips \
+                 is evaluated against the direct TCP peer. If this daemon sits behind a reverse \
+                 proxy, set it to that proxy's address or every key will appear to connect from it."
+            );
+        } else {
+            tracing::info!(
+                "Forwarding headers are honoured only from: {}",
+                trusted_proxies.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
         Self {
             allowed_env_vars,
+            trusted_proxies,
             log_retention_days: parse_or_warn("LOG_RETENTION_DAYS", defaults.log_retention_days),
             retention_sweep_seconds: parse_or_warn("RETENTION_SWEEP_SECONDS", defaults.retention_sweep_seconds)
                 .max(1),
@@ -225,6 +257,38 @@ fn parse_script_roots(raw: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Parses `TRUSTED_PROXIES` into the set of peers whose forwarding headers are believed.
+///
+/// Accepts both CIDR notation (`10.0.0.0/8`) and bare addresses (`127.0.0.1`, `::1`), because an
+/// operator naming a single proxy should not have to remember to append `/32`. A bare address is
+/// widened to a host route — `/32` for IPv4, `/128` for IPv6 — which matches exactly that one host.
+///
+/// A malformed entry is dropped with a warning rather than aborting startup, matching how the rest
+/// of this module treats bad overrides. The failure mode is deliberately the safe one: a dropped
+/// entry means a proxy is *not* trusted, so requests through it are evaluated against its own
+/// address instead of silently accepting a header it forwarded.
+fn parse_trusted_proxies(raw: &str) -> Vec<IpNetwork> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| match entry.parse::<IpNetwork>() {
+            Ok(network) => Some(network),
+            // `IpNetwork`'s parser is the authority on CIDR text; this fallback only covers the
+            // bare-address spelling, and does so by construction rather than by string surgery.
+            Err(_) => match entry.parse::<IpAddr>() {
+                Ok(addr) => Some(IpNetwork::from(addr)),
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring invalid TRUSTED_PROXIES entry {entry:?}: expected an IP address \
+                         or CIDR range. Forwarding headers from that peer will NOT be trusted."
+                    );
+                    None
+                }
+            },
+        })
+        .collect()
+}
+
 /// Splits a comma-separated variable list, trimming blanks and dropping empty entries.
 fn parse_env_var_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -298,6 +362,33 @@ mod tests {
         // A relative root would move with the daemon's working directory, so it is not a boundary.
         assert_eq!(parse_script_roots("hooks,../escape"), Vec::<PathBuf>::new());
         assert!(parse_script_roots("").is_empty());
+    }
+
+    #[test]
+    fn parses_trusted_proxies_in_both_spellings() {
+        // A bare address is widened to a host route, so an operator naming one proxy need not
+        // remember the /32.
+        let parsed = parse_trusted_proxies("127.0.0.1, 10.0.0.0/8 , ::1,2001:db8::/32");
+        assert_eq!(parsed.len(), 4);
+        assert!(parsed[0].contains("127.0.0.1".parse::<IpAddr>().expect("valid")));
+        assert!(!parsed[0].contains("127.0.0.2".parse::<IpAddr>().expect("valid")));
+        assert!(parsed[1].contains("10.1.2.3".parse::<IpAddr>().expect("valid")));
+        assert!(parsed[2].contains("::1".parse::<IpAddr>().expect("valid")));
+        assert!(parsed[3].contains("2001:db8::5".parse::<IpAddr>().expect("valid")));
+    }
+
+    #[test]
+    fn trusted_proxies_defaults_to_empty_and_drops_malformed_entries() {
+        // Empty is the secure default: no peer is trusted, so no forwarding header is believed.
+        assert!(parse_trusted_proxies("").is_empty());
+        assert!(parse_trusted_proxies("  ,, ").is_empty());
+        assert!(RuntimeConfig::default().trusted_proxies.is_empty());
+
+        // A malformed entry is dropped rather than aborting startup — and dropping it means "not
+        // trusted", which is the safe direction to fail in.
+        let parsed = parse_trusted_proxies("not-an-ip, 10.0.0.0/8, 999.1.1.1, 10.0.0.0/99");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].contains("10.9.9.9".parse::<IpAddr>().expect("valid")));
     }
 
     #[test]

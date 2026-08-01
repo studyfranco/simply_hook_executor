@@ -22,6 +22,10 @@ const SIGNATURE_HEADER: &str = "X-Signature-256";
 const HUB_SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
 /// Header carrying the Unix-seconds timestamp a signature was computed at.
 const TIMESTAMP_HEADER: &str = "X-Timestamp";
+/// Forwarding header naming the original client, honoured only from a trusted proxy.
+const FORWARDED_FOR_HEADER: &str = "X-Forwarded-For";
+/// Single-address forwarding header, honoured only from a trusted proxy.
+const REAL_IP_HEADER: &str = "X-Real-IP";
 /// Largest request body that will be buffered in order to verify a signature. Signed payloads are
 /// small JSON documents; the bound stops an attacker from forcing unbounded buffering just by
 /// attaching a signature header.
@@ -62,6 +66,52 @@ fn rightmost_ip(header_value: &str) -> Option<std::net::IpAddr> {
         .next_back()
         .map(|s| s.trim())
         .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+}
+
+/// Resolves the address `bound_ips` is evaluated against, and audit entries are attributed to.
+///
+/// A forwarding header is a *claim by the sender*, not an observation. It becomes evidence only
+/// when the sender is a proxy the operator put there deliberately, which is what
+/// [`RuntimeConfig::trusted_proxies`](crate::config::RuntimeConfig::trusted_proxies) enumerates.
+/// When the peer is not on that list the headers are ignored outright and the TCP peer address is
+/// used — the one value in the request an attacker cannot choose without actually controlling the
+/// host it names.
+///
+/// This ordering is the whole fix for the spoofing bypass. Reading the header first and validating
+/// afterwards would still let an untrusted client pick the address the CIDR allowlist sees; the
+/// trust decision therefore has to come from the socket, before any header is consulted.
+///
+/// With no trusted proxies configured (the default) this degrades to "always use the peer", which
+/// is correct for a directly-exposed daemon and safe for a proxied one — every key simply appears
+/// to connect from the proxy, which an operator notices immediately, rather than the allowlist
+/// silently accepting anything.
+fn resolve_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer: std::net::IpAddr,
+    trusted_proxies: &[IpNetwork],
+) -> std::net::IpAddr {
+    let peer = normalize_ip(peer);
+
+    if !trusted_proxies.iter().any(|net| net.contains(peer)) {
+        return peer;
+    }
+
+    // The peer is a trusted proxy, so its forwarding headers are believable. The rightmost
+    // `X-Forwarded-For` hop is the one that proxy appended itself; entries to its left were
+    // supplied by whatever called it and are not independently verifiable.
+    let forwarded = headers
+        .get(FORWARDED_FOR_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(rightmost_ip)
+        .or_else(|| {
+            headers
+                .get(REAL_IP_HEADER)
+                .and_then(|h| h.to_str().ok())
+                .map(str::trim)
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        });
+
+    forwarded.map(normalize_ip).unwrap_or(peer)
 }
 
 /// Builds the exact byte string a signature is computed over.
@@ -196,21 +246,9 @@ pub async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    // Resilient IP resolution: prefer X-Forwarded-For (rightmost hop), then X-Real-IP, and only
-    // fall back to the raw TCP peer address if neither proxy header is present/valid.
-    let client_ip = headers
-        .get("X-Forwarded-For")
-        .and_then(|h| h.to_str().ok())
-        .and_then(rightmost_ip)
-        .or_else(|| {
-            headers
-                .get("X-Real-IP")
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.trim())
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        })
-        .unwrap_or(addr.ip());
-    let client_ip = normalize_ip(client_ip);
+    // Forwarding headers are consulted only when the TCP peer is a configured trusted proxy;
+    // otherwise the peer address itself is authoritative. See [`resolve_client_ip`].
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state.config.trusted_proxies);
 
     // One canonical way to name yourself: the bearer API key. It is hashed and matched against
     // `api_keys.key_hash`, which is the only key lookup path in the system.
@@ -245,11 +283,19 @@ pub async fn auth_middleware(
             AppError::Internal
         })?;
 
+    // An empty `bound_ips` means "unrestricted" and is the only way to opt out. A key that names
+    // ranges is held to them **whatever its scopes** — `is_master` used to bypass this check, which
+    // meant the single most valuable credential in the system was also the only one whose network
+    // restriction was decorative while the dashboard displayed it as enforced. A master key that
+    // should reach the API from anywhere expresses that by leaving `bound_ips` empty (or listing
+    // `0.0.0.0/0,::/0`), not by having the check skipped behind its back.
     let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
 
-    if !is_allowed && !key_record.is_master {
+    if !is_allowed {
         tracing::warn!(
-            "Access denied: Client IP {} not in bound networks {:?}",
+            key = %key_record.prefix,
+            is_master = key_record.is_master,
+            "Access denied: client IP {} not in bound networks {:?}",
             client_ip,
             key_record.bound_ips
         );
@@ -513,6 +559,88 @@ mod tests {
     fn normalizes_ipv4_mapped_addresses() {
         let mapped: std::net::IpAddr = "::ffff:192.168.1.1".parse().expect("valid IPv6 literal");
         assert_eq!(normalize_ip(mapped), "192.168.1.1".parse::<std::net::IpAddr>().expect("valid IPv4"));
+    }
+
+    /// Builds a header map carrying one forwarding header.
+    fn forwarded(name: &str, value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+            value.parse().expect("valid header value"),
+        );
+        headers
+    }
+
+    fn ip(raw: &str) -> std::net::IpAddr {
+        raw.parse().expect("valid IP literal")
+    }
+
+    #[test]
+    fn forwarding_headers_are_ignored_from_an_untrusted_peer() {
+        let peer = ip("203.0.113.5");
+
+        // No trusted proxies at all — the production default.
+        for (name, value) in [
+            ("X-Forwarded-For", "10.1.2.3"),
+            ("X-Forwarded-For", "10.1.2.3, 10.4.5.6"),
+            ("X-Real-IP", "10.1.2.3"),
+        ] {
+            assert_eq!(
+                resolve_client_ip(&forwarded(name, value), peer, &[]),
+                peer,
+                "{name} from an untrusted peer must not change the resolved address"
+            );
+        }
+
+        // A trust list that simply does not include this peer behaves identically.
+        let trusted = ["10.0.0.0/8".parse().expect("valid CIDR")];
+        assert_eq!(
+            resolve_client_ip(&forwarded("X-Forwarded-For", "10.1.2.3"), peer, &trusted),
+            peer
+        );
+    }
+
+    #[test]
+    fn forwarding_headers_are_honoured_from_a_trusted_peer() {
+        let peer = ip("10.0.0.9");
+        let trusted: [IpNetwork; 1] = ["10.0.0.0/8".parse().expect("valid CIDR")];
+
+        // The rightmost hop is the one the trusted proxy appended itself.
+        assert_eq!(
+            resolve_client_ip(&forwarded("X-Forwarded-For", "203.0.113.1, 192.168.4.4"), peer, &trusted),
+            ip("192.168.4.4")
+        );
+        assert_eq!(
+            resolve_client_ip(&forwarded("X-Real-IP", "192.168.4.4"), peer, &trusted),
+            ip("192.168.4.4")
+        );
+        // An IPv4-mapped hop is normalized so it can match an IPv4 CIDR.
+        assert_eq!(
+            resolve_client_ip(&forwarded("X-Real-IP", "::ffff:192.168.4.4"), peer, &trusted),
+            ip("192.168.4.4")
+        );
+        // Garbage falls back to the peer rather than failing open.
+        assert_eq!(
+            resolve_client_ip(&forwarded("X-Forwarded-For", "not-an-ip"), peer, &trusted),
+            peer
+        );
+        // No header at all: the peer stands.
+        assert_eq!(resolve_client_ip(&axum::http::HeaderMap::new(), peer, &trusted), peer);
+    }
+
+    #[test]
+    fn a_trusted_peer_is_matched_after_ipv4_mapping_is_normalized() {
+        // A dual-stack listener surfaces an IPv4 proxy as ::ffff:10.0.0.9; the trust check must
+        // still recognize it, or a correct TRUSTED_PROXIES entry would silently stop applying.
+        let trusted: [IpNetwork; 1] = ["10.0.0.0/8".parse().expect("valid CIDR")];
+        assert_eq!(
+            resolve_client_ip(
+                &forwarded("X-Forwarded-For", "192.168.4.4"),
+                ip("::ffff:10.0.0.9"),
+                &trusted
+            ),
+            ip("192.168.4.4")
+        );
     }
 
     #[test]

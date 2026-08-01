@@ -49,11 +49,11 @@ Stores authentication keys, global scopes, and network restrictions.
 | `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`) for display and log correlation. Safe to log. **Not a credential and not an authentication header** — callers identify themselves with `X-API-Key`, which is the only key lookup path. `NULL` only for keys issued before signing secrets existed; rotate such a key to mint a pair. |
 | `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret — see the storage model below. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
 | `hmac_mode` | String | NOT NULL, DEFAULT `'CANONICAL_V1'` | Signature verification scheme: `CANONICAL_V1` or `BODY_ONLY`. See the enumeration section below. |
-| `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. |
+| `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. Enforced for **every** key including `is_master` (see below); an empty value means "unrestricted". The address compared against it is the TCP peer unless that peer is in `TRUSTED_PROXIES`. |
 | `max_concurrent_jobs`| Integer | NOT NULL, DEFAULT `10` | Maximum simultaneous script executions allowed for this key. |
-| `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all RBAC checks if `true`. |
-| `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage other API keys. |
-| `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create and manage hooks. |
+| `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all **RBAC** checks if `true`. It does **not** bypass the `bound_ips` network check, which is a transport boundary rather than a permission. Granting this flag is itself master-only. |
+| `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage **other** API keys. Explicitly *not* the right to grant global scopes, to administer a key that is itself `is_master`, or to alter the caller's own hook permissions — all three are master-only, or the scope would be self-amplifying and thus equivalent to `is_master`. |
+| `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create hooks (creation auto-provisions full rights on the new hook). Never confers rights over a hook created by someone else, and never over a hook carrying `run_as_user`. |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
 

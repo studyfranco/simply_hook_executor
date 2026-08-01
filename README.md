@@ -250,12 +250,13 @@ automatically if present):
 | `SIGNATURE_MAX_AGE_SECONDS` | `300` | Anti-replay window for `X-Timestamp`, applied symmetrically (past *and* future). |
 | `REQUIRE_SIGNED_REQUESTS` | `false` | When `true`, every authenticated request must carry a valid signature — bearer-only auth is refused. Requires an HTTPS-served dashboard, since the browser cannot sign otherwise. |
 | `ALLOWED_SCRIPT_ROOTS` | *(unset — unrestricted)* | Comma-separated absolute directories that a hook's `script_path` must live under. Strongly recommended in production: without it, any key holding `can_manage_hooks` can point a hook at any absolute path. Relative entries are ignored with a warning (a boundary that moves with the working directory is not a boundary). |
+| `TRUSTED_PROXIES` | *(unset — trust nothing)* | Comma-separated CIDRs or bare IPs (`127.0.0.1,10.0.0.0/8`) whose `X-Forwarded-For` / `X-Real-IP` headers are believed. **Set this to the reverse proxy actually in front of the daemon, and nothing else.** With it unset the headers are ignored entirely and `bound_ips` is evaluated against the direct TCP peer — correct for a directly-exposed daemon, and safe for a proxied one (every key simply appears to connect from the proxy). A range wider than the real proxy fleet re-opens the bypass for every host inside it. |
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |
 | `MAX_OUTPUT_BYTES` | `1048576` | Per-stream cap on captured stdout/stderr. Excess is discarded (but still drained) and flagged in the stored output. |
 | `BIND_HOST` (or `HOST`) | `0.0.0.0` | Interface to listen on. Must be a literal IP (`0.0.0.0`, `127.0.0.1`, `::`, `::1`) — hostnames are not resolved, since picking one of several resolved addresses is a security decision, not a convenience. `BIND_HOST` wins if both are set. |
 | `PORT` | `3000` | Listen port. `0` lets the OS assign a free ephemeral port (useful for tests); the actual port is logged at startup. |
-| `BOOTSTRAP_SUBNET` | `0.0.0.0/0` | `bound_ips` assigned to the auto-generated master key. |
+| `BOOTSTRAP_SUBNET` | `0.0.0.0/0,::/0` | `bound_ips` assigned to the auto-generated master key. Both families by default: `bound_ips` binds master keys too, so an IPv4-only value would lock you out of a dual-stack deployment on the first request. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_hook_executor=debug`. |
 
 A malformed `BIND_HOST` or `PORT` logs a warning and falls back to the default rather than

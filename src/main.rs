@@ -88,7 +88,12 @@ async fn bootstrap_master_key(
         _ => api::generate_random_key(),
     };
     let key_hash = api::hash_key(&plaintext_key);
-    let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0".to_owned());
+    // Both families, matching the `api_keys.bound_ips` column default in `SCHEMA.MD`. Listing only
+    // `0.0.0.0/0` would have been harmless while master keys bypassed the CIDR check; now that they
+    // are held to it, an IPv4-only default would lock an operator out of a dual-stack deployment on
+    // the very first request.
+    let bound_ip =
+        std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
 
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     let now = chrono::Utc::now().naive_utc();
