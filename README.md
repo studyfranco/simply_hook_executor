@@ -250,7 +250,7 @@ automatically if present):
 | `SIGNATURE_MAX_AGE_SECONDS` | `300` | Anti-replay window for `X-Timestamp`, applied symmetrically (past *and* future). |
 | `REQUIRE_SIGNED_REQUESTS` | `false` | When `true`, every authenticated request must carry a valid signature — bearer-only auth is refused. Requires an HTTPS-served dashboard, since the browser cannot sign otherwise. |
 | `ALLOWED_SCRIPT_ROOTS` | *(unset — unrestricted)* | Comma-separated absolute directories that a hook's `script_path` must live under. Strongly recommended in production: without it, any key holding `can_manage_hooks` can point a hook at any absolute path. Relative entries are ignored with a warning (a boundary that moves with the working directory is not a boundary). |
-| `TRUSTED_PROXIES` | *(unset — trust nothing)* | Comma-separated CIDRs or bare IPs (`127.0.0.1,10.0.0.0/8`) whose `X-Forwarded-For` / `X-Real-IP` headers are believed. **Set this to the reverse proxy actually in front of the daemon, and nothing else.** With it unset the headers are ignored entirely and `bound_ips` is evaluated against the direct TCP peer — correct for a directly-exposed daemon, and safe for a proxied one (every key simply appears to connect from the proxy). A range wider than the real proxy fleet re-opens the bypass for every host inside it. |
+| `TRUSTED_PROXIES` | *(unset — trust nothing)* | Comma-separated CIDRs, bare IPs, **or hostnames** (`127.0.0.1,172.16.0.0/12,traefik`) whose `X-Forwarded-For` / `X-Real-IP` headers are believed. **Set this to the reverse proxy actually in front of the daemon, and nothing else.** With it unset the headers are ignored entirely and `bound_ips` is evaluated against the direct TCP peer — correct for a directly-exposed daemon, and safe for a proxied one (every key simply appears to connect from the proxy). A range wider than the real proxy fleet re-opens the bypass for every host inside it. Hostnames are re-resolved every 30s so a restarted container is picked up without a restart here; a name that fails to resolve is simply not trusted. |
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |
 | `MAX_OUTPUT_BYTES` | `1048576` | Per-stream cap on captured stdout/stderr. Excess is discarded (but still drained) and flagged in the stored output. |
@@ -288,15 +288,17 @@ scripts must exist *inside* the container to be executable), and exposes port `3
 
 Every route below requires an `X-API-Key` header; missing or invalid keys get `401`, and keys
 whose `bound_ips` CIDRs don't cover the caller's (proxy-aware) source address get `403`. Master
-keys bypass all RBAC and CIDR checks. Any route accepting a hook `{identifier}` takes either the
-hook's UUID or its unique name.
+keys bypass all RBAC checks — but **not** the CIDR check: `bound_ips` binds every key, master
+included, and an empty value is the only way to say "from anywhere". Any route accepting a hook
+`{identifier}` takes either the hook's UUID or its unique name.
 
 | Method | Path | Purpose |
 | :--- | :--- | :--- |
 | `GET` | `/api/auth/me` | Identity + effective RBAC permissions for the calling key. |
 | `POST` / `GET` | `/api/hooks` | Create / list hooks (creation requires `is_master` or `can_manage_hooks`). |
 | `GET` | `/api/hooks/{identifier}` | Read one hook. Needs any mapping (`can_execute` or `can_manage`). |
-| `PUT` / `PATCH` / `DELETE` | `/api/hooks/{identifier}` | Update / delete one hook. Needs `can_manage`. |
+| `PUT` / `PATCH` / `DELETE` | `/api/hooks/{identifier}` | Update one hook, or move it to the trash. Needs `can_manage`. `DELETE` is a **soft** delete: nothing cascades and the row is recoverable for 92 days. `?hard=true` drops it for good (master only). |
+| `POST` | `/api/hooks/{identifier}/restore` | Bring a trashed hook back (master only). |
 | `POST` | `/api/hooks/{identifier}/execute` | Run the hook and return its recorded outcome. Needs `can_execute`. |
 | `POST` | `/api/hooks/{identifier}/test` | Dry run: preview the resolved command without executing. Needs `can_execute` — the preview reveals the resolved command line and child environment. |
 | `GET` / `POST` | `/api/hooks/{identifier}/parameters` | List / declare parameters. |
@@ -312,6 +314,7 @@ hook's UUID or its unique name.
 | `DELETE` | `/api/executions` | Run the retention sweep on demand (`?older_than_days=`, master only). |
 | `GET` | `/api/audit-logs` | Audit trail (`?action=`, `?limit=`, `?offset=`; master only). |
 | `GET` | `/api/settings` | Runtime configuration and instance counters (master only). |
+| `POST` | `/api/system/purge-hooks` | Permanently drop trashed hooks older than 92 days (`?older_than_days=`, master only). |
 
 `POST .../execute` accepts two body shapes: `{"parameters": {...}}` for first-party clients, or a
 bare flat object for webhook senders that can only post their own document. An empty body means

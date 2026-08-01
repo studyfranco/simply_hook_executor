@@ -95,8 +95,39 @@ Defines executable script definitions and execution constraints.
 | `script_path` | String | NOT NULL | Absolute filesystem path to executable (`/usr/local/bin/ban.sh`). |
 | `default_timeout_seconds` | Integer | NOT NULL, DEFAULT `30` | Maximum allowed runtime before `SIGKILL`. |
 | `run_as_user` | String | NULLABLE, DEFAULT `NULL` | Target account for privileged execution. `NULL`/empty runs the script directly as the daemon user; a value (e.g. `root`, `postgres`) runs it via `sudo -n -u <user> --`. |
+| `is_deleted` | Boolean | NOT NULL, DEFAULT `false` | Soft-delete flag. A `true` row is in the trash: invisible to every ordinary route and unexecutable, but fully intact. |
+| `deleted_at` | DateTime | NULLABLE, DEFAULT `NULL` | When the hook was trashed. The clock the 92-day purge measures from. |
+| `deleted_by` | Text | NULLABLE, DEFAULT `NULL` | The `api_keys.id` of whoever trashed it, **as text**. |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
+
+#### Soft delete
+
+`DELETE /api/hooks/{id}` marks the row rather than dropping it. The reason is the cascade: `hooks` is
+the parent of `hook_parameters`, `api_key_hook_permissions`, **and `executions`**, all
+`ON DELETE CASCADE`. Dropping one row therefore destroyed the complete audit record of everything
+that hook had ever run, irreversibly, from a single mistyped identifier.
+
+| Operation | Effect |
+| :--- | :--- |
+| `DELETE /api/hooks/{id}` | `is_deleted = true`, `deleted_at = now()`, `deleted_by = caller` — nothing cascades |
+| `GET /api/hooks`, `GET /api/hooks/{id}`, execute, `/test`, `/webhook/{id}`, parameter routes | behave as though the row does not exist (`404`) |
+| `GET /api/hooks?include_deleted=true`, `GET /api/hooks/{id}?include_deleted=true` | the trash view — **master only** |
+| `POST /api/hooks/{id}/restore` | clears all three columns — **master only** |
+| `DELETE /api/hooks/{id}?hard=true` | drops the row, cascading everything — **master only** |
+| `POST /api/system/purge-hooks` | drops trash older than 92 days — **master only** |
+
+Three details are deliberate:
+
+- **`deleted_by` is text, not a foreign key.** Attribution has to outlive the acting key; a real FK
+  would either cascade the attribution away with that key or block it from ever being deleted. This
+  matches how `audit_logs` already denormalizes `api_key_name` and `api_key_prefix`.
+- **`hooks.name` stays unique across live *and* trashed rows.** Scoping uniqueness to live rows needs
+  a partial unique index, whose syntax is backend-specific and therefore forbidden by `AGENT.MD`. A
+  trashed hook consequently still holds its name; creating a replacement returns `409` with a message
+  naming the trashed holder and how to free it.
+- **A soft-deleted hook keeps its execution history visible** in `GET /api/executions`. Preserving
+  that history is the entire point of the feature, so hiding it along with the hook would defeat it.
 
 ---
 

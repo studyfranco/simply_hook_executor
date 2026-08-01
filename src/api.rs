@@ -124,12 +124,17 @@ async fn create_audit_log(
     Ok(())
 }
 
-/// Resolves a hook from a path segment that may be either its UUID or its unique name.
+/// Resolves a hook from a path segment that may be either its UUID or its unique name, **including
+/// soft-deleted ones**.
 ///
 /// Every hook route takes a `String` rather than a strictly-typed `Uuid` for exactly this reason:
 /// a caller wiring up `/webhook/nftables_ban` gets a working request instead of Axum rejecting it
 /// with a `422` before any handler runs.
-async fn resolve_hook(
+///
+/// Almost every caller wants [`resolve_hook`] instead. This variant exists for the three trash
+/// routes — restore, hard delete, and the master's `include_deleted` view — which by definition need
+/// to address a row the rest of the API pretends is gone.
+async fn resolve_hook_including_deleted(
     db: &sea_orm::DatabaseConnection,
     identifier: &str,
 ) -> Result<hook::Model, AppError> {
@@ -143,6 +148,40 @@ async fn resolve_hook(
         .one(db)
         .await?
         .ok_or(AppError::NotFound)
+}
+
+/// Resolves a **live** hook by UUID or name.
+///
+/// A soft-deleted hook reports `404`, identically to one that never existed. That equivalence is
+/// deliberate: "deleted" is a state the rest of the API does not model, so every route that reads,
+/// executes, or edits a hook behaves as though the row is gone. Returning a distinguishable error
+/// would mean auditing each of those routes for whether acting on a trashed hook is safe; a `404`
+/// makes the answer uniform and unforgettable.
+async fn resolve_hook(
+    db: &sea_orm::DatabaseConnection,
+    identifier: &str,
+) -> Result<hook::Model, AppError> {
+    let found = resolve_hook_including_deleted(db, identifier).await?;
+    if found.is_deleted {
+        return Err(AppError::NotFound);
+    }
+    Ok(found)
+}
+
+/// Narrows a hook query to live rows unless the caller asked for the trash and may see it.
+///
+/// Master-only, because a soft-deleted hook still carries its `script_path` and `run_as_user` — the
+/// full definition of something that was privileged enough to want deleting.
+fn require_master_for_deleted_view(
+    key: &api_key::Model,
+    include_deleted: bool,
+) -> Result<(), AppError> {
+    if include_deleted && !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only master API keys can view deleted hooks".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fetches the caller's explicit permission grant for a hook, if any.
@@ -635,6 +674,12 @@ pub struct HookDetail {
     pub default_timeout_seconds: i32,
     /// Account the script runs as via `sudo`, or `None` when it runs as the daemon user.
     pub run_as_user: Option<String>,
+    /// Whether the hook is in the trash. Only ever `true` in a master's `include_deleted` view.
+    pub is_deleted: bool,
+    /// When it was trashed, if it was.
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+    /// The `api_keys.id` of whoever trashed it, if it was.
+    pub deleted_by: Option<String>,
     /// Declared parameters, in the order used for positional CLI arguments.
     pub parameters: Vec<hook_parameter::Model>,
     /// Whether the requesting key may execute this hook.
@@ -670,6 +715,9 @@ async fn build_hook_detail(
         script_path: model.script_path,
         default_timeout_seconds: model.default_timeout_seconds,
         run_as_user: model.run_as_user,
+        is_deleted: model.is_deleted,
+        deleted_at: model.deleted_at,
+        deleted_by: model.deleted_by,
         parameters,
         can_execute,
         can_manage,
@@ -762,15 +810,32 @@ pub async fn create_hook(
         script_path: Set(payload.script_path.clone()),
         default_timeout_seconds: Set(timeout),
         run_as_user: Set(run_as_user.clone()),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };
 
     if let Err(err) = Hook::insert(model).exec(&state.db).await {
         if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
-            return Err(AppError::Conflict(format!(
-                "A hook named '{name}' already exists"
-            )));
+            // `hooks.name` stays unique across live *and* trashed rows: a partial unique index is
+            // the one way to scope it, and the syntax differs per backend, which `AGENT.MD` forbids.
+            // The name is therefore still held by whatever is in the trash — say so explicitly,
+            // because "already exists" for a hook the caller just deleted and cannot see is a
+            // genuinely baffling error to receive.
+            let trashed = Hook::find()
+                .filter(hook::Column::Name.eq(name.clone()))
+                .filter(hook::Column::IsDeleted.eq(true))
+                .one(&state.db)
+                .await?;
+            return Err(AppError::Conflict(match trashed {
+                Some(_) => format!(
+                    "A deleted hook named '{name}' still holds that name. Restore it, or purge it \
+                     with DELETE /api/hooks/{name}?hard=true, before reusing the name."
+                ),
+                None => format!("A hook named '{name}' already exists"),
+            }));
         }
         return Err(err.into());
     }
@@ -817,12 +882,29 @@ pub async fn create_hook(
     Ok(Json(build_hook_detail(&state.db, &key, created).await?))
 }
 
+/// Query parameters for the hook listing.
+#[derive(Deserialize)]
+pub struct ListHooksQuery {
+    /// Include soft-deleted hooks — the master's trash view. Defaults to `false`.
+    pub include_deleted: Option<bool>,
+}
+
 /// Handles `GET /api/hooks` — lists every hook the caller can see.
+///
+/// Soft-deleted hooks are omitted unless a master asks for them with `?include_deleted=true`, so the
+/// default view is exactly what an operator expects "the hooks" to mean.
 pub async fn list_hooks(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Query(params): Query<ListHooksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let include_deleted = params.include_deleted.unwrap_or(false);
+    require_master_for_deleted_view(&key, include_deleted)?;
+
     let mut query = Hook::find().order_by_asc(hook::Column::Name);
+    if !include_deleted {
+        query = query.filter(hook::Column::IsDeleted.eq(false));
+    }
 
     if let Some(ids) = visible_hook_ids(&state.db, &key).await? {
         if ids.is_empty() {
@@ -840,12 +922,23 @@ pub async fn list_hooks(
 }
 
 /// Handles `GET /api/hooks/{identifier}` — one hook, by UUID or name.
+///
+/// A soft-deleted hook is a `404` unless a master asks for it with `?include_deleted=true`, which is
+/// how the trash view drills into a row before restoring it.
 pub async fn get_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Path(identifier): Path<String>,
+    Query(params): Query<ListHooksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model = resolve_hook(&state.db, &identifier).await?;
+    let include_deleted = params.include_deleted.unwrap_or(false);
+    require_master_for_deleted_view(&key, include_deleted)?;
+
+    let model = if include_deleted {
+        resolve_hook_including_deleted(&state.db, &identifier).await?
+    } else {
+        resolve_hook(&state.db, &identifier).await?
+    };
     require_visibility(&state.db, &key, model.id).await?;
     Ok(Json(build_hook_detail(&state.db, &key, model).await?))
 }
@@ -939,24 +1032,80 @@ pub async fn update_hook(
     Ok(Json(build_hook_detail(&state.db, &key, updated).await?))
 }
 
-/// Handles `DELETE /api/hooks/{identifier}` — removes a hook, cascading its parameters,
-/// permissions, and execution history.
+/// Query parameters for `DELETE /api/hooks/{identifier}`.
+#[derive(Deserialize)]
+pub struct DeleteHookQuery {
+    /// Drop the row outright instead of moving it to the trash. Master-only.
+    pub hard: Option<bool>,
+}
+
+/// Handles `DELETE /api/hooks/{identifier}` — moves a hook to the trash, or (master, `?hard=true`)
+/// drops it outright.
+///
+/// The default is a **soft** delete for every caller, master included. Dropping the row cascades the
+/// hook's parameters, permission grants, and entire execution history, so the destructive path is
+/// the one that has to be asked for explicitly rather than the one you get by mistyping a UUID.
+/// `?hard=true` is master-only for the same reason: irreversibly destroying an audit trail is not
+/// something a scoped `can_manage` grant should be able to do.
 pub async fn delete_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(identifier): Path<String>,
+    Query(query): Query<DeleteHookQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model = resolve_hook(&state.db, &identifier).await?;
+    let hard = query.hard.unwrap_or(false);
+    // A hard delete may target something already in the trash, which is the normal way an operator
+    // empties it; a soft delete only ever applies to a live hook.
+    let model = if hard {
+        resolve_hook_including_deleted(&state.db, &identifier).await?
+    } else {
+        resolve_hook(&state.db, &identifier).await?
+    };
     require_manage(&state.db, &key, model.id).await?;
+    // Deleting a privileged hook is a change to a privileged hook like any other.
+    require_master_for_privileged_hook(&key, &model, "delete")?;
 
     let reference = format_reference(&model.name, model.id);
     let name = model.name.clone();
 
-    let result = Hook::delete_by_id(model.id).exec(&state.db).await?;
-    if result.rows_affected == 0 {
-        return Err(AppError::NotFound);
+    if hard {
+        if !key.is_master {
+            return Err(AppError::Forbidden(
+                "Only master API keys can permanently delete a hook; omit ?hard=true to move it \
+                 to the trash instead"
+                    .to_owned(),
+            ));
+        }
+
+        let result = Hook::delete_by_id(model.id).exec(&state.db).await?;
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound);
+        }
+
+        create_audit_log(
+            &state.db,
+            &key,
+            client_ip.0,
+            "HOOK_HARD_DELETE",
+            Some(name),
+            Some(format!(
+                "Permanently deleted hook {reference}, discarding its parameters, permissions, and \
+                 execution history"
+            )),
+        )
+        .await?;
+
+        return Ok(axum::http::StatusCode::NO_CONTENT);
     }
+
+    let mut active: hook::ActiveModel = model.into();
+    active.is_deleted = Set(true);
+    active.deleted_at = Set(Some(Utc::now().naive_utc()));
+    // Stored as text so the attribution outlives the acting key.
+    active.deleted_by = Set(Some(key.id.to_string()));
+    active.updated_at = Set(Utc::now().naive_utc());
+    active.update(&state.db).await?;
 
     create_audit_log(
         &state.db,
@@ -964,11 +1113,109 @@ pub async fn delete_hook(
         client_ip.0,
         "HOOK_DELETE",
         Some(name),
-        Some(format!("Deleted hook {reference}")),
+        Some(format!(
+            "Moved hook {reference} to the trash; it is recoverable until purged after \
+             {} days",
+            crate::retention::DELETED_HOOK_RETENTION_DAYS
+        )),
     )
     .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Handles `POST /api/hooks/{identifier}/restore` — brings a soft-deleted hook back.
+///
+/// Master-only. A trashed hook keeps its `script_path` and `run_as_user`, so restoring one puts a
+/// previously-removed definition — potentially a privileged one — back into service; that is a
+/// decision for the same authority that can create such a hook in the first place.
+pub async fn restore_hook(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only master API keys can restore a deleted hook".to_owned(),
+        ));
+    }
+
+    let model = resolve_hook_including_deleted(&state.db, &identifier).await?;
+    if !model.is_deleted {
+        return Err(AppError::InvalidInput(format!(
+            "Hook '{}' is not deleted",
+            model.name
+        )));
+    }
+
+    let reference = format_reference(&model.name, model.id);
+    let name = model.name.clone();
+    let hook_id = model.id;
+
+    let mut active: hook::ActiveModel = model.into();
+    active.is_deleted = Set(false);
+    active.deleted_at = Set(None);
+    active.deleted_by = Set(None);
+    active.updated_at = Set(Utc::now().naive_utc());
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "HOOK_RESTORE",
+        Some(name),
+        Some(format!("Restored hook {reference} from the trash")),
+    )
+    .await?;
+
+    let restored = Hook::find_by_id(hook_id).one(&state.db).await?.ok_or(AppError::Internal)?;
+    Ok(Json(build_hook_detail(&state.db, &key, restored).await?))
+}
+
+/// Handles `POST /api/system/purge-hooks` — permanently drops trashed hooks past the retention
+/// window.
+///
+/// Master-only, and irreversible: it discards each purged hook's execution history along with the
+/// row. Runs the same sweep as the background worker, so an operator reclaiming space immediately
+/// gets exactly the behaviour that would have happened on its own schedule.
+pub async fn purge_deleted_hooks(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Query(query): Query<PurgeQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only master keys can purge deleted hooks".to_owned(),
+        ));
+    }
+
+    let days = query
+        .older_than_days
+        .unwrap_or(crate::retention::DELETED_HOOK_RETENTION_DAYS);
+    if days < 0 {
+        return Err(AppError::InvalidInput(
+            "older_than_days must not be negative".to_owned(),
+        ));
+    }
+
+    let purged = crate::retention::purge_expired_deleted_hooks(&state.db, days).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "HOOK_PURGE",
+        None,
+        Some(format!(
+            "Purged {purged} deleted hook(s) trashed more than {days} day(s) ago"
+        )),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({ "purged": purged, "older_than_days": days })))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2180,6 +2427,7 @@ pub async fn get_settings(
         trusted_proxies: state
             .config
             .trusted_proxies
+            .spec()
             .iter()
             .map(ToString::to_string)
             .collect(),

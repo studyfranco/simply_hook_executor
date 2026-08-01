@@ -10,6 +10,7 @@ To keep this context clean and modular, responsibilities are split across three 
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, process execution rules, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
+4. **`example/`**: You can find the code of other similar/linked project inside.
 
 ---
 
@@ -80,7 +81,9 @@ Rules the implementation MUST hold to:
 - **CIDR Restriction:** API Keys are bound to CIDR network ranges (`bound_ips`, supporting comma-separated IPv4/IPv6 ranges like `127.0.0.1/32, 10.0.0.0/8, ::/0`). Middleware MUST validate the client's IP against these bounds.
   - The check applies to **every** key, including `is_master`. `is_master` bypasses *RBAC* checks; it does not bypass the *network* boundary. An empty `bound_ips` is the only way to express "from anywhere" — a master key whose binding was silently ignored while the dashboard displayed it as enforced was the worst possible combination.
 - **Trusted-Proxy IP Extraction:** Do NOT use external IP extraction crates. A forwarding header is a **claim by the sender**, not an observation, and becomes evidence only when the sender is a proxy the operator put there:
-  - `X-Forwarded-For` / `X-Real-IP` MUST be parsed **only** when the TCP peer (`axum::extract::ConnectInfo`) matches `TRUSTED_PROXIES` (comma-separated CIDRs or bare IPs). From a trusted peer, take the **rightmost** `X-Forwarded-For` hop — the one that proxy appended itself; entries to its left came from whatever called it and are not verifiable.
+  - `X-Forwarded-For` / `X-Real-IP` MUST be parsed **only** when the TCP peer (`axum::extract::ConnectInfo`) matches `TRUSTED_PROXIES`. Entries may be bare IPs, CIDR ranges, **or hostnames** (`traefik`, `proxy.internal`) resolved via `tokio::net::lookup_host` — container platforms assign the proxy's address at runtime, so it cannot be written into configuration ahead of time. Resolution is cached with a short TTL so a moved container is picked up without a restart, and an unresolvable name is simply *not trusted* (a DNS outage must never be able to widen trust).
+  - From a trusted peer, walk `X-Forwarded-For` **right to left and skip hops that are themselves trusted proxies**; the first remaining address is the client. Rightmost-first is what makes the suffix unforgeable — each proxy appends the address it actually saw, so entries to the left of the last trusted hop are hearsay the client supplied. Skipping trusted entries is what makes a *chain* work: with `client → P1 → P2 → us` the header reads `client, P1` and a naive "rightmost entry" would report the proxy as the caller.
+  - A header naming nothing but trusted proxies says nothing about the client; fall back to the peer rather than inventing one. `X-Real-IP` is consulted only when `X-Forwarded-For` yields nothing.
   - Otherwise the TCP peer address is authoritative and the headers MUST be ignored entirely.
   - The trust decision MUST come from the socket **before** any header is consulted. Reading the header first and validating afterwards still lets an untrusted client choose the address the allowlist sees.
   - `TRUSTED_PROXIES` defaults to **empty** (trust nothing). Honouring these headers unconditionally lets any client pick its own apparent source address, which defeats `bound_ips` outright and forges `audit_logs.client_ip` at the same time.
@@ -110,7 +113,8 @@ Rules the implementation MUST hold to:
 | `PUT`/`DELETE /api/keys/{id}`, `POST /api/keys/{id}/rotate` where the **target** is `is_master` | `is_master`. Rotation returns the new plaintext secret, so rotating someone else's master key is credential theft with a lockout attached |
 | `POST /api/keys/{id}/permissions` where `{id}` is the **caller's own key** | `is_master` — granting rights to yourself is escalation, not administration |
 | `POST`/`DELETE /api/keys/{id}/permissions*` on a hook the caller does not `can_manage` | `is_master` — you cannot hand out (or strip) authority over a hook you do not manage |
-| **Any** mutation of a hook whose `run_as_user` is non-empty — `PUT`/`PATCH /api/hooks/{id}`, all parameter CRUD, granting permissions on it | `is_master`. Every part of a privileged hook's definition decides what runs with the borrowed privileges: `script_path` names the binary, the parameter contract supplies its argv, the timeout bounds it. Guarding only the `run_as_user` field protects nothing. **Clearing** the elevation is covered too, or the attack simply gains a step |
+| **Any** mutation of a hook whose `run_as_user` is non-empty — `PUT`/`PATCH /api/hooks/{id}`, `DELETE`, all parameter CRUD, granting permissions on it | `is_master`. Every part of a privileged hook's definition decides what runs with the borrowed privileges: `script_path` names the binary, the parameter contract supplies its argv, the timeout bounds it. Guarding only the `run_as_user` field protects nothing. **Clearing** the elevation is covered too, or the attack simply gains a step |
+| `GET /api/hooks?include_deleted=true`, `POST /api/hooks/{id}/restore`, `DELETE /api/hooks/{id}?hard=true`, `POST /api/system/purge-hooks` | `is_master`. A trashed hook keeps its `script_path` and `run_as_user`, so reading or reviving one exposes (or reinstates) a definition someone chose to remove; hard delete and purge irreversibly discard execution history, which no scoped `can_manage` grant should be able to do |
 
 Listing endpoints narrow by these rules rather than rejecting: `GET /api/hooks` and `GET /api/executions` return only what the caller may read.
 
@@ -142,10 +146,33 @@ Listing endpoints narrow by these rules rather than rejecting: `GET /api/hooks` 
 - **Per-Key Concurrency Throttling:** Enforce `max_concurrent_jobs` per `ApiKey` using `tokio::sync::Semaphore`. If a key exceeds its concurrency limit, reject the request with `429 Too Many Requests`.
 - **Execution Timeouts:** Enforce per-hook timeout (defaults to 30 seconds if unspecified in the hook configuration). If execution exceeds the timeout, kill the process tree (`SIGKILL`) and record status `TIMEOUT`.
 
+### 3b. SQLite Concurrency
+
+When the backend is SQLite (the zero-config default), the daemon applies two pragmas at startup —
+`journal_mode=WAL` and `busy_timeout=5000` — before migrations run. This is the one place a
+backend-specific statement is permitted, and it is a *connection pragma*, not a query: the SQL-agnostic
+rule in the Tech Stack section still holds for everything the ORM issues.
+
+- **WAL** lets readers proceed against the last committed snapshot while a writer appends. Without it
+  the default rollback journal takes a database-wide exclusive lock for every write, so one hook
+  recording its `executions` row blocks every concurrent reader — the opposite of what a daemon whose
+  job is parallel execution needs. It is **persistent** (stored in the file header), so setting it
+  once covers the whole pool and every later run.
+- **`busy_timeout`** covers what WAL does not: WAL still allows only one writer, so simultaneous
+  executions can still collide, and without a timeout the loser fails instantly with `SQLITE_BUSY` as
+  a spurious `500`. It is **per-connection**; the pool-wide guarantee comes from SQLx's own five-second
+  default, which this statement matches and makes explicit.
+- Failure to apply either is logged, never fatal. An in-memory database (`sqlite::memory:`, used
+  throughout the test suite) legitimately cannot use WAL.
+
 ### 4. History, Output Capture & Log Retention
 
 - Every execution produces an `Execution` record storing status (`SUCCESS`, `FAILED`, `TIMEOUT`), exit code, full `stdout`, full `stderr`, duration in milliseconds, resolved parameters JSON, and timestamp.
-- **Log Retention Worker:** An asynchronous background task purges `Execution` entries older than `LOG_RETENTION_DAYS` (default: 30 days) on a periodic schedule.
+- **Retention Worker:** An asynchronous background task runs two sweeps on the same interval:
+  1. `Execution` entries older than `LOG_RETENTION_DAYS` (default: 30 days).
+  2. Soft-deleted `Hook` rows trashed more than **92 days** ago (`DELETED_HOOK_RETENTION_DAYS`), also exposed on demand at `POST /api/system/purge-hooks`.
+- The two windows are **separately** governed, and the worker keeps running when either is disabled. `LOG_RETENTION_DAYS=0` means "keep history forever", not "stop maintaining the trash" — an operator shortening log retention to reclaim disk must not silently shrink the undo window for deleted automation as a side effect.
+- **Hook deletion is soft by default** for every caller, master included; see `SCHEMA.MD`. The destructive path (`?hard=true`) is the one that has to be asked for explicitly, because it cascades the hook's parameters, permissions, and entire execution history.
 
 ### 5. Dry-Run / Test Endpoint (`POST /api/hooks/:id/test`)
 

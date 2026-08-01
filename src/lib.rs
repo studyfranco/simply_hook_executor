@@ -36,6 +36,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 pub mod api;
 pub mod config;
 pub mod crypto;
+pub mod db;
 pub mod entities;
 pub mod error;
 pub mod executor;
@@ -62,6 +63,8 @@ pub fn create_app(state: AppState) -> Router {
         // so the handler's semantics are partial-update either way.
         .route("/hooks/{identifier}", axum::routing::patch(api::update_hook))
         .route("/hooks/{identifier}", delete(api::delete_hook))
+        // Trash management. Both are master-only; see the handlers.
+        .route("/hooks/{identifier}/restore", post(api::restore_hook))
         .route("/hooks/{identifier}/execute", post(api::execute_hook_endpoint))
         .route("/hooks/{identifier}/test", post(api::test_hook))
         // Hook parameters
@@ -88,6 +91,8 @@ pub fn create_app(state: AppState) -> Router {
         // Observability
         .route("/audit-logs", get(api::list_audit_logs))
         .route("/settings", get(api::get_settings))
+        // System maintenance
+        .route("/system/purge-hooks", post(api::purge_deleted_hooks))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

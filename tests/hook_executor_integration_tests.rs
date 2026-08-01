@@ -1919,6 +1919,9 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         script_path: Set("/bin/true".to_owned()),
         default_timeout_seconds: Set(30),
         run_as_user: Set(None),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -1926,6 +1929,11 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
     .await
     .expect("a hook is insertable after the upgrade");
     assert_eq!(legacy.run_as_user, None, "an unelevated hook keeps running as the daemon user");
+    // The soft-delete migration backfills existing rows as live rather than leaving the column
+    // nullable, so an upgrade cannot make a hook vanish from the default listing.
+    assert!(!legacy.is_deleted, "an upgraded hook is live, not trashed");
+    assert_eq!(legacy.deleted_at, None);
+    assert_eq!(legacy.deleted_by, None);
 
     // And the column accepts a value.
     let mut active: hook::ActiveModel = legacy.into();
@@ -2985,10 +2993,13 @@ async fn retention_worker_purges_on_its_own_schedule_and_shuts_down_cleanly() {
 }
 
 #[tokio::test]
-async fn retention_worker_is_disabled_when_retention_days_is_zero() {
+async fn log_retention_zero_keeps_history_but_still_purges_the_hook_trash() {
     let db = setup_test_db().await;
     let hook_id = insert_hook(&db, "kept_forever", "/bin/true", 30).await;
     insert_execution_aged(&db, hook_id, 3650).await;
+    // Trashed well past the 92-day window, so the hook sweep must claim it.
+    let (owner_id, _owner) = insert_key(&db, "owner", "", KeyScopes::master()).await;
+    let expired = insert_hook_deleted_days_ago(&db, "long_gone", "/bin/true", 200, owner_id).await;
 
     let state = AppState::new(
         db.clone(),
@@ -3001,14 +3012,22 @@ async fn retention_worker_is_disabled_when_retention_days_is_zero() {
     );
     let (shutdown_tx, worker) = spawn_retention_worker(&state);
 
-    // With retention disabled the worker exits immediately — without waiting for the shutdown
-    // signal, which is still held here precisely to prove that.
-    let stopped = tokio::time::timeout(Duration::from_secs(5), worker).await;
-    assert!(stopped.is_ok(), "a disabled worker should return instead of ticking forever");
+    // `LOG_RETENTION_DAYS=0` means "keep history forever", not "stop maintaining the trash". The
+    // worker therefore keeps running — it owns two sweeps, and only one of them is disabled.
+    assert!(
+        wait_until(Duration::from_secs(5), async || {
+            fetch_hook_row(&db, expired).await.is_none()
+        })
+        .await,
+        "the deleted-hook sweep must still run when log retention is disabled"
+    );
 
-    // A decade-old record is still there.
+    // ...while a decade-old execution record is untouched.
     assert_eq!(execution_count(&db).await, 1);
+
     drop(shutdown_tx);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    assert!(stopped.is_ok(), "the worker still shuts down on signal");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -4173,5 +4192,416 @@ async fn bound_ips_restricts_master_keys_as_well() {
     assert_eq!(
         send(&app, json_request("GET", "/api/auth/me", &local_master, None)).await.status,
         StatusCode::OK
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Hook soft delete, trash management, and the 92-day purge
+// ─────────────────────────────────────────────────────────────
+
+/// A non-master `DELETE` must hide the hook without destroying anything.
+///
+/// The row surviving is the entire point: dropping it cascades the hook's parameters, permission
+/// grants, and execution history, so a mistaken delete used to take the audit record of every run
+/// with it.
+#[tokio::test]
+async fn a_non_master_delete_is_soft_and_leaves_the_row_intact() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("soft.sh", "echo ok");
+    let hook_id = insert_hook(&db, "soft_hook", &script, 30).await;
+    insert_parameter(&db, hook_id, "p1", Some("v"), false).await;
+    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    grant(&db, key_id, hook_id, true, true).await;
+
+    // Run it once so there is history worth preserving.
+    let run = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &editor, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK);
+
+    let deleted = send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &editor, None)).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+
+    // The row is still there, flagged and attributed.
+    let row = fetch_hook_row(&db, hook_id).await.expect("the row must survive a soft delete");
+    assert!(row.is_deleted, "the hook is flagged as deleted");
+    assert!(row.deleted_at.is_some(), "the deletion is timestamped");
+    assert_eq!(
+        row.deleted_by.as_deref(),
+        Some(key_id.to_string().as_str()),
+        "the acting key is recorded"
+    );
+    // Nothing cascaded: the parameter contract and the execution history are untouched.
+    assert_eq!(execution_count(&db).await, 1, "history survives a soft delete");
+
+    // ...but the API behaves as though it is gone, for every route.
+    assert_eq!(
+        send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &editor, None)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&app, json_request("GET", "/api/hooks", &editor, None)).await.json.as_array().map(Vec::len),
+        Some(0),
+        "a trashed hook is absent from the listing"
+    );
+    for (method, uri) in [
+        ("POST", format!("/api/hooks/{hook_id}/execute")),
+        ("POST", format!("/api/hooks/{hook_id}/test")),
+        ("POST", "/webhook/soft_hook".to_owned()),
+        ("GET", format!("/api/hooks/{hook_id}/parameters")),
+    ] {
+        let res = send(&app, json_request(method, &uri, &editor, Some(json!({})))).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{method} {uri} must treat a trashed hook as gone");
+    }
+    // Above all: it cannot run.
+    assert_eq!(execution_count(&db).await, 1, "no execution was recorded for a trashed hook");
+
+    // A non-master cannot see the trash, by name or by flag.
+    let peeking = send(&app, json_request("GET", "/api/hooks?include_deleted=true", &editor, None)).await;
+    assert_eq!(peeking.status, StatusCode::FORBIDDEN);
+}
+
+/// A master can see the trash, restore from it, and empty it.
+#[tokio::test]
+async fn a_master_can_view_restore_and_hard_delete_a_trashed_hook() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("trash.sh", "echo ok");
+    let hook_id = insert_hook(&db, "trash_hook", &script, 30).await;
+    let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &master, None)).await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    // Default listing hides it; the trash view shows it, flagged.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/hooks", &master, None)).await.json.as_array().map(Vec::len),
+        Some(0)
+    );
+    let trash = send(&app, json_request("GET", "/api/hooks?include_deleted=true", &master, None)).await;
+    assert_eq!(trash.status, StatusCode::OK);
+    let rows = trash.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["is_deleted"], json!(true));
+    assert!(rows[0]["deleted_at"].is_string(), "the trash view reports when it was deleted");
+
+    // Restore brings it back into service.
+    let restored = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/restore"), &master, None),
+    )
+    .await;
+    assert_eq!(restored.status, StatusCode::OK);
+    assert_eq!(restored.field("is_deleted"), &json!(false));
+    assert_eq!(restored.field("deleted_at"), &json!(null));
+    assert_eq!(restored.field("deleted_by"), &json!(null));
+
+    // It is fully live again.
+    assert_eq!(
+        send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await.status,
+        StatusCode::OK
+    );
+    // Restoring something that is not deleted is a 400, not a silent no-op.
+    let again = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/restore"), &master, None)).await;
+    assert_eq!(again.status, StatusCode::BAD_REQUEST);
+
+    // Hard delete drops the row for good.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}?hard=true"), &master, None)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(fetch_hook_row(&db, hook_id).await.is_none(), "a hard delete removes the row");
+}
+
+/// Restore and hard delete are master-only; a `can_manage` grant is not enough.
+#[tokio::test]
+async fn trash_management_is_master_only() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("guard.sh", "echo ok");
+    let hook_id = insert_hook(&db, "guard_hook", &script, 30).await;
+    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    grant(&db, key_id, hook_id, true, true).await;
+
+    // A non-master cannot destroy the row even on a hook it fully manages: hard delete discards an
+    // audit trail, which no scoped grant should be able to do.
+    let hard = send(
+        &app,
+        json_request("DELETE", &format!("/api/hooks/{hook_id}?hard=true"), &editor, None),
+    )
+    .await;
+    assert_eq!(hard.status, StatusCode::FORBIDDEN);
+    assert!(fetch_hook_row(&db, hook_id).await.is_some(), "the row survives the refused hard delete");
+
+    // Soft delete, then confirm restore is refused too.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &editor, None)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let restore = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/restore"), &editor, None),
+    )
+    .await;
+    assert_eq!(restore.status, StatusCode::FORBIDDEN);
+    assert!(
+        fetch_hook_row(&db, hook_id).await.is_some_and(|h| h.is_deleted),
+        "the hook stays in the trash"
+    );
+}
+
+/// A privileged hook keeps its master-only guard through the delete routes as well.
+#[tokio::test]
+async fn deleting_a_privileged_hook_stays_master_only() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("root.sh", "echo ok");
+    let hook_id = insert_hook_as(&db, "root_hook", &script, 30, Some("root")).await;
+    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    grant(&db, key_id, hook_id, true, true).await;
+
+    let soft = send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &editor, None)).await;
+    assert_eq!(soft.status, StatusCode::FORBIDDEN, "even trashing an elevated hook is master-only");
+    assert!(fetch_hook_row(&db, hook_id).await.is_some_and(|h| !h.is_deleted));
+}
+
+/// A trashed hook still holds its unique name, and the conflict says so.
+///
+/// `hooks.name` is unique across live and trashed rows alike — a partial unique index is the only
+/// way to scope it and its syntax is backend-specific, which `AGENT.MD` forbids. The behaviour is
+/// therefore a deliberate trade-off, and the error has to explain itself.
+#[tokio::test]
+async fn a_trashed_hook_still_holds_its_name_and_says_so() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+
+    let script = scripts.write_script("named.sh", "echo ok");
+    let hook_id = insert_hook(&db, "taken_name", &script, 30).await;
+    let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &master, None)).await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    let conflict = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "taken_name", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    let message = conflict.string("error");
+    assert!(
+        message.contains("deleted") && message.contains("hard=true"),
+        "the conflict must explain that a trashed hook holds the name, and how to free it: {message}"
+    );
+
+    // Freeing the name makes the create succeed.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}?hard=true"), &master, None)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let created = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "taken_name", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK);
+}
+
+/// The 92-day sweep drops expired trash and leaves everything else alone.
+#[tokio::test]
+async fn the_purge_removes_only_trash_past_the_retention_window() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (owner_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // One live hook, one freshly trashed, one trashed just inside the window, one just outside.
+    let live = insert_hook(&db, "live", "/bin/true", 30).await;
+    let fresh = insert_hook_deleted_days_ago(&db, "fresh", "/bin/true", 1, owner_id).await;
+    let inside = insert_hook_deleted_days_ago(&db, "inside", "/bin/true", 91, owner_id).await;
+    let outside = insert_hook_deleted_days_ago(&db, "outside", "/bin/true", 93, owner_id).await;
+
+    let purged = send(&app, json_request("POST", "/api/system/purge-hooks", &master, None)).await;
+    assert_eq!(purged.status, StatusCode::OK);
+    assert_eq!(purged.field("purged"), &json!(1), "only the row past 92 days is dropped");
+    assert_eq!(purged.field("older_than_days"), &json!(92));
+
+    assert!(fetch_hook_row(&db, outside).await.is_none(), "expired trash is gone");
+    assert!(fetch_hook_row(&db, inside).await.is_some(), "trash inside the window survives");
+    assert!(fetch_hook_row(&db, fresh).await.is_some(), "recent trash survives");
+    assert!(fetch_hook_row(&db, live).await.is_some(), "a live hook is never touched");
+
+    // The threshold is overridable for an operator reclaiming space sooner.
+    let aggressive = send(
+        &app,
+        json_request("POST", "/api/system/purge-hooks?older_than_days=30", &master, None),
+    )
+    .await;
+    assert_eq!(aggressive.status, StatusCode::OK);
+    assert_eq!(aggressive.field("purged"), &json!(1), "the 91-day row is now in scope");
+    assert!(fetch_hook_row(&db, inside).await.is_none());
+    assert!(fetch_hook_row(&db, live).await.is_some(), "a live hook is still never touched");
+
+    // A zero threshold is a no-op rather than "delete everything", matching LOG_RETENTION_DAYS=0.
+    let zero = send(
+        &app,
+        json_request("POST", "/api/system/purge-hooks?older_than_days=0", &master, None),
+    )
+    .await;
+    assert_eq!(zero.field("purged"), &json!(0));
+    assert!(fetch_hook_row(&db, fresh).await.is_some());
+}
+
+/// The purge endpoint is master-only, and rejects a negative window.
+#[tokio::test]
+async fn the_purge_endpoint_is_master_only_and_validated() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (owner_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let scopes = KeyScopes { can_manage_hooks: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (_id, manager) = insert_key(&db, "manager", "", scopes).await;
+
+    let expired = insert_hook_deleted_days_ago(&db, "expired", "/bin/true", 200, owner_id).await;
+
+    let refused = send(&app, json_request("POST", "/api/system/purge-hooks", &manager, None)).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(fetch_hook_row(&db, expired).await.is_some(), "the refused purge changed nothing");
+
+    let negative = send(
+        &app,
+        json_request("POST", "/api/system/purge-hooks?older_than_days=-1", &master, None),
+    )
+    .await;
+    assert_eq!(negative.status, StatusCode::BAD_REQUEST);
+    assert!(fetch_hook_row(&db, expired).await.is_some());
+}
+
+/// The background worker runs the hook sweep on its own schedule, not just on demand.
+#[tokio::test]
+async fn the_retention_worker_purges_expired_trash_on_its_own() {
+    let db = setup_test_db().await;
+    let (owner_id, _master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let expired = insert_hook_deleted_days_ago(&db, "expired", "/bin/true", 200, owner_id).await;
+    let recent = insert_hook_deleted_days_ago(&db, "recent", "/bin/true", 5, owner_id).await;
+
+    let state = AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig { retention_sweep_seconds: 1, ..(*test_config()).clone() }),
+        test_cipher(),
+    );
+    let (shutdown_tx, worker) = spawn_retention_worker(&state);
+
+    assert!(
+        wait_until(Duration::from_secs(5), async || {
+            fetch_hook_row(&db, expired).await.is_none()
+        })
+        .await,
+        "the worker should purge trash past the 92-day window"
+    );
+    assert!(fetch_hook_row(&db, recent).await.is_some(), "recent trash is left alone");
+
+    drop(shutdown_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Dynamic proxy resolution (Docker / Traefik)
+// ─────────────────────────────────────────────────────────────
+
+/// A hostname in `TRUSTED_PROXIES` is resolved, so a container addressed by name can be trusted.
+///
+/// `localhost` stands in for `traefik` here because it is the one name guaranteed to resolve on any
+/// machine without network access; the code path taken is identical.
+#[tokio::test]
+async fn a_hostname_trusted_proxy_is_resolved_and_honoured() {
+    let db = setup_test_db().await;
+    // The simulated peer is 127.0.0.1, which is what `localhost` resolves to — so the daemon must
+    // believe its forwarding header, exactly as it would for `traefik` on a Docker network.
+    let app = create_app(test_state_with_trusted_proxies(&db, &["localhost"]));
+    let (_id, scoped) = insert_key(&db, "lan-only", "192.168.0.0/16", KeyScopes::plain()).await;
+
+    // Without a header the peer itself is used, and loopback is outside the key's range.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &scoped, None)).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    let forwarded = send(
+        &app,
+        forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "192.168.4.4"),
+    )
+    .await;
+    assert_eq!(forwarded.status, StatusCode::OK, "a name-resolved proxy's header is believed");
+}
+
+/// A Docker bridge CIDR works alongside a hostname, and neither widens the other.
+#[tokio::test]
+async fn docker_cidrs_and_hostnames_coexist_without_widening_trust() {
+    let db = setup_test_db().await;
+    // The classic Docker/Traefik shape: the bridge network plus the proxy's service name.
+    let app = create_app(test_state_with_trusted_proxies(&db, &["172.16.0.0/12", "traefik"]));
+    let (_id, scoped) = insert_key(&db, "lan-only", "10.0.0.0/8", KeyScopes::plain()).await;
+
+    // The test peer is 127.0.0.1: not in the bridge range, and `traefik` does not resolve here.
+    // Its forged header must therefore be ignored outright.
+    for value in ["10.1.2.3", "10.1.2.3, 10.4.5.6"] {
+        let res = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", value)).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "an unresolvable hostname entry must not trust an unrelated peer"
+        );
+    }
+}
+
+/// With a chain of proxies, the client is the rightmost hop that is not itself a trusted proxy.
+///
+/// This is the case that a naive "take the rightmost entry" reading gets wrong: behind two proxies
+/// the last entry *is* a proxy, and reporting it as the client would break `bound_ips` for every
+/// caller and fill the audit trail with the infrastructure's own addresses.
+#[tokio::test]
+async fn a_proxy_chain_resolves_to_the_real_client() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1", "172.16.0.0/12"]));
+    let (_id, scoped) = insert_key(&db, "corp", "203.0.113.0/24", KeyScopes::plain()).await;
+
+    // client(203.0.113.50) → P1(172.16.0.9) → us(127.0.0.1). The header's last entry is P1.
+    let res = send(
+        &app,
+        forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "203.0.113.50, 172.16.0.9"),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "the trusted hop is peeled to reach the real client");
+
+    // A client prepending a lie cannot displace the suffix the proxies appended.
+    let spoofed = send(
+        &app,
+        forwarded_request(
+            "/api/auth/me",
+            &scoped,
+            "X-Forwarded-For",
+            "203.0.113.50, 8.8.8.8, 172.16.0.9",
+        ),
+    )
+    .await;
+    assert_eq!(
+        spoofed.status,
+        StatusCode::FORBIDDEN,
+        "the rightmost non-proxy hop is 8.8.8.8, which is outside the key's range"
     );
 }

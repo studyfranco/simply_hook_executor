@@ -1322,3 +1322,186 @@ be readable from the UI rather than only from the daemon's environment.
   up. Left alone deliberately rather than overlooked.
 - A non-master key manager can still edit `bound_ips` on *non-master* keys. Lateral within the set of
   keys it already administers, and inherent to what `can_manage_keys` is for.
+
+---
+
+## 2026-08-01 — Proxy parity with `simply_ip_vault`, hook soft delete, SQLite WAL
+
+Four workstreams: bringing proxy validation to parity with the reference implementation in
+`example/simply_ip_vault` (and extending it for container platforms), hook soft delete with a 92-day
+purge, SQLite concurrency pragmas, and the regression tests for all of it.
+
+### 1. Proxy validation — a real defect found by the cross-check
+
+The audit against `example/simply_ip_vault/src/config.rs` was not a formality. **Our implementation
+had a genuine bug the reference did not**, and it would have bitten in exactly the deployment this
+round was meant to support.
+
+Our `resolve_client_ip` took the **rightmost** `X-Forwarded-For` hop unconditionally. That is correct
+for a single proxy and wrong for a chain. With `client → P1 → P2 → us` the header reads `client, P1`,
+so the rightmost entry is **P1 — a proxy, not the client**. Every caller behind two hops would have
+been authorized against their proxy's address, and the audit trail would have recorded the
+infrastructure instead of the caller.
+
+The reference walks the chain **right to left, skipping addresses that are themselves trusted
+proxies**, and takes the first remaining one. That is now our implementation too, verbatim in
+behaviour:
+
+- Rightmost-first is what makes the *suffix* unforgeable — each proxy appends the address it actually
+  observed, so entries to the left of the last trusted hop are hearsay the client supplied.
+- Skipping trusted entries is what makes a chain resolve to the client rather than to a proxy.
+- A header naming nothing but trusted proxies says nothing about the client, so the peer stands
+  rather than a proxy being reported as the caller.
+- `X-Real-IP` is consulted only when `X-Forwarded-For` yields nothing, under the same precondition.
+
+`resolve_client_ip` and `normalize_ip` moved from `middleware.rs` to `config.rs`, matching the
+reference's layout so the two files can be diffed directly; the middleware now calls
+`crate::config::resolve_client_ip(peer, &headers, &trusted)` exactly as the reference does.
+
+`the_chain_is_walked_right_to_left_past_trusted_hops` and the E2E chain checks in §30 are the
+regression guards. Both fail against the old rightmost-only logic.
+
+### 2. Hostname resolution in `TRUSTED_PROXIES` (beyond the reference)
+
+The reference accepts only IPs and CIDRs. On Docker/Traefik the proxy's address is assigned by the
+orchestrator and changes on every restart, so it cannot be written into configuration at all — the
+operator knows the *service name*, not the address.
+
+`TRUSTED_PROXIES` now accepts three spellings, parsed into a `ProxySpec` enum:
+
+| Spelling | Example | Matched |
+| :--- | :--- | :--- |
+| CIDR | `172.16.0.0/12` | arithmetically, no lookup |
+| Bare address | `127.0.0.1`, `::1` | widened to `/32` / `/128` |
+| Hostname | `traefik`, `proxy.internal` | resolved via `tokio::net::lookup_host` |
+
+Design decisions worth recording:
+
+- **Resolution is cached with a 30-second TTL, not resolved once at startup.** A name resolved once
+  and cached forever keeps trusting an address the orchestrator has since handed to a different
+  container — a stale entry here is a trusted-proxy grant pointing at something arbitrary. Thirty
+  seconds bounds that window while keeping DNS out of the request path in the steady state.
+- **The no-hostname path costs an `Arc` clone.** `TrustedProxies::resolved()` returns the precomputed
+  networks without touching the lock or the resolver when no names are configured, which is every
+  deployment that names its proxies by address.
+- **An unresolvable name is simply not trusted**, logged at `warn`. Failing closed matters here: a DNS
+  outage must never be able to *widen* what the daemon believes, and a container that is down should
+  stop being trusted rather than keep a stale grant alive.
+- **A malformed entry is not silently reinterpreted as a hostname.** `is_hostname_like` rejects
+  anything containing `/` or `:`, and anything made only of digits and dots, so `10.0.0.0/8x` is
+  reported as the typo it is instead of becoming a lookup that quietly never matches.
+
+`RuntimeConfig.trusted_proxies` changed type from `Vec<IpNetwork>` to `TrustedProxies`, which carries
+the spec plus the shared cache. `PartialEq`/`Debug` are implemented by hand over the *spec* only — two
+sets configured identically are equal regardless of when their caches last refreshed.
+
+### 3. Hook soft delete + 92-day purge
+
+**The problem.** `hooks` is the parent of `hook_parameters`, `api_key_hook_permissions`, **and
+`executions`**, all `ON DELETE CASCADE`. A single `DELETE /api/hooks/{id}` therefore destroyed the
+complete audit record of everything that hook had ever run — irreversibly, from one mistyped
+identifier.
+
+New columns (migration `m20230105_000001`): `is_deleted`, `deleted_at`, `deleted_by`.
+
+| Route | Behaviour |
+| :--- | :--- |
+| `DELETE /api/hooks/{id}` | soft for **everyone**, master included — nothing cascades |
+| ordinary read/execute/parameter routes | `404`, identical to a hook that never existed |
+| `GET /api/hooks{,/{id}}?include_deleted=true` | trash view, master only |
+| `POST /api/hooks/{id}/restore` | master only |
+| `DELETE /api/hooks/{id}?hard=true` | master only, cascades |
+| `POST /api/system/purge-hooks` | master only, drops trash past 92 days |
+
+Decisions:
+
+- **Soft is the default for master too.** The destructive path is the one that should require saying
+  so, not the one you get from a typo. `?hard=true` is master-only because discarding an audit trail
+  is not something a scoped `can_manage` grant should be able to do.
+- **A trashed hook is a `404`, not a distinguishable state.** Making "deleted" invisible rather than
+  special means every route that reads, executes, or edits a hook inherits the right behaviour
+  without being individually audited for whether acting on a trashed row is safe.
+- **`deleted_by` is text, not an FK.** Attribution must outlive the acting key; an FK would either
+  cascade it away or block that key from being deleted. Same reasoning as `audit_logs`' denormalized
+  key name and prefix.
+- **`hooks.name` stays unique across live and trashed rows** — scoping uniqueness needs a partial
+  unique index whose syntax is backend-specific, which `AGENT.MD` forbids. The trade-off is accepted
+  and made legible instead: creating a hook whose name a trashed row holds returns `409` naming the
+  trashed holder and how to free it. "A hook named X already exists" for a hook the caller just
+  deleted and cannot see would be a genuinely baffling error.
+- **Execution history of a trashed hook stays visible** in `GET /api/executions`. Preserving it is the
+  entire point; hiding it with the hook would defeat the feature.
+- **Deleting a privileged hook is master-only**, like every other mutation of one.
+- **92 days is not configurable alongside `LOG_RETENTION_DAYS`.** They answer different questions —
+  "how much history do we keep?" versus "how long is a mistake reversible?" — and an operator
+  shortening log retention to save disk must not silently shrink the undo window for deleted
+  automation. This also changed the worker's shutdown contract: it now keeps running when
+  `LOG_RETENTION_DAYS=0`, because that means "keep history forever", not "stop maintaining the trash".
+  `log_retention_zero_keeps_history_but_still_purges_the_hook_trash` replaces the old test that
+  asserted the worker exited.
+
+### 4. SQLite WAL + busy timeout
+
+Applied in `src/db.rs` at startup, **before** migrations (the migration run is itself a long write,
+and exactly when a concurrently-starting replica would hit `SQLITE_BUSY`).
+
+Two facts established by reading the vendored SQLx source rather than assuming:
+
+- SQLx's SQLite URL parser accepts only `mode`, `cache`, `immutable`, `vfs` — **not** `journal_mode`
+  or `busy_timeout`, so these cannot be smuggled through `DATABASE_URL`.
+- SQLx's per-connection `busy_timeout` default is already exactly five seconds.
+
+That matters because the two pragmas have different scopes, and it would be misleading to imply
+otherwise:
+
+- **`journal_mode=WAL` is persistent** — recorded in the file header, so one statement covers the
+  whole pool and every future run. `wal_and_busy_timeout_are_applied_to_a_file_backed_database`
+  asserts it survives reconnection.
+- **`busy_timeout` is per-connection.** This statement sets it for the connection that served it; the
+  pool-wide guarantee comes from SQLx's default, which this matches and makes explicit rather than
+  replaces.
+
+Failures are logged, never fatal: `sqlite::memory:` legitimately reports `journal_mode=memory`, and
+the whole test suite runs on it. The pragma call is also the one deliberate exception to the
+SQL-agnostic rule, gated on `DatabaseBackend::Sqlite` and documented as such.
+
+**A migration bug this surfaced:** the soft-delete migration originally added all three columns in one
+`ALTER TABLE`. `sea-query`'s SQLite backend **panics** on that ("Sqlite doesn't support multiple alter
+options") rather than returning an error, so it took down 20+ tests at once. Split into one statement
+per column, which is also the only form portable across all three supported backends.
+
+### 5. Tests
+
+| Area | Coverage |
+| :--- | :--- |
+| Proxy chains | right-to-left peeling, prepended-lie rejection, all-trusted-hops fallback, IPv4-mapped normalization |
+| Hostnames | resolution + caching, unresolvable name not trusted, hostname peer trusted end to end, Docker CIDR + hostname coexisting |
+| Soft delete | row survives with history and grants intact; every route 404s; trash invisible to non-master |
+| Trash management | master view/restore/hard delete; all three refused to a `can_manage` holder |
+| Purge | 92-day boundary (91 vs 93 days), overridable window, `0` is a no-op, master-only, negative rejected, background worker sweeps on its own |
+| Name reuse | trashed hook holds its name; `409` explains it; freeing the name works |
+| WAL | file-backed database reaches WAL and keeps it across reconnection; in-memory is a clean no-op |
+
+E2E §20 was rewritten from "Hook Deletion Cascade" to cover soft delete, the trash, restore, name
+retention, and the hard-delete cascade. The main E2E instance now boots with
+`TRUSTED_PROXIES=127.0.0.1,localhost` so both spellings — literal and name-resolved — are exercised
+against a real DNS lookup rather than a stub.
+
+### Validation
+
+- `cargo check --all-targets` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean.
+- `cargo test` — 60 unit + 90 integration pass (was 54 + 79).
+- `./scripts/test_e2e.sh` — 593/593 checks pass (was 554).
+
+### Scope notes
+
+- **`can_manage_groups` has no analogue here.** It belongs to `simply_ip_vault`'s IP-group model;
+  this schema has hooks and the `api_key_hook_permission` junction, and the equivalent guards are
+  already in place from the previous commit.
+- **Tasks 1 (partly) and 2 were already delivered in `2a7e16d`** — the trusted-proxy gate, `bound_ips`
+  applying to master keys, and every RBAC guard. Re-verified rather than reimplemented; this round
+  added the chain-peeling fix and hostname support on top.
+- **No SPA trash UI.** The dashboard's delete button now soft-deletes and the listing hides trashed
+  hooks correctly, but there is no screen for viewing or restoring the trash — that was not in scope,
+  and the routes are master-only API surface for now. Worth adding.

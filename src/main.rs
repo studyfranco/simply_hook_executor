@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
-    api, config, config::RuntimeConfig, create_app, crypto, entities, migration,
+    api, config, config::RuntimeConfig, create_app, crypto, db, entities, migration,
     spawn_retention_worker, state::AppState,
 };
 use tokio::net::TcpListener;
@@ -170,6 +170,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opt = ConnectOptions::new(db_url);
     opt.sqlx_logging_level(log::LevelFilter::Debug);
     let db: DatabaseConnection = Database::connect(opt).await?;
+
+    // Before migrations: the migration run is itself a long write, and is exactly the moment a
+    // concurrently-starting replica would otherwise hit SQLITE_BUSY.
+    db::apply_sqlite_pragmas(&db).await?;
 
     tracing::info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;

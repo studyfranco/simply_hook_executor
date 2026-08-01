@@ -8,8 +8,301 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ipnetwork::IpNetwork;
+
+/// How long a resolved `TRUSTED_PROXIES` hostname is reused before being looked up again.
+///
+/// Container addresses change on restart, so a name resolved once at startup and cached forever
+/// would keep trusting an address the orchestrator has since handed to something else — a stale
+/// entry here is a trusted-proxy grant pointing at an arbitrary container. Thirty seconds bounds
+/// that window while keeping DNS out of the per-request path in the steady state.
+const TRUSTED_PROXY_DNS_TTL: Duration = Duration::from_secs(30);
+
+/// One entry of `TRUSTED_PROXIES`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxySpec {
+    /// A literal address or CIDR range. Matched arithmetically, with no name lookup.
+    Network(IpNetwork),
+    /// A DNS name (`traefik`, `proxy.internal`), resolved at match time.
+    ///
+    /// Exists for container platforms where the proxy's address is assigned by the orchestrator and
+    /// changes on every restart, so it cannot be written into configuration ahead of time.
+    Hostname(String),
+}
+
+impl std::fmt::Display for ProxySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(network) => write!(f, "{network}"),
+            Self::Hostname(name) => write!(f, "{name}"),
+        }
+    }
+}
+
+/// The cached result of resolving every hostname entry.
+#[derive(Default)]
+struct ResolvedProxies {
+    /// Static networks merged with the addresses the hostnames currently resolve to.
+    networks: Arc<Vec<IpNetwork>>,
+    /// When the resolution ran, or `None` if it never has.
+    refreshed_at: Option<Instant>,
+}
+
+/// The set of peers whose forwarding headers are believed.
+///
+/// Holds the parsed `TRUSTED_PROXIES` specification plus a short-lived cache of resolved hostnames.
+/// Cloning shares the cache, so every handler sees the same resolution rather than each maintaining
+/// its own.
+pub struct TrustedProxies {
+    /// The configuration exactly as written, for logging and the settings endpoint.
+    spec: Vec<ProxySpec>,
+    /// Literal entries, precomputed. Also the complete answer when no hostnames are configured,
+    /// which is the common case and costs nothing but an `Arc` clone to serve.
+    networks: Arc<Vec<IpNetwork>>,
+    /// Hostname entries awaiting resolution.
+    hostnames: Vec<String>,
+    /// Reuse window for a resolution.
+    ttl: Duration,
+    cache: Arc<tokio::sync::RwLock<ResolvedProxies>>,
+}
+
+impl Clone for TrustedProxies {
+    fn clone(&self) -> Self {
+        Self {
+            spec: self.spec.clone(),
+            networks: Arc::clone(&self.networks),
+            hostnames: self.hostnames.clone(),
+            ttl: self.ttl,
+            cache: Arc::clone(&self.cache),
+        }
+    }
+}
+
+impl std::fmt::Debug for TrustedProxies {
+    /// Renders the specification, not the cache: a `{:?}` of application state should say what the
+    /// operator configured, not which addresses a name happened to resolve to a moment ago.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TrustedProxies").field(&self.spec).finish()
+    }
+}
+
+impl PartialEq for TrustedProxies {
+    /// Compares the specification only. Two sets configured identically are equal even if their
+    /// caches were refreshed at different moments.
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec
+    }
+}
+
+impl Eq for TrustedProxies {}
+
+impl Default for TrustedProxies {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl TrustedProxies {
+    /// Builds the set from a parsed specification.
+    pub fn new(spec: Vec<ProxySpec>) -> Self {
+        let networks: Vec<IpNetwork> = spec
+            .iter()
+            .filter_map(|entry| match entry {
+                ProxySpec::Network(network) => Some(*network),
+                ProxySpec::Hostname(_) => None,
+            })
+            .collect();
+        let hostnames = spec
+            .iter()
+            .filter_map(|entry| match entry {
+                ProxySpec::Hostname(name) => Some(name.clone()),
+                ProxySpec::Network(_) => None,
+            })
+            .collect();
+
+        Self {
+            spec,
+            networks: Arc::new(networks),
+            hostnames,
+            ttl: TRUSTED_PROXY_DNS_TTL,
+            cache: Arc::new(tokio::sync::RwLock::new(ResolvedProxies::default())),
+        }
+    }
+
+    /// Parses a raw `TRUSTED_PROXIES` value.
+    pub fn from_raw(raw: &str) -> Self {
+        Self::new(parse_trusted_proxies(raw))
+    }
+
+    /// Whether nothing at all is trusted — the secure default.
+    pub fn is_empty(&self) -> bool {
+        self.spec.is_empty()
+    }
+
+    /// The specification as configured, for display.
+    pub fn spec(&self) -> &[ProxySpec] {
+        &self.spec
+    }
+
+    /// Overrides the DNS reuse window. Test-facing: a suite cannot wait 30 seconds to observe that
+    /// a re-resolution happened.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// The networks to match a request against right now, resolving hostnames if the cache is cold
+    /// or stale.
+    ///
+    /// Returns an [`Arc`] rather than a fresh `Vec` so the steady-state cost is a refcount bump. The
+    /// no-hostname case — every deployment that names its proxies by address — never touches the
+    /// lock or the resolver at all.
+    pub async fn resolved(&self) -> Arc<Vec<IpNetwork>> {
+        if self.hostnames.is_empty() {
+            return Arc::clone(&self.networks);
+        }
+
+        {
+            let cache = self.cache.read().await;
+            if cache.refreshed_at.is_some_and(|at| at.elapsed() < self.ttl) {
+                return Arc::clone(&cache.networks);
+            }
+        }
+
+        let mut cache = self.cache.write().await;
+        // Re-check under the write lock: several requests can queue behind one expiry, and only the
+        // first should pay for the lookup.
+        if cache.refreshed_at.is_some_and(|at| at.elapsed() < self.ttl) {
+            return Arc::clone(&cache.networks);
+        }
+
+        let mut networks = (*self.networks).clone();
+        for hostname in &self.hostnames {
+            networks.extend(resolve_hostname(hostname).await);
+        }
+
+        cache.networks = Arc::new(networks);
+        cache.refreshed_at = Some(Instant::now());
+        Arc::clone(&cache.networks)
+    }
+}
+
+/// Resolves one hostname to the host routes it currently names.
+///
+/// A failure yields nothing rather than propagating: an unresolvable name means "this proxy is not
+/// currently trusted", which is the safe direction to fail in. A DNS outage must never be able to
+/// *widen* what the daemon believes, and a container that is down should stop being trusted rather
+/// than keep a stale grant alive.
+async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
+    // Port 0: `lookup_host` wants a socket address, but only the address half is used.
+    match tokio::net::lookup_host((hostname, 0u16)).await {
+        Ok(addrs) => {
+            let networks: Vec<IpNetwork> =
+                addrs.map(|addr| IpNetwork::from(normalize_ip(addr.ip()))).collect();
+            if networks.is_empty() {
+                tracing::warn!(
+                    "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
+                     trusted until it does."
+                );
+            } else {
+                tracing::debug!(
+                    "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
+                    networks.iter().map(|n| n.ip().to_string()).collect::<Vec<_>>().join(", ")
+                );
+            }
+            networks
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not resolve TRUSTED_PROXIES hostname {hostname:?}: {e}. It is not trusted \
+                 until resolution succeeds."
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Normalizes an IPv4-mapped IPv6 address (`::ffff:192.168.1.1`) down to its plain IPv4 form.
+///
+/// Dual-stack listeners and reverse proxies routinely surface IPv4 clients this way. Without this,
+/// such a peer would fail to match an IPv4 CIDR in either `bound_ips` or `TRUSTED_PROXIES` — the
+/// first causing a spurious `403`, the second silently downgrading a trusted proxy to an untrusted
+/// one.
+pub fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+/// Reports whether `ip` falls inside any of the `trusted` networks.
+fn is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
+    trusted.iter().any(|net| net.contains(ip))
+}
+
+/// Determines the client address to authorize `bound_ips` against, and to record in the audit trail.
+///
+/// **The forwarding headers are only consulted when `peer` — the immediate TCP peer, which cannot
+/// be forged — is itself inside `trusted`.** Any other client gets its TCP address used verbatim, no
+/// matter what it claims in `X-Forwarded-For`. That check is the whole control: `X-Forwarded-For` is
+/// an ordinary request header, so honouring it from an arbitrary peer turns `bound_ips` from a
+/// network restriction into a self-asserted one that any caller satisfies by typing an allowed
+/// address into a header.
+///
+/// When the peer *is* trusted, the header is walked **right to left, skipping addresses that are
+/// themselves trusted proxies**, and the first remaining address is the client. Rightmost-first is
+/// what makes the suffix unforgeable: each proxy appends the address it actually saw, so entries to
+/// the left of the last trusted hop are hearsay the client supplied. Skipping trusted entries is
+/// what makes a *chain* work — with `client → P1 → P2 → us` the header reads `client, P1` and the
+/// rightmost entry is `P1`, a proxy rather than the client.
+///
+/// `X-Real-IP` (single-valued, no chain) is consulted only when `X-Forwarded-For` is absent or
+/// yields nothing, under exactly the same trust precondition.
+///
+/// Falls back to `peer` whenever the headers are absent, unparseable, or contain nothing but trusted
+/// proxies — never to an unvalidated claim.
+pub fn resolve_client_ip(
+    peer: IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[IpNetwork],
+) -> IpAddr {
+    let peer = normalize_ip(peer);
+
+    // The load-bearing check. Everything below is unreachable for an untrusted caller.
+    if !is_trusted(peer, trusted) {
+        return peer;
+    }
+
+    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|h| h.to_str().ok()) {
+        let client = forwarded
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .map(normalize_ip)
+            .rev()
+            .find(|ip| !is_trusted(*ip, trusted));
+
+        if let Some(client) = client {
+            return client;
+        }
+        // A header listing only trusted proxies (or nothing parseable) says nothing about the
+        // client; fall through rather than inventing one.
+    }
+
+    if let Some(real_ip) = headers
+        .get("X-Real-IP")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .and_then(|s| s.parse::<IpAddr>().ok())
+    {
+        return normalize_ip(real_ip);
+    }
+
+    peer
+}
 
 /// Default environment variables inherited by hook sub-processes, per `AGENT.MD`.
 const DEFAULT_ALLOWED_ENV_VARS: &str = "PATH,LANG,TERM,SYSTEMROOT";
@@ -76,7 +369,9 @@ pub struct RuntimeConfig {
     /// Set this to the address of the reverse proxy actually sitting in front of the daemon, and
     /// nothing else. A range wider than the real proxy fleet re-opens the bypass for every host
     /// inside it.
-    pub trusted_proxies: Vec<IpNetwork>,
+    ///
+    /// Entries may be addresses, CIDR ranges, or hostnames; see [`TrustedProxies`].
+    pub trusted_proxies: TrustedProxies,
 }
 
 impl Default for RuntimeConfig {
@@ -89,7 +384,7 @@ impl Default for RuntimeConfig {
             signature_max_age_seconds: DEFAULT_SIGNATURE_MAX_AGE_SECONDS,
             require_signed_requests: false,
             allowed_script_roots: Vec::new(),
-            trusted_proxies: Vec::new(),
+            trusted_proxies: TrustedProxies::default(),
         }
     }
 }
@@ -129,7 +424,7 @@ impl RuntimeConfig {
         }
 
         let trusted_proxies =
-            parse_trusted_proxies(std::env::var("TRUSTED_PROXIES").ok().as_deref().unwrap_or(""));
+            TrustedProxies::from_raw(std::env::var("TRUSTED_PROXIES").ok().as_deref().unwrap_or(""));
         if trusted_proxies.is_empty() {
             tracing::info!(
                 "TRUSTED_PROXIES is unset: X-Forwarded-For and X-Real-IP are ignored and bound_ips \
@@ -139,7 +434,7 @@ impl RuntimeConfig {
         } else {
             tracing::info!(
                 "Forwarding headers are honoured only from: {}",
-                trusted_proxies.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+                trusted_proxies.spec().iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
             );
         }
 
@@ -257,30 +552,69 @@ fn parse_script_roots(raw: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether `candidate` is shaped like a DNS name.
+///
+/// Deliberately strict. An entry reaching this point already failed to parse as an address or a
+/// CIDR, and the two ways that happens are a typo and a hostname. Accepting anything at all as a
+/// name would turn `10.0.0.0/8x` into a lookup that quietly never matches, so a would-be CIDR is
+/// better reported as the mistake it is: entries containing `/` or `:` are refused outright, since
+/// those characters only appear in prefix and IPv6 syntax.
+fn is_hostname_like(candidate: &str) -> bool {
+    if candidate.is_empty() || candidate.len() > 253 {
+        return false;
+    }
+    if candidate.contains('/') || candidate.contains(':') {
+        return false;
+    }
+    // A leading or trailing separator is malformed rather than merely unusual.
+    let bytes = candidate.as_bytes();
+    let edges_are_alphanumeric = bytes
+        .first()
+        .zip(bytes.last())
+        .is_some_and(|(f, l)| f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric());
+    if !edges_are_alphanumeric {
+        return false;
+    }
+    // A name made only of digits and dots is a malformed IPv4 literal, not a hostname.
+    if candidate.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+    candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+}
+
 /// Parses `TRUSTED_PROXIES` into the set of peers whose forwarding headers are believed.
 ///
-/// Accepts both CIDR notation (`10.0.0.0/8`) and bare addresses (`127.0.0.1`, `::1`), because an
-/// operator naming a single proxy should not have to remember to append `/32`. A bare address is
-/// widened to a host route — `/32` for IPv4, `/128` for IPv6 — which matches exactly that one host.
+/// Three spellings are accepted, in this order:
+///
+/// - **CIDR** (`10.0.0.0/8`, `172.16.0.0/12`) — the Docker/Traefik bridge-network case.
+/// - **Bare address** (`127.0.0.1`, `::1`), widened to a host route (`/32`, `/128`), because an
+///   operator naming one proxy should not have to remember the prefix.
+/// - **Hostname** (`traefik`, `proxy.internal`), resolved at match time — see
+///   [`TrustedProxies::resolved`]. This is what makes the setting usable on a container platform,
+///   where the proxy's address is assigned by the orchestrator and changes on every restart.
 ///
 /// A malformed entry is dropped with a warning rather than aborting startup, matching how the rest
 /// of this module treats bad overrides. The failure mode is deliberately the safe one: a dropped
 /// entry means a proxy is *not* trusted, so requests through it are evaluated against its own
 /// address instead of silently accepting a header it forwarded.
-fn parse_trusted_proxies(raw: &str) -> Vec<IpNetwork> {
+fn parse_trusted_proxies(raw: &str) -> Vec<ProxySpec> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|entry| match entry.parse::<IpNetwork>() {
-            Ok(network) => Some(network),
-            // `IpNetwork`'s parser is the authority on CIDR text; this fallback only covers the
-            // bare-address spelling, and does so by construction rather than by string surgery.
+            Ok(network) => Some(ProxySpec::Network(network)),
+            // `IpNetwork`'s parser is the authority on CIDR text; these fallbacks cover the
+            // bare-address and hostname spellings by construction rather than by string surgery.
             Err(_) => match entry.parse::<IpAddr>() {
-                Ok(addr) => Some(IpNetwork::from(addr)),
+                Ok(addr) => Some(ProxySpec::Network(IpNetwork::from(addr))),
+                Err(_) if is_hostname_like(entry) => Some(ProxySpec::Hostname(entry.to_owned())),
                 Err(_) => {
                     tracing::warn!(
-                        "Ignoring invalid TRUSTED_PROXIES entry {entry:?}: expected an IP address \
-                         or CIDR range. Forwarding headers from that peer will NOT be trusted."
+                        "Ignoring invalid TRUSTED_PROXIES entry {entry:?}: expected an IP address, \
+                         a CIDR range, or a hostname. Forwarding headers from that peer will NOT \
+                         be trusted."
                     );
                     None
                 }
@@ -364,17 +698,46 @@ mod tests {
         assert!(parse_script_roots("").is_empty());
     }
 
+    /// Builds a header map from `(name, value)` pairs.
+    fn headers(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                value.parse().expect("valid header value"),
+            );
+        }
+        map
+    }
+
+    fn ip(raw: &str) -> IpAddr {
+        raw.parse().expect("valid IP literal")
+    }
+
+    fn nets(raw: &str) -> Vec<IpNetwork> {
+        parse_trusted_proxies(raw)
+            .into_iter()
+            .filter_map(|spec| match spec {
+                ProxySpec::Network(network) => Some(network),
+                ProxySpec::Hostname(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn parses_trusted_proxies_in_both_spellings() {
-        // A bare address is widened to a host route, so an operator naming one proxy need not
-        // remember the /32.
-        let parsed = parse_trusted_proxies("127.0.0.1, 10.0.0.0/8 , ::1,2001:db8::/32");
-        assert_eq!(parsed.len(), 4);
-        assert!(parsed[0].contains("127.0.0.1".parse::<IpAddr>().expect("valid")));
-        assert!(!parsed[0].contains("127.0.0.2".parse::<IpAddr>().expect("valid")));
-        assert!(parsed[1].contains("10.1.2.3".parse::<IpAddr>().expect("valid")));
-        assert!(parsed[2].contains("::1".parse::<IpAddr>().expect("valid")));
-        assert!(parsed[3].contains("2001:db8::5".parse::<IpAddr>().expect("valid")));
+    fn parses_addresses_cidrs_and_hostnames() {
+        let parsed = parse_trusted_proxies("127.0.0.1, 10.0.0.0/8 , ::1, traefik, proxy.internal");
+        assert_eq!(
+            parsed,
+            vec![
+                // A bare address is widened to a host route, so naming one proxy needs no /32.
+                ProxySpec::Network("127.0.0.1/32".parse().expect("valid")),
+                ProxySpec::Network("10.0.0.0/8".parse().expect("valid")),
+                ProxySpec::Network("::1/128".parse().expect("valid")),
+                ProxySpec::Hostname("traefik".to_owned()),
+                ProxySpec::Hostname("proxy.internal".to_owned()),
+            ]
+        );
     }
 
     #[test]
@@ -385,10 +748,195 @@ mod tests {
         assert!(RuntimeConfig::default().trusted_proxies.is_empty());
 
         // A malformed entry is dropped rather than aborting startup — and dropping it means "not
-        // trusted", which is the safe direction to fail in.
-        let parsed = parse_trusted_proxies("not-an-ip, 10.0.0.0/8, 999.1.1.1, 10.0.0.0/99");
-        assert_eq!(parsed.len(), 1);
-        assert!(parsed[0].contains("10.9.9.9".parse::<IpAddr>().expect("valid")));
+        // trusted", which is the safe direction to fail in. Critically, a botched CIDR must not be
+        // silently reinterpreted as a hostname that then never resolves.
+        for malformed in ["999.1.1.1", "10.0.0.0/99", "10.0.0.0/8x", "-leading-dash", "::ffff::x"] {
+            assert!(
+                parse_trusted_proxies(malformed).is_empty(),
+                "{malformed:?} must be rejected outright, not accepted as a hostname"
+            );
+        }
+
+        let parsed = parse_trusted_proxies("10.0.0.0/8x, 10.0.0.0/8, traefik");
+        assert_eq!(
+            parsed,
+            vec![
+                ProxySpec::Network("10.0.0.0/8".parse().expect("valid")),
+                ProxySpec::Hostname("traefik".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinguishes_hostnames_from_malformed_addresses() {
+        for name in ["traefik", "proxy.internal", "gw-1", "a", "svc_name", "x.y.z-9"] {
+            assert!(is_hostname_like(name), "{name:?} should be accepted as a hostname");
+        }
+        for not_a_name in [
+            "",
+            "10.0.0.1",      // a well-formed address is handled before this is ever consulted
+            "999.1.1.1",     // a malformed IPv4 literal, not a name
+            "10.0.0.0/8",    // CIDR syntax
+            "::1",           // IPv6 syntax
+            "-leading",
+            "trailing-",
+            ".dotted",
+            "has space",
+            "bad!char",
+        ] {
+            assert!(!is_hostname_like(not_a_name), "{not_a_name:?} should not be a hostname");
+        }
+    }
+
+    #[test]
+    fn forwarding_headers_are_ignored_when_the_peer_is_not_trusted() {
+        let peer = ip("203.0.113.5");
+        let hdrs = headers(&[("X-Forwarded-For", "10.1.2.3"), ("X-Real-IP", "10.1.2.3")]);
+
+        // Nothing trusted at all — the production default.
+        assert_eq!(resolve_client_ip(peer, &hdrs, &[]), peer);
+        // A trust list that simply does not include this peer behaves identically.
+        assert_eq!(resolve_client_ip(peer, &hdrs, &nets("10.0.0.0/8")), peer);
+    }
+
+    #[test]
+    fn a_trusted_peer_has_its_forwarded_client_believed() {
+        let peer = ip("10.0.0.9");
+        let trusted = nets("10.0.0.0/8");
+
+        assert_eq!(
+            resolve_client_ip(peer, &headers(&[("X-Forwarded-For", "192.168.4.4")]), &trusted),
+            ip("192.168.4.4")
+        );
+        // X-Real-IP is consulted only when X-Forwarded-For yields nothing.
+        assert_eq!(
+            resolve_client_ip(peer, &headers(&[("X-Real-IP", "192.168.4.4")]), &trusted),
+            ip("192.168.4.4")
+        );
+        // An IPv4-mapped hop is normalized so it can match an IPv4 CIDR.
+        assert_eq!(
+            resolve_client_ip(peer, &headers(&[("X-Real-IP", "::ffff:192.168.4.4")]), &trusted),
+            ip("192.168.4.4")
+        );
+        // Garbage falls back to the peer rather than failing open.
+        assert_eq!(
+            resolve_client_ip(peer, &headers(&[("X-Forwarded-For", "not-an-ip")]), &trusted),
+            peer
+        );
+        assert_eq!(resolve_client_ip(peer, &axum::http::HeaderMap::new(), &trusted), peer);
+    }
+
+    #[test]
+    fn the_chain_is_walked_right_to_left_past_trusted_hops() {
+        let peer = ip("10.0.0.2");
+        let trusted = nets("10.0.0.0/8,172.16.0.0/12");
+
+        // client → P1(172.16.0.9) → P2(10.0.0.2) → us. The header reads "client, P1"; the rightmost
+        // entry is a proxy, so it must be skipped to reach the real client.
+        assert_eq!(
+            resolve_client_ip(
+                peer,
+                &headers(&[("X-Forwarded-For", "203.0.113.50, 172.16.0.9")]),
+                &trusted
+            ),
+            ip("203.0.113.50")
+        );
+
+        // A client that prepends a lie gets it ignored: only the suffix each proxy appended counts.
+        assert_eq!(
+            resolve_client_ip(
+                peer,
+                &headers(&[("X-Forwarded-For", "8.8.8.8, 203.0.113.50, 172.16.0.9")]),
+                &trusted
+            ),
+            ip("203.0.113.50")
+        );
+
+        // A header naming nothing but trusted proxies says nothing about the client, so the peer
+        // stands rather than a proxy being reported as the caller.
+        assert_eq!(
+            resolve_client_ip(peer, &headers(&[("X-Forwarded-For", "10.0.0.3, 172.16.0.9")]), &trusted),
+            peer
+        );
+    }
+
+    #[test]
+    fn a_trusted_peer_is_matched_after_ipv4_mapping_is_normalized() {
+        // A dual-stack listener surfaces an IPv4 proxy as ::ffff:10.0.0.9; the trust check must
+        // still recognize it, or a correct TRUSTED_PROXIES entry would silently stop applying.
+        assert_eq!(
+            resolve_client_ip(
+                ip("::ffff:10.0.0.9"),
+                &headers(&[("X-Forwarded-For", "192.168.4.4")]),
+                &nets("10.0.0.0/8")
+            ),
+            ip("192.168.4.4")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_is_a_no_op_when_only_addresses_are_configured() {
+        let proxies = TrustedProxies::from_raw("127.0.0.1,10.0.0.0/8");
+        let resolved = proxies.resolved().await;
+        assert_eq!(resolved.len(), 2);
+        assert!(is_trusted(ip("10.1.2.3"), &resolved));
+        // Same allocation each time: the no-hostname path must not rebuild or lock anything.
+        assert!(Arc::ptr_eq(&resolved, &proxies.resolved().await));
+    }
+
+    #[tokio::test]
+    async fn hostnames_resolve_to_their_addresses_and_are_cached() {
+        // `localhost` is the one name guaranteed resolvable without network access.
+        let proxies = TrustedProxies::from_raw("localhost,192.0.2.0/24");
+        let resolved = proxies.resolved().await;
+
+        assert!(
+            is_trusted(ip("127.0.0.1"), &resolved) || is_trusted(ip("::1"), &resolved),
+            "localhost should resolve to a loopback address: {resolved:?}"
+        );
+        // The literal entry alongside it is preserved.
+        assert!(is_trusted(ip("192.0.2.7"), &resolved));
+        // A second call inside the TTL reuses the cached allocation rather than resolving again.
+        assert!(Arc::ptr_eq(&resolved, &proxies.resolved().await));
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_hostname_is_simply_not_trusted() {
+        // Failing closed matters: a DNS outage must never be able to *widen* what is trusted.
+        let proxies =
+            TrustedProxies::from_raw("no-such-host.invalid,10.0.0.0/8").with_ttl(Duration::ZERO);
+        let resolved = proxies.resolved().await;
+
+        assert!(is_trusted(ip("10.1.2.3"), &resolved), "the literal entry still applies");
+        assert_eq!(resolved.len(), 1, "the unresolvable name contributes nothing: {resolved:?}");
+
+        // With a zero TTL every call re-resolves, so a name that starts working is picked up
+        // without a restart — the property that makes container addresses usable at all.
+        assert!(!Arc::ptr_eq(&resolved, &proxies.resolved().await));
+    }
+
+    #[tokio::test]
+    async fn a_hostname_peer_is_trusted_end_to_end() {
+        let proxies = TrustedProxies::from_raw("localhost");
+        let trusted = proxies.resolved().await;
+
+        // The loopback peer is trusted because the *name* resolved to it, so its header is believed.
+        let forwarded = resolve_client_ip(
+            ip("127.0.0.1"),
+            &headers(&[("X-Forwarded-For", "203.0.113.50")]),
+            &trusted,
+        );
+        assert_eq!(forwarded, ip("203.0.113.50"));
+
+        // An unrelated peer is still untrusted, so its identical header is ignored.
+        assert_eq!(
+            resolve_client_ip(
+                ip("203.0.113.9"),
+                &headers(&[("X-Forwarded-For", "203.0.113.50")]),
+                &trusted
+            ),
+            ip("203.0.113.9")
+        );
     }
 
     #[test]

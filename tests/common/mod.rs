@@ -14,7 +14,7 @@ use axum::{
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
-    config::RuntimeConfig,
+    config::{RuntimeConfig, TrustedProxies},
     crypto::SecretCipher,
     entities::{api_key, api_key::HmacMode, api_key_hook_permission, execution, hook, hook_parameter},
     migration,
@@ -53,7 +53,7 @@ pub fn test_config() -> Arc<RuntimeConfig> {
         // No trusted proxies, matching the production default. Every test therefore exercises the
         // secure path — forwarding headers ignored, `bound_ips` evaluated against the TCP peer —
         // and a test that wants headers honoured must opt in via `test_state_with_trusted_proxies`.
-        trusted_proxies: Vec::new(),
+        trusted_proxies: TrustedProxies::default(),
     })
 }
 
@@ -84,15 +84,13 @@ pub fn test_state_with_roots(db: &DatabaseConnection, roots: Vec<std::path::Path
 /// Builds application state that believes forwarding headers from `proxies`.
 ///
 /// `with_connect_info` simulates a `127.0.0.1` peer, so passing `"127.0.0.1"` here is what puts a
-/// test on the "behind a trusted reverse proxy" path.
+/// test on the "behind a trusted reverse proxy" path. Entries are the raw `TRUSTED_PROXIES`
+/// spelling — addresses, CIDRs, or hostnames — so a test can exercise name resolution too.
 pub fn test_state_with_trusted_proxies(db: &DatabaseConnection, proxies: &[&str]) -> AppState {
     AppState::new(
         db.clone(),
         Arc::new(RuntimeConfig {
-            trusted_proxies: proxies
-                .iter()
-                .map(|p| p.parse().expect("test trusted proxy is a valid IP or CIDR"))
-                .collect(),
+            trusted_proxies: TrustedProxies::from_raw(&proxies.join(",")),
             ..(*test_config()).clone()
         }),
         test_cipher(),
@@ -349,6 +347,9 @@ pub async fn insert_hook_as(
         script_path: Set(script_path.to_owned()),
         default_timeout_seconds: Set(timeout_seconds),
         run_as_user: Set(run_as_user.map(str::to_owned)),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -357,6 +358,50 @@ pub async fn insert_hook_as(
     .expect("seeding a hook succeeds");
 
     id
+}
+
+/// Inserts a hook already in the trash, backdated by `deleted_days_ago`.
+///
+/// Backdating is the only way to exercise the 92-day purge without waiting a quarter:
+/// `hooks.deleted_at` is written by the handler at deletion time, so an age has to be seeded
+/// directly — the same approach [`insert_execution_aged`] takes for log retention.
+pub async fn insert_hook_deleted_days_ago(
+    db: &DatabaseConnection,
+    name: &str,
+    script_path: &str,
+    deleted_days_ago: i64,
+    deleted_by: Uuid,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let now = chrono::Utc::now().naive_utc();
+    let deleted_at = (chrono::Utc::now() - chrono::Duration::days(deleted_days_ago)).naive_utc();
+
+    hook::ActiveModel {
+        id: Set(id),
+        name: Set(name.to_owned()),
+        description: Set(None),
+        script_path: Set(script_path.to_owned()),
+        default_timeout_seconds: Set(30),
+        run_as_user: Set(None),
+        is_deleted: Set(true),
+        deleted_at: Set(Some(deleted_at)),
+        deleted_by: Set(Some(deleted_by.to_string())),
+        created_at: Set(now),
+        updated_at: Set(deleted_at),
+    }
+    .insert(db)
+    .await
+    .expect("seeding a deleted hook succeeds");
+
+    id
+}
+
+/// Reads a hook row directly, bypassing the API's soft-delete filtering.
+///
+/// The point of soft delete is that the row survives while the API pretends it does not, so proving
+/// that needs a path to the database the handlers do not mediate.
+pub async fn fetch_hook_row(db: &DatabaseConnection, id: Uuid) -> Option<hook::Model> {
+    hook::Entity::find_by_id(id).one(db).await.expect("querying hooks succeeds")
 }
 
 /// Declares a parameter on a hook.

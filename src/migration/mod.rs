@@ -6,6 +6,7 @@ mod m20230101_000001_initial_schema;
 mod m20230102_000001_add_run_as_user;
 mod m20230103_000001_add_signing_secret;
 mod m20230104_000001_add_hmac_mode;
+mod m20230105_000001_add_hook_soft_delete;
 
 /// The ordered set of all schema migrations for `simply_hook_executor`.
 pub struct Migrator;
@@ -18,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20230102_000001_add_run_as_user::Migration),
             Box::new(m20230103_000001_add_signing_secret::Migration),
             Box::new(m20230104_000001_add_hmac_mode::Migration),
+            Box::new(m20230105_000001_add_hook_soft_delete::Migration),
         ]
     }
 }

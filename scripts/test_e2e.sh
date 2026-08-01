@@ -333,10 +333,15 @@ log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping neede
 # instance on the "behind a reverse proxy" path so §15 can drive bound_ips with X-Forwarded-For.
 # It is deliberately NOT the default: §30 boots a second instance without it to prove that an
 # unconfigured daemon ignores forwarding headers entirely.
+#
+# Both spellings are configured at once — the literal address and the `localhost` *hostname* that
+# resolves to it. That is the Docker/Traefik shape (a proxy named rather than addressed, because the
+# orchestrator assigns its IP), and it lets §30 prove name resolution works against a real DNS
+# lookup rather than a stub.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     ALLOWED_ENV_VARS="PATH" LOG_RETENTION_DAYS=30 \
     ALLOWED_SCRIPT_ROOTS="$HOOK_DIR" \
-    TRUSTED_PROXIES="$BIND_HOST" \
+    TRUSTED_PROXIES="$BIND_HOST,localhost" \
     BIND_HOST="$BIND_HOST" PORT="$SERVER_PORT" \
     "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -1171,32 +1176,110 @@ check_jq ".allowed_env_vars | join(\",\")" "PATH" "the configured passthrough al
 check_jq ".log_retention_days" "30" "the configured retention window is reported"
 # Which peers may speak for a client decides what every bound_ips check compares against, so an
 # operator must be able to read it back rather than infer it from the daemon's environment.
-check_jq ".trusted_proxies | join(\",\")" "$BIND_HOST/32" "the configured trusted proxy is reported"
+check_jq ".trusted_proxies | join(\",\")" "$BIND_HOST/32,localhost" \
+    "both proxy spellings are reported as configured, the hostname unresolved"
 check_true '.hook_count >= 8' "the hook counter reflects everything created above"
 check_true '.execution_count >= 1' "the execution counter is populated"
 
 # ── 20. Hook deletion cascade ───────────────────────────────────────────────
 
-log_section "20. Hook Deletion Cascade"
+log_section "20. Hook Soft Delete, Trash & Hard-Delete Cascade"
 
 api_call GET "/api/executions?hook=param_hook&limit=50" "$MASTER_KEY"
 check "200" "param_hook has execution history before deletion"
 check_true 'length >= 1' "at least one execution exists for it"
 
+# --- Soft delete: hidden, but nothing is destroyed ---
 api_call DELETE "/api/hooks/$PARAM_HOOK_ID" "$MASTER_KEY"
-check "204" "delete param_hook"
+check "204" "delete param_hook (soft by default)"
 
 api_call GET "/api/hooks/param_hook" "$MASTER_KEY"
-check "404" "the hook is gone"
+check "404" "the hook reads as gone to every ordinary route"
+api_call POST "/api/hooks/$PARAM_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "404" "a trashed hook cannot be executed"
+api_call GET "/api/hooks" "$MASTER_KEY"
+check_true 'all(.[]; .name != "param_hook")' "it is absent from the default listing"
+
+# The whole point: the history and the permission grants survive.
+api_call GET "/api/executions?limit=100" "$MASTER_KEY"
+check "200" "history is still readable after a soft delete"
+check_true '[.[] | select(.hook_name == "param_hook")] | length >= 1' \
+    "the trashed hook's execution history is preserved, not cascaded away"
+
+# --- Master trash view & restore ---
+api_call GET "/api/hooks?include_deleted=true" "$MASTER_KEY"
+check "200" "master can list the trash"
+check_true '[.[] | select(.name == "param_hook" and .is_deleted == true)] | length == 1' \
+    "the trashed hook appears in the trash view, flagged"
+check_true '[.[] | select(.name == "param_hook") | .deleted_at] | all(. != null)' \
+    "the deletion is timestamped"
+check_true '[.[] | select(.name == "param_hook") | .deleted_by] | all(. != null)' \
+    "the acting key is recorded"
+
+api_call GET "/api/hooks?include_deleted=true" "$EXEC_KEY"
+check "403" "a non-master cannot view the trash"
+api_call POST "/api/hooks/$PARAM_HOOK_ID/restore" "$EXEC_KEY"
+check "403" "a non-master cannot restore"
+api_call DELETE "/api/hooks/$PARAM_HOOK_ID?hard=true" "$EXEC_KEY"
+check "403" "a non-master cannot hard-delete"
+
+api_call POST "/api/hooks/$PARAM_HOOK_ID/restore" "$MASTER_KEY"
+check "200" "master restores the hook"
+check_jq ".is_deleted" "false" "it is live again"
+check_jq ".deleted_at" "null" "the deletion timestamp is cleared"
+api_call GET "/api/hooks/param_hook" "$MASTER_KEY"
+check "200" "the restored hook is reachable again"
+
+api_call POST "/api/hooks/$PARAM_HOOK_ID/restore" "$MASTER_KEY"
+check "400" "restoring a live hook is a validation error, not a silent no-op"
+
+# --- A trashed hook still holds its unique name ---
+api_call DELETE "/api/hooks/$PARAM_HOOK_ID" "$MASTER_KEY"
+check "204" "trash it again"
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$PARAM_SCRIPT" '{name:"param_hook",script_path:$p}')"
+check "409" "a trashed hook still holds its unique name"
+check_true '.error | contains("hard=true")' "the conflict explains how to free the name"
+
+# --- Hard delete: now everything cascades ---
+api_call DELETE "/api/hooks/$PARAM_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "master hard-deletes the trashed hook"
+
+api_call GET "/api/hooks?include_deleted=true" "$MASTER_KEY"
+check_true 'all(.[]; .name != "param_hook")' "it is gone from the trash too"
 
 api_call GET "/api/executions?limit=100" "$MASTER_KEY"
-check "200" "history is still readable after the cascade"
-check_true 'all(.[]; .hook_name != "param_hook")' "the deleted hook's executions cascaded away"
+check "200" "history is readable after the hard delete"
+check_true 'all(.[]; .hook_name != "param_hook")' "the hard delete cascaded its executions away"
 
 api_call GET "/api/keys" "$MASTER_KEY"
 check "200" "list keys after the cascade"
 check_true 'all(.[]; [.hook_permissions[] | select(.hook_name == "param_hook")] | length == 0)' \
-    "permission mappings for the deleted hook cascaded away too"
+    "permission mappings for the hard-deleted hook cascaded away too"
+
+# --- The 92-day purge endpoint ---
+api_call POST "/api/system/purge-hooks" "$EXEC_KEY"
+check "403" "the purge endpoint is master-only"
+api_call POST "/api/system/purge-hooks?older_than_days=-1" "$MASTER_KEY"
+check "400" "a negative window is rejected"
+api_call POST "/api/system/purge-hooks" "$MASTER_KEY"
+check "200" "master runs the purge sweep"
+check_jq ".older_than_days" "92" "it defaults to the 92-day retention window"
+check_jq ".purged" "0" "nothing in this run's trash is old enough to purge"
+
+# A freshly-trashed hook is untouched by the default window but caught by a zero-day one... except
+# `0` is deliberately a no-op ("keep forever"), matching LOG_RETENTION_DAYS=0.
+PURGE_SCRIPT=$(make_hook_script "purge_me.sh" 'echo purge')
+api_call POST "/api/hooks" "$MASTER_KEY" "$(jq -nc --arg p "$PURGE_SCRIPT" '{name:"purge_me",script_path:$p}')"
+check "200" "create a hook destined for the trash"
+PURGE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call DELETE "/api/hooks/$PURGE_HOOK_ID" "$MASTER_KEY"
+check "204" "trash it"
+api_call POST "/api/system/purge-hooks?older_than_days=0" "$MASTER_KEY"
+check "200" "a zero window runs"
+check_jq ".purged" "0" "zero means 'keep forever', not 'delete everything'"
+api_call GET "/api/hooks?include_deleted=true" "$MASTER_KEY"
+check_true '[.[] | select(.name == "purge_me")] | length == 1' "the freshly-trashed hook survives"
 
 # ── 21. Linux permission & path containment diagnostics ─────────────────────
 
@@ -2186,6 +2269,31 @@ else
     wait "$STRICT_SERVER_PID" 2>/dev/null || true
     STRICT_SERVER_PID=""
 fi
+
+# The main instance is booted with TRUSTED_PROXIES set to a *hostname* alias of the bind address
+# (see Boot), which is the Docker/Traefik shape: the proxy is named, not addressed, because the
+# orchestrator assigns its IP. Everything §15 asserted about CIDR entries must hold identically when
+# the entry had to be resolved first.
+api_call GET "/api/settings" "$MASTER_KEY"
+check "200" "read the resolved proxy configuration"
+check_true '.trusted_proxies | length == 2' "both the literal and the hostname entry are reported"
+check_true '.trusted_proxies | any(. == "localhost")' "the hostname is kept as written, not flattened to an IP"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Hostname Proxy Key","bound_ips":"198.51.100.0/24"}'
+check "200" "create a key bound to a range the loopback peer is outside of"
+HOSTPROXY_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+api_call GET "/api/auth/me" "$HOSTPROXY_KEY"
+check "403" "without a forwarding header the real peer is used, and it is out of range"
+api_call GET "/api/auth/me" "$HOSTPROXY_KEY" "" "198.51.100.7"
+check "200" "a header from the name-resolved proxy is believed"
+
+# Chain peeling: with client → P1 → us, the rightmost entry is P1, a trusted proxy. Reporting it as
+# the client would break bound_ips for every caller behind a second hop.
+api_call GET "/api/auth/me" "$HOSTPROXY_KEY" "" "198.51.100.7, 127.0.0.1"
+check "200" "a trusted hop is peeled to reach the real client behind it"
+api_call GET "/api/auth/me" "$HOSTPROXY_KEY" "" "198.51.100.7, 203.0.113.9"
+check "403" "the rightmost non-proxy hop wins, so an untrusted last hop is the client"
 
 # bound_ips now applies to master keys too — previously is_master skipped the check entirely.
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Bound Master","is_master":true,"bound_ips":"10.10.10.0/24"}'

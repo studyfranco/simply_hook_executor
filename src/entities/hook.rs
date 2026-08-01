@@ -27,6 +27,20 @@ pub struct Model {
     /// through `sudo -n -u <user> --`, so what is actually permitted remains governed by
     /// `sudoers` — this field can request elevation, never grant it.
     pub run_as_user: Option<String>,
+    /// Whether the hook is in the trash rather than live.
+    ///
+    /// A soft-deleted hook is invisible to every ordinary route and cannot be executed, but its row,
+    /// its parameter contract, its permission grants, and — the reason this exists — its full
+    /// execution history all survive. Dropping the row cascades all of that away, so an accidental
+    /// `DELETE` used to destroy the audit record of everything the hook had ever run.
+    pub is_deleted: bool,
+    /// When the hook was moved to the trash, and the clock the 92-day purge measures from.
+    pub deleted_at: Option<DateTime>,
+    /// The `api_keys.id` of whoever deleted it, as text.
+    ///
+    /// Deliberately not a foreign key: attribution must outlive the acting key, which an FK would
+    /// either cascade away or block from ever being deleted.
+    pub deleted_by: Option<String>,
     /// Hook creation timestamp.
     pub created_at: DateTime,
     /// Hook last-update timestamp.
