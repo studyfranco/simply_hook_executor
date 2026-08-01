@@ -1505,3 +1505,81 @@ against a real DNS lookup rather than a stub.
 - **No SPA trash UI.** The dashboard's delete button now soft-deletes and the listing hides trashed
   hooks correctly, but there is no screen for viewing or restoring the trash — that was not in scope,
   and the routes are master-only API surface for now. Worth adding.
+
+---
+
+## 2026-08-01 — Read-only comparative security audit vs `simply_ip_vault`
+
+Deliverable: `SECURITY_COMPARISON_REPORT.md`. **No source file was modified**; the only writes this
+session were that report and this note. No tests were run.
+
+### What the cross-check found in *our* code (not yet fixed — awaiting arbitration)
+
+- **H-1, ordering (`src/middleware.rs:212–241`).** We evaluate `bound_ips` *before* the signature.
+  The reference verifies the HMAC first and documents why: running the network check first lets a
+  caller who cannot prove possession of the signing secret learn, from `403` vs `401` alone, whether
+  a key it merely guessed is bound to its own network. Free to fix; move the CIDR block below
+  `verify_signature`. Note it compounds with H-2 — fixing H-2 alone would make this oracle *newly*
+  meaningful rather than mostly moot.
+- **H-2, posture (`src/config.rs:385`).** `require_signed_requests` defaults to `false`, so
+  `X-API-Key` alone authenticates out of the box. The reference has no such switch and can therefore
+  claim "a leaked key is useless without its signing secret". We cannot, by default. Separately,
+  `BODY_ONLY` is accepted *inbound* with no timestamp and thus no replay protection at all — the
+  reference only ever uses `BODY_ONLY` for *outbound* dispatch.
+- **H-3, proportionality (`src/api.rs:2233`).** `update_key_hook_permissions` checks only that the
+  caller manages the hook. The reference additionally enforces verb-by-verb: you cannot grant a verb
+  you do not hold. A key with `can_manage_keys` + `can_manage` (but not `can_execute`) on a hook can
+  mint a key, grant it `can_execute`, and use it. Bounded — `require_master_for_privileged_hook`
+  blocks this entirely for `run_as_user` hooks, and `can_manage` already permits rewriting
+  `script_path` — but `can_execute`/`can_manage` are separate columns and an operator will expect
+  granting one without the other to mean something.
+- **H-4, idempotency (`src/api.rs:343`).** `require_master_to_grant_scopes` is not baseline-aware:
+  it treats any `true` as a grant, so a non-master key manager cannot re-save a key that *already*
+  holds `can_manage_hooks` (the dashboard posts every field). The reference passes the target's
+  current values as a baseline. Not a vulnerability — the failure is a spurious `403` — but a real
+  usability cost with no security benefit, since `requested == held == true` authorizes nothing.
+
+### What the cross-check found in the *reference* (reported, not our code to fix)
+
+- **V-1, high.** The vault signs `uri.path()` and deliberately excludes the query string, on the
+  documented premise that query parameters are read-only filters. That premise no longer holds in
+  its own code: `DELETE /api/ips/{id}` reads `?hard=true` from the query, and `DELETE /api/ips`
+  computes `query_params.merge(body_params)` where the **query wins over the signed body**. So a
+  signed request can have `?target_address=…&group_name=…` appended in transit and still verify.
+  This is why our `path_and_query` choice is load-bearing rather than stylistic.
+- **V-1 interop consequence.** `DEFAULT_HMAC_TEMPLATE` reproduces `canonical_v1_payload`
+  byte-for-byte, so a vault `CANONICAL_V1` dispatch is verifiable by our middleware — **only for
+  requests with no query string.** Where one is present the two now disagree.
+- **V-2, medium.** `VAULT_ENCRYPTION_KEY` SHA-256's any string, so a one-character passphrase yields
+  a database that looks encrypted. `open_signing_secret` also returns any unprefixed value verbatim
+  *as* the secret. Our `SecretCipher` rejects both cases.
+
+### Where we are ahead, and worth not regressing
+
+- **Hostname hops inside the chain walk.** The reference's `is_literal_network` deliberately skips
+  DNS during the walk, so a hop identified only by hostname is treated as a *client* rather than
+  skipped. Conservative, but it bites exactly the all-hostname Docker/Traefik deployment that
+  hostname support exists to serve. Our merged `Arc<Vec<IpNetwork>>` handles it for free.
+- **Body limits.** Ours derives `MAX_SIGNED_BODY_BYTES` *from* `MAX_REQUEST_BODY_BYTES`. The
+  reference hard-codes 2 MiB independently of Axum's implicit 2 MiB default — they coincide today by
+  accident, and nothing keeps them coincident.
+- **Crypto at rest.** XChaCha20's 192-bit random nonce is collision-safe by construction; AES-GCM's
+  96-bit nonce needs a birthday argument. Plus length-validated keys, fail-closed prefix parsing,
+  cipher built once into `AppState`, and hex-encoded plaintext mode (not greppable in a dump).
+
+### DNS cache trade-off — deliberate divergence, not a defect either way
+
+The reference caches per hostname and caches *nothing* on failure, so a blip costs one request but a
+sustained DNS outage fires a lookup per request — request-rate-multiplied amplification against the
+resolver. We cache the merged result including partial failure, so a failed name stays untrusted for
+up to the 30s TTL (visible as `403`s) but the resolver is hit at most once per TTL. Ours is the
+better behaviour under adverse conditions; theirs is more responsive under normal ones. Their
+*per-name* structure is the better shape and is worth adopting without adopting their failure
+handling.
+
+### Gaps present in both (neither project is ahead)
+
+No replay-nonce cache (identical signed requests replay within the ±300s window); no "last master
+key" guard, so two masters can lock each other out with no recovery short of database access;
+`TRUSTED_PROXIES=0.0.0.0/0` re-opens full spoofing with only a startup log to notice; a non-master
+key manager can widen another non-master key's `bound_ips`; `audit_logs` has no retention sweep.
