@@ -1,630 +1,213 @@
 # Comparative Security Audit — `simply_ip_vault` vs `simply_hook_executor`
 
-**Date:** 2026-08-01
-**Mode:** Strictly read-only. No source file was modified; no code was written.
+**Date:** 2026-08-02
+**Mode: strictly read-only.** No file under `src/` or `./example` was modified, and no application
+code was written. The only file produced by this audit is this report.
 **Subject A (reference):** `simply_ip_vault`, at `./example/simply_ip_vault`
-**Subject B (this repo):** `simply_hook_executor`, at HEAD `49d347a`
-**Scope:** `src/config.rs`, `src/middleware.rs`, `src/api.rs`, `src/crypto.rs`, `src/main.rs`, `src/state.rs`, `src/db.rs`, `src/lib.rs`, `src/retention.rs`, `src/webhooks.rs`
+**Subject B (this repo):** `simply_hook_executor`, at HEAD `8b70b2c`
 
 ---
 
-## 0. Executive summary
+## Reference freshness (Task 1)
 
-The two projects have converged on the same architecture and, in most places, on byte-identical
-security logic — the `X-Forwarded-For` chain walk in particular is now the same algorithm in both.
-Where they diverge, **neither project is uniformly stronger.** Each holds a control the other lacks,
-and each carries a weakness the other has already closed.
+**Reference freshness: CORROBORATED BUT NOT PINNED — no commit hash exists on disk for `./example`.**
 
-| # | Control | `simply_ip_vault` | `simply_hook_executor` | Stronger |
-|---|---|---|---|---|
-| 1 | XFF chain walk (right-to-left, skip trusted) | Yes | Yes | tie |
-| 2 | Hostname entries in `TRUSTED_PROXIES` | Yes (per-name cache) | Yes (merged cache) | vault (marginal) |
-| 3 | Hostname hops skipped *inside* the chain walk | **No** | Yes | **hook_executor** |
-| 4 | `bound_ips` enforced against master keys | Yes | Yes | tie |
-| 5 | Authenticate-then-authorize ordering | Yes | **No** | **vault** |
-| 6 | Signature mandatory | Yes, always | **No**, opt-in | **vault** |
-| 7 | Query string covered by the signature | **No** | Yes | **hook_executor** |
-| 8 | Replayable inbound auth mode accepted | No | Yes (`BODY_ONLY`) | **vault** |
-| 9 | Constant-time MAC comparison | Yes | Yes | tie |
-| 10 | AEAD for secrets at rest | AES-GCM (96-bit nonce) | XChaCha20-Poly1305 (192-bit) | **hook_executor** |
-| 11 | Malformed encryption key fails closed | **No** (any passphrase) | Yes (hard error) | **hook_executor** |
-| 12 | Per-verb grant proportionality | Yes | **No** | **vault** |
-| 13 | Master-only scope gating | Yes | Yes | tie |
-| 14 | Self-grant refusal | Yes | Yes | tie |
-| 15 | Explicit request body limit | **No** (Axum implicit) | Yes (1 MiB, shared) | **hook_executor** |
-| 16 | SQLite WAL + `busy_timeout` | Yes | Yes | tie (see §4.1) |
+| Check | Result |
+| :--- | :--- |
+| `git -C ./example/simply_ip_vault rev-parse HEAD` | Returns `8b70b2c690ddbf53927260b78feebdd708f5973a` — **this repository's HEAD**, not the reference's. `git` walked up out of `./example` into the enclosing repo. |
+| `git -C ./example/simply_ip_vault rev-parse --show-toplevel` | `/home/fallrik/Documents/workspaces/simply_hook_executor` — confirms the above. |
+| `find example -name ".git*"` | Nothing. `./example` is a plain directory copy with no VCS metadata of its own. |
+| `git ls-files example` | Empty — `example/*` is in this repo's `.gitignore`, so it is not tracked here either. |
+| Stale `.git` file, gitlink, or worktree pointer | None present. |
+| An `AGENT_NOTES.MD` inside `./example` naming a different last-audited commit | Present, but it records no commit identifier for itself anywhere. |
 
-**The four findings worth acting on first:**
+**Closest available marker, and what it says.** Modification times in `./example/simply_ip_vault` run
+to **2026-08-02 11:39–11:46** (`src/config.rs` 11:42, `src/main.rs` 11:39,
+`scripts/verify_convergence.sh` 11:42, `AGENT_NOTES.MD` 11:46, `SCHEMA.MD` 11:44). This repository's
+convergence commit `8b70b2c` is dated **2026-08-02 11:35:50**. The reference therefore postdates our
+own convergence work by four to eleven minutes.
 
-- **V-1 (vault, high):** the HMAC signs the path but **not the query string**, while `DELETE /api/ips`
-  merges query parameters *over* the signed JSON body and `DELETE /api/ips/{id}` reads `?hard=true`
-  from the query. The signature therefore does not bind what the request does.
-- **H-1 (hook_executor, high):** `bound_ips` is evaluated **before** the signature, inverting the
-  reference's authenticate-then-authorize order and creating a 401/403 oracle.
-- **H-2 (hook_executor, medium-high):** request signing is **optional by default**
-  (`REQUIRE_SIGNED_REQUESTS=false`), and the `BODY_ONLY` HMAC mode is accepted **inbound** with no
-  timestamp and therefore no replay protection at all.
-- **V-2 (vault, medium):** `VAULT_ENCRYPTION_KEY` accepts any string and SHA-256's it into a key, so
-  a one-character passphrase produces a valid-looking encrypted database.
+Content corroborates the timestamps. `./example/simply_ip_vault/AGENT_NOTES.MD` carries a
+**"Session 24 — Cross-service security convergence (`simply_ip_vault` half)"** entry with a validation
+table (143 unit/integration tests, 377/377 E2E), and the source matches that entry rather than merely
+claiming it: `signed_target()` uses `path_and_query()`, `ReplayGuard` exists in `state.rs`,
+`DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)` is applied in `lib.rs`, and `apply_sqlite_pragmas`
+returns `()`. **This is not the stale, pre-hardening reference an earlier cross-audit encountered.**
+Every finding below was verified by reading the source at these paths, not by trusting those notes.
+
+**One genuine staleness caveat, in the opposite direction.** The reference's own *"Convergence Parity
+Check"* section describes `simply_hook_executor` from a copy predating commit `8b70b2c` — it states
+this repo has a 1 MiB body limit, no replay guard, and checks `bound_ips` before the signature. All
+three were closed by `8b70b2c` and are **no longer true**. That table should not be relied on as a
+description of this repository.
+
+Per the task instruction, `./example` was not fetched, pulled, or updated.
 
 ---
 
-## 1. Proxy & IP middleware
+## 1. Proxy & IP middleware (`src/middleware.rs`, `src/config.rs`)
 
-### 1.1 `TRUSTED_PROXIES` parsing and representation
+| Aspect | simply_ip_vault (`./example`) | simply_hook_executor (this repo) | Assessment |
+| :--- | :--- | :--- | :--- |
+| `TRUSTED_PROXIES` entry types | `parse_trusted_proxies` accepts CIDR, bare address (widened to a host route), or hostname → `ProxyMatcher::{Network,Hostname}` | `parse_trusted_proxies` accepts the same three → `ProxySpec::{Network,Hostname}` | Equivalent; identical precedence (CIDR → address → hostname) |
+| Hostname resolution | `resolve_hostname` via `tokio::net::lookup_host((name, 0u16))`, addresses normalized and merged | Same call, same normalization; returns `(Vec<IpNetwork>, bool)` so the caller can distinguish "resolved to nothing" from "lookup failed" | Equivalent; this repo carries one extra bit of state, used only to pick the TTL |
+| Resolution shape | Whole-set flat snapshot: `resolved() -> Arc<Vec<IpNetwork>>` merges literals with every hostname's addresses | Identical: `resolved() -> Arc<Vec<IpNetwork>>` over `ResolvedProxies { hosts, merged }` | Equivalent — and this shape is what makes the chain walk below correct for hostname-identified hops on both sides |
+| Positive cache TTL | `POSITIVE_TTL = 30s`, per hostname | `TRUSTED_PROXY_DNS_TTL = 30s`, per hostname | Equivalent |
+| No-hostname fast path | `resolved()` returns `Arc::clone(&self.networks)`, touching neither lock nor resolver | Identical early return | Equivalent |
+| Concurrent-refresh collapsing | Freshness re-checked under the `tokio::sync::RwLock` write guard; lookups run while it is held | Identical (`all_fresh` re-checked under the write guard; `refresh_stale` awaits under it) | Equivalent — a burst arriving on one expiry costs a single DNS query on both sides |
+| Malformed-entry rejection | `is_plausible_hostname`: rejects `/`, `:`, all-digits-and-dots, leading `-`/`.`, trailing `-`, length > 253 | `is_hostname_like`: rejects `/`, `:`, all-digits-and-dots, length > 253, and requires **alphanumeric first and last characters** | Both close the "typo'd IPv4 becomes a never-resolving hostname" hole. This repo is marginally stricter (it also rejects the legal trailing-dot FQDN `proxy.internal.`); neither direction is a security defect |
+| Rejected-entry reporting | `parse_trusted_proxies` returns `(matchers, rejected)` for the caller to log at startup | Emits `tracing::warn!` inline per rejected entry | Equivalent operator visibility; cosmetic plumbing difference |
+| Peer-trust precondition | `resolve_client_ip`: `if !is_trusted(peer, trusted) { return peer; }` before any header is read | Byte-identical guard | Equivalent — the load-bearing anti-spoofing check is the same on both sides |
+| `X-Forwarded-For` parsing | Split on `,`, trim, drop unparseable, `normalize_ip`, `.rev()`, `.find(\|ip\| !is_trusted(*ip, trusted))` | Byte-identical expression | Equivalent. Neither performs unconditional rightmost extraction; both walk right-to-left skipping trusted hops |
+| Hostname-identified hop inside the chain | Skipped exactly like a CIDR hop — the flat snapshot makes them indistinguishable to the walk | Skipped identically | Equivalent. This closed a real prior gap on the reference side, where `is_literal_network` returned `false` for every hostname matcher and so never peeled a container-named hop |
+| Header listing only trusted proxies | Falls through to `X-Real-IP`, then to `peer` — never invents a client | Identical fallthrough | Equivalent; both fail to the unforgeable TCP peer rather than open |
+| `X-Real-IP` | Consulted only when the peer is trusted **and** `X-Forwarded-For` yielded nothing; single value, normalized | Identical | Equivalent |
+| IPv4-mapped IPv6 normalization | `normalize_ip` via `to_ipv4_mapped()`, applied to the peer, every XFF hop, `X-Real-IP`, and every resolved hostname address | Identical function, identical application points | Equivalent |
+| `bound_ips` and Master keys | `networks.is_empty() \|\| networks.iter().any(\|net\| net.contains(client_ip))` — **no `is_master` exemption**; an empty value is the only opt-out | Identical expression, identical no-exemption rationale in-code | Equivalent — both removed the exemption that made the most powerful credential the only one whose network restriction was decorative |
+| `bound_ips` position in the pipeline | Last, after signature and replay (*"Now that the caller has proven it holds the signing secret"*) | Last, after signature and replay, under the `── Authorization ──` banner | Equivalent — neither side exposes a `401`/`403` oracle to a caller who cannot authenticate |
+| Bootstrap key default `bound_ips` | `BOOTSTRAP_SUBNET`, default `0.0.0.0/0,::/0` (`main.rs:103`) | `BOOTSTRAP_SUBNET`, default `0.0.0.0/0,::/0` (`main.rs:96`), matched by the initial-schema migration default | Equivalent; both avoid stranding an IPv6-first bootstrap now that master keys are bound |
 
-**`simply_ip_vault`** — [`config.rs:164`](example/simply_ip_vault/src/config.rs#L164)
-`parse_trusted_proxies` returns `(Vec<ProxyMatcher>, Vec<String>)` — matchers **and the rejected
-entries**, which `from_env` logs at `error!` level with a count. Entries are classified CIDR →
-bare address → hostname, with `is_plausible_hostname` ([`:189`](example/simply_ip_vault/src/config.rs#L189))
-as the last gate. That gate is deliberately permissive: `999.1.1.1` is accepted **as a hostname**
-because it is a legal DNS label, on the reasoning that a name which never resolves fails in the same
-safe direction.
-
-**`simply_hook_executor`** — [`config.rs:602`](src/config.rs#L602)
-`parse_trusted_proxies` returns a bare `Vec<ProxySpec>` and warns inline per rejected entry. Same
-three-way classification, but `is_hostname_like` ([`:562`](src/config.rs#L562)) is **stricter**: it
-rejects anything made only of digits and dots, so `999.1.1.1` is reported as a malformed address
-rather than silently becoming a name.
-
-**Difference.** The vault surfaces rejects as an aggregated startup `error!`; hook_executor emits
-per-entry `warn!`. The vault's is easier to notice in a busy log. Conversely hook_executor catches
-one more class of typo — a fat-fingered IPv4 literal — as a configuration error instead of a
-never-resolving name.
-
-**Analysis.** Roughly even, with a small edge to hook_executor on classification and a small edge to
-the vault on reporting. Both fail in the safe direction (a dropped entry means *less* trust). The
-ideal is hook_executor's stricter `is_hostname_like` combined with the vault's aggregated
-`(accepted, rejected)` return and `error!`-level summary.
-
-### 1.2 Hostname resolution and caching
-
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Cache granularity | per hostname | one merged network list |
-| Lock | `std::sync::RwLock` | `tokio::sync::RwLock` |
-| TTL | 30s ([`:30`](example/simply_ip_vault/src/config.rs#L30)) | 30s ([`:21`](src/config.rs#L21)) |
-| Failure caching | not cached — retried next request | cached for the full TTL |
-| Thundering herd | possible | prevented (double-checked write lock) |
-| Zero-hostname cost | iterates matchers | `Arc::clone`, no lock ([`:163`](src/config.rs#L163)) |
-
-**Difference.** These are two genuinely different trade-offs on the same 30-second window.
-
-The vault caches nothing on a resolution failure, so a DNS blip costs at most one request's worth of
-untrusted proxy — but during a sustained DNS outage **every request fires a fresh lookup**, putting
-resolver latency and load on the hot path. hook_executor caches the partial result, so a failed
-hostname stays untrusted for up to 30s (visible as `403`s), but the resolver is hit at most once per
-TTL regardless of how badly DNS is behaving.
-
-**Analysis.** hook_executor's is the more robust behaviour under adverse conditions — DNS being down
-should not turn into a request-rate-multiplied lookup storm against the resolver, which is a
-self-inflicted amplification path. The vault's is the more responsive under normal conditions. The
-vault's *per-name* cache is the better structure, though: one unresolvable name in hook_executor
-does not poison the others' addresses (they are merged into the same list before caching), but it
-does mean the whole merged list is recomputed on any expiry.
-
-### 1.3 `X-Forwarded-For` parsing
-
-**Both projects walk the chain right-to-left, skipping addresses that are themselves trusted
-proxies, and fall back to the TCP peer when the header yields nothing.** The code is
-substantively identical:
-
-- vault: [`config.rs:251`](example/simply_ip_vault/src/config.rs#L251) `resolve_client_ip`
-- hook_executor: [`config.rs:266`](src/config.rs#L266) `resolve_client_ip`
-
-Both gate the entire header path behind `if !is_trusted(peer) { return peer; }` — the load-bearing
-check that stops an arbitrary client from satisfying `bound_ips` by writing an address into a
-header. Both normalize IPv4-mapped IPv6 on **both** sides of every comparison. Both prefer
-`X-Forwarded-For` over `X-Real-IP` so a proxy setting both cannot be played off against itself.
-
-**One real divergence.** The vault's chain walk uses `is_literal_network`
-([`:223`](example/simply_ip_vault/src/config.rs#L223)), which consults **only** `ProxyMatcher::Network`
-entries and deliberately ignores hostnames — documented as an intentional latency trade-off. The
-consequence, which the vault's own doc comment states: *a chained hop identified only by hostname is
-treated as a client rather than skipped.* hook_executor resolves hostnames into the same
-`Arc<Vec<IpNetwork>>` used for the whole walk ([`middleware.rs:188`](src/middleware.rs#L188)), so a
-hostname-named intermediate hop **is** skipped correctly.
-
-Concretely, with `TRUSTED_PROXIES=traefik,nginx` and a chain `client → nginx → traefik → us`:
-- hook_executor resolves the client correctly.
-- The vault stops at `nginx`'s address and attributes the request to the proxy.
-
-This is the same class of bug the vault cross-check previously found in hook_executor (unconditional
-rightmost extraction), surviving in the vault for hostname-only configurations. It is
-**conservative** — it never trusts an address further left than it should — but it does mean
-`bound_ips` and the audit trail record infrastructure instead of callers in an all-hostname Docker
-deployment, which is exactly the deployment hostname support exists to serve.
-
-**Analysis.** **hook_executor is stronger here**, and at no real cost: it already resolves hostnames
-once per TTL into a flat network list, so reusing that list inside the walk is free. The vault's
-stated cost ("a DNS lookup per header entry") only applies to its per-name-lazy design.
-
-### 1.4 `bound_ips` enforcement, including master keys
-
-**Both projects apply `bound_ips` to every key with no master exemption**, and both document the
-removal of that exemption in near-identical terms:
-
-- vault: [`middleware.rs:203`](example/simply_ip_vault/src/middleware.rs#L203)
-- hook_executor: [`middleware.rs:230`](src/middleware.rs#L230)
-
-```rust
-let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
-```
-
-Both treat empty `bound_ips` as "unrestricted" (the opt-out), both reject an unparseable stored CIDR
-as `Internal` rather than failing open, and both log the denial with the key prefix.
-
-**The one difference is *where* this check sits in the pipeline**, which is significant enough to be
-its own finding — see §3.4.
-
-**Analysis.** Tie on the logic itself. Both got this right, and both got it right for the same
-stated reason: a master key whose network restriction is decorative while the dashboard displays it
-as enforced is worse than not offering the field.
+This category is fully converged: the trust precondition, the chain walk, the normalization, and the
+`bound_ips` enforcement are the same algorithm in the same order, and both sides ship a
+`scripts/verify_convergence.sh` that diffs these functions mechanically so drift is caught by CI
+rather than by the next audit. The only surviving deltas are hostname *syntax* strictness at the
+edges and where rejected entries are logged — neither changes which address a request is authorized
+as.
 
 ---
 
-## 2. RBAC & privilege-escalation guards
+## 2. RBAC & privilege-escalation guards (`src/api.rs`)
 
-### 2.1 Key minting and scope elevation
+The vocabulary differs by domain — the reference gates group access (`can_create_groups`,
+`can_manage_webhooks`, `api_key_group_permission{can_read,can_write,can_delete}`), this repo gates
+hook access (`can_manage_hooks`, `api_key_hook_permission{can_execute,can_manage}`) — so each row
+compares the *guard*, not the field name.
 
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Guard | `guard_scope_elevation` [`api.rs:190`](example/simply_ip_vault/src/api.rs#L190) | `require_master_to_grant_scopes` [`api.rs:343`](src/api.rs#L343) |
-| Master-only scopes | `is_master`, `can_manage_keys`, `can_create_groups` | `is_master`, `can_manage_keys`, `can_manage_hooks` |
-| Delegable scope | `can_manage_webhooks` | — |
-| Baseline-aware | **Yes** — compares against target's current values | **No** — any `true` is a grant |
-| `is_master` via update | not exposed in payload | not exposed in payload |
-| Revocation | always allowed | always allowed |
+| Aspect | simply_ip_vault (`./example`) | simply_hook_executor (this repo) | Assessment |
+| :--- | :--- | :--- | :--- |
+| Key-administration entry gate | `if !key.is_master && !key.can_manage_keys { Forbidden }` on create/list/update/delete/rotate | Same predicate on the same set of handlers | Equivalent |
+| Global scopes a non-master may grant | `MASTER_ONLY_SCOPES = ["is_master", "can_manage_keys", "can_create_groups"]`; `can_manage_webhooks` is deliberately delegable | `require_master_to_grant_scopes` covers `is_master`, `can_manage_keys`, `can_manage_hooks` — **every** global scope is master-only | This repo has the smaller surface, having no delegable global scope at all; the reference's exclusion is argued in-code (`can_manage_webhooks` confers no authority over keys or groups). No security delta |
+| Elevation-guard semantics | `guard_scope_elevation(caller, requested, held)` rejects `Some(true)` only where the **target does not already hold** the scope, so an idempotent full-field `PUT` succeeds | `require_master_to_grant_scopes` rejects any `Some(true)` from a non-master regardless of the target's current value | This repo is strictly more conservative; the reference is more ergonomic and equally safe, since re-asserting a scope the target already holds authorizes nothing new. Behavioural divergence to arbitrate on UX grounds, not a security finding |
+| `is_master` on the update payload | `UpdateApiKeyPayload` deliberately omits the field — promotion via `PUT` is impossible | `UpdateApiKeyPayload` likewise omits it; `require_master_to_grant_scopes(&key, None, …)` passes `None` explicitly | Equivalent |
+| Operating on a Master target | `guard_master_target(caller, target)` — `target.is_master && !caller.is_master` → `403` | `require_master_to_administer(key, target, action)` — same predicate, plus the action name in the message | Equivalent |
+| Master-target guard coverage | `update_api_key`, `delete_api_key`, `rotate_api_key`, `rotate_signing_secret` | `update_api_key` (`api.rs:2006`), `delete_api_key` (`api.rs:2079`), `rotate_api_key` (`api.rs:2129`) | Equivalent; the reference has a fourth site only because it splits secret rotation from key rotation |
+| Rotation treated as credential theft | Guarded, because the response returns the new plaintext secret | Guarded, with the same reasoning stated at the call site | Equivalent |
+| Self-deletion | `if id == key.id { Forbidden("Cannot delete yourself") }` | Identical check and message | Equivalent |
+| Self-granting a global scope | Explicit block: `id == key.id && !key.is_master && payload.can_manage_webhooks == Some(true) && !key.can_manage_webhooks` | Not required — every global scope is already master-only to grant, so self and non-self are covered by one guard | Equivalent outcome; this repo needs one guard where the reference needs two because it has no delegable scope |
+| Self-granting a resource permission | Covered by `guard_delegated_group_grant`, which measures the request against the caller's own row | Explicit block in `update_key_hook_permissions`: `if !key.is_master && id == key.id { Forbidden }` | Equivalent outcome by different means |
+| **Delegated grant — per-verb proportionality** | `guard_delegated_group_grant` checks **each verb independently** against the caller's own row: `(requested.can_read && !held.can_read) \|\| (can_write …) \|\| (can_delete …)` → `403` | `update_key_hook_permissions` requires `require_manage(caller, hook)` but then writes `can_execute`/`can_manage` **verbatim from the payload** — a caller holding `can_manage` but not `can_execute` can grant `can_execute` to a second key it controls | **Reference is stronger.** Proportionality is enforced at the resource level here but not per verb. Genuine discrepancy; merits a follow-up convergence pass |
+| Delegated grant — caller must hold the resource | Implied by `guard_delegated_group_grant` (no row → `403`) | `require_manage(&state.db, &key, hook_model.id)` before any write | Equivalent at the resource level |
+| Delegated grant — privileged resource | N/A (no elevated-execution concept) | `require_master_for_privileged_hook(&key, &hook_model, "grant permissions on")` — distributing rights over a `run_as_user` hook stays master-only even for its manager | An additional control with no reference counterpart; not a discrepancy |
+| **Revoking a resource permission** | `revoke_key_group_permission` checks only `is_master \|\| can_manage_keys`, then deletes — **no per-group check and no master-target check**. Any key manager can strip any key's access to any group | `revoke_key_hook_permission` applies `require_manage(&state.db, &key, hook_model.id)` for non-masters, mirroring the grant path | **This repo is stronger.** The reference leaves an ungated cross-tenant tampering / availability path on revoke. Genuine discrepancy; merits a follow-up convergence pass |
+| Permissions on a Master target key | `update_key_group_permissions`: `if target_key.is_master { … }` (`api.rs:1815`) | `update_key_hook_permissions`: `if target_key.is_master { InvalidInput("Cannot configure M:N permissions on a master key") }` | Equivalent |
+| Mutating a privileged resource | N/A | `require_master_for_privileged_hook` on update, delete, and all three parameter handlers — covering `script_path`, the parameter contract, and the timeout, not merely the `run_as_user` field | Domain-specific to this repo; nothing to score against |
+| Audit-log read access | Master-only | Master-only (`list_audit_logs`, `api.rs:2353`) | Equivalent |
+| Soft-delete lifecycle operations | Restore and hard-purge are `is_master`-only (`api.rs:1049`, `api.rs:1120`) | Restore and purge of trashed hooks are `is_master`-only | Equivalent |
 
-Both refuse a non-master minting a key with a master-only scope, and both give the same reason: a
-`can_manage_keys` key that can mint `is_master` is operationally identical to `is_master`, just less
-visible in the dashboard.
-
-**Difference.** The vault passes the target's *current* scope values as a baseline, so re-submitting
-a scope the key already holds is a no-op rather than a rejection. hook_executor treats every `true`
-as a grant regardless of current state.
-
-hook_executor's is stricter but breaks idempotent `PUT`: a non-master key manager cannot re-save an
-existing key that already carries `can_manage_hooks`, because the dashboard posts every field. This
-is a usability cost, not a vulnerability — the failure is a spurious `403`, which is the safe
-direction.
-
-**Analysis.** The vault's baseline-aware form is the better design and is not weaker: permitting
-`requested == true && current == true` authorizes nothing new. hook_executor should adopt it.
-
-### 2.2 Rotation and deletion of master keys
-
-**Functionally identical.**
-
-- vault: `guard_master_target` [`api.rs:216`](example/simply_ip_vault/src/api.rs#L216)
-- hook_executor: `require_master_to_administer` [`api.rs:378`](src/api.rs#L378)
-
-Both reduce to `if target.is_master && !caller.is_master → 403`, both are applied to update, delete,
-and rotate, and both log the attempt. hook_executor's takes an `action` string so the error names
-the operation; the vault's emits one message covering all three.
-
-Both also refuse self-deletion (`id == key.id`) before anything else.
-
-**Analysis.** Tie. The rationale is stated identically in both: rotation returns the new plaintext
-secret in its response, making "rotate the master key" a one-request credential theft that also
-locks out the legitimate holder.
-
-### 2.3 Self-granting and cross-tenant escalation
-
-**Both refuse self-granting outright** rather than merely bounding it:
-
-- vault: [`api.rs:1828`](example/simply_ip_vault/src/api.rs#L1828) — `if id == key.id && !key.is_master → 403`
-- hook_executor: [`api.rs:2204`](src/api.rs#L2204) — same shape
-
-The vault's comment articulates why refusal beats bounding, and it is the correct argument: a
-"cannot grant beyond what you hold" check compares against grants held *at this instant*, so a
-caller allowed to target itself can **ratchet** — grant itself `can_read` on a group it can already
-read, then use that row as the basis for widening to `can_write`. Requiring a second party removes
-the ratchet by construction.
-
-Both also refuse to configure M:N permissions on a master key at all.
-
-**Difference — and this is a gap in hook_executor.** The vault additionally enforces **per-verb
-proportionality** via `guard_delegated_group_grant`
-([`api.rs:131`](example/simply_ip_vault/src/api.rs#L131)): a non-master may not grant `can_read`,
-`can_write`, or `can_delete` on a group unless it holds that *same verb* itself. Each verb is checked
-independently — holding `can_read` does not confer the right to grant `can_write`.
-
-hook_executor checks only that the caller **manages** the hook
-([`api.rs:2233`](src/api.rs#L2233), `require_manage`), plus a master-only gate for privileged hooks.
-There is no check that the caller holds `can_execute` before granting `can_execute`. So a key with
-`can_manage_keys` globally and `can_manage` (but **not** `can_execute`) on a hook can:
-
-1. create a new API key (permitted — it holds `can_manage_keys`),
-2. grant that key `can_execute` on the hook (permitted — it manages the hook, and the self-grant
-   check does not apply because the target is a *different* key),
-3. authenticate as the new key and execute.
-
-The blast radius is bounded: `require_master_for_privileged_hook`
-([`api.rs:410`](src/api.rs#L410)) blocks this entirely for any hook with `run_as_user` set, and a
-`can_manage` holder can already rewrite the hook's `script_path`, so execution authority is arguably
-implied by management authority in this schema. But the two scopes are modelled as **separate
-columns** on `api_key_hook_permission`, which means an operator can grant `can_manage` without
-`can_execute` and reasonably expect that to mean something. Today it does not.
-
-**Analysis.** **The vault is stronger.** Its verb-by-verb proportionality rule is the more complete
-model, and it is the one hook_executor should adopt: if `can_execute` and `can_manage` are distinct
-columns, granting either should require holding it.
-
-### 2.4 Hook/record-level privilege guards (no direct counterpart)
-
-hook_executor carries one guard with no analogue in the vault, because the vault has nothing
-equivalent to guard: `require_master_for_privileged_hook`
-([`api.rs:410`](src/api.rs#L410)) makes **every** mutation of a hook with a non-empty `run_as_user`
-master-only — `script_path`, parameters, timeouts, permission grants, and deletion, plus clearing
-the elevation itself. It is applied at eight call sites.
-
-The reasoning is sound and worth recording: guarding only the `run_as_user` *field* would leave a
-`can_manage` holder able to repoint an existing root hook at a different script without ever
-touching the protected field.
-
-Conversely, the vault's `can_create_groups` scope is master-only specifically because group creation
-auto-grants the creator full read/write/delete — the one path to group access without a master
-signing off. hook_executor has no auto-grant-on-create path, so no equivalent is needed.
-
-**Analysis.** Both are correct for their own domain. Not comparable.
+Both services now enforce the same three-layer model — an entry scope, a master-only set of global
+scopes, and a master-target guard on every administrative verb. The two remaining defects point in
+**opposite** directions, so neither codebase can adopt the other wholesale: the reference's grant path
+is the more precise one (per verb) while its revoke path is under-guarded, and this repo's revoke path
+is correctly gated while its grant path checks only resource-level management.
 
 ---
 
-## 3. Cryptography & HMAC
+## 3. Cryptography, HMAC & authentication posture (`src/crypto.rs`, `src/middleware.rs`, `src/api.rs`)
 
-### 3.1 Constant-time comparison — both correct
+| Aspect | simply_ip_vault (`./example`) | simply_hook_executor (this repo) | Assessment |
+| :--- | :--- | :--- | :--- |
+| **Authentication posture** | Mandatory full-URI HMAC + anti-replay on **every** key. No per-key mode, no `REQUIRE_SIGNED_REQUESTS`, no exempt route — asserted by `verify_convergence.sh` | Per-key `api_keys.hmac_mode` ∈ {`CANONICAL_V1`, `BODY_ONLY`} plus a `REQUIRE_SIGNED_REQUESTS` switch, to interoperate with third-party senders that sign with their own conventions or not at all | **Intentional asymmetry — do not unify** |
+| Signature comparison primitive | `mac.verify_slice(&provided_bytes).is_ok()` in `crypto::verify_signature` | `mac.verify_slice(&expected)?` in `middleware::verify_signature` | Equivalent; both constant-time via `Mac::verify_slice → CtOutput::eq → subtle::ConstantTimeEq::ct_eq` |
+| Any `==`/`!=` against a secret, signature, digest, or MAC | None in `src/` — grep for `==`/`!=` on secret/signature/digest/token/mac identifiers returns no non-test hits | None in `src/` — same grep, same result | Equivalent; both clean, and both assert the absence in their convergence checker |
+| API-key lookup by digest | `Sha256(presented) → hex → filter(Column::KeyHash.eq(hash))` | Identical | Equivalent — and correctly **not** treated as a secret comparison: this is an indexed DB lookup on a one-way digest, where a timing signal would leak which index pages were visited, not the key |
+| Canonical string layout | `METHOD\nTARGET\nTIMESTAMP\nBODY`, LF-delimited, no trailing newline (`crypto::canonical_v1_payload`) | Byte-identical construction (`middleware::signature_base`) | Equivalent; both delimit explicitly to prevent component-boundary shifting |
+| **Canonicalization scope** | `signed_target()` → `uri.path_and_query()`, falling back to `uri.path()` only when no query exists | Same expression inline in `auth_middleware`, same fallback | Equivalent — the query string is signed on both sides. This closed a real prior gap on the reference side, where `?hard=true` was freely appendable to a captured signed `DELETE` |
+| Nested-route URI recovery | `OriginalUri` extension preferred over `parts.uri`, because `.nest("/api", …)` strips the prefix inner layers observe | Identical, with the same rationale recorded | Equivalent |
+| Raw-body binding | Signature computed over the buffered bytes verbatim, which are then re-attached to the request | Identical | Equivalent — the bytes verified are the bytes parsed on both sides |
+| Timestamp window | `MAX_TIMESTAMP_SKEW_SECS = 300`, symmetric via `.abs()`, rejected as `401` | `SIGNATURE_MAX_AGE_SECONDS` default `300`, symmetric via `.abs()`, rejected as `401` | Equivalent; both refuse forward-dated requests, without which the window would be one-sided |
+| Timestamp check placement | `validate_timestamp` runs **before** the API-key database lookup | `verify_timestamp` runs **after** the key lookup, inside the signature branch | **Reference is marginally stronger**: a stale or malformed timestamp costs it no DB round-trip, so unauthenticated traffic cannot force a query. Low severity, but a free ordering win |
+| **Anti-replay — single-use tracking** | `ReplayGuard::observe(key_id, signature, timestamp)` in `state.rs` tracks accepted `(key, signature)` pairs; the window alone is not relied on | `ReplayGuard::check_and_record(key_id, digest)` in `replay.rs` — the same property, applied to `CANONICAL_V1` keys | Equivalent for full-HMAC keys, which is the standard this repo's `CANONICAL_V1` mode is held to. `BODY_ONLY` is untracked by design: it carries no timestamp, so there is no window to be single-use within, and those senders redeliver on purpose |
+| Replay entry identity | `format!("{key_id}:{signature}")`, where the middleware trims, strips `sha256=`, and lowercases first | `SignatureId { key_id: Uuid, digest: Vec<u8> }` — the raw verified digest, never the header text | This repo is marginally stronger: normalization is structural rather than performed by string surgery, so no header spelling can produce two entries for one signature |
+| Replay recorded only after verification | Yes — `observe` is called after `verify_signature` returns true, with the reasoning stated in-code | Yes — `check_and_record` takes the digest returned by `verify_signature` | Equivalent; neither lets an observer burn a signature the legitimate client is about to send |
+| Replay expiry clock | Wall clock — entries carry the request's `X-Timestamp` and are retained while `(now - ts).abs() <= 300` | Monotonic — entries carry `Instant::now() + window` | This repo is marginally stronger: a backward NTP step cannot expire entries early. The reference's choice is internally consistent with its own timestamp check, so the exposure is narrow |
+| Replay pruning strategy | `seen.retain(…)` on **every** `observe` call — O(n) per authenticated request | `prune_if_due` sweeps at most once per `window / 4`, plus an early sweep at capacity — amortized O(1) per request | This repo is stronger on availability: at the reference's ceiling, every signed request walks 100k entries |
+| **Replay behaviour at capacity** | `MAX_TRACKED_SIGNATURES = 100_000`; on overflow the map is **cleared** (`seen.clear()`), logged as *"Replay protection is degraded for the current window"* | `MAX_TRACKED_SIGNATURES = 250_000`; on overflow it sweeps expired entries early, **keeps enforcing**, and warns | **This repo is stronger, and this is the most consequential finding.** The reference fails *open*, and the map is global across keys: any single key holding a valid signing secret can flood the guard to clear it and reopen the replay window for **every other key, master included** |
+| Replay-guard lock poisoning | Fails closed — the request is rejected | Fails closed — the request is rejected | Equivalent |
+| At-rest AEAD | XChaCha20-Poly1305, 24-byte random nonce per operation | XChaCha20-Poly1305, 24-byte random nonce per operation | Equivalent; both moved off 96-bit nonces and their birthday bound |
+| Encryption-key requirement | Exactly 64 hex characters; anything else → `CryptoError::InvalidKey` → startup abort | Exactly 64 hex characters; identical error and identical abort | Equivalent. Both closed the "SHA-256 of any passphrase" derivation |
+| Cipher lifetime and `Debug` | Built once at startup, held in `AppState`; `Debug` renders `SecretCipher::Sealed(<redacted>)` | Built once at startup, held in `AppState`; `Debug` renders `SecretCipher::Sealed(<redacted>)` | Equivalent; neither re-reads the environment per request, and neither can leak key material through a state dump |
+| Stored-secret formats accepted by `open()` | `v1.xchacha20poly1305.`, `v1.plain.`, legacy `aesgcm256:` (AES-GCM under SHA-256 of the hex key text), **and any unprefixed value returned verbatim as the secret** | `v1.xchacha20poly1305.`, `v1.plain.`; anything else → `CryptoError::MalformedCiphertext` | **This repo is stronger.** The reference's terminal `Ok(stored.to_owned())` means a row whose prefix is truncated or corrupted is silently used as a plaintext HMAC secret instead of failing. It is a deliberate, documented AES-migration affordance — but it is a fail-open path this repo does not have |
+| Encryption env var | `VAULT_ENCRYPTION_KEY` primary, `SIGNING_SECRET_KEY` alias | `SIGNING_SECRET_KEY` primary, `VAULT_ENCRYPTION_KEY` alias | Primary and alias are reversed, but **both accept both**, so one provisioning system serves both services. Cosmetic |
+| Signature-mode downgrade guard | N/A — one mode exists | `X-Hub-Signature-256` is honoured **only** for `BODY_ONLY` keys; a `CANONICAL_V1` key cannot be downgraded to body-only signing by sending the other header name | A control this repo needs precisely because of the intentional asymmetry, and implements correctly. Nothing to unify |
 
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Comparison | `mac.verify_slice(...)` [`crypto.rs:141`](example/simply_ip_vault/src/crypto.rs#L141) | `mac.verify_slice(...)` [`middleware.rs:139`](src/middleware.rs#L139) |
-| Chain | `verify_slice → CtOutput::eq → subtle::ConstantTimeEq` | same |
-| Wrong-length tag | rejected by `verify_slice` | rejected, plus an explicit test |
-
-Neither project compares hex strings with `==`. hook_executor additionally carries a test that flips
-**every bit at every byte position** of a valid tag and asserts each is rejected
-([`middleware.rs:420`](src/middleware.rs#L420)) — a deterministic fingerprint that would catch a
-prefix-only or truncated comparison being introduced later.
-
-**Analysis.** Tie on the control; hook_executor has the stronger regression test around it.
-
-### 3.2 Canonical string construction
-
-Both build `METHOD \n PATH \n TIMESTAMP \n RAW_BODY`, both use LF delimiters for the same stated
-reason (`"POST" + "/api/x"` and `"POS" + "T/api/x"` are identical under plain concatenation), and
-both use the raw body verbatim rather than a re-serialization. Both carry a test proving the
-boundary-shift case.
-
-**The one divergence is the query string, and it matters.**
-
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Signed target | `uri.path()` — **query excluded** ([`middleware.rs:154`](example/simply_ip_vault/src/middleware.rs#L154)) | `path_and_query()` — **query included** ([`middleware.rs:312`](src/middleware.rs#L312)) |
-| `OriginalUri` used | yes | yes |
-
-The vault documents the omission as a deliberate trade-off — reverse proxies reorder and re-encode
-query strings — on the premise that *"query parameters on `/api/*` are read-only filters, while every
-mutating field travels in the signed body."*
-
-**That premise is no longer true in the vault's own code.** Two routes violate it:
-
-1. **`DELETE /api/ips/{id}?hard=true`** — [`api.rs:949`](example/simply_ip_vault/src/api.rs#L949)
-   reads `DeleteRecordQuery { hard }` from the query string. `hard=true` converts a reversible soft
-   delete into permanent destruction of the row and its cascade. Since the query is unsigned, a
-   signed soft-delete request can be rewritten in transit — or replayed within the 300s window — as
-   a hard delete, and the signature still verifies.
-
-2. **`DELETE /api/ips`** — [`api.rs:1203`](example/simply_ip_vault/src/api.rs#L1203) computes
-   `query_params.merge(body_params)`, where `merge` resolves each field as
-   `self.<field>.or(other.<field>)` — **the query wins over the signed body.** An in-flight signed
-   request with body `{"target_address":"1.2.3.4","group_name":"low-risk"}` can have
-   `?target_address=9.9.9.9&group_name=critical` appended; the body is untouched, the path is
-   unchanged, the signature verifies, and the handler acts on the attacker's parameters.
-
-The second case does not even require capture-and-replay — appending a query string to a request in
-transit is sufficient. RBAC still applies to the substituted group, so this is an integrity break
-bounded by the caller's own permissions rather than a straight escalation. But it means **the
-signature does not bind what the request does**, which is the entire property the signature exists
-to provide.
-
-hook_executor's inclusion of the query is not theoretical either: it now serves
-`DELETE /api/hooks/{id}?hard=true`, `GET /api/hooks?include_deleted=true`, and
-`POST /api/system/purge-hooks`. Its doc comment cites exactly this class of attack.
-
-**Analysis.** **hook_executor is materially stronger.** The proxy-rewriting concern the vault cites
-is real, but it is a *compatibility* argument being traded against an *integrity* guarantee, and the
-vault has since added mutating query parameters that make the trade unsound. Recommended
-unification: adopt `path_and_query` in the vault.
-
-### 3.3 Inbound signature modes and anti-replay
-
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Signature required inbound | **always** | **optional** unless `REQUIRE_SIGNED_REQUESTS=true` (default `false`) |
-| `X-Timestamp` required | always | only in `CANONICAL_V1`, and only when a signature is present |
-| Accepted inbound modes | `CANONICAL_V1` only | per-key `CANONICAL_V1` **or** `BODY_ONLY` |
-| Window | ±300s symmetric ([`crypto.rs:35`](example/simply_ip_vault/src/crypto.rs#L35)) | ±300s symmetric, configurable ([`config.rs:322`](src/config.rs#L322)) |
-| Nonce/jti replay cache | none | none |
-| `sha256=` prefix | optional | **mandatory** |
-| Alternate header | none | `X-Hub-Signature-256`, `BODY_ONLY` keys only |
-
-Both validate the timestamp **before** the expensive work — the vault before the DB lookup, and
-hook_executor before recovering the secret and hashing the body. Both are symmetric, and both
-document why: a forward-dated request would otherwise stay replayable for the length of its skew.
-
-**Two divergences, both favouring the vault.**
-
-*First,* hook_executor's `require_signed_requests` defaults to `false`
-([`config.rs:385`](src/config.rs#L385)), so out of the box possession of `X-API-Key` alone
-authenticates. The vault's middleware has no such switch — a request without a valid
-`X-Signature-256` never reaches a handler. The vault states the resulting property directly: *"a
-leaked key is useless without its signing secret."* hook_executor does not have that property by
-default. The stated reason (a bearer-only client keeps working after an upgrade) is a legitimate
-migration concern, but the default is the insecure one.
-
-*Second,* hook_executor accepts `BODY_ONLY` **inbound**. That mode signs the body alone, requires no
-`X-Timestamp`, and therefore has **no anti-replay whatsoever** — a captured request is replayable
-indefinitely. hook_executor is honest about this (`describe_hmac_mode` writes *"BODY_ONLY —
-body-only, no replay protection"* into the audit trail), and the mode exists for GitHub-style webhook
-senders that cannot produce a canonical string. The vault supports `BODY_ONLY` too, but **only for
-outbound webhook dispatch** ([`webhooks.rs:298`](example/simply_ip_vault/src/webhooks.rs#L298)) —
-it is never an inbound authentication mode.
-
-**Analysis.** **The vault is stronger on posture.** Its "always signed, always timestamped,
-one mode" stance is simpler to reason about and has no insecure configuration. hook_executor's
-flexibility is a deliberate product requirement, but it should be paired with `REQUIRE_SIGNED_REQUESTS`
-defaulting to `true`, and `BODY_ONLY` keys should be visibly marked in the dashboard as
-replay-vulnerable (the audit string already says so; the UI does not).
-
-**Shared gap:** *neither* project maintains a nonce/`jti` cache, so within the 300s window an
-identical `CANONICAL_V1` request can be replayed verbatim in both. The window bounds it, but for
-non-idempotent routes (`POST /api/hooks/{id}/execute`, `POST /api/ban`) the exposure is real.
-
-### 3.4 Middleware check ordering — a finding in hook_executor
-
-| Step | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| 1 | resolve client IP | resolve client IP |
-| 2 | validate timestamp | look up key by hash |
-| 3 | look up key by hash | **`bound_ips` CIDR check** |
-| 4 | recover signing secret | validate timestamp *(if signed)* |
-| 5 | buffer body, verify signature | recover secret, buffer body, verify signature |
-| 6 | **`bound_ips` CIDR check** | — |
-
-The vault's comment states the rationale explicitly:
-
-> Verify the HMAC signature *before* the CIDR check: authenticate, then authorize. Running the
-> network-binding check first would let a caller who cannot prove possession of the signing secret
-> learn — from the 403-vs-401 distinction alone — whether a key it merely guessed is bound to the
-> caller's own network.
-
-**hook_executor runs them in the opposite order** ([`middleware.rs:212–241`](src/middleware.rs#L212)),
-so an attacker holding only a leaked `X-API-Key` (no signing secret) can distinguish:
-
-- `403 Client IP not allowed` → the key exists **and** is bound to networks excluding the attacker
-- `401 Invalid request signature` → the key exists and the attacker's network is permitted
-
-That is a network-topology oracle available to someone who cannot authenticate. It is low severity
-on its own — the attacker already needs a valid `X-API-Key`, and with signing optional by default
-that key is usually sufficient anyway — but it is free to fix and the reference already models the
-correct order.
-
-**Analysis.** **The vault is stronger.** hook_executor should move the `bound_ips` block to after
-signature verification. Note the two findings compound: with `REQUIRE_SIGNED_REQUESTS=false` the
-ordering barely matters because the key alone authenticates; fixing H-2 without also fixing H-1
-would make the oracle *newly* meaningful.
-
-### 3.5 Secret encryption at rest
-
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| AEAD | AES-GCM-256 | XChaCha20-Poly1305 |
-| Nonce width | 96 bits, random | **192 bits**, random |
-| Env var | `VAULT_ENCRYPTION_KEY` | `SIGNING_SECRET_KEY` (accepts `VAULT_ENCRYPTION_KEY` as alias) |
-| Key derivation | SHA-256 of **any** passphrase ([`crypto.rs:150`](example/simply_ip_vault/src/crypto.rs#L150)) | requires exactly 64 hex chars ([`crypto.rs:98`](src/crypto.rs#L98)) |
-| Malformed key | impossible — anything works | **hard error**, no plaintext fallback |
-| Structure | free functions, env read per call | `SecretCipher` built once, held in `AppState` |
-| Plaintext mode | stores the secret **verbatim** | hex-encoded behind `v1.plain.` |
-| Unknown-format value | returned **as-is** as the secret | `MalformedCiphertext` error |
-| Versioned prefix | `aesgcm256:` | `v1.xchacha20poly1305.` / `v1.plain.` |
-
-Four differences favour hook_executor:
-
-1. **Nonce width.** AES-GCM with a *random* 96-bit nonce has a birthday bound around 2³² messages
-   under one key before collision risk becomes non-negligible — and a GCM nonce collision is
-   catastrophic, not gradual. Signing secrets are sealed rarely, so this is not an operational
-   concern today, but XChaCha20's 192-bit nonce makes random generation collision-safe by
-   construction with no counting argument required.
-
-2. **Key validation.** The vault SHA-256's whatever string it finds, so `VAULT_ENCRYPTION_KEY=x`
-   yields a valid 32-byte key and a database that *looks* encrypted while carrying one character of
-   entropy. hook_executor rejects anything that is not 64 hex characters, and treats a malformed key
-   as fatal rather than falling back to plaintext — its comment names the reason: *"an operator who
-   set the variable believes their secrets are encrypted."*
-
-3. **Fail-closed parsing.** The vault's `open_signing_secret`
-   ([`crypto.rs:203`](example/simply_ip_vault/src/crypto.rs#L203)) returns any value lacking the
-   sealed prefix **verbatim as the secret**. A corrupted or partially-written row is silently
-   accepted as key material. hook_executor requires a recognized prefix and errors otherwise.
-
-4. **Structure.** The vault reads the environment variable inside `encryption_key()` on every seal
-   and open — i.e. once per authenticated request on the hot path. hook_executor resolves it once at
-   startup into `AppState.cipher`, which is both faster and immune to mid-process env mutation.
-
-The vault holds one advantage: `encryption_enabled()` and its startup logging make the mode visible,
-and its dev fallback needs no migration. hook_executor's hex-encoded plaintext mode is a genuine
-small win — the raw secret is never a substring of the stored column, so a `grep` of a database dump
-does not surface it.
-
-**Analysis.** **hook_executor is clearly stronger.** The vault should adopt the length-validated key
-(rejecting short passphrases outright), the fail-closed prefix requirement, and construction-once
-into `AppState`. Migrating AES-GCM → XChaCha20 is lower priority given the low seal volume, but the
-`v1.` prefix scheme makes such a migration straightforward and is worth adopting on its own.
-
-### 3.6 Outbound webhook templates (vault only)
-
-hook_executor has no outbound dispatch, so this is informational. The vault's
-`resolve_hmac_template` ([`webhooks.rs:131`](example/simply_ip_vault/src/webhooks.rs#L131)) expands
-`{method}`, `{path}`, `{timestamp}`, `{body}` and treats any other `{...}` as literal text so a JSON
-body template can coexist with the syntax. Its test suite covers the case that matters — a **body
-containing template syntax** must land in the signed string verbatim and not be re-expanded — and
-asserts that `DEFAULT_HMAC_TEMPLATE` reproduces `canonical_v1_payload` byte-for-byte, so an outbound
-dispatch is verifiable by an inbound middleware.
-
-That last property is the interoperability contract between the two projects, and it holds: a vault
-`CANONICAL_V1` dispatch produces exactly the bytes hook_executor's middleware reconstructs — **for
-requests with no query string.** Where a query string is present the two now disagree (§3.2), so a
-vault-signed dispatch to a hook_executor URL carrying query parameters will fail verification. This
-is a concrete interop consequence of the §3.2 divergence, not merely a stylistic one.
+The authentication-posture row is recorded as a permanent architectural decision and is not scored.
+Everything else here is held to one standard, and this repo's `CANONICAL_V1` mode meets it: the same
+canonical string, the same full-URI scope, the same `Mac::verify_slice`, and the same
+verify-then-record ordering. Replay-guard capacity behaviour is the one place where two
+implementations of a shared requirement diverge in a way that changes the security property rather
+than only the cost of achieving it.
 
 ---
 
-## 4. Database configuration & edge cases
+## 4. Database configuration & edge cases (`src/main.rs`, `src/state.rs`)
 
-### 4.1 SQLite initialization
+| Aspect | simply_ip_vault (`./example`) | simply_hook_executor (this repo) | Assessment |
+| :--- | :--- | :--- | :--- |
+| `PRAGMA journal_mode=WAL` | Applied at startup; the result is read back and logged, and a non-WAL answer (in-memory databases) is logged as normal rather than as an error | Applied at startup; read back via `try_get::<String>("", "journal_mode")` and logged identically | Equivalent |
+| `PRAGMA busy_timeout` | Applied, 5000 ms | Applied, `SQLITE_BUSY_TIMEOUT_MS = 5_000` | Equivalent |
+| Backend guard | `if db.get_database_backend() != DatabaseBackend::Sqlite { return; }` | Same guard, same early return | Equivalent; neither inspects URL text, so `AGENT.MD`'s SQL-agnostic rule survives a PostgreSQL move |
+| **Pragma failure handling** | **Non-fatal by construction** — `apply_sqlite_pragmas` returns `()`. Every failure inside is logged and swallowed; the function is structurally incapable of aborting startup | Non-fatal in effect — returns `Result<(), DbErr>`, but every internal failure is logged and swallowed, and `main.rs:238` treats an `Err` as `tracing::warn!` plus "Starting anyway" | Behaviourally identical. The reference is marginally stronger by construction: its signature makes it impossible for a future caller to reintroduce a `?`. Cosmetic, but a free type-level guarantee |
+| Pragma ordering relative to migrations | Pragmas applied before `Migrator::up` | Pragmas applied before `Migrator::up` (`main.rs:238`, then `main.rs:246`) | Equivalent |
+| Module location | `state.rs` | `db.rs` | Cosmetic; flagged as a documented divergence by both `verify_convergence.sh` scripts |
+| Cipher-init failure at startup | Propagated out of `setup_state`, so the process exits — falling back to plaintext would write secrets in the clear for an operator who believes they are encrypted | `crypto::SecretCipher::from_env()?` at `main.rs:251`, so the process exits | Equivalent; both fail closed on the one condition that must be fatal |
+| **`TRUSTED_PROXIES` DNS negative caching** | `NEGATIVE_TTL = 5s`, tracked per hostname in `HostnameState { resolved, attempted_at }` and selected by `is_fresh(positive, negative)` | `TRUSTED_PROXY_DNS_NEGATIVE_TTL = 5s`, per hostname in `HostnameEntry { resolved, at }`, selected by an identically-shaped `is_fresh(positive, negative)` | Equivalent. Both bound a dead name to one query per 5s per name regardless of inbound rate, so neither can be turned into a DNS amplifier against its own resolver |
+| Per-hostname failure isolation | One failing name does not drag healthy names onto the short retry interval | Identical — `refresh_stale` skips still-fresh entries name by name | Equivalent |
+| **Boot grace / delayed re-check** | `prime_with_grace()`: detached task primes, logs the specific failing names, sleeps `BOOT_GRACE_PERIOD = 60s`, re-primes, logs a definitive verdict. **Never aborts** | `prime_trusted_proxies()`: detached task calls `prime()`, logs failing names, sleeps `TRUSTED_PROXY_BOOT_GRACE = 60s`, calls `prime()` again with `force = true`, logs a definitive verdict. **Never aborts** | Equivalent. Both treat an unresolvable proxy as one disabled entry rather than a crash loop, and both fail closed for that entry alone |
+| Boot re-check freshness | `prime()` clears `cache.hosts` first, forcing a real lookup rather than reusing what a concurrent request just cached | `refresh_stale(cache, force = true)` bypasses the TTL check for the same reason | Equivalent |
+| **`DefaultBodyLimit`** | `DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)` = 3 MiB, applied **outside** `.nest("/api", …)` so the static fallback is covered too; set exactly once, no route overrides it | `DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)` = 3 MiB, applied outside **both** `.nest("/api", …)` and `.nest("/webhook", …)` as well as the static fallback; set exactly once | Equivalent — same value, same placement discipline, and on both sides a limit that cannot be sidestepped by aiming at a different route |
+| **Signature-buffering constant** | `middleware::MAX_SIGNED_BODY_BYTES = crate::MAX_REQUEST_BODY_BYTES` | `middleware::MAX_SIGNED_BODY_BYTES = crate::MAX_REQUEST_BODY_BYTES` | Equivalent — derived from the same value on both sides, so no band of sizes exists that one layer buffers and HMACs only for the other to reject |
+| Soft-delete retention default | 92 days, overridable via `IP_RETENTION_DAYS` | 92 days, overridable via `DELETED_HOOK_RETENTION_DAYS` | Equivalent, and both are now env-configurable independently of log retention |
+| Purge predicate | `is_deleted = true` **AND** `deleted_at IS NOT NULL` **AND** `deleted_at < threshold` | `IsDeleted.eq(true)` **AND** `DeletedAt.is_not_null()` **AND** `DeletedAt.lt(threshold)` | Equivalent — three explicit guards on both sides, so a live or restored record is never purged on the strength of a stale `deleted_at` |
+| Non-positive retention value | `<= 0` disables purging; the sweep is a no-op | `<= 0` disables purging; the sweep is a no-op | Equivalent |
 
-Both projects apply the same two pragmas at startup, both gated on
-`DatabaseBackend::Sqlite` rather than on the URL string:
-
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Location | `state.rs:35` `apply_sqlite_pragmas` | `db.rs` `apply_sqlite_pragmas` |
-| `journal_mode=WAL` | yes, result read back and logged | yes, result read back and logged |
-| `busy_timeout` | 5000 ms via `execute_unprepared` | 5000 ms via `execute_raw` |
-| On failure | **propagates** — `?` in `main.rs:202`, startup aborts | **logs and continues** |
-| Tests | — | file-backed WAL persistence + in-memory no-op |
-
-Both correctly note that WAL is persistent (it lives in the database file header, so it survives
-reconnection and covers the whole pool) whereas `busy_timeout` is per-connection. hook_executor's
-notes additionally record that SQLx's own `busy_timeout` default is already 5s, which is what makes
-the pool-wide guarantee hold rather than the single statement issued here — a distinction the vault
-does not draw.
-
-**Difference.** Failure handling. The vault aborts startup if a pragma fails; hook_executor logs and
-continues, degrading to rollback-journal mode.
-
-**Analysis.** Marginal edge to the vault. A `journal_mode` that silently failed to apply produces
-writer-blocks-reader stalls under load that are hard to diagnose later — failing loudly at startup
-is the better signal, and there is no availability argument for continuing, since the pragma cannot
-fail on a healthy SQLite database. hook_executor's read-back-and-log does surface the same
-information, just at a level an operator may not be watching.
-
-### 4.2 Request body limits
-
-| | `simply_ip_vault` | `simply_hook_executor` |
-|---|---|---|
-| Router-level limit | **none declared** — Axum's implicit 2 MiB default | explicit `DefaultBodyLimit::max(1 MiB)` [`lib.rs:118`](src/lib.rs#L118) |
-| Signing buffer cap | 2 MiB, independent constant | `crate::MAX_REQUEST_BODY_BYTES` — **the same constant** [`middleware.rs:38`](src/middleware.rs#L38) |
-| Applies to unauthenticated requests | via Axum default | yes, layer is outside both nests |
-
-**Difference.** The vault declares no explicit limit and hard-codes an independent 2 MiB in the
-middleware. Those two numbers happen to coincide today, but nothing enforces that they stay
-coincident — and if the middleware constant were ever raised above the extractor's, a body between
-the two would be fully buffered and HMAC'd before being rejected, paying the memory cost of a
-payload already decided against.
-
-hook_executor derives the middleware cap **from** the router constant, so the two cannot drift.
-
-**Analysis.** **hook_executor is stronger** — not because 1 MiB beats 2 MiB, but because the
-relationship between the two limits is expressed in code rather than maintained by coincidence.
-
-### 4.3 Retention and soft delete
-
-Both implement soft delete with a 92-day purge and a background sweep. Structurally identical:
-`is_deleted` / `deleted_at` / `deleted_by` columns, hidden from reads, master-only restore, master-only
-`?hard=true`, and a purge that filters on **both** `is_deleted = true` and `deleted_at < threshold`.
-Both document the same reason for the redundant flag check: a restored row keeps its old
-`deleted_at`, and matching on the timestamp alone would destroy live data.
-
-**Differences:**
-
-- The vault's 92-day window is configurable via `IP_RETENTION_DAYS`; hook_executor hard-codes
-  `DELETED_HOOK_RETENTION_DAYS = 92` deliberately, so that shortening log retention to save disk
-  does not silently shrink the undo window for deleted automation.
-- hook_executor runs **two** sweeps on one schedule (executions + trashed hooks) and keeps the
-  worker alive when `LOG_RETENTION_DAYS=0` so the hook purge still runs.
-- Neither project's `?hard=true` is reachable by a non-master.
-
-**Analysis.** Tie, with a note: the vault's configurability is a legitimate operator convenience,
-but hook_executor's argument for decoupling the two windows is the sounder default. Both would
-benefit from the vault's env override applied to a *separate* variable rather than a shared one.
+The two services now share one startup contract: pragmas are a performance setting that can never
+take the daemon down, an unresolvable proxy hostname disables one entry rather than the process, and
+a malformed encryption key is the single condition that *must* abort. The only divergence is the
+pragma helper's return type — a type-level guarantee on the reference side, a caller-side convention
+here — which is identical in behaviour today and differs only in resistance to a careless future
+edit.
 
 ---
 
-## 5. Shared gaps — present in both
+## Executive summary
 
-These are not comparative findings; both projects have them.
-
-1. **No replay nonce cache.** Within the ±300s window an identical signed request replays
-   successfully in both. Bounded but real for non-idempotent routes.
-2. **No "last master key" guard.** Both refuse self-deletion, but a master can delete the only
-   *other* master, and two masters can lock each other out, leaving the system with no master
-   credential and no recovery path short of direct database access.
-3. **`TRUSTED_PROXIES` is only as tight as the operator makes it.** `TRUSTED_PROXIES=0.0.0.0/0`
-   re-opens full header spoofing in both, with only a startup log to notice it. Neither warns on an
-   over-broad entry specifically.
-4. **A non-master key manager may edit `bound_ips` on non-master keys** in both, widening another
-   key's network reach without master involvement.
-5. **Audit-log volume is unbounded** in both — `retention.rs` purges records/executions but not
-   `audit_logs`.
-
----
-
-## 6. Unification recommendations
-
-Ordered by security value, not effort. **No code was changed to produce this report; these are
-proposals for arbitration.**
-
-### Adopt into `simply_ip_vault` (from hook_executor)
-
-| Pri | Change | Ref |
-|---|---|---|
-| **1** | Sign `path_and_query`, not `path` — closes the `?hard=true` and query-overrides-body integrity breaks | §3.2 |
-| **2** | Reject `VAULT_ENCRYPTION_KEY` values that are not 64 hex chars; fail hard rather than deriving a key from a one-character passphrase | §3.5 |
-| **3** | Require a recognized prefix in `open_signing_secret`; never return an unrecognized value as the secret | §3.5 |
-| 4 | Resolve hostname matchers inside the XFF chain walk so hostname-named hops are skipped | §1.3 |
-| 5 | Declare an explicit `DefaultBodyLimit` and derive the middleware's signing cap from it | §4.2 |
-| 6 | Build the cipher once into `AppState` instead of reading the env var per seal/open | §3.5 |
-| 7 | Hex-encode plaintext-mode secrets so they are not greppable in a database dump | §3.5 |
-
-### Adopt into `simply_hook_executor` (from the vault)
-
-| Pri | Change | Ref |
-|---|---|---|
-| **1** | Move the `bound_ips` check **after** signature verification — authenticate, then authorize | §3.4 |
-| **2** | Default `REQUIRE_SIGNED_REQUESTS` to `true` | §3.3 |
-| **3** | Add per-verb grant proportionality: require `can_execute` to grant `can_execute` | §2.3 |
-| 4 | Make `require_master_to_grant_scopes` baseline-aware so an idempotent `PUT` of an existing scope is not a `403` | §2.1 |
-| 5 | Abort startup when a SQLite pragma fails instead of logging and continuing | §4.1 |
-| 6 | Cache resolved hostnames **per name** rather than as one merged list | §1.2 |
-| 7 | Return `(accepted, rejected)` from `parse_trusted_proxies` and log rejects as an aggregated `error!` | §1.1 |
-
-### Adopt into both
-
-| Pri | Change | Ref |
-|---|---|---|
-| **1** | Refuse deletion of the last remaining master key | §5.2 |
-| 2 | Add a bounded replay-nonce cache keyed on `(key_id, signature)` with the anti-replay window as its TTL | §5.1 |
-| 3 | Warn loudly at startup when `TRUSTED_PROXIES` contains `0.0.0.0/0` or `::/0` | §5.3 |
-| 4 | Apply retention to `audit_logs` | §5.5 |
-| 5 | Require master to modify `bound_ips` on any key | §5.4 |
-
----
-
-## 7. Verification notes
-
-Every claim above was read directly from source at the cited line. Three were checked with
-particular care because they assert a weakness rather than a difference:
-
-- **§3.2 / V-1** — confirmed by reading three separate sites: the vault's middleware uses
-  `original.0.path()` (query excluded), `DeleteRecordQuery` declares `hard: Option<bool>` behind
-  `Query<...>`, and `delete_ip` calls `query_params.merge(body_params)` where `merge` is
-  `self.<field>.or(other.<field>)` — establishing that the query operand wins over the signed body.
-- **§3.4 / H-1** — confirmed by reading both middlewares end to end and comparing the statement
-  order; the vault's own comment names the 403-vs-401 oracle as the reason for its ordering.
-- **§1.3** — confirmed from `is_literal_network`'s body, which matches only `ProxyMatcher::Network`
-  and returns `false` for every `Hostname`. The vault's own doc comment acknowledges the resulting
-  behaviour; this report's contribution is noting that it bites exactly the Docker/Traefik
-  deployment hostname support was added to serve.
-
-No test suite was executed and no file other than this report and `AGENT_NOTES.MD` was written.
+Across the four categories this audit compared **65 rows** — 15 on proxy and IP middleware, 17 on
+RBAC and privilege-escalation guards, 20 on cryptography and authentication, and 13 on database
+configuration and edge cases. **Fifty-four are equivalent or byte-identical**, reflecting that both
+services have now completed their halves of the arbitrated convergence: the `X-Forwarded-For` chain
+walk, `bound_ips` enforcement including on master keys, authenticate-before-authorize ordering,
+full-URI canonicalization, `Mac::verify_slice` with no `==` anywhere near a digest,
+XChaCha20-Poly1305 under a strictly-validated key, a 3 MiB `DefaultBodyLimit` sharing its constant
+with the signature buffer, non-fatal SQLite pragmas, negative DNS caching with a 60-second boot
+grace, and a 92-day soft-delete purge are the same on both sides. **One row is the intentional,
+permanent architectural asymmetry** — mandatory full-HMAC on every `simply_ip_vault` key versus this
+repo's per-key posture — and is recorded rather than scored; where a `simply_hook_executor` key does
+use `CANONICAL_V1`, it meets the reference's standard in every respect measured here. That leaves
+**ten genuine discrepancies**, four of which are cosmetic or purely ergonomic (env-var primary/alias
+ordering, pragma module placement, hostname-syntax strictness at the edges, and the
+idempotent-resubmission baseline in the scope-elevation guard), and **six that merit a follow-up
+convergence pass**. Ranked by consequence: (1) the reference's `ReplayGuard` **clears its entire map
+at 100k entries**, so any one key holding a valid signing secret can flood the guard and reopen the
+replay window for every other key including master, where this repo prunes and keeps enforcing — the
+only finding here that converts into a concrete cross-key attack; (2) this repo's per-hook grant path
+checks resource-level management but **not per-verb proportionality**, so a `can_manage`-only holder
+can grant `can_execute` to a second key it controls, which the reference's
+`guard_delegated_group_grant` blocks; (3) the reference's `revoke_key_group_permission` is gated only
+on `can_manage_keys` and applies **no per-group and no master-target check**, permitting cross-tenant
+revocation that this repo's `require_manage` prevents; (4) the reference's `SecretCipher::open()`
+returns an unprefixed stored value **verbatim as the signing secret** rather than erroring — a
+documented AES-migration affordance that is nonetheless a fail-open path; (5) the reference prunes
+its replay map on **every** authenticated request (O(n)) where this repo sweeps once per
+quarter-window; and (6) this repo validates `X-Timestamp` **after** the API-key database lookup
+rather than before, so a stale timestamp costs a query it need not. Findings 1, 3, 4 and 5 are for
+the reference to close; findings 2 and 6 are for this repository.

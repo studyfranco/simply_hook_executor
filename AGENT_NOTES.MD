@@ -1867,3 +1867,54 @@ Current: **2 converged, 3 known divergences, 0 drifted, 0 skipped.** Each known 
 row above marked "peer must converge"; when the peer adopts the arbitrated behaviour its fingerprint
 will change and the entry should be deleted from both the script and this table rather than
 re-recorded.
+
+---
+
+## 2026-08-02 — Post-convergence comparative security audit (read-only)
+
+Re-ran the cross-service comparison against `./example/simply_ip_vault` now that **both** halves of
+the convergence pass have landed. Output: `SECURITY_COMPARISON_REPORT.md` (rewritten — the previous
+version described this repo at `49d347a`, before `8b70b2c`, and its findings H-1, H-2's body limit,
+and "no replay cache" are stale). No source file in `src/` or `./example` was touched; no commit made.
+
+### Reference freshness
+
+`./example/simply_ip_vault` has **no `.git` of its own** — `git -C ./example/… rev-parse HEAD` walks
+up and answers with *this* repo's HEAD, and `example/*` is gitignored here, so **no commit hash for
+the reference exists on disk**. Closest marker: mtimes of 2026-08-02 11:39–11:46, four to eleven
+minutes *after* our own convergence commit `8b70b2c` (11:35:50), plus a "Session 24 — Cross-service
+security convergence (`simply_ip_vault` half)" entry in its `AGENT_NOTES.MD` whose claims were spot-
+checked against its source and hold. Verdict recorded as **corroborated but not pinned** — not the
+stale reference an earlier cross-audit hit.
+
+Caveat worth remembering: **the reference's own parity table is stale about us.** It still describes
+this repo as having a 1 MiB body limit, no replay guard, and `bound_ips` before the signature. All
+three were closed by `8b70b2c`.
+
+### Result
+
+65 rows compared; 54 equivalent or byte-identical; 1 intentional asymmetry (authentication posture,
+not scored); 10 genuine discrepancies, of which 4 are cosmetic. Six worth a future convergence pass:
+
+| # | Finding | Owner |
+| :--- | :--- | :--- |
+| 1 | Peer's `ReplayGuard` **clears the whole map** at 100k entries (fails open). The map is global across keys, so one key with a valid signing secret can flood it and reopen the replay window for every other key, master included. Ours prunes early and keeps enforcing. | peer |
+| 2 | Our `update_key_hook_permissions` checks `require_manage` on the hook but **not per-verb proportionality** — a `can_manage`-only holder can grant `can_execute` to a second key it controls. Peer's `guard_delegated_group_grant` checks each verb against the caller's own row. | **us** |
+| 3 | Peer's `revoke_key_group_permission` has no per-group and no master-target check — any `can_manage_keys` holder can strip any key's access to any group. Our revoke mirrors the grant path via `require_manage`. | peer |
+| 4 | Peer's `SecretCipher::open()` ends in `Ok(stored.to_owned())`, so an unprefixed/corrupted row is used verbatim as the HMAC secret. Ours errors `MalformedCiphertext`. Deliberate AES-migration affordance, but fail-open. | peer |
+| 5 | Peer prunes its replay map on *every* `observe` (O(n) per authenticated request); ours sweeps once per `window / 4`. | peer |
+| 6 | We validate `X-Timestamp` **after** the API-key DB lookup; the peer validates it before, so a stale timestamp costs it no query. | **us** |
+
+Findings 2 and 6 are the only items on our side and neither is currently exploitable without an
+already-privileged key; they are recorded here rather than fixed because this pass was read-only.
+
+### Confirmed converged (spot-checked in source, not taken from either set of notes)
+
+`resolve_client_ip` byte-identical including the hostname-hop skip; `bound_ips` with no master
+exemption and placed last in the pipeline on both sides; `path_and_query()` signing with `OriginalUri`
+recovery; `Mac::verify_slice` as the only digest comparison in either `src/` (grep-verified, no `==`
+on any secret/signature/digest/token); XChaCha20-Poly1305 with a 64-hex-mandatory key that aborts
+startup; `DefaultBodyLimit::max(3 MiB)` outside every nest with `MAX_SIGNED_BODY_BYTES` derived from
+it; non-fatal SQLite pragmas before migrations; 30s/5s positive/negative DNS TTLs per hostname with a
+60s boot grace that never aborts; 92-day purge filtered on all three of `is_deleted`,
+`deleted_at IS NOT NULL`, and `deleted_at < threshold`.
