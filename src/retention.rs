@@ -4,8 +4,9 @@
 //!
 //! - **Execution history**, which grows without bound because every invocation stores its full
 //!   stdout and stderr. Purged past `LOG_RETENTION_DAYS` (default 30).
-//! - **Soft-deleted hooks**, purged past [`DELETED_HOOK_RETENTION_DAYS`] (92), which is what stops
-//!   the trash from being an unbounded graveyard of dead definitions and their histories.
+//! - **Soft-deleted hooks**, purged past `DELETED_HOOK_RETENTION_DAYS`
+//!   ([`DEFAULT_DELETED_HOOK_RETENTION_DAYS`], 92), which is what stops the trash from being an
+//!   unbounded graveyard of dead definitions and their histories.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,11 +24,12 @@ use crate::entities::{execution, hook};
 /// start of a quarter is still recoverable during the review at its end, which is the realistic
 /// moment someone discovers an automation went missing.
 ///
-/// Deliberately *not* configurable alongside `LOG_RETENTION_DAYS`. The two answer different
-/// questions — "how much history do we keep?" versus "how long is a mistake reversible?" — and an
-/// operator shortening log retention to save disk should not silently shrink the undo window for
-/// deleted automation as a side effect.
-pub const DELETED_HOOK_RETENTION_DAYS: i64 = 92;
+/// Overridable through `DELETED_HOOK_RETENTION_DAYS`, but deliberately *not* shared with
+/// `LOG_RETENTION_DAYS`. The two answer different questions — "how much history do we keep?" versus
+/// "how long is a mistake reversible?" — and an operator shortening log retention to save disk
+/// should not silently shrink the undo window for deleted automation as a side effect. See
+/// [`crate::config::RuntimeConfig::deleted_hook_retention_days`].
+pub const DEFAULT_DELETED_HOOK_RETENTION_DAYS: i64 = 92;
 
 /// Deletes every execution older than `retention_days`, returning how many rows were removed.
 ///
@@ -61,10 +63,13 @@ pub async fn purge_expired_executions(
 /// A non-positive `retention_days` disables purging and is a no-op, mirroring
 /// [`purge_expired_executions`] so an operator can keep the trash forever if they want to.
 ///
-/// The `is_deleted` filter is not redundant with the `deleted_at` one. A live hook always has
-/// `deleted_at = NULL` and so cannot match a `<` comparison — but relying on that would make the
-/// query's safety depend on an invariant held elsewhere in the code, and this is the one query in
-/// the system that destroys audit history. Both conditions are stated explicitly.
+/// All three filters are stated explicitly, and the redundancy is deliberate. A live hook always
+/// has `deleted_at = NULL`, and SQL's three-valued logic already makes `NULL < threshold` evaluate
+/// to `NULL` rather than true — so in principle either condition alone would be safe. But this is
+/// the one query in the system that destroys audit history, and making its safety depend on an
+/// invariant held elsewhere in the code (or on a reader recalling how `NULL` compares) is the wrong
+/// trade for a few bytes of SQL. `is_deleted = true AND deleted_at IS NOT NULL AND deleted_at <
+/// threshold` says what it means without anyone having to reason it out.
 pub async fn purge_expired_deleted_hooks(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -76,6 +81,7 @@ pub async fn purge_expired_deleted_hooks(
     let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
     let result = hook::Entity::delete_many()
         .filter(hook::Column::IsDeleted.eq(true))
+        .filter(hook::Column::DeletedAt.is_not_null())
         .filter(hook::Column::DeletedAt.lt(threshold))
         .exec(db)
         .await?;
@@ -99,13 +105,14 @@ pub async fn run_retention_worker(
     if config.log_retention_days <= 0 {
         tracing::info!(
             "Log retention is disabled (LOG_RETENTION_DAYS=0); the worker will still purge \
-             soft-deleted hooks after {DELETED_HOOK_RETENTION_DAYS} days."
+             soft-deleted hooks after {} days.",
+            config.deleted_hook_retention_days
         );
     }
 
     tracing::info!(
         retention_days = config.log_retention_days,
-        deleted_hook_retention_days = DELETED_HOOK_RETENTION_DAYS,
+        deleted_hook_retention_days = config.deleted_hook_retention_days,
         sweep_seconds = config.retention_sweep_seconds,
         "Retention worker started."
     );
@@ -125,11 +132,12 @@ pub async fn run_retention_worker(
                 }
                 // Run regardless of how the execution sweep went: one failing must not silently
                 // stop the other, or a transient error would leave the trash growing unnoticed.
-                match purge_expired_deleted_hooks(&db, DELETED_HOOK_RETENTION_DAYS).await {
+                match purge_expired_deleted_hooks(&db, config.deleted_hook_retention_days).await {
                     Ok(0) => tracing::debug!("Retention sweep: no deleted hooks to purge."),
                     Ok(n) => tracing::info!(
-                        "Retention sweep: permanently removed {n} hook(s) deleted more than \
-                         {DELETED_HOOK_RETENTION_DAYS} days ago."
+                        "Retention sweep: permanently removed {n} hook(s) deleted more than {} \
+                         days ago.",
+                        config.deleted_hook_retention_days
                     ),
                     Err(e) => tracing::error!("Deleted-hook retention sweep failed: {e}"),
                 }

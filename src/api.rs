@@ -1116,7 +1116,7 @@ pub async fn delete_hook(
         Some(format!(
             "Moved hook {reference} to the trash; it is recoverable until purged after \
              {} days",
-            crate::retention::DELETED_HOOK_RETENTION_DAYS
+            state.config.deleted_hook_retention_days
         )),
     )
     .await?;
@@ -1194,7 +1194,7 @@ pub async fn purge_deleted_hooks(
 
     let days = query
         .older_than_days
-        .unwrap_or(crate::retention::DELETED_HOOK_RETENTION_DAYS);
+        .unwrap_or(state.config.deleted_hook_retention_days);
     if days < 0 {
         return Err(AppError::InvalidInput(
             "older_than_days must not be negative".to_owned(),
@@ -2384,6 +2384,8 @@ pub struct SettingsResponse {
     pub trusted_proxies: Vec<String>,
     /// Age, in days, beyond which execution history is purged (`0` = never).
     pub log_retention_days: i64,
+    /// Days a soft-deleted hook stays recoverable before the sweep drops it for good (`0` = never).
+    pub deleted_hook_retention_days: i64,
     /// Interval between retention sweeps, in seconds.
     pub retention_sweep_seconds: u64,
     /// Per-stream cap on captured output, in bytes.
@@ -2432,6 +2434,7 @@ pub async fn get_settings(
             .map(ToString::to_string)
             .collect(),
         log_retention_days: state.config.log_retention_days,
+        deleted_hook_retention_days: state.config.deleted_hook_retention_days,
         retention_sweep_seconds: state.config.retention_sweep_seconds,
         max_output_bytes: state.config.max_output_bytes,
         signature_max_age_seconds: state.config.signature_max_age_seconds,

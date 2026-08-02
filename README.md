@@ -89,6 +89,11 @@ Details that matter when writing a client:
   with `SIGNATURE_MAX_AGE_SECONDS`.
 - A signed request **must** carry `X-Timestamp`; a missing or malformed one is a `401`, never
   treated as "now".
+- **A signature is single-use.** The window alone bounds how *long* a captured request stays valid,
+  not how many times it may be used — so within the window each `CANONICAL_V1` signature is
+  accepted exactly once and a resend is refused with `401`. Sign each request; do not cache and
+  replay one. (`BODY_ONLY` keys are exempt: they carry no timestamp, and the webhook senders that
+  mode exists for redeliver deliberately.)
 
 Every request identifies its key with `X-API-Key` — that is the only key lookup path. A signature
 is optional by default and adds request integrity on top of bearer authentication; set
@@ -247,11 +252,12 @@ automatically if present):
 | `DATABASE_URL` | `sqlite://simply_hook_executor.db?mode=rwc` | SeaORM connection string. |
 | `ALLOWED_ENV_VARS` | `PATH,LANG,TERM,SYSTEMROOT` | Comma-separated allowlist of host variables passed through to hook sub-processes. Everything else is cleared. An empty value means total isolation. |
 | `SIGNING_SECRET_KEY` (or `VAULT_ENCRYPTION_KEY`) | *(unset — no encryption)* | 64 hex characters (32 bytes) used to encrypt `api_keys.signing_secret` at rest. Strongly recommended: without it, database read access is enough to forge webhook signatures. A malformed value aborts startup rather than silently storing secrets in the clear. `SIGNING_SECRET_KEY` wins if both are set. |
-| `SIGNATURE_MAX_AGE_SECONDS` | `300` | Anti-replay window for `X-Timestamp`, applied symmetrically (past *and* future). |
+| `SIGNATURE_MAX_AGE_SECONDS` | `300` | Anti-replay window for `X-Timestamp`, applied symmetrically (past *and* future). Also how long a `CANONICAL_V1` signature is remembered as already-used: within this window a signature is accepted exactly once, so an intercepted request cannot be resent. |
 | `REQUIRE_SIGNED_REQUESTS` | `false` | When `true`, every authenticated request must carry a valid signature — bearer-only auth is refused. Requires an HTTPS-served dashboard, since the browser cannot sign otherwise. |
 | `ALLOWED_SCRIPT_ROOTS` | *(unset — unrestricted)* | Comma-separated absolute directories that a hook's `script_path` must live under. Strongly recommended in production: without it, any key holding `can_manage_hooks` can point a hook at any absolute path. Relative entries are ignored with a warning (a boundary that moves with the working directory is not a boundary). |
-| `TRUSTED_PROXIES` | *(unset — trust nothing)* | Comma-separated CIDRs, bare IPs, **or hostnames** (`127.0.0.1,172.16.0.0/12,traefik`) whose `X-Forwarded-For` / `X-Real-IP` headers are believed. **Set this to the reverse proxy actually in front of the daemon, and nothing else.** With it unset the headers are ignored entirely and `bound_ips` is evaluated against the direct TCP peer — correct for a directly-exposed daemon, and safe for a proxied one (every key simply appears to connect from the proxy). A range wider than the real proxy fleet re-opens the bypass for every host inside it. Hostnames are re-resolved every 30s so a restarted container is picked up without a restart here; a name that fails to resolve is simply not trusted. |
+| `TRUSTED_PROXIES` | *(unset — trust nothing)* | Comma-separated CIDRs, bare IPs, **or hostnames** (`127.0.0.1,172.16.0.0/12,traefik`) whose `X-Forwarded-For` / `X-Real-IP` headers are believed. **Set this to the reverse proxy actually in front of the daemon, and nothing else.** With it unset the headers are ignored entirely and `bound_ips` is evaluated against the direct TCP peer — correct for a directly-exposed daemon, and safe for a proxied one (every key simply appears to connect from the proxy). A range wider than the real proxy fleet re-opens the bypass for every host inside it. Hostnames are re-resolved every 30s so a restarted container is picked up without a restart here; a name that fails to resolve is simply not trusted, and the failure is itself cached briefly so an unresolvable entry cannot turn request traffic into a DNS storm. A hostname that does not resolve at startup is logged as an error and re-checked once after a minute — the daemon serves throughout, with that entry untrusted, rather than crash-looping. |
 | `LOG_RETENTION_DAYS` | `30` | Age beyond which `executions` rows are purged. `0` keeps history forever. |
+| `DELETED_HOOK_RETENTION_DAYS` | `92` | Days a soft-deleted hook stays recoverable before the sweep drops it and its history for good. `0` keeps the trash forever. Governed separately from `LOG_RETENTION_DAYS` on purpose: shortening log retention to reclaim disk must not silently shrink the undo window for deleted automation. |
 | `RETENTION_SWEEP_SECONDS` | `3600` | Interval between retention sweeps. |
 | `MAX_OUTPUT_BYTES` | `1048576` | Per-stream cap on captured stdout/stderr. Excess is discarded (but still drained) and flagged in the stored output. |
 | `BIND_HOST` (or `HOST`) | `0.0.0.0` | Interface to listen on. Must be a literal IP (`0.0.0.0`, `127.0.0.1`, `::`, `::1`) — hostnames are not resolved, since picking one of several resolved addresses is a security decision, not a convenience. `BIND_HOST` wins if both are set. |

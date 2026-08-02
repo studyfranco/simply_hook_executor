@@ -147,6 +147,62 @@ async fn bootstrap_master_key(
     Ok(())
 }
 
+/// Resolves every `TRUSTED_PROXIES` hostname at startup, and schedules one re-check if any failed.
+///
+/// Startup is where a misspelled or not-yet-running proxy should be reported, while an operator is
+/// still watching the log — the alternative is discovering it later as inexplicable `403`s from
+/// clients whose `bound_ips` were evaluated against the proxy's address instead of their own.
+///
+/// What it deliberately does **not** do is fail. A name that does not resolve at boot is usually a
+/// sibling container that has not finished starting, and this daemon and its reverse proxy come up
+/// together with no ordering guarantee. Aborting would convert an ordinary startup race into a
+/// crash loop, which is strictly worse than serving: the entry is already fail-closed — an
+/// unresolvable name is trusted by nobody — so the running daemon is more available and no less
+/// safe. Trust for that one entry is withheld; the service as a whole keeps working.
+///
+/// After [`config::TRUSTED_PROXY_BOOT_GRACE`] the failed names are tried once more, loudly, so the
+/// log carries a definitive verdict rather than only the initial pessimistic one. The steady-state
+/// negative cache retries continuously regardless; this exists to make the outcome *legible*.
+fn prime_trusted_proxies(trusted_proxies: &config::TrustedProxies) {
+    // `RuntimeConfig::from_env` has already reported what is configured (or that nothing is), so
+    // there is nothing to add when there are no names to look up.
+    if trusted_proxies.is_empty() {
+        return;
+    }
+
+    let proxies = trusted_proxies.clone();
+    tokio::spawn(async move {
+        let unresolved = proxies.prime().await;
+        if unresolved.is_empty() {
+            tracing::info!("All TRUSTED_PROXIES entries resolved.");
+            return;
+        }
+
+        tracing::error!(
+            "TRUSTED_PROXIES {unresolved:?} could not be resolved at startup. Forwarding headers \
+             from those hosts are NOT trusted, and requests through them will be matched against \
+             the proxy's own address. Serving anyway; re-checking in {}s.",
+            config::TRUSTED_PROXY_BOOT_GRACE.as_secs()
+        );
+
+        tokio::time::sleep(config::TRUSTED_PROXY_BOOT_GRACE).await;
+
+        let still_unresolved = proxies.prime().await;
+        if still_unresolved.is_empty() {
+            tracing::info!(
+                "TRUSTED_PROXIES {unresolved:?} resolved on re-check; they are trusted from now on."
+            );
+        } else {
+            tracing::error!(
+                "TRUSTED_PROXIES {still_unresolved:?} are still unresolvable after the {}s grace \
+                 period. Continuing with those entries disabled — check the names and the \
+                 daemon's DNS configuration. They are retried automatically as traffic arrives.",
+                config::TRUSTED_PROXY_BOOT_GRACE.as_secs()
+            );
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -173,7 +229,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Before migrations: the migration run is itself a long write, and is exactly the moment a
     // concurrently-starting replica would otherwise hit SQLITE_BUSY.
-    db::apply_sqlite_pragmas(&db).await?;
+    //
+    // Explicitly non-fatal, and the `if let` rather than `?` is the point. These are *performance*
+    // pragmas: WAL removes reader/writer contention and the busy timeout absorbs writer collisions,
+    // but the daemon is entirely correct without either. Refusing to boot over one — on a
+    // filesystem that will not support WAL, or an in-memory database that legitimately cannot — is
+    // trading a real outage for a theoretical slowdown. The failure is logged loudly instead.
+    if let Err(e) = db::apply_sqlite_pragmas(&db).await {
+        tracing::warn!(
+            "Could not apply the SQLite concurrency pragmas: {e}. Starting anyway — expect \
+             reduced write concurrency, but correctness is unaffected."
+        );
+    }
 
     tracing::info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;
@@ -198,9 +265,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         allowed_env_vars = ?config.allowed_env_vars,
         log_retention_days = config.log_retention_days,
+        deleted_hook_retention_days = config.deleted_hook_retention_days,
         max_output_bytes = config.max_output_bytes,
         "Runtime configuration loaded."
     );
+
+    prime_trusted_proxies(&config.trusted_proxies);
 
     let state = AppState::new(db, config.shared(), std::sync::Arc::new(cipher));
     let (retention_tx, retention_handle) = spawn_retention_worker(&state);

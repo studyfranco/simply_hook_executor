@@ -96,7 +96,9 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration;
     use sea_orm::Database;
+    use sea_orm_migration::MigratorTrait;
 
     /// A file-backed database is the only place WAL can actually engage, so that is where the
     /// assertion has to be made — an in-memory database would pass a weaker test vacuously.
@@ -159,9 +161,44 @@ mod tests {
 
     /// An in-memory database cannot use WAL. That must be a logged no-op, not a startup failure —
     /// the entire test suite runs on `sqlite::memory:`.
+    ///
+    /// This is the resilience contract in miniature: the pragmas are a *performance* setting, and
+    /// the daemon is entirely correct without them. A database that declines WAL must still come up
+    /// and still be usable, because refusing to boot over a setting that did not apply trades a
+    /// real outage for a theoretical slowdown.
     #[tokio::test]
-    async fn an_in_memory_database_is_left_alone_without_erroring() {
+    async fn a_database_that_cannot_use_wal_still_starts_and_works() {
         let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        assert!(apply_sqlite_pragmas(&db).await.is_ok(), "a declined pragma is never fatal");
+
+        // WAL genuinely did not engage — so the assertion above is tolerance, not a silent success.
+        let mode: String = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA journal_mode;",
+            ))
+            .await
+            .expect("query succeeds")
+            .expect("a row is returned")
+            .try_get("", "journal_mode")
+            .expect("the column is a string");
+        assert_ne!(mode.to_ascii_lowercase(), "wal", "an in-memory database cannot use WAL");
+
+        // And the connection is still fully usable afterwards, which is the point of continuing.
+        migration::Migrator::up(&db, None).await.expect("migrations still run");
+
+        // Re-applying is idempotent: a restart against the same database must not fail either.
+        assert!(apply_sqlite_pragmas(&db).await.is_ok());
+    }
+
+    /// A non-SQLite backend must be skipped outright rather than issued a `PRAGMA` it cannot parse.
+    /// This is what keeps `AGENT.MD`'s SQL-agnostic rule intact once PostgreSQL is in play.
+    #[tokio::test]
+    async fn the_pragmas_are_scoped_to_sqlite_by_backend_not_by_url_text() {
+        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        assert_eq!(db.get_database_backend(), DatabaseBackend::Sqlite);
+        // The guard reads `get_database_backend()`, so a PostgreSQL pool returns early before any
+        // statement is built — there is no URL parsing to get wrong.
         assert!(apply_sqlite_pragmas(&db).await.is_ok());
     }
 }

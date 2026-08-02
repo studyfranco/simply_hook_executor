@@ -48,7 +48,7 @@ Each API key carries an `hmac_mode` selecting how its signatures are verified:
 
 | Mode | Signed material | Headers | Replay protection |
 | :--- | :--- | :--- | :--- |
-| `CANONICAL_V1` *(default)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` | `X-Signature-256` + `X-Timestamp` | yes (300s window) |
+| `CANONICAL_V1` *(default)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` | `X-Signature-256` + `X-Timestamp` | yes — 300s window **and** single use |
 | `BODY_ONLY` | `RAW_BODY` only | `X-Signature-256` **or** `X-Hub-Signature-256`, no timestamp | **none** |
 
 `BODY_ONLY` exists only to accept GitHub/Forgejo/GitLab-style webhooks whose format cannot be changed. It MUST remain opt-in per key, `X-Hub-Signature-256` MUST be ignored for `CANONICAL_V1` keys (so the stricter mode cannot be downgraded by header choice), and it MUST still require *a* signature — it relaxes the format, never the requirement.
@@ -70,9 +70,12 @@ Rules the implementation MUST hold to:
 - **Newline delimiters are mandatory.** Plain concatenation is ambiguous (`POST` + `/api/x` collides with `POS` + `T/api/x`), which would let a signature be replayed across a different method/path split.
 - **`PATH_AND_QUERY` is the target the *client* requested**, including the `/api` prefix and any query string. Because `Router::nest` strips the prefix from the URI inner layers observe, the middleware MUST read `OriginalUri`, not `parts.uri`. Signing only the path would leave `?older_than_days=0` freely rewritable on an otherwise-valid signed request.
 - **`RAW_BODY` is the bytes as received**, never a re-serialized form. An absent body signs as the empty string.
-- **Anti-replay:** `X-Timestamp` must be within **300 seconds** (`SIGNATURE_MAX_AGE_SECONDS`) of server time. The window is applied **symmetrically** — a forward-dated request is refused too, since it would otherwise stay replayable for the length of its skew. A missing or malformed timestamp on a signed request is a `401`; it is never coerced to "now".
+- **Anti-replay is two checks, not one.** The window bounds *how long* a captured request stays useful; single-use enforcement bounds *how many times* it may be used. Only both together are replay protection:
+  1. **Window:** `X-Timestamp` must be within **300 seconds** (`SIGNATURE_MAX_AGE_SECONDS`) of server time, applied **symmetrically** — a forward-dated request is refused too, since it would otherwise stay replayable for the length of its skew. A missing or malformed timestamp on a signed request is a `401`; it is never coerced to "now".
+  2. **Single use:** a `CANONICAL_V1` signature is accepted exactly once. `src/replay.rs` remembers each verified `(api_key_id, digest)` for the length of the window and refuses a second presentation, so an intercepted request cannot simply be resent. The digest is recorded **only after** it verifies — recording unverified signatures would let anyone who merely *observed* a request burn it before the legitimate copy arrived, turning the control into a denial-of-service primitive aimed at the client it protects. `BODY_ONLY` is exempt: it carries no timestamp, so there is no window to be single-use within, and the third-party senders it exists for redeliver on purpose.
 - **Constant-time comparison** via `Mac::verify_slice`. Comparing hex strings with `==` would leak the signature one byte at a time.
 - **Timestamp before HMAC:** a stale request is rejected before the secret is decrypted and the body hashed.
+- **Authenticate, then authorize.** The whole authentication sequence — key lookup, timestamp, signature, single-use — runs **strictly before** the `bound_ips` CIDR check. Running the network check first let a caller holding only a leaked `X-API-Key` distinguish `403 Client IP not allowed` from `401`, and so learn whether a key it had merely found is bound to networks excluding it: a map of the deployment's topology, handed to someone who had proven nothing. An unauthenticated caller must receive `401` for every key, indistinguishably.
 - **`REQUIRE_SIGNED_REQUESTS=true`** makes signatures mandatory on every authenticated route, bearer or not. It defaults to `false` so existing bearer-only clients keep working across an upgrade.
 
 #### Signing Secret Storage
@@ -81,7 +84,8 @@ Rules the implementation MUST hold to:
 - **CIDR Restriction:** API Keys are bound to CIDR network ranges (`bound_ips`, supporting comma-separated IPv4/IPv6 ranges like `127.0.0.1/32, 10.0.0.0/8, ::/0`). Middleware MUST validate the client's IP against these bounds.
   - The check applies to **every** key, including `is_master`. `is_master` bypasses *RBAC* checks; it does not bypass the *network* boundary. An empty `bound_ips` is the only way to express "from anywhere" — a master key whose binding was silently ignored while the dashboard displayed it as enforced was the worst possible combination.
 - **Trusted-Proxy IP Extraction:** Do NOT use external IP extraction crates. A forwarding header is a **claim by the sender**, not an observation, and becomes evidence only when the sender is a proxy the operator put there:
-  - `X-Forwarded-For` / `X-Real-IP` MUST be parsed **only** when the TCP peer (`axum::extract::ConnectInfo`) matches `TRUSTED_PROXIES`. Entries may be bare IPs, CIDR ranges, **or hostnames** (`traefik`, `proxy.internal`) resolved via `tokio::net::lookup_host` — container platforms assign the proxy's address at runtime, so it cannot be written into configuration ahead of time. Resolution is cached with a short TTL so a moved container is picked up without a restart, and an unresolvable name is simply *not trusted* (a DNS outage must never be able to widen trust).
+  - `X-Forwarded-For` / `X-Real-IP` MUST be parsed **only** when the TCP peer (`axum::extract::ConnectInfo`) matches `TRUSTED_PROXIES`. Entries may be bare IPs, CIDR ranges, **or hostnames** (`traefik`, `proxy.internal`) resolved via `tokio::net::lookup_host` — container platforms assign the proxy's address at runtime, so it cannot be written into configuration ahead of time. Resolution is cached **per hostname**, on two clocks: a **30s positive TTL** so a moved container is picked up without a restart, and a **short negative TTL** for failures. The negative cache is a security-adjacent availability control, not an optimization — without it a single unresolvable entry turns the daemon's own request rate into its DNS query rate, which is a self-inflicted amplification path that bites hardest when the resolver is already unhealthy. An unresolvable name is simply *not trusted* (a DNS outage must never be able to widen trust).
+  - **Boot resilience:** hostnames are resolved once at startup so a typo or a not-yet-running proxy is reported while an operator is watching. A failure is **never fatal**. The daemon logs an error, serves with that entry untrusted, and re-checks once after a **1-minute grace period**; if it still does not resolve, it keeps serving with that entry disabled. A name that fails at boot is usually a sibling container that has not finished starting, and this daemon and its reverse proxy come up in no guaranteed order — aborting would convert an ordinary startup race into a crash loop, which is strictly worse than serving given the entry is already fail-closed.
   - From a trusted peer, walk `X-Forwarded-For` **right to left and skip hops that are themselves trusted proxies**; the first remaining address is the client. Rightmost-first is what makes the suffix unforgeable — each proxy appends the address it actually saw, so entries to the left of the last trusted hop are hearsay the client supplied. Skipping trusted entries is what makes a *chain* work: with `client → P1 → P2 → us` the header reads `client, P1` and a naive "rightmost entry" would report the proxy as the caller.
   - A header naming nothing but trusted proxies says nothing about the client; fall back to the peer rather than inventing one. `X-Real-IP` is consulted only when `X-Forwarded-For` yields nothing.
   - Otherwise the TCP peer address is authoritative and the headers MUST be ignored entirely.
@@ -165,12 +169,27 @@ rule in the Tech Stack section still holds for everything the ORM issues.
 - Failure to apply either is logged, never fatal. An in-memory database (`sqlite::memory:`, used
   throughout the test suite) legitimately cannot use WAL.
 
+### 3c. Request Body Ceiling
+
+Every request body — authenticated or not, on every nested route — is capped at **3 MiB**
+(`MAX_REQUEST_BODY_BYTES`), applied as a single router-wide `DefaultBodyLimit` layer outside both
+`nest()` calls.
+
+- **One constant, two enforcement points.** `middleware::auth_middleware` buffers the raw body to
+  recompute the HMAC and derives its own cap from this same constant. Two independently-chosen
+  numbers would leave a band of sizes that one layer accepts and the other refuses — a parser
+  differential, and the shape of a real class of bug.
+- **No per-route override may raise it.** An exception granted to whichever route seemed special
+  enough would reintroduce exactly the differential the shared constant removes.
+- The value is the figure converged with `simply_ip_vault`, so the two services refuse the same
+  payloads. A body over the limit is rejected with `413` before it is read to completion.
+
 ### 4. History, Output Capture & Log Retention
 
 - Every execution produces an `Execution` record storing status (`SUCCESS`, `FAILED`, `TIMEOUT`), exit code, full `stdout`, full `stderr`, duration in milliseconds, resolved parameters JSON, and timestamp.
 - **Retention Worker:** An asynchronous background task runs two sweeps on the same interval:
   1. `Execution` entries older than `LOG_RETENTION_DAYS` (default: 30 days).
-  2. Soft-deleted `Hook` rows trashed more than **92 days** ago (`DELETED_HOOK_RETENTION_DAYS`), also exposed on demand at `POST /api/system/purge-hooks`.
+  2. Soft-deleted `Hook` rows trashed more than **92 days** ago, overridable via `DELETED_HOOK_RETENTION_DAYS` (`0` keeps the trash forever), also exposed on demand at `POST /api/system/purge-hooks`. The purge states all three guards explicitly — `is_deleted = true AND deleted_at IS NOT NULL AND deleted_at < threshold` — even though SQL's three-valued logic already makes either of the first two sufficient. This is the one query in the system that destroys audit history, and its safety must not depend on an invariant held elsewhere in the code or on a reader recalling how `NULL` compares.
 - The two windows are **separately** governed, and the worker keeps running when either is disabled. `LOG_RETENTION_DAYS=0` means "keep history forever", not "stop maintaining the trash" — an operator shortening log retention to reclaim disk must not silently shrink the undo window for deleted automation as a side effect.
 - **Hook deletion is soft by default** for every caller, master included; see `SCHEMA.MD`. The destructive path (`?hard=true`) is the one that has to be asked for explicitly, because it cascades the hook's parameters, permissions, and entire execution history.
 

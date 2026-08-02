@@ -7,6 +7,7 @@ use sea_orm::DatabaseConnection;
 use crate::config::RuntimeConfig;
 use crate::crypto::SecretCipher;
 use crate::executor::ConcurrencyLimiter;
+use crate::replay::ReplayGuard;
 
 /// Global application state.
 ///
@@ -24,6 +25,8 @@ pub struct AppState {
     pub limiter: Arc<ConcurrencyLimiter>,
     /// Protects recoverable secrets (currently `api_keys.signing_secret`) at rest.
     pub cipher: Arc<SecretCipher>,
+    /// Enforces single use of `CANONICAL_V1` signatures inside the anti-replay window.
+    pub replay_guard: Arc<ReplayGuard>,
 }
 
 impl AppState {
@@ -31,16 +34,23 @@ impl AppState {
     ///
     /// The cipher is an explicit parameter rather than a default so no caller can accidentally
     /// construct state that writes signing secrets in the clear without having said so.
+    ///
+    /// The replay guard is built here instead, from the configured window, because there is exactly
+    /// one correct value for it and no caller should be choosing another: a guard whose memory is
+    /// shorter than the timestamp window would leave a gap where a signature is too new to be
+    /// rejected as stale and too old to be remembered as used.
     pub fn new(
         db: DatabaseConnection,
         config: Arc<RuntimeConfig>,
         cipher: Arc<SecretCipher>,
     ) -> Self {
+        let replay_guard = Arc::new(ReplayGuard::new(config.signature_max_age_seconds));
         Self {
             db,
             config,
             limiter: Arc::new(ConcurrencyLimiter::new()),
             cipher,
+            replay_guard,
         }
     }
 }

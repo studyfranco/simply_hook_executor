@@ -43,6 +43,7 @@ pub fn test_config() -> Arc<RuntimeConfig> {
     Arc::new(RuntimeConfig {
         allowed_env_vars: vec!["PATH".to_owned()],
         log_retention_days: 30,
+        deleted_hook_retention_days: 92,
         retention_sweep_seconds: 3600,
         max_output_bytes: 64 * 1024,
         signature_max_age_seconds: 300,
@@ -67,6 +68,22 @@ pub fn test_cipher() -> Arc<SecretCipher> {
 /// Builds application state around a database handle.
 pub fn test_state(db: &DatabaseConnection) -> AppState {
     AppState::new(db.clone(), test_config(), test_cipher())
+}
+
+/// Builds application state where every authenticated route demands a valid signature.
+///
+/// This is the posture the auth-before-authz ordering matters most under: with signing mandatory, a
+/// caller holding only a stolen bearer key genuinely cannot authenticate, so what it can still
+/// *learn* from the response code is the whole question.
+pub fn test_state_requiring_signatures(db: &DatabaseConnection) -> AppState {
+    AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig {
+            require_signed_requests: true,
+            ..(*test_config()).clone()
+        }),
+        test_cipher(),
+    )
 }
 
 /// Builds application state whose hook scripts are confined to `roots`.

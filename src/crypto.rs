@@ -247,6 +247,69 @@ mod tests {
         assert_eq!(upgraded.open(&legacy).expect("opening succeeds"), "issued-before");
     }
 
+    /// `SIGNING_SECRET_KEY` is process-wide state, so the tests that mutate it must not run
+    /// concurrently on different libtest threads — `set_var` is `unsafe` precisely because
+    /// concurrent mutation is a data race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Startup must fail closed on a bad key rather than degrade to plaintext.
+    ///
+    /// This is the property that matters most in this module: an operator who set the variable
+    /// believes their signing secrets are encrypted. Silently writing them in the clear because the
+    /// value was mistyped would betray that belief at exactly the moment it counted, and would do so
+    /// invisibly — the daemon would start, serve, and look entirely healthy.
+    #[test]
+    fn a_malformed_key_aborts_startup_instead_of_downgrading_to_plaintext() {
+        let _guard = ENV_LOCK.lock();
+
+        for bad in ["not-hex", "00ff", "", "   ", &"a".repeat(63), &"a".repeat(65), "zz".repeat(32).as_str()] {
+            unsafe { std::env::set_var(KEY_ENV_VAR, bad) };
+            let outcome = SecretCipher::from_env();
+            match bad.trim() {
+                // An empty or whitespace-only value is "unset" rather than "malformed", and is the
+                // documented zero-config path — it warns loudly at startup instead.
+                "" => assert!(
+                    outcome.is_ok_and(|c| !c.is_encrypting()),
+                    "an empty {KEY_ENV_VAR} is the documented plaintext fallback"
+                ),
+                _ => assert!(
+                    matches!(outcome, Err(CryptoError::InvalidKey)),
+                    "{bad:?} must abort startup, not silently store secrets in the clear"
+                ),
+            }
+        }
+
+        // A well-formed key produces an encrypting cipher, so the loop above is not passing simply
+        // because everything fails.
+        unsafe { std::env::set_var(KEY_ENV_VAR, TEST_KEY) };
+        assert!(SecretCipher::from_env().is_ok_and(|c| c.is_encrypting()));
+
+        unsafe { std::env::remove_var(KEY_ENV_VAR) };
+    }
+
+    /// The alias exists for deployments already provisioning a general-purpose vault key, and must
+    /// be held to the same standard — an alias that accepted a weaker key would be a way around the
+    /// check above.
+    #[test]
+    fn the_alias_is_honoured_but_validated_just_as_strictly() {
+        let _guard = ENV_LOCK.lock();
+        unsafe { std::env::remove_var(KEY_ENV_VAR) };
+
+        unsafe { std::env::set_var(KEY_ENV_VAR_ALIAS, TEST_KEY) };
+        assert!(SecretCipher::from_env().is_ok_and(|c| c.is_encrypting()));
+
+        unsafe { std::env::set_var(KEY_ENV_VAR_ALIAS, "too-short") };
+        assert!(matches!(SecretCipher::from_env(), Err(CryptoError::InvalidKey)));
+
+        // The primary variable wins when both are set, so an unrelated legacy value cannot
+        // downgrade a deployment that configured the specific one.
+        unsafe { std::env::set_var(KEY_ENV_VAR, TEST_KEY) };
+        assert!(SecretCipher::from_env().is_ok_and(|c| c.is_encrypting()));
+
+        unsafe { std::env::remove_var(KEY_ENV_VAR) };
+        unsafe { std::env::remove_var(KEY_ENV_VAR_ALIAS) };
+    }
+
     #[test]
     fn malformed_keys_and_values_are_rejected() {
         assert!(matches!(SecretCipher::from_hex_key("not-hex"), Err(CryptoError::InvalidKey)));

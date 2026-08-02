@@ -5,6 +5,7 @@
 //! override logs a warning and falls back to the default rather than aborting startup, since a
 //! typo in a unit file should never take the whole service down.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,13 +13,39 @@ use std::time::{Duration, Instant};
 
 use ipnetwork::IpNetwork;
 
-/// How long a resolved `TRUSTED_PROXIES` hostname is reused before being looked up again.
+/// How long a *successfully* resolved `TRUSTED_PROXIES` hostname is reused before being looked up
+/// again.
 ///
 /// Container addresses change on restart, so a name resolved once at startup and cached forever
 /// would keep trusting an address the orchestrator has since handed to something else — a stale
 /// entry here is a trusted-proxy grant pointing at an arbitrary container. Thirty seconds bounds
 /// that window while keeping DNS out of the per-request path in the steady state.
 const TRUSTED_PROXY_DNS_TTL: Duration = Duration::from_secs(30);
+
+/// How long a *failed* lookup is remembered before the name is tried again.
+///
+/// This is the anti-storm control, and it is the reason failures are cached at all. Without a
+/// negative cache, a single unresolvable entry turns every inbound request into a fresh DNS query:
+/// the daemon's own request rate becomes its query rate against the resolver, which is a
+/// self-inflicted amplification path that gets worse exactly when DNS is already unhealthy. Caching
+/// the failure bounds it to one lookup per name per window no matter how much traffic arrives.
+///
+/// Deliberately much shorter than [`TRUSTED_PROXY_DNS_TTL`]. The two windows are asymmetric because
+/// their costs are: over-trusting a stale address is a security problem, so success expires slowly
+/// enough to be cheap but fast enough to track a moved container, while an unresolvable name is
+/// merely *untrusted* — the safe direction — so it can be retried aggressively to shorten the
+/// outage without ever widening trust.
+const TRUSTED_PROXY_DNS_NEGATIVE_TTL: Duration = Duration::from_secs(5);
+
+/// How long the daemon waits after a failed boot-time resolution before its one loud re-check.
+///
+/// A hostname that does not resolve at startup is almost always a service that has simply not
+/// finished starting yet — the reverse proxy and this daemon come up together under Compose or
+/// Kubernetes, in no guaranteed order. Aborting on that would turn an ordinary startup race into a
+/// crash loop, and a crash loop is *worse* than serving: the entry is already fail-closed (an
+/// unresolvable name is trusted by nobody), so the daemon that keeps running is strictly more
+/// available than the one that keeps dying, and no less safe.
+pub const TRUSTED_PROXY_BOOT_GRACE: Duration = Duration::from_secs(60);
 
 /// One entry of `TRUSTED_PROXIES`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,13 +68,39 @@ impl std::fmt::Display for ProxySpec {
     }
 }
 
-/// The cached result of resolving every hostname entry.
+/// One hostname's most recent lookup outcome.
+struct HostnameEntry {
+    /// The host routes the name resolved to. Empty when the lookup failed, which is what makes a
+    /// failed entry contribute nothing to the trusted set rather than falling back to something.
+    networks: Vec<IpNetwork>,
+    /// Whether the lookup itself succeeded.
+    ///
+    /// Tracked separately from `networks.is_empty()` because the two carry different TTLs, and a
+    /// name that resolves to an empty answer is a failure for our purposes: it should be retried on
+    /// the short negative window, not held for the full positive one.
+    resolved: bool,
+    /// When the lookup ran.
+    at: Instant,
+}
+
+impl HostnameEntry {
+    /// Whether this entry may still be served without re-querying DNS.
+    fn is_fresh(&self, positive: Duration, negative: Duration) -> bool {
+        let ttl = if self.resolved { positive } else { negative };
+        self.at.elapsed() < ttl
+    }
+}
+
+/// The per-hostname resolution cache, plus the flattened view the request path actually reads.
 #[derive(Default)]
 struct ResolvedProxies {
-    /// Static networks merged with the addresses the hostnames currently resolve to.
-    networks: Arc<Vec<IpNetwork>>,
-    /// When the resolution ran, or `None` if it never has.
-    refreshed_at: Option<Instant>,
+    /// Cache keyed by hostname, so each name expires on its own clock. One unresolvable entry
+    /// therefore costs one lookup per negative window — it does not drag the healthy names into
+    /// being re-resolved alongside it.
+    hosts: HashMap<String, HostnameEntry>,
+    /// Static networks merged with every cached hostname's addresses, precomputed so the hot path
+    /// is an `Arc` clone rather than a walk over the map.
+    merged: Arc<Vec<IpNetwork>>,
 }
 
 /// The set of peers whose forwarding headers are believed.
@@ -63,8 +116,10 @@ pub struct TrustedProxies {
     networks: Arc<Vec<IpNetwork>>,
     /// Hostname entries awaiting resolution.
     hostnames: Vec<String>,
-    /// Reuse window for a resolution.
+    /// Reuse window for a successful resolution.
     ttl: Duration,
+    /// Reuse window for a failed one. See [`TRUSTED_PROXY_DNS_NEGATIVE_TTL`].
+    negative_ttl: Duration,
     cache: Arc<tokio::sync::RwLock<ResolvedProxies>>,
 }
 
@@ -75,6 +130,7 @@ impl Clone for TrustedProxies {
             networks: Arc::clone(&self.networks),
             hostnames: self.hostnames.clone(),
             ttl: self.ttl,
+            negative_ttl: self.negative_ttl,
             cache: Arc::clone(&self.cache),
         }
     }
@@ -122,12 +178,20 @@ impl TrustedProxies {
             })
             .collect();
 
+        let networks = Arc::new(networks);
         Self {
             spec,
-            networks: Arc::new(networks),
+            // The flattened view starts as the static entries alone. Until a hostname resolves it
+            // contributes nothing, which is the fail-closed default the boot grace period relies
+            // on: the daemon serves immediately, with unresolved names simply not trusted yet.
+            cache: Arc::new(tokio::sync::RwLock::new(ResolvedProxies {
+                hosts: HashMap::new(),
+                merged: Arc::clone(&networks),
+            })),
+            networks,
             hostnames,
             ttl: TRUSTED_PROXY_DNS_TTL,
-            cache: Arc::new(tokio::sync::RwLock::new(ResolvedProxies::default())),
+            negative_ttl: TRUSTED_PROXY_DNS_NEGATIVE_TTL,
         }
     }
 
@@ -146,19 +210,92 @@ impl TrustedProxies {
         &self.spec
     }
 
-    /// Overrides the DNS reuse window. Test-facing: a suite cannot wait 30 seconds to observe that
-    /// a re-resolution happened.
+    /// Overrides the successful-resolution reuse window. Test-facing: a suite cannot wait 30
+    /// seconds to observe that a re-resolution happened.
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
         self
     }
 
-    /// The networks to match a request against right now, resolving hostnames if the cache is cold
-    /// or stale.
+    /// Overrides the failed-resolution reuse window. Test-facing, for the same reason as
+    /// [`TrustedProxies::with_ttl`] — and additionally so a test can assert that a failure is
+    /// cached *at all*, by observing that a second call inside the window issues no lookup.
+    pub fn with_negative_ttl(mut self, negative_ttl: Duration) -> Self {
+        self.negative_ttl = negative_ttl;
+        self
+    }
+
+    /// Whether every configured hostname currently has a usable cache entry.
+    fn all_fresh(&self, cache: &ResolvedProxies) -> bool {
+        self.hostnames.iter().all(|hostname| {
+            cache
+                .hosts
+                .get(hostname)
+                .is_some_and(|entry| entry.is_fresh(self.ttl, self.negative_ttl))
+        })
+    }
+
+    /// Re-resolves the stale hostnames in place and rebuilds the flattened view.
+    ///
+    /// Returns the names that failed, which is what [`TrustedProxies::prime`] reports to the
+    /// operator at startup.
+    ///
+    /// `force` bypasses the TTL check entirely. It exists for the boot re-check: after the grace
+    /// period the answer to "is this name resolvable *now*" must come from DNS, not from whatever
+    /// the cache happens to be holding.
+    async fn refresh_stale(&self, cache: &mut ResolvedProxies, force: bool) -> Vec<String> {
+        let mut failed = Vec::new();
+        let mut changed = false;
+
+        for hostname in &self.hostnames {
+            let fresh = !force
+                && cache
+                    .hosts
+                    .get(hostname)
+                    .is_some_and(|entry| entry.is_fresh(self.ttl, self.negative_ttl));
+            if fresh {
+                // A cached failure counts as a current failure for reporting purposes: the name is
+                // untrusted right now either way, and re-querying it here would defeat the negative
+                // cache this whole path exists to honour.
+                if cache.hosts.get(hostname).is_some_and(|entry| !entry.resolved) {
+                    failed.push(hostname.clone());
+                }
+                continue;
+            }
+
+            let (networks, resolved) = resolve_hostname(hostname).await;
+            if !resolved {
+                failed.push(hostname.clone());
+            }
+            cache.hosts.insert(
+                hostname.clone(),
+                HostnameEntry { networks, resolved, at: Instant::now() },
+            );
+            changed = true;
+        }
+
+        if changed {
+            let mut merged = (*self.networks).clone();
+            for entry in cache.hosts.values() {
+                merged.extend(entry.networks.iter().copied());
+            }
+            cache.merged = Arc::new(merged);
+        }
+
+        failed
+    }
+
+    /// The networks to match a request against right now, resolving hostnames whose cache entry is
+    /// cold or expired.
     ///
     /// Returns an [`Arc`] rather than a fresh `Vec` so the steady-state cost is a refcount bump. The
     /// no-hostname case — every deployment that names its proxies by address — never touches the
     /// lock or the resolver at all.
+    ///
+    /// The write lock is held across the lookups on purpose. It is what collapses a burst of
+    /// requests arriving on an expired entry into a *single* query: the rest queue, then find the
+    /// entry fresh and return immediately. Combined with the negative TTL, that bounds DNS traffic
+    /// to one query per name per window regardless of how much load the daemon is under.
     pub async fn resolved(&self) -> Arc<Vec<IpNetwork>> {
         if self.hostnames.is_empty() {
             return Arc::clone(&self.networks);
@@ -166,36 +303,49 @@ impl TrustedProxies {
 
         {
             let cache = self.cache.read().await;
-            if cache.refreshed_at.is_some_and(|at| at.elapsed() < self.ttl) {
-                return Arc::clone(&cache.networks);
+            if self.all_fresh(&cache) {
+                return Arc::clone(&cache.merged);
             }
         }
 
         let mut cache = self.cache.write().await;
         // Re-check under the write lock: several requests can queue behind one expiry, and only the
         // first should pay for the lookup.
-        if cache.refreshed_at.is_some_and(|at| at.elapsed() < self.ttl) {
-            return Arc::clone(&cache.networks);
+        if self.all_fresh(&cache) {
+            return Arc::clone(&cache.merged);
         }
 
-        let mut networks = (*self.networks).clone();
-        for hostname in &self.hostnames {
-            networks.extend(resolve_hostname(hostname).await);
-        }
+        self.refresh_stale(&mut cache, false).await;
+        Arc::clone(&cache.merged)
+    }
 
-        cache.networks = Arc::new(networks);
-        cache.refreshed_at = Some(Instant::now());
-        Arc::clone(&cache.networks)
+    /// Resolves every configured hostname unconditionally, returning those that failed.
+    ///
+    /// Called once at startup so a misspelled or not-yet-running proxy is reported while an
+    /// operator is still watching the log, rather than surfacing later as inexplicable `403`s — and
+    /// called again after [`TRUSTED_PROXY_BOOT_GRACE`] to give a service that was merely slow to
+    /// start a second chance. It never fails: an unresolvable name is a name nobody is trusted
+    /// under, which is a safe state to serve traffic in.
+    pub async fn prime(&self) -> Vec<String> {
+        if self.hostnames.is_empty() {
+            return Vec::new();
+        }
+        let mut cache = self.cache.write().await;
+        self.refresh_stale(&mut cache, true).await
     }
 }
 
 /// Resolves one hostname to the host routes it currently names.
 ///
+/// Returns the addresses and whether the lookup *succeeded*. The caller needs both: an empty answer
+/// and a failed answer are equally untrusted right now, but they are cached on different clocks —
+/// see [`HostnameEntry::is_fresh`].
+///
 /// A failure yields nothing rather than propagating: an unresolvable name means "this proxy is not
 /// currently trusted", which is the safe direction to fail in. A DNS outage must never be able to
 /// *widen* what the daemon believes, and a container that is down should stop being trusted rather
 /// than keep a stale grant alive.
-async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
+async fn resolve_hostname(hostname: &str) -> (Vec<IpNetwork>, bool) {
     // Port 0: `lookup_host` wants a socket address, but only the address half is used.
     match tokio::net::lookup_host((hostname, 0u16)).await {
         Ok(addrs) => {
@@ -206,20 +356,20 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
                      trusted until it does."
                 );
-            } else {
-                tracing::debug!(
-                    "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
-                    networks.iter().map(|n| n.ip().to_string()).collect::<Vec<_>>().join(", ")
-                );
+                return (networks, false);
             }
-            networks
+            tracing::debug!(
+                "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
+                networks.iter().map(|n| n.ip().to_string()).collect::<Vec<_>>().join(", ")
+            );
+            (networks, true)
         }
         Err(e) => {
             tracing::warn!(
                 "Could not resolve TRUSTED_PROXIES hostname {hostname:?}: {e}. It is not trusted \
                  until resolution succeeds."
             );
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
@@ -330,6 +480,14 @@ pub struct RuntimeConfig {
     /// Age, in days, beyond which `executions` rows are purged. Overridden by
     /// `LOG_RETENTION_DAYS`. A value of `0` disables purging entirely.
     pub log_retention_days: i64,
+    /// Days a soft-deleted hook stays recoverable before the sweep drops it for good. Overridden by
+    /// `DELETED_HOOK_RETENTION_DAYS`; `0` keeps the trash forever.
+    ///
+    /// Governed **separately** from [`RuntimeConfig::log_retention_days`] rather than sharing a
+    /// window with it. The two answer different questions — "how much history do we keep?" versus
+    /// "how long is a mistake reversible?" — and an operator shortening log retention to reclaim
+    /// disk must not silently shrink the undo window for deleted automation as a side effect.
+    pub deleted_hook_retention_days: i64,
     /// Seconds between retention sweeps. Overridden by `RETENTION_SWEEP_SECONDS`.
     pub retention_sweep_seconds: u64,
     /// Maximum bytes retained per captured stream (stdout and stderr each). Output beyond this is
@@ -379,6 +537,7 @@ impl Default for RuntimeConfig {
         Self {
             allowed_env_vars: parse_env_var_list(DEFAULT_ALLOWED_ENV_VARS),
             log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
+            deleted_hook_retention_days: crate::retention::DEFAULT_DELETED_HOOK_RETENTION_DAYS,
             retention_sweep_seconds: DEFAULT_RETENTION_SWEEP_SECONDS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             signature_max_age_seconds: DEFAULT_SIGNATURE_MAX_AGE_SECONDS,
@@ -442,6 +601,14 @@ impl RuntimeConfig {
             allowed_env_vars,
             trusted_proxies,
             log_retention_days: parse_or_warn("LOG_RETENTION_DAYS", defaults.log_retention_days),
+            // Clamped at zero rather than accepted verbatim: a negative window would read as
+            // "purge everything trashed since the future", and the purge is the one query in the
+            // system that destroys audit history. `0` already means "keep forever".
+            deleted_hook_retention_days: parse_or_warn(
+                "DELETED_HOOK_RETENTION_DAYS",
+                defaults.deleted_hook_retention_days,
+            )
+            .max(0),
             retention_sweep_seconds: parse_or_warn("RETENTION_SWEEP_SECONDS", defaults.retention_sweep_seconds)
                 .max(1),
             max_output_bytes: parse_or_warn("MAX_OUTPUT_BYTES", defaults.max_output_bytes),
@@ -903,16 +1070,81 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_hostname_is_simply_not_trusted() {
         // Failing closed matters: a DNS outage must never be able to *widen* what is trusted.
-        let proxies =
-            TrustedProxies::from_raw("no-such-host.invalid,10.0.0.0/8").with_ttl(Duration::ZERO);
+        let proxies = TrustedProxies::from_raw("no-such-host.invalid,10.0.0.0/8");
         let resolved = proxies.resolved().await;
 
         assert!(is_trusted(ip("10.1.2.3"), &resolved), "the literal entry still applies");
         assert_eq!(resolved.len(), 1, "the unresolvable name contributes nothing: {resolved:?}");
+    }
 
-        // With a zero TTL every call re-resolves, so a name that starts working is picked up
-        // without a restart — the property that makes container addresses usable at all.
-        assert!(!Arc::ptr_eq(&resolved, &proxies.resolved().await));
+    /// Negative caching, and the reason it exists: without it the daemon's own request rate becomes
+    /// its DNS query rate the moment a name stops resolving, which is a self-inflicted
+    /// amplification path that bites hardest exactly when the resolver is already unhealthy.
+    ///
+    /// A fresh `Arc` is the observable signal that a lookup ran — the flattened view is only
+    /// rebuilt when at least one name was actually re-queried — so pointer identity across calls is
+    /// what proves no query was issued.
+    #[tokio::test]
+    async fn a_failed_resolution_is_cached_so_traffic_cannot_become_a_dns_storm() {
+        let proxies = TrustedProxies::from_raw("no-such-host.invalid")
+            .with_negative_ttl(Duration::from_secs(30));
+
+        let first = proxies.resolved().await;
+        for attempt in 0..10 {
+            assert!(
+                Arc::ptr_eq(&first, &proxies.resolved().await),
+                "request {attempt} re-queried DNS inside the negative window"
+            );
+        }
+    }
+
+    /// The other half of the same contract: the failure is cached, not permanent. A proxy that was
+    /// merely slow to start must become trusted on its own, without a restart.
+    #[tokio::test]
+    async fn a_failed_resolution_is_retried_once_its_negative_ttl_expires() {
+        let proxies =
+            TrustedProxies::from_raw("no-such-host.invalid").with_negative_ttl(Duration::ZERO);
+
+        let first = proxies.resolved().await;
+        assert!(
+            !Arc::ptr_eq(&first, &proxies.resolved().await),
+            "an expired negative entry must be re-resolved rather than held forever"
+        );
+    }
+
+    /// Per-domain expiry: one unresolvable name must not drag a healthy one into being re-queried
+    /// alongside it, and must not suppress the healthy name's addresses either.
+    #[tokio::test]
+    async fn one_failing_name_does_not_disturb_the_names_that_resolve() {
+        let proxies = TrustedProxies::from_raw("localhost,no-such-host.invalid,192.0.2.7")
+            .with_negative_ttl(Duration::ZERO);
+
+        for attempt in 0..3 {
+            let resolved = proxies.resolved().await;
+            assert!(
+                is_trusted(ip("127.0.0.1"), &resolved) || is_trusted(ip("::1"), &resolved),
+                "attempt {attempt}: the healthy name must stay trusted"
+            );
+            assert!(is_trusted(ip("192.0.2.7"), &resolved), "attempt {attempt}: literal preserved");
+            assert!(
+                !is_trusted(ip("203.0.113.9"), &resolved),
+                "attempt {attempt}: the failing name must contribute nothing"
+            );
+        }
+    }
+
+    /// Boot priming reports the names that could not be resolved, which is what `main` turns into
+    /// the startup error and the post-grace-period re-check. It must never fail or panic — a
+    /// daemon that refuses to start over an unresolvable proxy is a crash loop, and the entry is
+    /// already fail-closed without one.
+    #[tokio::test]
+    async fn priming_reports_unresolvable_names_without_failing() {
+        let proxies = TrustedProxies::from_raw("localhost,no-such-host.invalid,10.0.0.0/8");
+        assert_eq!(proxies.prime().await, vec!["no-such-host.invalid".to_owned()]);
+
+        // A configuration with nothing to look up is a no-op rather than a spurious success log.
+        assert!(TrustedProxies::from_raw("10.0.0.0/8").prime().await.is_empty());
+        assert!(TrustedProxies::default().prime().await.is_empty());
     }
 
     #[tokio::test]

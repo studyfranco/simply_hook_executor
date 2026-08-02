@@ -16,7 +16,7 @@
 # generation + pagination + enrichment, the master-only settings endpoint, stored-XSS payload
 # round-tripping (plus the SPA's text-node rendering invariant), CLI-flag-shaped argument injection
 # against both argv and the sudo boundary, the killpg process-escape boundary (in-group vs setsid),
-# and the 1 MiB request body ceiling. Every request is logged with a timestamp, method, full URL,
+# and the 3 MiB request body ceiling. Every request is logged with a timestamp, method, full URL,
 # color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
@@ -1803,14 +1803,16 @@ PYEOF
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "one altered byte in the middle of a large body invalidates the signature"
 
-    # Just under the 1 MiB verification buffer: still accepted.
-    head -c 1040000 /dev/zero | tr '\0' 'z' > "$WORK_DIR/pad_near.txt"
+    # Just under the 3 MiB verification buffer: still accepted. 3 MiB is the converged limit
+    # shared with simply_ip_vault, and it governs both the router's DefaultBodyLimit and the
+    # middleware's signature buffer from a single constant.
+    head -c 3100000 /dev/zero | tr '\0' 'z' > "$WORK_DIR/pad_near.txt"
     jq -nc --rawfile p "$WORK_DIR/pad_near.txt" '{parameters:{marker:"near"},padding:$p}' > "$WORK_DIR/near_body.json"
     signed_file_call POST "$BIG_PATH" "$WORK_DIR/near_body.json" "$BIG_SECRET" "$BIG_AUTH"
-    check "200" "a payload just under the 1 MiB buffer limit is accepted"
+    check "200" "a payload just under the 3 MiB buffer limit is accepted"
 
     # Over the bound: refused with an explanatory error rather than a hang or an OOM.
-    head -c 2097152 /dev/zero | tr '\0' 'w' > "$WORK_DIR/pad_over.txt"
+    head -c 6291456 /dev/zero | tr '\0' 'w' > "$WORK_DIR/pad_over.txt"
     jq -nc --rawfile p "$WORK_DIR/pad_over.txt" '{parameters:{marker:"over"},padding:$p}' > "$WORK_DIR/over_body.json"
     signed_file_call POST "$BIG_PATH" "$WORK_DIR/over_body.json" "$BIG_SECRET" "$BIG_AUTH"
     check "400" "a payload over the buffer limit is refused"
@@ -2304,6 +2306,116 @@ check "403" "a master key is held to its own bound_ips rather than bypassing the
 # ...and honouring the trusted proxy's header brings it back inside the range.
 api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "10.10.10.5"
 check "200" "the same master key is accepted from inside its bound range"
+
+# ── 31. Convergence: anti-replay, full-URI signing, auth-before-authz ───────
+
+log_section "31. Convergence (anti-replay, full-URI coverage, pipeline ordering)"
+
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    CONV_SCRIPT=$(make_hook_script "convergence.sh" 'echo "ran=${HOOK_PARAM_TARGET}"')
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"convergence_hook\",\"script_path\":\"$CONV_SCRIPT\",\"parameters\":[{\"param_key\":\"target\",\"default_value\":\"none\",\"is_required\":true}]}"
+    check "200" "create a hook for the convergence checks"
+    CONV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    CONV_PATH="/api/hooks/$CONV_HOOK_ID/execute"
+    CONV_BODY='{"parameters":{"target":"conv"}}'
+
+    # --- Anti-replay: a captured signature is single-use ---
+    # The timestamp is pinned so both requests are byte-identical. Re-reading the clock would
+    # produce a different signature, which is a different request rather than a replay.
+    CONV_TS=$(date +%s)
+    CONV_SIG=$(sign_canonical "$MASTER_SIGNING_SECRET" "POST" "$CONV_PATH" "$CONV_TS" "$CONV_BODY")
+    replay_call() {
+        RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+            -H "X-API-Key: $SIGNING_MASTER_KEY" -H "Content-Type: application/json" \
+            -H "X-Timestamp: $CONV_TS" -H "X-Signature-256: sha256=$CONV_SIG" \
+            -d "$CONV_BODY" "$BASE_URL$CONV_PATH")
+        RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+        local color; color=$(status_color "$RESP_STATUS")
+        printf "%s ${color}[%s]${RESET} %-6s %s ${DIM}(replay probe)${RESET}\n" \
+            "$(ts)" "$RESP_STATUS" "POST" "$BASE_URL$CONV_PATH" >&2
+        print_response_body
+    }
+
+    replay_call
+    check "200" "the original signed request is accepted"
+    check_jq ".status" "SUCCESS" "the original request executed"
+
+    replay_call
+    check "401" "an intercepted signature replayed inside the window is rejected"
+    check_true '.error | contains("already been used")' "the refusal names signature reuse"
+
+    replay_call
+    check "401" "the replay stays rejected on later attempts rather than sliding through"
+
+    # A freshly signed request from the same key still works: reuse is refused, not the key.
+    SIGN_SECRET="$MASTER_SIGNING_SECRET"
+    SIGN_AUTH="X-API-Key: $SIGNING_MASTER_KEY"
+    SIGN_TS=$((CONV_TS - 30))
+    signed_call POST "$CONV_PATH" "$CONV_BODY"
+    check "200" "a distinct signature from the same key is not a replay"
+    SIGN_TS=""
+
+    # --- Full-URI coverage: the query string is inside the signed material ---
+    # A signature over the bare path must not authorize the same path with ?hard=true appended,
+    # which is what stops a captured soft delete from becoming permanent destruction.
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"query_target_hook\",\"script_path\":\"$CONV_SCRIPT\"}"
+    check "200" "create a hook to aim the query-tampering probe at"
+    QT_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    QT_PATH="/api/hooks/$QT_HOOK_ID"
+
+    QT_TS=$(date +%s)
+    QT_SIG=$(sign_canonical "$MASTER_SIGNING_SECRET" "DELETE" "$QT_PATH" "$QT_TS" "")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X DELETE \
+        -H "X-API-Key: $SIGNING_MASTER_KEY" \
+        -H "X-Timestamp: $QT_TS" -H "X-Signature-256: sha256=$QT_SIG" \
+        "$BASE_URL$QT_PATH?hard=true")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "appending ?hard=true to a signed path invalidates the signature"
+
+    api_call GET "$QT_PATH" "$MASTER_KEY"
+    check "200" "the hook survived: the escalated request was never authorized"
+
+    # Stripping a signed query parameter is equally a rewrite.
+    QT_TS=$(date +%s)
+    QT_SIG=$(sign_canonical "$MASTER_SIGNING_SECRET" "GET" "/api/hooks?include_deleted=true" "$QT_TS" "")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X GET \
+        -H "X-API-Key: $SIGNING_MASTER_KEY" \
+        -H "X-Timestamp: $QT_TS" -H "X-Signature-256: sha256=$QT_SIG" \
+        "$BASE_URL/api/hooks")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "dropping a signed query parameter also invalidates the signature"
+
+    # --- Auth before authz: no 401-vs-403 oracle for an unauthenticated caller ---
+    # A key bound to a network this client is not in. With a *bad* signature the response must be
+    # 401 — identical to an in-range key with a bad signature — so nothing about the key's network
+    # binding leaks to a caller that cannot authenticate.
+    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Oracle Probe","bound_ips":"10.99.0.0/16"}'
+    check "200" "create a key bound to a network excluding the caller"
+    ORACLE_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+    ORACLE_TS=$(date +%s)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X GET \
+        -H "X-API-Key: $ORACLE_KEY" \
+        -H "X-Timestamp: $ORACLE_TS" \
+        -H "X-Signature-256: sha256=$(printf '11%.0s' $(seq 1 32))" \
+        "$BASE_URL/api/auth/me")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "an out-of-network key with a bad signature answers 401, not 403"
+
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X GET \
+        -H "X-API-Key: $SIGNING_MASTER_KEY" \
+        -H "X-Timestamp: $ORACLE_TS" \
+        -H "X-Signature-256: sha256=$(printf '11%.0s' $(seq 1 32))" \
+        "$BASE_URL/api/auth/me")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "an in-network key with a bad signature answers 401 too — the codes match"
+
+    # Authorization still applies once authentication succeeds.
+    api_call GET "/api/auth/me" "$ORACLE_KEY"
+    check "403" "once authenticated, the CIDR restriction is enforced and reported honestly"
+else
+    warn "Skipping §31: openssl is not available to sign requests."
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-/// Hard ceiling on the size of any request body this daemon will buffer, in bytes (1 MiB).
+/// Hard ceiling on the size of any request body this daemon will buffer, in bytes (3 MiB).
 ///
 /// Applied as an explicit [`DefaultBodyLimit`] over the whole router rather than left to Axum's
 /// implicit 2 MiB default, for three reasons:
@@ -31,7 +31,13 @@ use tower_http::trace::TraceLayer;
 ///   guarantee; pinning it here means an upgrade cannot silently widen the exposure.
 ///
 /// A body over the limit is rejected with `413 Payload Too Large` before it is read to completion.
-pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+///
+/// The value is the converged figure shared with `simply_ip_vault`: 3 MiB, chosen so both services
+/// refuse the same payloads. It is applied as a single router-wide layer with **no per-route
+/// override** — a route permitted to raise it would reintroduce exactly the differential this
+/// constant exists to remove, and would do so at whichever route someone judged special enough to
+/// deserve the exception.
+pub const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 pub mod api;
 pub mod config;
@@ -42,6 +48,7 @@ pub mod error;
 pub mod executor;
 pub mod middleware;
 pub mod migration;
+pub mod replay;
 pub mod retention;
 pub mod state;
 

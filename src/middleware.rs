@@ -122,7 +122,11 @@ fn verify_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
 /// `==` on the decoded bytes or the hex text. `subtle` is reached through the RustCrypto `Mac` API
 /// rather than depended on directly: the API already provides the guarantee, and hand-rolling the
 /// comparison would be more code for no benefit.
-fn verify_signature(header_value: &str, secret: &str, base: &[u8]) -> Result<(), AppError> {
+/// Returns the verified digest on success, so the caller can hand it to
+/// [`crate::replay::ReplayGuard`] without re-decoding the header. Returning the bytes rather than
+/// the header text also normalizes spelling: `sha256=AB…` and `sha256=ab…` are the same signature
+/// and must not be recordable as two distinct single uses.
+fn verify_signature(header_value: &str, secret: &str, base: &[u8]) -> Result<Vec<u8>, AppError> {
     let hex_signature = header_value
         .strip_prefix("sha256=")
         .ok_or_else(|| AppError::Unauthorized("Signature must be formatted as sha256=<hex>".to_owned()))?;
@@ -137,7 +141,9 @@ fn verify_signature(header_value: &str, secret: &str, base: &[u8]) -> Result<(),
     mac.update(base);
 
     mac.verify_slice(&expected)
-        .map_err(|_| AppError::Unauthorized("Invalid request signature".to_owned()))
+        .map_err(|_| AppError::Unauthorized("Invalid request signature".to_owned()))?;
+
+    Ok(expected)
 }
 
 /// Recovers a key's signing secret from storage, ready to verify a signature against.
@@ -207,38 +213,6 @@ pub async fn auth_middleware(
         .await
         .map_err(AppError::DbError)?
         .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
-
-    // Validate the client IP against the bound CIDRs.
-    let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
-    let networks: Vec<IpNetwork> = bound_ips_str
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
-            AppError::Internal
-        })?;
-
-    // An empty `bound_ips` means "unrestricted" and is the only way to opt out. A key that names
-    // ranges is held to them **whatever its scopes** — `is_master` used to bypass this check, which
-    // meant the single most valuable credential in the system was also the only one whose network
-    // restriction was decorative while the dashboard displayed it as enforced. A master key that
-    // should reach the API from anywhere expresses that by leaving `bound_ips` empty (or listing
-    // `0.0.0.0/0,::/0`), not by having the check skipped behind its back.
-    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
-
-    if !is_allowed {
-        tracing::warn!(
-            key = %key_record.prefix,
-            is_master = key_record.is_master,
-            "Access denied: client IP {} not in bound networks {:?}",
-            client_ip,
-            key_record.bound_ips
-        );
-        return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
-    }
 
     // Signature verification requires the raw body, which means buffering it and rebuilding the
     // request. That only happens when a signature is actually presented — unsigned requests keep
@@ -318,7 +292,29 @@ pub async fn auth_middleware(
                 None => bytes.to_vec(),
             };
 
-            verify_signature(&signature, &secret, &base)?;
+            let digest = verify_signature(&signature, &secret, &base)?;
+
+            // Single-use enforcement, and only now that the digest is proven authentic. Recording
+            // an unverified signature would let anyone who merely *observed* a request burn it
+            // before the legitimate client's copy arrived — turning replay protection into a
+            // denial-of-service primitive aimed at the client it exists to protect.
+            //
+            // `CANONICAL_V1` only, which is what `timestamp.is_some()` selects for. `BODY_ONLY`
+            // carries no timestamp and therefore has no window to be single-use within; per
+            // `AGENT.MD` that mode exists to accept third-party senders whose format cannot be
+            // changed, and those senders redeliver on purpose.
+            if timestamp.is_some()
+                && !state.replay_guard.check_and_record(key_record.id, &digest)
+            {
+                tracing::warn!(
+                    key = %key_record.prefix,
+                    "Rejected replay: this signature was already used inside the {}s window",
+                    state.config.signature_max_age_seconds
+                );
+                return Err(AppError::Unauthorized(
+                    "This signature has already been used; sign a fresh request".to_owned(),
+                ));
+            }
 
             Request::from_parts(parts, Body::from(bytes))
         }
@@ -334,6 +330,48 @@ pub async fn auth_middleware(
         }
         None => req,
     };
+
+    // ── Authorization ────────────────────────────────────────────────────────────────────────
+    // Everything above authenticates: it establishes *who* is calling. Only now, with that
+    // settled, is the caller's source network checked.
+    //
+    // The order is load-bearing, not stylistic. Running the network check first meant a caller
+    // holding nothing but a leaked `X-API-Key` — no signing secret, so unable to authenticate —
+    // could still distinguish `403 Client IP not allowed` from `401 Invalid request signature`,
+    // and thereby learn whether a key it had merely found is bound to networks excluding it. That
+    // is a map of the deployment's network topology handed to someone who cannot authenticate.
+    // Authenticate, then authorize: an unauthenticated caller now gets `401` for every key, and
+    // learns nothing from it beyond "not authenticated".
+    let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
+    let networks: Vec<IpNetwork> = bound_ips_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
+            AppError::Internal
+        })?;
+
+    // An empty `bound_ips` means "unrestricted" and is the only way to opt out. A key that names
+    // ranges is held to them **whatever its scopes** — `is_master` used to bypass this check, which
+    // meant the single most valuable credential in the system was also the only one whose network
+    // restriction was decorative while the dashboard displayed it as enforced. A master key that
+    // should reach the API from anywhere expresses that by leaving `bound_ips` empty (or listing
+    // `0.0.0.0/0,::/0`), not by having the check skipped behind its back.
+    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
+
+    if !is_allowed {
+        tracing::warn!(
+            key = %key_record.prefix,
+            is_master = key_record.is_master,
+            "Access denied: client IP {} not in bound networks {:?}",
+            client_ip,
+            key_record.bound_ips
+        );
+        return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
+    }
 
     req.extensions_mut().insert(ClientIp(client_ip));
     req.extensions_mut().insert(key_record);

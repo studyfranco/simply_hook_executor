@@ -880,11 +880,24 @@ async fn hmac_mode_toggle_takes_effect_immediately_without_a_restart() {
     let uri = "/webhook/toggle_hook";
     let body = json!({}).to_string();
 
-    let canonical = || signed_request("POST", uri, &subject.plaintext, &subject.signing_secret, &body);
+    // Each call is stamped a second earlier than the last. Every timestamp is comfortably inside
+    // the 300s window, but they produce *distinct* signatures — which this test needs, because
+    // anti-replay now refuses a second use of the same one. Re-sending an identical signature is a
+    // replay whether or not the resender is the original client, and that is the point.
+    let canonical = |age_seconds: i64| {
+        signed_request_at(
+            "POST",
+            uri,
+            &subject.plaintext,
+            &subject.signing_secret,
+            &body,
+            now_timestamp() - age_seconds,
+        )
+    };
     let body_only = || body_only_request(uri, &subject.plaintext, &subject.signing_secret, &body, "X-Hub-Signature-256");
 
     // Starting state: canonical accepted, body-only refused.
-    assert_eq!(send(&app, canonical()).await.status, StatusCode::OK);
+    assert_eq!(send(&app, canonical(0)).await.status, StatusCode::OK);
     assert_eq!(send(&app, body_only()).await.status, StatusCode::UNAUTHORIZED);
 
     // Flip to BODY_ONLY through the API (itself signed, since signing is mandatory here).
@@ -905,7 +918,7 @@ async fn hmac_mode_toggle_takes_effect_immediately_without_a_restart() {
     // The very next request already follows the new rules, in both directions.
     assert_eq!(send(&app, body_only()).await.status, StatusCode::OK, "BODY_ONLY should now be accepted");
     assert_eq!(
-        send(&app, canonical()).await.status,
+        send(&app, canonical(1)).await.status,
         StatusCode::UNAUTHORIZED,
         "canonical signatures should now be refused"
     );
@@ -925,7 +938,7 @@ async fn hmac_mode_toggle_takes_effect_immediately_without_a_restart() {
     assert_eq!(back.status, StatusCode::OK);
     assert_eq!(back.field("hmac_mode"), &json!("CANONICAL_V1"));
 
-    assert_eq!(send(&app, canonical()).await.status, StatusCode::OK, "canonical should be accepted again");
+    assert_eq!(send(&app, canonical(2)).await.status, StatusCode::OK, "canonical should be accepted again");
     assert_eq!(send(&app, body_only()).await.status, StatusCode::UNAUTHORIZED, "BODY_ONLY should be refused again");
 
     // The key's own identity endpoint reflects the live mode too, which is what the SPA signs with.
@@ -997,10 +1010,14 @@ async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit
         "a single altered byte in the middle of a large body must invalidate the signature"
     );
 
-    // Just under the 1 MiB buffer bound: still accepted.
-    let near_limit_padding = "z".repeat(1024 * 1024 - 4096);
+    // Just under the buffer bound: still accepted. Sized from the constant rather than a literal,
+    // so the converged 3 MiB figure cannot be changed in one place and silently missed here.
+    let near_limit_padding = "z".repeat(simply_hook_executor::MAX_REQUEST_BODY_BYTES - 4096);
     let near_limit_body = json!({ "parameters": { "marker": "near" }, "padding": near_limit_padding }).to_string();
-    assert!(near_limit_body.len() < 1024 * 1024, "must stay under the buffer limit");
+    assert!(
+        near_limit_body.len() < simply_hook_executor::MAX_REQUEST_BODY_BYTES,
+        "must stay under the buffer limit"
+    );
     let response = send(
         &app,
         signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &near_limit_body),
@@ -1010,7 +1027,7 @@ async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit
 
     // Over the bound: refused before any hashing or execution, with an explanatory error rather
     // than a hang or an OOM.
-    let oversized_padding = "w".repeat(2 * 1024 * 1024);
+    let oversized_padding = "w".repeat(2 * simply_hook_executor::MAX_REQUEST_BODY_BYTES);
     let oversized_body = json!({ "parameters": { "marker": "over" }, "padding": oversized_padding }).to_string();
     let response = send(
         &app,
@@ -4604,4 +4621,357 @@ async fn a_proxy_chain_resolves_to_the_real_client() {
         StatusCode::FORBIDDEN,
         "the rightmost non-proxy hop is 8.8.8.8, which is outside the key's range"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Convergence pass: pipeline ordering, anti-replay, full-URI coverage, retention guards
+// ─────────────────────────────────────────────────────────────
+
+/// Authenticate-then-authorize: a caller that cannot authenticate must learn nothing about the
+/// network binding of the key it is presenting.
+///
+/// Before the reorder, `bound_ips` was evaluated before the signature, so a caller holding only a
+/// leaked `X-API-Key` could tell `403 Client IP not allowed` (the key exists and is bound to
+/// networks excluding me) apart from `401` (everything else) — a map of the deployment's topology,
+/// handed out to someone who had proven nothing. Both branches must now answer `401`.
+#[tokio::test]
+async fn an_unauthenticated_caller_cannot_distinguish_a_bad_key_from_a_bad_source_network() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state_requiring_signatures(&db));
+
+    // Bound to a network the test client (127.0.0.1) is emphatically not in.
+    let elsewhere = insert_key_full(&db, "elsewhere", "10.99.0.0/16", KeyScopes::plain()).await;
+    // Bound to the caller's own network, so only the signature distinguishes the two.
+    let local = insert_key_full(&db, "local", "127.0.0.1/32", KeyScopes::plain()).await;
+
+    // No signature at all, with signing mandatory.
+    let unsigned = |key: &str| json_request("GET", "/api/auth/me", key, None);
+    assert_eq!(send(&app, unsigned(&elsewhere.plaintext)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&app, unsigned(&local.plaintext)).await.status, StatusCode::UNAUTHORIZED);
+
+    // A *wrong* signature — the stolen-key case. The out-of-network key must not answer 403 while
+    // the in-network one answers 401; that difference is the oracle.
+    let wrong_signature = |key: &str| {
+        with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/auth/me")
+                .header("X-API-Key", key)
+                .header("X-Timestamp", now_timestamp().to_string())
+                .header("X-Signature-256", format!("sha256={}", "11".repeat(32))),
+        )
+        .body(axum::body::Body::empty())
+        .expect("request builds")
+    };
+    let out_of_network = send(&app, wrong_signature(&elsewhere.plaintext)).await;
+    let in_network = send(&app, wrong_signature(&local.plaintext)).await;
+    assert_eq!(out_of_network.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(in_network.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        out_of_network.status, in_network.status,
+        "the response must not depend on whether the key's bound_ips admits the caller"
+    );
+
+    // And an unknown key is indistinguishable from both.
+    assert_eq!(send(&app, wrong_signature("no-such-key")).await.status, StatusCode::UNAUTHORIZED);
+
+    // Authorization still happens — it just happens *after* authentication succeeds.
+    let authenticated_but_out_of_network = send(
+        &app,
+        signed_bearer_request("GET", "/api/auth/me", &elsewhere.plaintext, &elsewhere.signing_secret, ""),
+    )
+    .await;
+    assert_eq!(
+        authenticated_but_out_of_network.status,
+        StatusCode::FORBIDDEN,
+        "once authenticated, the CIDR restriction is enforced and reported honestly"
+    );
+}
+
+/// Anti-replay: a validly-signed request, captured and resent inside the timestamp window, must be
+/// refused. The window alone never provided this — it bounds how long a capture stays useful, not
+/// how many times it may be used.
+#[tokio::test]
+async fn an_intercepted_signed_request_cannot_be_replayed_inside_the_window() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_full(&db, "sender", "", KeyScopes::hook_manager()).await;
+
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("replay.sh", "#!/bin/sh\necho ran\n");
+    let hook = insert_hook(&db, "replay_hook", &script, 30).await;
+    grant(&db, sender.id, hook, true, true).await;
+    let uri = format!("/api/hooks/{hook}/execute");
+    let body = json!({ "parameters": {} }).to_string();
+
+    // The timestamp is captured once and reused, so every call rebuilds the *identical* request —
+    // same signature, byte for byte. Letting each call re-read the clock would make the test
+    // depend on whether the sends happened to straddle a second boundary, and a "replay" with a
+    // different timestamp is a different signature and not a replay at all.
+    let captured_at = now_timestamp();
+    let intercepted = || {
+        signed_request_at(
+            "POST",
+            &uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &body,
+            captured_at,
+        )
+    };
+
+    let first = send(&app, intercepted()).await;
+    assert_eq!(first.status, StatusCode::OK, "the legitimate request goes through");
+    assert_eq!(first.field("status"), &json!("SUCCESS"));
+
+    // Byte-for-byte the same request: same key, same timestamp, same signature, same body.
+    let replay = send(&app, intercepted()).await;
+    assert_eq!(
+        replay.status,
+        StatusCode::UNAUTHORIZED,
+        "a signature that has already been honoured must not be honoured twice"
+    );
+    assert!(replay.string("error").contains("already been used"));
+
+    // Replaying it repeatedly stays refused rather than sliding through on a later attempt.
+    for _ in 0..3 {
+        assert_eq!(send(&app, intercepted()).await.status, StatusCode::UNAUTHORIZED);
+    }
+
+    // A freshly signed request from the same key still works — the guard rejects reuse, not the key.
+    let fresh = send(
+        &app,
+        signed_request_at(
+            "POST",
+            &uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &body,
+            captured_at - 5,
+        ),
+    )
+    .await;
+    assert_eq!(fresh.status, StatusCode::OK, "a distinct signature is not a replay");
+}
+
+/// `BODY_ONLY` is deliberately exempt: it carries no timestamp, so there is no window to be
+/// single-use within, and per `AGENT.MD` it exists to accept third-party senders whose format
+/// cannot be changed — senders that redeliver on purpose.
+#[tokio::test]
+async fn body_only_keys_are_not_subject_to_single_use_enforcement() {
+    use simply_hook_executor::entities::api_key::HmacMode;
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender =
+        insert_key_with_mode(&db, "github", "", KeyScopes::hook_manager(), HmacMode::BodyOnly).await;
+
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("redeliver.sh", "#!/bin/sh\necho ok\n");
+    let hook = insert_hook(&db, "redeliver_hook", &script, 30).await;
+    grant(&db, sender.id, hook, true, true).await;
+    let uri = format!("/webhook/{hook}");
+    let body = json!({}).to_string();
+
+    // A webhook sender's redelivery is the same bytes twice, and must keep working.
+    for attempt in 0..3 {
+        let response = send(
+            &app,
+            body_only_request(&uri, &sender.plaintext, &sender.signing_secret, &body, "X-Hub-Signature-256"),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "redelivery {attempt} must be accepted");
+    }
+}
+
+/// Full-URI coverage: the query string is inside the signed material, so rewriting it in transit
+/// invalidates the signature. This is what stops a captured `DELETE /api/hooks/{id}` from being
+/// escalated to `?hard=true` — a reversible soft delete turned into permanent destruction of the
+/// hook and its entire execution history.
+#[tokio::test]
+async fn tampering_with_the_query_string_invalidates_the_signature() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let master = insert_key_full(&db, "master", "", KeyScopes::master()).await;
+
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("target.sh", "#!/bin/sh\nexit 0\n");
+    let hook = insert_hook(&db, "query_target", &script, 30).await;
+
+    // Signed for the soft-delete path, then replayed with `?hard=true` appended.
+    let signed_path = format!("/api/hooks/{hook}");
+    let timestamp = now_timestamp();
+    let escalated = with_connect_info(
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("{signed_path}?hard=true"))
+            .header("X-API-Key", &master.plaintext)
+            .header("X-Timestamp", timestamp.to_string())
+            .header(
+                "X-Signature-256",
+                sign_request(&master.signing_secret, "DELETE", &signed_path, timestamp, ""),
+            ),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+
+    assert_eq!(
+        send(&app, escalated).await.status,
+        StatusCode::UNAUTHORIZED,
+        "a signature over the bare path must not authorize the same path with ?hard=true"
+    );
+    assert!(
+        fetch_hook_row(&db, hook).await.is_some(),
+        "the hook must survive: the escalated request was never authorized"
+    );
+
+    // The reverse direction too — dropping a signed query parameter is equally a rewrite.
+    let listing = "/api/hooks?include_deleted=true";
+    let timestamp = now_timestamp();
+    let stripped = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/hooks")
+            .header("X-API-Key", &master.plaintext)
+            .header("X-Timestamp", timestamp.to_string())
+            .header(
+                "X-Signature-256",
+                sign_request(&master.signing_secret, "GET", listing, timestamp, ""),
+            ),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(send(&app, stripped).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// The converged 3 MiB ceiling is one constant governing both the router limit and the middleware's
+/// signature buffer. Two independently-chosen numbers would leave a band of sizes accepted by one
+/// layer and refused by the other, which is the shape of a parser-differential bug.
+#[tokio::test]
+async fn the_body_limit_is_three_mib_and_shared_by_the_router_and_the_signature_buffer() {
+    assert_eq!(
+        simply_hook_executor::MAX_REQUEST_BODY_BYTES,
+        3 * 1024 * 1024,
+        "the converged limit shared with simply_ip_vault"
+    );
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let sender = insert_key_full(&db, "bulk", "", KeyScopes::hook_manager()).await;
+
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("bulk.sh", "#!/bin/sh\necho sized\n");
+    let hook = insert_hook(&db, "bulk_hook", &script, 30).await;
+    grant(&db, sender.id, hook, true, true).await;
+    let uri = format!("/api/hooks/{hook}/execute");
+
+    // Comfortably inside the old 1 MiB bound but well over it: proof the ceiling actually moved,
+    // rather than the constant changing while some other layer still enforced the old value.
+    let padding = "p".repeat(2 * 1024 * 1024);
+    let body = json!({ "parameters": {}, "padding": padding }).to_string();
+    assert!(body.len() > 1024 * 1024 && body.len() < simply_hook_executor::MAX_REQUEST_BODY_BYTES);
+
+    let response =
+        send(&app, signed_request("POST", &uri, &sender.plaintext, &sender.signing_secret, &body))
+            .await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "a 2 MiB signed body must be buffered, verified, and executed under the 3 MiB ceiling"
+    );
+
+    // Unauthenticated requests are bounded by the same layer, so an anonymous caller cannot force
+    // an allocation the authenticated path would have refused.
+    let oversized = raw_request(
+        "POST",
+        &uri,
+        "not-a-real-key",
+        vec![b'x'; simply_hook_executor::MAX_REQUEST_BODY_BYTES + 4096],
+    );
+    let status = send(&app, oversized).await.status;
+    assert!(
+        status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::UNAUTHORIZED,
+        "an oversized unauthenticated body must be refused, got {status}"
+    );
+}
+
+/// The purge is the one query in the system that destroys audit history, so its guards are asserted
+/// directly: a live hook, and a *restored* hook that kept its old `deleted_at`, must both survive a
+/// sweep that removes genuinely-trashed rows around them.
+#[tokio::test]
+async fn the_purge_spares_live_and_restored_hooks_whatever_their_deleted_at_says() {
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    use simply_hook_executor::retention::purge_expired_deleted_hooks;
+
+    let db = setup_test_db().await;
+    let owner = insert_key_full(&db, "owner", "", KeyScopes::hook_manager()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("keep.sh", "#!/bin/sh\nexit 0\n");
+
+    let live = insert_hook(&db, "still_live", &script, 30).await;
+    let trashed = insert_hook_deleted_days_ago(&db, "long_gone", &script, 200, owner.id).await;
+    let recent = insert_hook_deleted_days_ago(&db, "recently_binned", &script, 5, owner.id).await;
+
+    // A restored hook: `is_deleted` cleared, but `deleted_at` deliberately left behind, which is
+    // exactly the row the `is_deleted = true` guard exists to protect.
+    let restored = insert_hook_deleted_days_ago(&db, "brought_back", &script, 300, owner.id).await;
+    let model = fetch_hook_row(&db, restored).await.expect("the restored hook exists");
+    let mut active: simply_hook_executor::entities::hook::ActiveModel = model.into();
+    active.is_deleted = Set(false);
+    active.update(&db).await.expect("restore succeeds");
+
+    let removed = purge_expired_deleted_hooks(&db, 92).await.expect("the sweep runs");
+    assert_eq!(removed, 1, "only the genuinely expired trashed hook is destroyed");
+
+    assert!(fetch_hook_row(&db, live).await.is_some(), "a live hook is untouched");
+    assert!(fetch_hook_row(&db, recent).await.is_some(), "trash inside the window is kept");
+    assert!(
+        fetch_hook_row(&db, restored).await.is_some(),
+        "a restored hook must survive its own stale deleted_at"
+    );
+    assert!(fetch_hook_row(&db, trashed).await.is_none(), "expired trash is gone");
+
+    // A disabled window keeps everything, so an operator can opt out without stopping the worker.
+    let still_there =
+        insert_hook_deleted_days_ago(&db, "kept_forever", &script, 999, owner.id).await;
+    assert_eq!(purge_expired_deleted_hooks(&db, 0).await.expect("no-op sweep"), 0);
+    assert!(fetch_hook_row(&db, still_there).await.is_some());
+}
+
+/// The retention window is configurable, and separately from `LOG_RETENTION_DAYS`: shortening log
+/// retention to reclaim disk must not silently shrink the undo window for deleted automation.
+#[tokio::test]
+async fn the_hook_retention_window_is_configurable_and_independent_of_log_retention() {
+    use simply_hook_executor::retention::{
+        purge_expired_deleted_hooks, DEFAULT_DELETED_HOOK_RETENTION_DAYS,
+    };
+
+    assert_eq!(DEFAULT_DELETED_HOOK_RETENTION_DAYS, 92, "the converged default");
+
+    let db = setup_test_db().await;
+    let owner = insert_key_full(&db, "owner", "", KeyScopes::hook_manager()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("cfg.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook_deleted_days_ago(&db, "aged_ten_days", &script, 10, owner.id).await;
+
+    // Survives the default window...
+    assert_eq!(
+        purge_expired_deleted_hooks(&db, DEFAULT_DELETED_HOOK_RETENTION_DAYS).await.expect("sweep"),
+        0
+    );
+    assert!(fetch_hook_row(&db, hook).await.is_some());
+
+    // ...and is removed under a shorter one, which is what makes the setting real.
+    assert_eq!(purge_expired_deleted_hooks(&db, 7).await.expect("sweep"), 1);
+    assert!(fetch_hook_row(&db, hook).await.is_none());
+
+    // The two windows are carried independently on the config, not derived from one another.
+    let config = RuntimeConfig {
+        log_retention_days: 0,
+        deleted_hook_retention_days: 92,
+        ..(*test_config()).clone()
+    };
+    assert_eq!(config.log_retention_days, 0);
+    assert_eq!(config.deleted_hook_retention_days, 92);
 }
