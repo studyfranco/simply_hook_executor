@@ -206,9 +206,11 @@ Every request body — authenticated or not, on every nested route — is capped
 ### 6. Frontend Integration & Dynamic UI
 
 - Single Page Application (SPA) served from `static/`.
-- Authenticates via `X-API-Key` stored in `localStorage`.
-- **Dynamic Scope Rendering:** On startup, `app.js` calls `GET /api/auth/me` and renders/hides tabs and controls (Executions/Dashboard, Hooks Management, API Keys & Permissions, System Settings) based on the returned permissions.
-- Global fetch wrapper injects `X-API-Key` and intercepts `401/403` responses to return to the login screen.
+- **Authenticates with full-HMAC `CANONICAL_V1` signing, unconditionally.** The session stores both an `X-API-Key` and its signing secret in `localStorage`, and *every* request the dashboard sends carries `X-API-Key`, `X-Timestamp` and `X-Signature-256`. There is no unsigned path, no bearer-only path, and no per-key mode selection in the browser: the SPA is a first-party client whose key we provision ourselves, so it is held to the strongest posture the backend offers rather than the most permissive one it accepts. Signing CANONICAL_V1 is also what puts the dashboard's own traffic under the anti-replay window and the single-use guard in `src/replay.rs`.
+  - This is a *client* policy, not a backend one. The per-key `hmac_mode` column and the `BODY_ONLY` mode remain permanent backend features for third-party webhook senders (§1), and the dashboard still **provisions and displays** them for other keys — it simply never uses `BODY_ONLY` for itself. A `BODY_ONLY` key therefore cannot log into the dashboard.
+  - Signing uses `window.crypto.subtle`, which browsers expose **only in a secure context**. A dashboard reached over plain HTTP at a LAN address cannot sign and is refused at the login screen with that stated plainly, rather than silently downgrading its own authentication.
+- **Dynamic Scope Rendering:** On startup, `app.js` calls `GET /api/auth/me` and renders/hides tabs and controls (Executions/Dashboard, Hooks Management, API Keys & Permissions, System Settings) based on the returned permissions. Because that call is itself signed, reaching the dashboard proves the caller holds the signing secret — not merely that the key exists.
+- Global fetch wrapper injects and signs the three authentication headers, and intercepts `401/403` responses to return to the login screen.
 - Custom dark confirmation modals for deletions (NO native `window.confirm()`).
 - High-contrast action buttons and styled custom checkboxes.
 

@@ -2511,6 +2511,119 @@ done
 api_call GET "/api/auth/me" "$MASTER_KEY" "" "" "X-Timestamp: 1"
 check "200" "an unsigned request's stray timestamp is still ignored"
 
+# ── 33. WebUI mandates full-HMAC (CANONICAL_V1) signing ─────────────────────
+
+log_section "33. WebUI full-HMAC enforcement"
+
+# Source invariants again, for the same reason section 26 uses them: there is no JS runtime and no
+# headless browser here (`AGENT.MD` forbids frontend dependencies), so the dashboard's signing
+# posture cannot be observed by driving it. What can be pinned is that the code has no other path.
+SPA_JS="$PROJECT_ROOT/static/app.js"
+SPA_HTML="$PROJECT_ROOT/static/index.html"
+
+# One signing implementation, and it is Web Crypto.
+if grep -qF 'crypto.subtle.sign(' "$SPA_JS"; then
+    check_local "subtle" "subtle" "the SPA signs with crypto.subtle"
+else
+    check_local "missing" "subtle" "the SPA signs with crypto.subtle"
+fi
+
+# Each pattern below marks a *client-side* behaviour that was removed. Deliberately precise rather
+# than a bare grep for "BODY_ONLY" or "hmacMode": both strings legitimately survive in the API-keys
+# table badge and the key-provisioning dropdowns, which describe the mode of *other* keys — the ones
+# an operator issues to webhook senders. What must not come back is this client choosing a mode for
+# its own traffic, or hashing with anything other than Web Crypto.
+# The patterns are anchored with \b so they cannot collide with the surviving display code:
+# `this.hmacModeBadge(...)` renders another key's mode in the API-keys table and must keep working.
+#   this.hmacMode\b        — the signer's own mode state, which drove the removed BODY_ONLY branch
+#   signatureHeaders       — the "sign if possible, otherwise don't" plumbing in apiFetch
+#   PureCrypto             — the hand-rolled SHA-256 fallback for insecure contexts
+#   X-Hub-Signature-256    — the GitHub-style header a browser must never send
+for FORBIDDEN in 'this\.hmacMode\b' 'signatureHeaders' 'PureCrypto' 'X-Hub-Signature-256'; do
+    if grep -qE "$FORBIDDEN" "$SPA_JS"; then
+        err "static/app.js still references '$FORBIDDEN'"
+        check_local "found" "absent" "the SPA has no '$FORBIDDEN' path"
+    else
+        check_local "absent" "absent" "the SPA has no '$FORBIDDEN' path"
+    fi
+done
+
+# The signer takes a secret and nothing else — a second constructor argument was the mode.
+if grep -qE 'new RequestSigner\([^)]*,' "$SPA_JS"; then
+    check_local "mode arg" "secret only" "RequestSigner takes only a signing secret"
+else
+    check_local "secret only" "secret only" "RequestSigner takes only a signing secret"
+fi
+
+# The API key header must be unconditional — the old form was `...(this.apiKey ? {...} : {})`.
+if grep -qE "\.\.\.\(this\.apiKey \?" "$SPA_JS"; then
+    check_local "conditional" "unconditional" "the SPA always sends X-API-Key"
+else
+    check_local "unconditional" "unconditional" "the SPA always sends X-API-Key"
+fi
+
+# All three CANONICAL_V1 headers are produced.
+for HEADER in "X-API-Key" "X-Timestamp" "X-Signature-256"; do
+    if grep -qF "'$HEADER'" "$SPA_JS"; then
+        check_local "present" "present" "the SPA sends $HEADER"
+    else
+        check_local "missing" "present" "the SPA sends $HEADER"
+    fi
+done
+
+# The canonical string is METHOD \n PATH_AND_QUERY \n TIMESTAMP \n BODY, matching signature_base().
+if grep -qF '${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${body ?? '"''"'}' "$SPA_JS"; then
+    check_local "canonical" "canonical" "the SPA builds the CANONICAL_V1 string in field order"
+else
+    check_local "wrong" "canonical" "the SPA builds the CANONICAL_V1 string in field order"
+fi
+
+# The login form demands both halves; an optional secret is what made unsigned sessions possible.
+if grep -qE 'id="login-signing-secret"[^>]*required' "$SPA_HTML"; then
+    check_local "required" "required" "the login form requires a signing secret"
+else
+    check_local "optional" "required" "the login form requires a signing secret"
+fi
+if grep -qiF "Signing Secret (optional)" "$SPA_HTML"; then
+    check_local "optional" "mandatory" "the login form no longer advertises an optional secret"
+else
+    check_local "mandatory" "mandatory" "the login form no longer advertises an optional secret"
+fi
+
+# Static assets still serve. The dashboard is the only unauthenticated surface, by design.
+RESP_CODE=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL/")
+check "200" "the dashboard is served"
+if grep -qF 'login-signing-secret' "$RESP_BODY_FILE"; then
+    check_local "served" "served" "the served HTML carries the mandatory-secret login form"
+else
+    check_local "stale" "served" "the served HTML carries the mandatory-secret login form"
+fi
+RESP_CODE=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL/app.js")
+check "200" "the SPA script is served"
+if grep -qF 'crypto.subtle.sign(' "$RESP_BODY_FILE"; then
+    check_local "served" "served" "the served script is the signing build"
+else
+    check_local "stale" "served" "the served script is the signing build"
+fi
+
+# End to end: the exact request shape app.js now emits — signed GET on a path the dashboard loads
+# first — is accepted by the real server. This is what makes the source invariants above mean
+# something rather than merely describing the file to itself.
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    SIGN_AUTH="X-API-Key: $SIGNING_MASTER_KEY"; SIGN_SECRET="$MASTER_SIGNING_SECRET"
+
+    signed_call GET "/api/auth/me" ""
+    check "200" "the dashboard's first request authenticates when signed CANONICAL_V1"
+    check_true '.hmac_mode != null' "the profile still reports the key's own mode to the UI"
+
+    # ...and the same request unsigned is refused the moment signing is mandatory, which is the
+    # posture the WebUI now always presents. (Under the default posture an unsigned bearer request
+    # is still accepted — that is the per-key flexibility the backend keeps for webhook senders;
+    # what changed is that the browser never takes it.)
+    api_call GET "/api/auth/me" "$SIGNING_MASTER_KEY"
+    check "200" "the backend still accepts unsigned bearer traffic from non-browser callers"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

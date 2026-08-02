@@ -189,238 +189,95 @@ class PagedCache {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Pure-JS HMAC-SHA256 fallback (FIPS 180-4 SHA-256 + RFC 2104 HMAC)
+// Request signing — CANONICAL_V1, mandatory, Web Crypto only
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Web Crypto's `crypto.subtle` is only exposed in a secure context (HTTPS or localhost). A
-// dashboard reached over plain HTTP on a LAN address therefore cannot use it at all. Rather than
-// silently dropping to unsigned requests — or pulling in a CDN dependency, which AGENT.MD forbids
-// outright — this is a self-contained implementation used only when `crypto.subtle` is absent.
+// Every request this dashboard sends is signed. There is no unsigned path, no bearer-only path, and
+// no per-key mode selection here: the browser is a first-party client whose key we provision
+// ourselves, so it is held to the strongest posture the backend offers rather than the most
+// permissive one it accepts.
 //
-// It is deliberately written against the specification's own structure so it can be checked line
-// by line, and `PureCrypto.selfTest()` verifies it against an RFC 4231 vector before it is ever
-// trusted with a real request.
-const PureCrypto = (() => {
-    // First 32 bits of the fractional parts of the cube roots of the first 64 primes.
-    const K = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-    ];
+// The backend still supports BODY_ONLY keys — that is what third-party webhook senders use, and
+// `AGENT.MD` §1 keeps it permanently. It is simply not something a human at a browser ever needs:
+// BODY_ONLY exists for senders whose signing format we do not control, and it carries no timestamp
+// and therefore no replay protection. Signing CANONICAL_V1 here means the dashboard's own traffic is
+// covered by the anti-replay window and the single-use guard in `src/replay.rs`, which the previous
+// mode-following behaviour silently gave up whenever the operator logged in with a BODY_ONLY key.
+//
+// `crypto.subtle` is the only implementation. It exists **only in a secure context** — HTTPS, or a
+// `localhost` origin — so a dashboard reached over plain HTTP at a LAN address cannot sign and is
+// refused at the login screen with that stated plainly. See `SecureContextGate` below: an
+// unreachable dashboard that says why beats one that silently downgrades its own authentication.
 
-    // First 32 bits of the fractional parts of the square roots of the first 8 primes.
-    const H0 = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-    ];
+// Whether Web Crypto is usable in this context, and the message to show when it is not.
+//
+// Checked once at startup rather than per request, because the answer cannot change for the lifetime
+// of the page and because a caller discovering it mid-flight can only report it as a failed request.
+const SecureContextGate = {
+    get available() {
+        return typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined';
+    },
 
-    // `>>> 0` after every arithmetic step: JS numbers are doubles, and without it intermediate
-    // sums exceed 2^32 and lose the wrap-around the algorithm depends on.
-    const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
-
-    // SHA-256 over a byte array, returning 32 bytes.
-    function sha256(bytes) {
-        const length = bytes.length;
-        // Padding: 0x80, then zeros, then the 64-bit big-endian bit length.
-        const withPadding = new Uint8Array((((length + 8) >> 6) + 1) << 6);
-        withPadding.set(bytes);
-        withPadding[length] = 0x80;
-
-        // Bit length as a 64-bit big-endian value. The high word is computed by division rather
-        // than a shift, because `<<` in JS is 32-bit and would silently truncate.
-        const bitLength = length * 8;
-        const view = new DataView(withPadding.buffer);
-        view.setUint32(withPadding.length - 8, Math.floor(bitLength / 0x100000000), false);
-        view.setUint32(withPadding.length - 4, bitLength >>> 0, false);
-
-        const h = H0.slice();
-        const w = new Uint32Array(64);
-
-        for (let offset = 0; offset < withPadding.length; offset += 64) {
-            for (let i = 0; i < 16; i++) {
-                w[i] = view.getUint32(offset + i * 4, false);
-            }
-            for (let i = 16; i < 64; i++) {
-                const s0 = (rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0;
-                const s1 = (rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0;
-                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
-            }
-
-            let [a, b, c, d, e, f, g, hh] = h;
-
-            for (let i = 0; i < 64; i++) {
-                const S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
-                const ch = ((e & f) ^ (~e & g)) >>> 0;
-                const temp1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
-                const S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
-                const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
-                const temp2 = (S0 + maj) >>> 0;
-
-                hh = g;
-                g = f;
-                f = e;
-                e = (d + temp1) >>> 0;
-                d = c;
-                c = b;
-                b = a;
-                a = (temp1 + temp2) >>> 0;
-            }
-
-            h[0] = (h[0] + a) >>> 0;
-            h[1] = (h[1] + b) >>> 0;
-            h[2] = (h[2] + c) >>> 0;
-            h[3] = (h[3] + d) >>> 0;
-            h[4] = (h[4] + e) >>> 0;
-            h[5] = (h[5] + f) >>> 0;
-            h[6] = (h[6] + g) >>> 0;
-            h[7] = (h[7] + hh) >>> 0;
-        }
-
-        const out = new Uint8Array(32);
-        const outView = new DataView(out.buffer);
-        h.forEach((word, i) => outView.setUint32(i * 4, word, false));
-        return out;
+    get reason() {
+        return (
+            'This dashboard signs every request with HMAC-SHA256 and needs the Web Crypto API, ' +
+            'which browsers expose only in a secure context. Reach it over HTTPS, or via ' +
+            'http://localhost:<port> / http://127.0.0.1:<port>.'
+        );
     }
+};
 
-    // RFC 2104 HMAC-SHA256. Block size is 64 bytes; a key longer than that is hashed first, and a
-    // shorter one is zero-padded.
-    function hmacSha256(keyBytes, messageBytes) {
-        const BLOCK = 64;
-        let key = keyBytes;
-        if (key.length > BLOCK) key = sha256(key);
-
-        const padded = new Uint8Array(BLOCK);
-        padded.set(key);
-
-        const inner = new Uint8Array(BLOCK + messageBytes.length);
-        const outer = new Uint8Array(BLOCK + 32);
-        for (let i = 0; i < BLOCK; i++) {
-            inner[i] = padded[i] ^ 0x36;
-            outer[i] = padded[i] ^ 0x5c;
-        }
-        inner.set(messageBytes, BLOCK);
-        outer.set(sha256(inner), BLOCK);
-
-        return sha256(outer);
-    }
-
-    const toHex = bytes => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
-
-    // RFC 4231 test case 2 ("Jefe" / "what do ya want for nothing?"). Chosen because its key is
-    // shorter than the block size and its message spans a padding boundary, so a mistake in either
-    // the padding or the ipad/opad construction shows up here.
-    function selfTest() {
-        const enc = new TextEncoder();
-        const digest = toHex(hmacSha256(enc.encode('Jefe'), enc.encode('what do ya want for nothing?')));
-        return digest === '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843';
-    }
-
-    return { sha256, hmacSha256, toHex, selfTest };
-})();
-
-// Signs a request the way the backend expects: HMAC-SHA256 over the canonical string
+// Signs a request the way `src/middleware.rs` verifies it: HMAC-SHA256 over the canonical string
 //
 //     METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY
 //
-// The newline delimiters, the query string, and the exact raw body all matter — see
-// `signature_base` in src/middleware.rs for why each component is covered.
-//
-// Web Crypto only exposes `crypto.subtle` in a secure context (HTTPS, or localhost). A dashboard
-// served over plain HTTP on a LAN address therefore *cannot* sign, so callers must treat a null
-// return as "signing unavailable" and fall back to bearer-only auth rather than sending a
-// half-formed signature.
+// The newline delimiters, the full path *including any query string*, and the exact raw body all
+// matter — see `signature_base` in `src/middleware.rs` for why each component is covered. The
+// timestamp is seconds since the epoch and is sent verbatim as `X-Timestamp`, because the server
+// feeds the header text straight into the MAC rather than re-parsing it.
 class RequestSigner {
-    constructor(signingSecret, hmacMode = 'CANONICAL_V1') {
+    constructor(signingSecret) {
         this.signingSecret = signingSecret || '';
-        this.hmacMode = hmacMode;
         this.cryptoKey = null;
-        // Memoized once: 'subtle' | 'pure' | 'none'.
-        this._backend = null;
     }
 
-    // Which implementation will actually be used. `crypto.subtle` is preferred wherever it exists
-    // (native, constant-time, non-extractable key); the pure-JS path is the plain-HTTP fallback and
-    // is only trusted after it reproduces a known RFC 4231 digest — a subtly broken hash would
-    // otherwise show up as an inexplicable stream of 401s.
-    get backend() {
-        if (this._backend === null) {
-            if (!this.signingSecret) {
-                this._backend = 'none';
-            } else if (globalThis.crypto?.subtle) {
-                this._backend = 'subtle';
-            } else if (PureCrypto.selfTest()) {
-                console.info(
-                    'Web Crypto is unavailable (insecure context); using the built-in pure-JS ' +
-                    'HMAC-SHA256 implementation, which passed its RFC 4231 self-test.'
-                );
-                this._backend = 'pure';
-            } else {
-                console.error('Pure-JS HMAC self-test FAILED; refusing to sign with it.');
-                this._backend = 'none';
-            }
-        }
-        return this._backend;
-    }
-
-    get available() {
-        return this.backend !== 'none';
-    }
-
-    // Imports the secret once and caches the non-extractable CryptoKey.
+    // Imports the secret once and caches the resulting non-extractable CryptoKey.
     async key() {
         if (!this.cryptoKey) {
             this.cryptoKey = await crypto.subtle.importKey(
                 'raw',
                 new TextEncoder().encode(this.signingSecret),
                 { name: 'HMAC', hash: 'SHA-256' },
-                false, // non-extractable: the imported key cannot be read back out
+                false, // non-extractable: the imported key cannot be read back out of the browser
                 ['sign']
             );
         }
         return this.cryptoKey;
     }
 
-    // Hex HMAC-SHA256 of `message` under the signing secret, via whichever backend is active.
+    // Hex HMAC-SHA256 of `message` under the signing secret.
     async digest(message) {
-        const enc = new TextEncoder();
-        if (this.backend === 'subtle') {
-            const signature = await crypto.subtle.sign('HMAC', await this.key(), enc.encode(message));
-            return [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
-        }
-        return PureCrypto.toHex(
-            PureCrypto.hmacSha256(enc.encode(this.signingSecret), enc.encode(message))
+        const signature = await crypto.subtle.sign(
+            'HMAC',
+            await this.key(),
+            new TextEncoder().encode(message)
         );
+        return [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // Returns the signature headers for a request, or null when signing is unavailable.
+    // The two signature headers for one request.
     //
-    // The signed material depends on the key's own `hmac_mode`, mirroring the backend exactly:
-    // CANONICAL_V1 signs METHOD/PATH/TIMESTAMP/BODY and sends X-Timestamp; BODY_ONLY signs the raw
-    // body alone and sends no timestamp, because none would be covered by that signature.
+    // Throws rather than returning null on failure. There is deliberately no "signing unavailable"
+    // return value any more: the caller has no fallback to take, and a thrown error surfaces at the
+    // one place that can act on it instead of turning into a request the server will reject with a
+    // 401 the user cannot interpret.
     async headers(method, pathAndQuery, body) {
-        if (!this.available) return null;
-
-        const payload = body ?? '';
-        try {
-            if (this.hmacMode === 'BODY_ONLY') {
-                return { 'X-Signature-256': `sha256=${await this.digest(payload)}` };
-            }
-            const timestamp = Math.floor(Date.now() / 1000).toString();
-            const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${payload}`;
-            return {
-                'X-Timestamp': timestamp,
-                'X-Signature-256': `sha256=${await this.digest(canonical)}`
-            };
-        } catch (e) {
-            // Never fall through to an unsigned request silently under a wrong assumption; the
-            // caller decides, and the console records why.
-            console.error('Request signing failed:', e);
-            return null;
-        }
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${body ?? ''}`;
+        return {
+            'X-Timestamp': timestamp,
+            'X-Signature-256': `sha256=${await this.digest(canonical)}`
+        };
     }
 }
 
@@ -473,8 +330,26 @@ class HookExecutorClient {
 
     async init() {
         this.bindEvents();
-        if (this.apiKey) {
+
+        // Refuse before anything else if the page cannot sign. Every request below is signed, so a
+        // dashboard without Web Crypto has no working path at all — better to say so once, at the
+        // login screen, than to let the operator type credentials into a form that cannot use them.
+        if (!SecureContextGate.available) {
+            this.showLogin();
+            this.showLoginError(SecureContextGate.reason);
+            document.getElementById('login-form').querySelectorAll('input, button')
+                .forEach(el => { el.disabled = true; });
+            return;
+        }
+
+        // A session needs *both* halves: the key names the caller, the secret proves it. A stored
+        // key with no stored secret is a half-session from an older build and cannot sign, so it is
+        // discarded rather than carried into a request that would 401.
+        if (this.apiKey && this.signer.signingSecret) {
             await this.verifyAuth();
+        } else if (this.apiKey) {
+            // `handleAuthFailure` clears both halves and shows the login screen itself.
+            this.handleAuthFailure();
         } else {
             this.showLogin();
         }
@@ -492,16 +367,17 @@ class HookExecutorClient {
         // is what the backend uses for GET/DELETE without a payload.
         const body = options.body ?? '';
 
-        const signatureHeaders = await this.signer.headers(method, pathAndQuery, body);
-
-        const headers = {
-            'Content-Type': 'application/json',
-            ...(this.apiKey ? { 'X-API-Key': this.apiKey } : {}),
-            ...(signatureHeaders || {}),
-            ...(options.headers || {})
-        };
-
         try {
+            // Signing is unconditional and happens before the request is built, so a signing
+            // failure can never fall through into an unsigned request. `options.headers` is spread
+            // first so a caller cannot accidentally override the three authentication headers.
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(options.headers || {}),
+                'X-API-Key': this.apiKey,
+                ...(await this.signer.headers(method, pathAndQuery, body))
+            };
+
             const res = await fetch(pathAndQuery, { ...options, headers });
 
             // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
@@ -556,12 +432,11 @@ class HookExecutorClient {
 
     async verifyAuth() {
         try {
+            // `GET /api/auth/me` is itself a signed CANONICAL_V1 request, so reaching the dashboard
+            // proves the secret is correct — not merely that the key exists. The server's
+            // `hmac_mode` is no longer consulted to pick a signing scheme: this client always signs
+            // CANONICAL_V1, and a key configured otherwise is a key that cannot drive the dashboard.
             this.state.profile = await this.apiFetch('/auth/me');
-            // The server is authoritative about how this key's signatures are verified, so adopt
-            // its mode rather than assuming CANONICAL_V1. A BODY_ONLY key signs the body alone.
-            if (this.state.profile.hmac_mode && this.state.profile.hmac_mode !== this.signer.hmacMode) {
-                this.signer = new RequestSigner(this.signer.signingSecret, this.state.profile.hmac_mode);
-            }
             this.showDashboard();
             this.enforceRBACUI();
             this.loadInitialData();
@@ -571,26 +446,28 @@ class HookExecutorClient {
     }
 
     async login(key, signingSecret) {
-        this.apiKey = key;
-        localStorage.setItem('simply_hook_executor_key', key);
-
-        this.signer = new RequestSigner(signingSecret);
-        if (signingSecret) {
-            localStorage.setItem('simply_hook_executor_signing_secret', signingSecret);
-            if (!this.signer.available) {
-                // Both backends are out: no secure context *and* the pure-JS fallback failed its
-                // self-test. Say so plainly instead of letting every request quietly go unsigned.
-                this.showToast(
-                    'Signing unavailable: no Web Crypto and the built-in fallback failed its self-test. Requests will use the API key only.',
-                    'error'
-                );
-            }
-        } else {
-            localStorage.removeItem('simply_hook_executor_signing_secret');
+        // Both fields are mandatory. `required` on the inputs already covers the ordinary path;
+        // this is the check that does not depend on markup staying correct.
+        if (!key || !signingSecret) {
+            this.showLoginError('An API key and its signing secret are both required.');
+            return;
         }
+
+        this.apiKey = key;
+        this.signer = new RequestSigner(signingSecret);
+        localStorage.setItem('simply_hook_executor_key', key);
+        localStorage.setItem('simply_hook_executor_signing_secret', signingSecret);
 
         document.getElementById('login-error').classList.add('hidden');
         await this.verifyAuth();
+    }
+
+    // Shows a message on the login screen. Used for the two failures that happen before any request
+    // is sent — an insecure context, and a half-filled form — which the 401 interceptor never sees.
+    showLoginError(message) {
+        const box = document.getElementById('login-error');
+        box.textContent = message;
+        box.classList.remove('hidden');
     }
 
     logout() {
@@ -1843,8 +1720,10 @@ class HookExecutorClient {
     bindEvents() {
         document.getElementById('login-form').addEventListener('submit', (e) => {
             e.preventDefault();
+            // Both trimmed: a trailing newline from a paste is invisible in a password field and
+            // would otherwise become part of the key lookup or the HMAC key material.
             this.login(
-                document.getElementById('login-key').value,
+                document.getElementById('login-key').value.trim(),
                 document.getElementById('login-signing-secret').value.trim()
             );
         });

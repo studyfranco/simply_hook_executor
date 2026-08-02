@@ -2108,3 +2108,105 @@ security-relevant one.
 | `cargo test` | **177 passed**, 0 failed (76 unit + 101 integration; +1 unit) |
 | `./scripts/test_e2e.sh` | **632/632**, 0 failed |
 | `./scripts/verify_convergence.sh` | 4 converged, 1 known, 0 drifted, exit 0 |
+
+---
+
+## 2026-08-02 (session 28) — WebUI simplified to mandate full-HMAC (`CANONICAL_V1`)
+
+Backend untouched: no file under `src/` changed. The dashboard is a first-party client whose key we
+provision ourselves, so it is now held to the strongest posture the backend offers instead of the
+most permissive one it accepts.
+
+### What the client used to do
+
+Three signing postures, chosen at runtime:
+
+1. **Unsigned** — no signing secret entered, so `apiFetch` sent `X-API-Key` alone. The login form
+   labelled the secret *"(optional)"*, which is what made this the default in practice.
+2. **`BODY_ONLY`** — `verifyAuth` read `hmac_mode` off `GET /api/auth/me` and *rebuilt the signer to
+   match the server's opinion of the key*. A dashboard logged in with a `BODY_ONLY` key therefore
+   signed the body alone, silently giving up the timestamp window and the single-use guard in
+   `src/replay.rs`, with no indication in the UI that it had done so.
+3. **`CANONICAL_V1`** — the intended path.
+
+### What it does now
+
+One posture. `apiFetch` signs unconditionally and builds the request *inside* the `try`, so a signing
+failure throws instead of falling through into an unsigned request. `options.headers` is spread
+**before** the three authentication headers, so a caller cannot override them by accident.
+
+`RequestSigner` lost its `hmacMode` parameter and its `BODY_ONLY` branch; `verifyAuth` no longer
+adopts the server's mode. Because `GET /api/auth/me` is itself signed, reaching the dashboard now
+proves the caller holds the signing secret rather than merely that the key exists.
+
+`init` also discards a stored key with no stored secret — a half-session left by the previous build,
+which could not sign and would only produce a `401` the user could not interpret.
+
+### The pure-JS SHA-256 fallback was removed — and that is a real trade
+
+`PureCrypto` was ~130 lines of hand-written FIPS 180-4 SHA-256 + RFC 2104 HMAC, self-tested against
+an RFC 4231 vector, used when `crypto.subtle` was absent. It existed for one reason: **Web Crypto is
+exposed only in a secure context**, so a dashboard reached at `http://192.168.x.x:3000` has no
+`crypto.subtle` at all.
+
+Removing it is the largest single complexity win in the file (231 lines deleted, 110 added) and was
+explicitly requested. The cost is stated plainly rather than buried: **a plain-HTTP LAN dashboard no
+longer works.** It is not left to fail mysteriously — `SecureContextGate` is checked before anything
+else in `init`, the login form is disabled, and the screen says to use HTTPS or `localhost`.
+
+Worth recording for whoever revisits this: `simply_ip_vault` — the higher-trust service — **kept** its
+equivalent fallback for exactly this reason. If this daemon is ever deployed behind plain HTTP, the
+implementation is recoverable from git history (`git show e1669a5:static/app.js`), and restoring it is
+contained: it is one IIFE plus a branch in `RequestSigner.digest`. That is a deployment decision, not
+a security one — the pure-JS path produced a byte-identical `CANONICAL_V1` signature.
+
+### What deliberately stayed
+
+`BODY_ONLY` remains a permanent backend feature (`AGENT.MD` §1) for third-party webhook senders whose
+signing format we do not control. The dashboard still **provisions** it (the create/edit key
+dropdowns) and **displays** it (`hmacModeBadge`, which flags it as the mode without replay
+protection). What it no longer does is use it for its own traffic. Consequence to be aware of: a
+`BODY_ONLY` key can no longer log into the dashboard, which the login hint now states.
+
+`AGENT.MD` §6 was rewritten — it still described the SPA as authenticating with `X-API-Key` alone.
+
+### `scripts/test_e2e.sh` §33 (16 checks)
+
+There is no JS runtime and no headless browser here (`AGENT.MD` forbids frontend dependencies), so
+the posture is pinned by source invariants plus one live round-trip, in the same style as §26.
+
+The guards were **mutation-checked against the previous build** rather than assumed — `git show
+HEAD:static/app.js` was run through each pattern, and 8 of 9 fire on it:
+
+| Guard | Fires on the old build? |
+| :--- | :--- |
+| `this\.hmacMode\b` absent | yes |
+| `signatureHeaders` absent | yes |
+| `PureCrypto` absent | yes |
+| `new RequestSigner(secret, mode)` absent | yes |
+| `...(this.apiKey ? …)` absent | yes |
+| canonical string in field order | yes |
+| `login-signing-secret` is `required` | yes |
+| no *"Signing Secret (optional)"* hint | yes |
+| `X-Hub-Signature-256` absent | **no — vacuous** |
+
+The last one never fired: the old SPA did not send that header either. It is kept as a forward-looking
+guard, not a regression guard, and is recorded as such so nobody mistakes it for proven coverage.
+
+Two patterns are anchored with `\b` for a reason found the hard way — a bare `grep -F hmacMode`
+matches `this.hmacModeBadge(...)`, and `=== 'BODY_ONLY'` matches the badge renderer. Both are display
+code for *other* keys and must keep working; the first version of these checks failed on exactly that.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **177 passed**, 0 failed (76 unit + 101 integration) |
+| `./scripts/test_e2e.sh` | **652/652**, 0 failed (+20) |
+| `./scripts/verify_convergence.sh` | 4 converged, 1 known, 0 drifted, exit 0 |
+
+JS syntax was verified structurally (bracket/string/template/comment-aware balance check) rather than
+by execution: no `node`, `deno`, `bun` or other JS engine is installed on this machine, and `AGENT.MD`
+forbids adding one.

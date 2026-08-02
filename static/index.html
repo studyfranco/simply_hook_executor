@@ -18,20 +18,26 @@
                 <h1>Simply Hook Executor</h1>
             </div>
             <h2>Secure Execution Daemon</h2>
-            <p class="subtitle">Please enter your API key to access the dashboard.</p>
+            <p class="subtitle">
+                Sign in with a full-HMAC (<code>CANONICAL_V1</code>) API key. Both the key and its
+                signing secret are required — this dashboard signs every request it sends.
+            </p>
             <form id="login-form" class="login-form">
                 <div class="form-group">
                     <label for="login-key">API Key</label>
-                    <input type="password" id="login-key" placeholder="Enter X-API-Key..." required class="input-field">
+                    <input type="password" id="login-key" placeholder="Enter X-API-Key..." required class="input-field" autocomplete="off">
                 </div>
                 <div class="form-group">
-                    <label for="login-signing-secret">Signing Secret (optional)</label>
-                    <input type="password" id="login-signing-secret" placeholder="Enables HMAC request signing" class="input-field" autocomplete="off">
+                    <label for="login-signing-secret">Signing Secret</label>
+                    <input type="password" id="login-signing-secret" placeholder="Enter the key's signing secret..." required class="input-field" autocomplete="off">
                     <span class="text-muted text-sm">
-                        If provided, every request is signed with HMAC-SHA256 over
-                        <code>METHOD + PATH + TIMESTAMP + BODY</code>. Requires HTTPS (or localhost)
-                        for the Web Crypto API, and is required when the server runs with
-                        <code>REQUIRE_SIGNED_REQUESTS</code>.
+                        Every request is signed with HMAC-SHA256 over
+                        <code>METHOD + PATH_AND_QUERY + TIMESTAMP + BODY</code> and sent as
+                        <code>X-API-Key</code>, <code>X-Timestamp</code> and
+                        <code>X-Signature-256</code>. Signing uses the browser's Web Crypto API,
+                        which is available only over <strong>HTTPS or on localhost</strong>. Keys in
+                        <code>BODY_ONLY</code> mode are for third-party webhook senders and cannot
+                        drive this dashboard.
                     </span>
                 </div>
                 <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
