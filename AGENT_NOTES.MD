@@ -2028,3 +2028,83 @@ never reached" assertions.
 
 The ordering test asserts on the *message*, not the status: both orderings answer `401`, so only
 "does the error name the window or the key lookup?" actually distinguishes them.
+
+---
+
+## 2026-08-02 (session 27) — Dead-code, import, lint-attribute and dependency audit
+
+A maintenance pass that found very little to remove. Recording the *negative* results as carefully
+as the changes, because "we looked and there was nothing" is the useful output of an audit like this
+— and because the next person to run one should not have to redo the search to learn that.
+
+### What was removed: nothing
+
+Four independent scans, all clean:
+
+- **Unused imports / private dead code.** `cargo clippy --all-targets -- -D warnings` already passes,
+  and `unused_imports` and `dead_code` are on by default, so both categories were empty by
+  construction. No `use` statement or private item survives unreferenced.
+- **Dead `pub` items.** `dead_code` cannot see through `pub` in a library, so this was scanned by
+  hand: all 144 `pub` items in `src/` were extracted and counted against a comment-stripped
+  concatenation of `src/` + `tests/`. Exactly one had no reference beyond its own definition — see
+  below. Everything else resolves to a router wiring, a handler signature, or a test.
+- **Dead struct fields and enum variants.** Scanned separately, since the item-level pass misses
+  them. Zero hits in either category.
+- **Over-broad visibility.** ~40 items are `pub` but referenced only within their own module. All
+  are load-bearing: serde payload structs appear in `pub` handler signatures (making them private
+  would trip `private_interfaces`), and the migration enums are `pub` by SeaORM convention.
+
+### Lint attributes: none exist
+
+There is no `#[allow(dead_code)]`, `#[allow(unused)]`, or any other lint override anywhere in `src/`
+or `tests/`. The only attribute of this family in the tree is `#![warn(missing_docs)]` in `lib.rs`,
+which tightens rather than relaxes. `tests/common/mod.rs` documents the deliberate *absence* of
+`#![allow(dead_code)]` — an unused helper there is meant to surface as a warning. Nothing to audit,
+and nothing to justify keeping.
+
+### Dependencies: all 22 are live, none removed
+
+Every crate in `Cargo.toml` has real references. `#![warn(unused_crate_dependencies)]` was tried and
+is **the wrong tool here**: it is per-target, so with one shared `[dependencies]` table it reports
+each target's counterpart crates as unused — it flagged `hex`, `sha2` and `hmac`, all of which the
+library uses heavily, merely because the binary does not. Its output was discarded in favour of the
+reference count.
+
+One dependency needed documenting rather than deleting. **`log` is used exactly once**, at
+`src/main.rs:227`, because `ConnectOptions::sqlx_logging_level` takes a `log::LevelFilter` and
+naming that type requires a direct dependency. Every diagnostic in this codebase goes through
+`tracing`, so `log` reads as a superseded second logging stack and is the one entry a future cleanup
+would plausibly delete on sight. A comment in `Cargo.toml` now says why it stays.
+
+### The one dead item: `TrustedProxies::with_ttl`
+
+`src/config.rs` carried a `pub fn with_ttl` with no caller. It is a test-facing builder whose
+sibling `with_negative_ttl` is used three times; it was orphaned in session 25, when the negative-TTL
+tests replaced the older test that had been its only user.
+
+**Resolved by restoring its purpose rather than deleting it,** because deleting it would have
+cemented a real coverage gap. `hostnames_resolve_to_their_addresses_and_are_cached` already asserts
+a successful resolution is *reused* inside the window, but nothing asserted it is ever *re-queried*
+— and that is the more security-relevant direction. `TRUSTED_PROXY_DNS_TTL` is the window in which a
+recreated container keeps its **old** address trusted, an address the orchestrator may already have
+reassigned. `AGENT.MD` accepts 30s precisely because it expires; a positive entry that never lapsed
+would become a standing grant to whoever inherited the address, clearable only by a restart.
+
+New test `a_successful_resolution_is_re_queried_once_its_positive_ttl_expires` uses `with_ttl` and
+mirrors `a_failed_resolution_is_retried_once_its_negative_ttl_expires`, reading the same fresh-`Arc`
+signal in the opposite direction. It was mutation-checked rather than assumed: making `is_fresh`
+return `true` for resolved entries fails it, and reverting passes it.
+
+Deleting `with_ttl` instead remains a defensible call — it is three lines to remove along with the
+test — but it trades a tested window for a smaller surface, which is the wrong direction for a
+security-relevant one.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **177 passed**, 0 failed (76 unit + 101 integration; +1 unit) |
+| `./scripts/test_e2e.sh` | **632/632**, 0 failed |
+| `./scripts/verify_convergence.sh` | 4 converged, 1 known, 0 drifted, exit 0 |

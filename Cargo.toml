@@ -24,6 +24,10 @@ hex = "0.4"
 rand = "0.10"
 thiserror = "2"
 dotenvy = "0.15"
+# Not a second logging stack — every diagnostic in this codebase goes through `tracing`. This is
+# here for exactly one call: `ConnectOptions::sqlx_logging_level` takes a `log::LevelFilter`, so
+# naming that type requires the crate as a direct dependency even though it arrives via SeaORM
+# anyway. Deleting it as "obviously superseded by tracing" breaks the build in `src/main.rs`.
 log = "0.4"
 # Used solely for `killpg(2)` when a hook exceeds its timeout: `tokio::process::Child::kill()`
 # only signals the direct child, which would leave orphaned grandchildren behind. Already in the

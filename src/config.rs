@@ -1067,6 +1067,34 @@ mod tests {
         assert!(Arc::ptr_eq(&resolved, &proxies.resolved().await));
     }
 
+    /// The other half of the positive window, and the half the test above cannot reach: a cached
+    /// *success* must eventually be re-queried, not held forever.
+    ///
+    /// This is the more security-relevant direction of the two. [`TRUSTED_PROXY_DNS_TTL`] is the
+    /// window in which a container that has been recreated keeps its **old** address trusted — an
+    /// address the orchestrator may well have already handed to something else. `AGENT.MD` accepts
+    /// that window at 30s precisely because it expires; a positive entry that never lapsed would
+    /// turn a moved proxy into a standing grant to whoever inherited its address, and would need a
+    /// restart to clear. Asserting expiry is what keeps that from regressing into "cached forever".
+    #[tokio::test]
+    async fn a_successful_resolution_is_re_queried_once_its_positive_ttl_expires() {
+        let proxies = TrustedProxies::from_raw("localhost").with_ttl(Duration::ZERO);
+
+        let first = proxies.resolved().await;
+        assert!(
+            is_trusted(ip("127.0.0.1"), &first) || is_trusted(ip("::1"), &first),
+            "localhost should resolve to a loopback address: {first:?}"
+        );
+
+        // A fresh `Arc` is the observable signal that a lookup ran: the flattened view is rebuilt
+        // only when at least one name was actually re-queried. This is the same signal the
+        // negative-caching tests use, read in the opposite direction.
+        assert!(
+            !Arc::ptr_eq(&first, &proxies.resolved().await),
+            "an expired positive entry must be re-resolved rather than trusted indefinitely"
+        );
+    }
+
     #[tokio::test]
     async fn an_unresolvable_hostname_is_simply_not_trusted() {
         // Failing closed matters: a DNS outage must never be able to *widen* what is trusted.
