@@ -112,6 +112,7 @@ normalize() {
         -e 's/\bmessage\b/BUF/g' \
         -e 's/\bbase\b/BUF/g' \
         -e 's/\bpath_and_query\b/TARGET/g' \
+        -e 's/\btarget\b/TARGET/g' \
         -e 's/\bpath\b/TARGET/g' \
         `# SeaORM API era, not behaviour: both issue the same statement` \
         -e 's/\bexecute_unprepared\b/EXEC/g' \
@@ -205,17 +206,15 @@ compare_value() {
 echo "${CYAN}${BOLD}Convergence check${RESET} — this service vs ${DIM}$PEER_ROOT${RESET}"
 echo
 
-# KNOWN-1. The walk is structurally identical; the predicate is not. The peer's `is_literal_network`
-# consults only literal CIDR entries and deliberately skips hostname matchers, so a chained hop
-# identified purely by hostname is treated as a *client* rather than skipped. Ours resolves
-# hostnames into the same network list the walk reads, so such a hop is skipped correctly. The
-# arbitrated spec requires skipping "exactly the trusted hostname/CIDR hops", so this service is
-# the conformant one and the peer is the side that must change.
+# KNOWN-1 is retired. The peer restructured its resolution into a flat snapshot, which retired
+# `is_literal_network` and with it the hostname hop it used to report as the client. The walk is
+# now byte-identical on both sides and this entry is expected to stay converged; the fingerprint is
+# kept only so a *reappearance* of the old shape is reported as drift rather than silently accepted.
 compare "X-Forwarded-For chain walk" \
     "src/config.rs" "resolve_client_ip" \
     "src/config.rs" "resolve_client_ip" \
     "3481781178" \
-    "Peer skips only literal CIDRs in the walk (is_literal_network); we skip resolved hostnames too. Peer must converge."
+    "Retired: peer converged on skipping resolved hostname hops. Any match here is a regression."
 
 # No divergence is accepted in the signed material. A difference here means a signature one service
 # issues is not one the other verifies.
@@ -225,21 +224,24 @@ compare "Signature canonicalization" \
     "-" \
     ""
 
-# KNOWN-2. Same two pragmas, same values; the peer propagates failure with `?` (fatal at startup)
-# while this service logs and continues. The arbitrated spec requires non-fatal, so this service is
-# the conformant one.
+# KNOWN-2, re-baselined. The original rationale ("peer aborts startup on pragma failure") is no
+# longer true: the peer converged on non-fatal and went one better, returning `()` so the function
+# is *structurally* incapable of aborting, where ours returns a `Result` its caller logs and
+# swallows. Same two pragmas, same values, same outcome; what differs now is the return type and
+# the log wording. Recorded rather than reconciled because adopting `()` would be a signature change
+# for no behavioural gain — worth doing on the next pass that touches this file, not on its own.
 compare "SQLite pragma initialization" \
     "src/db.rs" "apply_sqlite_pragmas" \
     "src/state.rs" "apply_sqlite_pragmas" \
-    "2455903075" \
-    "Peer aborts startup on pragma failure; convergence requires non-fatal. Peer must converge."
+    "3743579462" \
+    "Peer returns (); ours returns Result and the caller swallows it. Both non-fatal — cosmetic."
 
-# KNOWN-3. The peer declares no explicit body limit at all and inherits Axum's implicit default,
-# with an independently hard-coded 2 MiB buffer in its middleware.
+# KNOWN-3 is retired: the peer adopted the 3 MiB ceiling and now derives its signature buffer from
+# the same constant. Both sides declare it explicitly, so this compares equal by value.
 compare_value "Request body ceiling" \
     '3 \* 1024 \* 1024' '3 \* 1024 \* 1024' \
     "missing-in-peer" \
-    "Peer has no DefaultBodyLimit layer and hard-codes 2 MiB in middleware. Peer must converge."
+    "Retired: peer adopted the 3 MiB DefaultBodyLimit and the shared constant."
 
 # Both services keep a 92-day soft-delete window; only the resource differs (hooks vs ip_records),
 # so the constants are compared by value rather than by name.

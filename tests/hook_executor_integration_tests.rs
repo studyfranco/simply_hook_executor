@@ -4975,3 +4975,311 @@ async fn the_hook_retention_window_is_configurable_and_independent_of_log_retent
     assert_eq!(config.log_retention_days, 0);
     assert_eq!(config.deleted_hook_retention_days, 92);
 }
+
+// ─────────────────────────────────────────────────────────────
+// Convergence: per-verb grant proportionality & pre-lookup freshness
+// ─────────────────────────────────────────────────────────────
+
+/// A delegated grant may not exceed the verbs the caller holds on that hook.
+///
+/// `require_manage` answers *whether* a caller may administer grants on a hook; it never answered
+/// *how much* of it may be handed out. `can_execute` and `can_manage` are separate columns in
+/// `SCHEMA.MD`, so an operator can deliberately grant management without execution — and before
+/// this guard, that key could route the missing verb to itself through a second key it controls:
+/// mint a key, grant it `can_execute`, authenticate as it, run the hook. Two requests, and the
+/// withheld capability is in hand.
+#[tokio::test]
+async fn a_delegated_grant_cannot_exceed_the_verbs_the_caller_holds() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("verbs.sh", "#!/bin/sh\necho ran\n");
+
+    let hook = insert_hook(&db, "delegated_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    let (accomplice_id, accomplice) = insert_key(&db, "accomplice", "", KeyScopes::plain()).await;
+
+    // The caller manages the hook but was deliberately not given execution rights on it.
+    grant(&db, manager_id, hook, false, true).await;
+
+    let over_grant = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{accomplice_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        over_grant.status,
+        StatusCode::FORBIDDEN,
+        "granting a verb the caller does not hold must be refused"
+    );
+    assert!(
+        over_grant.raw.contains("can_execute"),
+        "the refusal names the verb that was over-granted, not just 'permission denied': {}",
+        over_grant.raw
+    );
+
+    // The refusal was real: no row was written, so the accomplice still cannot run the hook.
+    let attempt = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &accomplice, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(attempt.status, StatusCode::FORBIDDEN, "the blocked grant never landed");
+
+    // Handing out a verb the caller *does* hold still works — this is proportionality, not a ban
+    // on delegation.
+    let within_bounds = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{accomplice_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(within_bounds.status, StatusCode::OK, "delegating a verb you hold is allowed");
+
+    // Revoking is never an escalation, so turning a flag off is allowed even for the verb the
+    // caller lacks: `false` cannot exceed anything.
+    let revoke = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{accomplice_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(revoke.status, StatusCode::OK, "revocation must not require holding the verb");
+
+    // On a hook where the caller genuinely holds execution, the identical request succeeds —
+    // proving the block was about the caller's own grant and nothing else about the payload.
+    let held_fully = insert_hook(&db, "fully_held_hook", &script, 30).await;
+    grant(&db, manager_id, held_fully, true, true).await;
+    let now_permitted = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{accomplice_id}/permissions"),
+            &manager,
+            Some(
+                json!({ "hook_id": held_fully.to_string(), "can_execute": true, "can_manage": false }),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(now_permitted.status, StatusCode::OK, "holding the verb makes the grant legitimate");
+
+    // A master key is exempt, as everywhere else in the RBAC model.
+    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let (bystander_id, _) = insert_key(&db, "bystander", "", KeyScopes::plain()).await;
+    let by_master = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{bystander_id}/permissions"),
+            &master,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(by_master.status, StatusCode::OK, "master keys bypass proportionality");
+}
+
+/// A caller holding *no* grant at all is still refused, and in the same words as before.
+///
+/// The entry gate moved inside `guard_delegated_hook_grant` when the per-verb check was added.
+/// Folding two checks into one function is exactly where a condition gets dropped by accident, so
+/// the pre-existing rule is pinned separately rather than left implied by the test above.
+#[tokio::test]
+async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("unmanaged.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "unmanaged_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+
+    // No row at all.
+    let no_grant = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(no_grant.status, StatusCode::FORBIDDEN);
+    assert!(
+        no_grant.raw.contains("manage access"),
+        "the entry gate's message is unchanged: {}",
+        no_grant.raw
+    );
+
+    // A row that grants execution but not management is not authority to administer grants either.
+    grant(&db, manager_id, hook, true, false).await;
+    let execute_only = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        execute_only.status,
+        StatusCode::FORBIDDEN,
+        "can_execute alone does not authorize delegating anything"
+    );
+}
+
+/// `X-Timestamp` is validated before the API key is looked up.
+///
+/// Both orderings answer `401`, so the status alone proves nothing. The *message* does: paired with
+/// an unknown key, only the freshness-first ordering can name the window — the other has already
+/// failed the key lookup and answers "Invalid API Key". That makes this a genuine assertion about
+/// which check ran first, not merely that the request was refused.
+#[tokio::test]
+async fn a_stale_timestamp_is_refused_before_the_api_key_is_looked_up() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    let stale = (now_timestamp() - 3_600).to_string();
+    let request = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/hooks")
+            .header("X-API-Key", "a-key-that-was-never-issued")
+            .header("X-Timestamp", &stale)
+            .header("X-Signature-256", "sha256=00"),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+
+    let response = send(&app, request).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert!(
+        response.raw.contains("window"),
+        "the timestamp window must be what rejected this, not the key lookup: {}",
+        response.raw
+    );
+    assert!(
+        !response.raw.contains("Invalid API Key"),
+        "reaching the key lookup means the ordering regressed: {}",
+        response.raw
+    );
+
+    // Malformed is handled at the same point, and is likewise not coerced to 'now'.
+    for malformed in ["not-a-number", "1700000000.5", ""] {
+        let request = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/hooks")
+                .header("X-API-Key", "a-key-that-was-never-issued")
+                .header("X-Timestamp", malformed)
+                .header("X-Signature-256", "sha256=00"),
+        )
+        .body(axum::body::Body::empty())
+        .expect("request builds");
+        let response = send(&app, request).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "a malformed timestamp {malformed:?} must be refused"
+        );
+        assert!(
+            !response.raw.contains("Invalid API Key"),
+            "{malformed:?} reached the key lookup: {}",
+            response.raw
+        );
+    }
+}
+
+/// Moving the window check earlier must not let it reach traffic it was never meant to judge.
+///
+/// The pre-check keys off the *shape* of the request — `X-Timestamp` alongside `X-Signature-256` —
+/// because the mode that owns the window lives in the row the lookup fetches. That boundary is the
+/// whole reason this is safe to hoist, so it is pinned here rather than left as an implementation
+/// detail: an unsigned bearer request and a `BODY_ONLY` webhook both carry a stale timestamp
+/// through untouched, exactly as they did before, while a signed one is refused.
+#[tokio::test]
+async fn hoisting_the_window_check_does_not_reach_unsigned_or_body_only_traffic() {
+    use simply_hook_executor::entities::api_key::HmacMode;
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("shape.sh", "#!/bin/sh\necho ok\n");
+
+    let bearer = insert_key_full(&db, "bearer", "", KeyScopes::plain()).await;
+    let sender = insert_key_with_mode(&db, "forgejo", "", KeyScopes::plain(), HmacMode::BodyOnly)
+        .await;
+    let hook = insert_hook(&db, "shaped_hook", &script, 30).await;
+    grant(&db, sender.id, hook, true, false).await;
+
+    let ancient = "1";
+
+    // An unsigned bearer request: there is no signed material, so there is nothing for a window to
+    // protect and the header is not the daemon's business.
+    let unsigned = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/hooks")
+            .header("X-API-Key", bearer.plaintext.as_str())
+            .header("X-Timestamp", ancient),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(
+        send(&app, unsigned).await.status,
+        StatusCode::OK,
+        "an unsigned request's stray timestamp is still ignored"
+    );
+
+    // A `BODY_ONLY` webhook, whose sender's format we do not control: the timestamp is not part of
+    // its signed material, so rejecting over it would break the integration this mode exists for.
+    let body = json!({}).to_string();
+    let webhook = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook/shaped_hook")
+            .header("X-API-Key", sender.plaintext.as_str())
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", ancient)
+            .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
+    )
+    .body(axum::body::Body::from(body))
+    .expect("request builds");
+    assert_eq!(
+        send(&app, webhook).await.status,
+        StatusCode::OK,
+        "a body-only sender's stray timestamp is still ignored"
+    );
+
+    // The canonical shape — both headers — is where the window applies, and it is enforced before
+    // the key is ever looked up.
+    let signed_shape = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/hooks")
+            .header("X-API-Key", bearer.plaintext.as_str())
+            .header("X-Timestamp", ancient)
+            .header("X-Signature-256", "sha256=00"),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(send(&app, signed_shape).await.status, StatusCode::UNAUTHORIZED);
+}

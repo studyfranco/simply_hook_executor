@@ -2417,6 +2417,100 @@ else
     warn "Skipping §31: openssl is not available to sign requests."
 fi
 
+# ── 32. Per-verb grant proportionality & pre-lookup timestamp validation ────
+
+log_section "32. Grant proportionality and freshness-before-lookup"
+
+# --- Per-verb proportionality on M:N hook permissions ---
+# `can_manage` is authority to administer a hook's grants; it is not authority to invent a verb the
+# caller was deliberately not given. Before this, a manage-only holder could route `can_execute` to
+# itself through a second key it controls: mint, grant, authenticate as the new key, run.
+PROP_SCRIPT=$(make_hook_script "proportional.sh" 'echo "prop ran"')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$PROP_SCRIPT" '{name:"proportional_hook",script_path:$p}')"
+check "200" "create a hook for the proportionality checks"
+PROP_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+create_scoped_key "Proportionality Delegator" ',"can_manage_keys":true'
+DELEGATOR_KEY="$CREATED_KEY"; DELEGATOR_ID="$CREATED_ID"
+create_scoped_key "Proportionality Accomplice"
+ACCOMPLICE_KEY="$CREATED_KEY"; ACCOMPLICE_ID="$CREATED_ID"
+
+# Manage without execute — the combination `SCHEMA.MD` models as two columns so it is expressible.
+api_call POST "/api/keys/$DELEGATOR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:true}')"
+check "200" "grant the delegator manage-without-execute (as master)"
+
+api_call POST "/api/hooks/$PROP_HOOK_ID/execute" "$DELEGATOR_KEY" '{"parameters":{}}'
+check "403" "the delegator genuinely cannot execute the hook itself"
+
+api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$DELEGATOR_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "403" "granting can_execute without holding it is refused"
+check_true '.error | contains("can_execute")' "the refusal names the over-granted verb"
+
+# The refusal was real, not cosmetic: no row landed, so the accomplice still cannot run it.
+api_call POST "/api/hooks/$PROP_HOOK_ID/execute" "$ACCOMPLICE_KEY" '{"parameters":{}}'
+check "403" "the blocked grant never reached the database"
+
+# Handing out a verb the caller does hold still works — this is proportionality, not a ban.
+api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$DELEGATOR_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:true}')"
+check "200" "delegating a verb the caller holds is still allowed"
+
+# Revoking is never an escalation: `false` cannot exceed anything, even for the missing verb.
+api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$DELEGATOR_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
+check "200" "revocation does not require holding the verb being cleared"
+
+# Once the caller holds both verbs, the identical request it was refused now succeeds.
+api_call POST "/api/keys/$DELEGATOR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "master widens the delegator to both verbs"
+api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$DELEGATOR_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "200" "the same grant is legitimate once the caller holds the verb"
+api_call POST "/api/hooks/$PROP_HOOK_ID/execute" "$ACCOMPLICE_KEY" '{"parameters":{}}'
+check "200" "the delegated execute right actually works"
+
+# The entry gate is unchanged: no grant at all is still refused, in the same words.
+create_scoped_key "Proportionality Outsider" ',"can_manage_keys":true'
+OUTSIDER_KEY="$CREATED_KEY"
+api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$OUTSIDER_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
+check "403" "a caller with no grant on the hook cannot administer its permissions"
+check_true '.error | contains("manage access")' "the entry gate's message is unchanged"
+
+# --- Freshness is checked before the API key is looked up ---
+# Both orderings answer 401, so the status proves nothing on its own. The *message* does: paired
+# with an unknown key, only the freshness-first ordering can name the window — the other has
+# already failed the key lookup and answers "Invalid API Key".
+STALE_TS=$(( $(date +%s) - 3600 ))
+RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X GET \
+    -H "X-API-Key: a-key-that-was-never-issued" \
+    -H "X-Timestamp: $STALE_TS" -H "X-Signature-256: sha256=00" \
+    "$BASE_URL/api/hooks")
+RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+check "401" "a stale timestamp on an unknown key is rejected"
+check_true '.error | contains("window")' "the window rejected it, not the key lookup"
+check_true '.error | contains("Invalid API Key") | not' "the key lookup was never reached"
+
+for BAD_TS in "not-a-number" "1700000000.5"; do
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X GET \
+        -H "X-API-Key: a-key-that-was-never-issued" \
+        -H "X-Timestamp: $BAD_TS" -H "X-Signature-256: sha256=00" \
+        "$BASE_URL/api/hooks")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "a malformed X-Timestamp ('$BAD_TS') is rejected before the lookup"
+    check_true '.error | contains("Invalid API Key") | not' \
+        "('$BAD_TS') never reached the key lookup"
+done
+
+# The hoist is scoped to the shape that owns a window — `X-Timestamp` *and* `X-Signature-256`.
+# An unsigned bearer request carries a stray timestamp through untouched, exactly as before.
+api_call GET "/api/auth/me" "$MASTER_KEY" "" "" "X-Timestamp: 1"
+check "200" "an unsigned request's stray timestamp is still ignored"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

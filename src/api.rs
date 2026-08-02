@@ -431,6 +431,77 @@ fn require_master_for_privileged_hook(
     )))
 }
 
+/// Rejects a delegated grant that would hand out more authority over a hook than the caller holds.
+///
+/// [`require_manage`] answers *whether* a caller may administer grants on a hook at all. This
+/// answers the separate question of *how much* it may hand out, and that question was previously
+/// never asked: a key holding `can_manage` but not `can_execute` could write `can_execute` onto a
+/// second key it also controls, authenticate as that key, and run the hook — obtaining in two
+/// requests a verb an operator had deliberately withheld from it. `SCHEMA.MD` models `can_execute`
+/// and `can_manage` as independent columns precisely so that combination is expressible; enforcing
+/// only one of them made the distinction advisory.
+///
+/// Each verb is checked **independently** against the caller's own row, exactly as `AGENT.MD`'s
+/// least-privilege rule implies: holding `can_manage` confers no right to grant `can_execute`, and
+/// vice versa.
+///
+/// Two behaviours fall out of the `wanted && !held` shape and are deliberate:
+///
+/// - **Revocation is never blocked.** Turning a flag *off* is a request for `false`, which can never
+///   exceed anything. Removing authority is not an escalation and must not need a master.
+/// - **Re-asserting a verb you hold is a no-op**, so an idempotent re-submission of an existing
+///   grant still succeeds rather than failing for a caller that changed nothing.
+///
+/// The `can_manage` entry gate is folded in here rather than left to a separate
+/// [`require_manage`] call so that both questions are answered from **one** permission row: the
+/// checks are about the same caller and the same hook, and reading it twice would invite the two
+/// answers to disagree if a grant were revoked between them.
+///
+/// Master keys bypass, per `AGENT.MD`'s RBAC model.
+async fn guard_delegated_hook_grant(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    hook: &hook::Model,
+    requested_execute: bool,
+    requested_manage: bool,
+) -> Result<(), AppError> {
+    if key.is_master {
+        return Ok(());
+    }
+
+    // The entry gate first: per `AGENT.MD`, administering grants on a hook at all requires
+    // `can_manage` over it. A caller without that row is refused in the same words
+    // [`require_manage`] uses, so the two paths stay indistinguishable to a caller probing them.
+    let Some(held) = hook_permission(db, key.id, hook.id).await?.filter(|p| p.can_manage) else {
+        return Err(AppError::Forbidden(
+            "Permission denied: You do not have manage access to this hook".to_owned(),
+        ));
+    };
+
+    let overreach = [
+        ("can_execute", requested_execute, held.can_execute),
+        ("can_manage", requested_manage, held.can_manage),
+    ]
+    .into_iter()
+    .find(|(_, wanted, holds)| *wanted && !*holds);
+
+    if let Some((verb, _, _)) = overreach {
+        tracing::warn!(
+            key = %key.prefix,
+            hook = %hook.name,
+            verb,
+            "Blocked privilege delegation: key attempted to grant a verb it does not hold itself"
+        );
+        return Err(AppError::Forbidden(format!(
+            "Permission denied: you cannot grant '{verb}' on hook '{}' because you do not hold it \
+             yourself",
+            hook.name
+        )));
+    }
+
+    Ok(())
+}
+
 /// Renders a key's signature mode for an audit log entry.
 ///
 /// `BODY_ONLY` is called out as replay-vulnerable rather than merely named: choosing it is a
@@ -2226,13 +2297,22 @@ pub async fn update_key_hook_permissions(
     };
     let hook_model = resolve_hook(&state.db, identifier).await?;
 
-    // You cannot hand out authority over a hook you do not yourself manage. Without this, holding
-    // `can_manage_keys` was enough to distribute execute rights on every hook in the system to any
-    // key — a cross-tenant hole in what is meant to be a per-hook M:N model.
+    // You cannot hand out authority over a hook you do not yourself manage, nor hand out more of it
+    // than you hold. Without the first, `can_manage_keys` alone was enough to distribute execute
+    // rights on every hook in the system — a cross-tenant hole in what is meant to be a per-hook
+    // M:N model. Without the second, a `can_manage`-only holder could route `can_execute` to itself
+    // through a second key. Both are enforced verb by verb in `guard_delegated_hook_grant`.
+    guard_delegated_hook_grant(
+        &state.db,
+        &key,
+        &hook_model,
+        payload.can_execute,
+        payload.can_manage,
+    )
+    .await?;
     if !key.is_master {
-        require_manage(&state.db, &key, hook_model.id).await?;
         // Rights over a *privileged* hook are the elevation itself, so distributing them stays
-        // master-only even for a caller who legitimately manages the hook.
+        // master-only even for a caller who legitimately manages the hook and holds both verbs.
         require_master_for_privileged_hook(&key, &hook_model, "grant permissions on")?;
     }
 

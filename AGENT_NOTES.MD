@@ -1918,3 +1918,113 @@ startup; `DefaultBodyLimit::max(3 MiB)` outside every nest with `MAX_SIGNED_BODY
 it; non-fatal SQLite pragmas before migrations; 30s/5s positive/negative DNS TTLs per hostname with a
 60s boot grace that never aborts; 92-day purge filtered on all three of `is_deleted`,
 `deleted_at IS NOT NULL`, and `deleted_at < threshold`.
+
+---
+
+## 2026-08-02 (session 26) — Per-verb grant proportionality; freshness before the key lookup
+
+The two findings the read-only audit earlier today assigned to *this* side. Both are now closed, so
+the only remaining items in that report belong to the peer.
+
+### 1. Per-verb grant proportionality (`src/api.rs`)
+
+`update_key_hook_permissions` asked whether the caller could administer grants on a hook
+(`require_manage`) but never how much of one it could hand out. `can_execute` and `can_manage` are
+separate columns in `SCHEMA.MD` precisely so an operator can grant management *without* execution —
+and that key could route the missing verb to itself in two requests: mint a second key (it holds
+`can_manage_keys`), grant *it* `can_execute` on the hook, authenticate as it, run the hook.
+
+New `guard_delegated_hook_grant` checks **each verb independently** against the caller's own row.
+Shape is `wanted && !held`, from which two properties fall out and are tested:
+
+- **Revocation is never blocked** — turning a flag off requests `false`, which cannot exceed
+  anything. Removing authority must not need a master.
+- **Re-asserting a verb you hold is a no-op**, so an idempotent re-submission still succeeds.
+
+The `can_manage` entry gate moved *inside* the new guard rather than staying a separate
+`require_manage` call, so both questions are answered from **one** permission row. Reading it twice
+would let the two answers disagree if a grant were revoked in between. The entry gate's refusal text
+is unchanged, deliberately: the two paths must stay indistinguishable to a caller probing them, and
+a separate test pins that message so folding the checks together cannot quietly drop one.
+
+Master keys bypass, and `require_master_for_privileged_hook` still runs afterwards — rights over a
+`run_as_user` hook remain master-only even for a caller that legitimately holds both verbs.
+
+### 2. Freshness before the key lookup (`src/middleware.rs`)
+
+`X-Timestamp` was validated after `api_keys` was queried, so every stale capture, broken client
+clock and scanner spraying garbage bought an indexed query from a caller that had proven nothing.
+New `prevalidate_timestamp_header` runs before the lookup.
+
+**The scope took one correction, and it is the interesting part of this change.** The first
+implementation validated the header *whenever present*, on every key. That broke
+`body_only_mode_accepts_github_style_webhook_signatures`, which asserts a stray `X-Timestamp` on a
+`BODY_ONLY` request is ignored — an existing, deliberate contract, because `AGENT.MD` §1 says that
+mode exists for senders whose format cannot be changed. The test was right and the change was wrong:
+enforcing a window there would reject a webhook over a header that is not part of its signed
+material, and would buy nothing, since `BODY_ONLY` carries no replay protection either way.
+
+The pre-check is therefore scoped to requests carrying `X-Timestamp` **and** `X-Signature-256` —
+the shape of a `CANONICAL_V1` request, and the only shape with a window. That is exact rather than
+approximate: for a `CANONICAL_V1` key, `X-Signature-256` is the only signature header honoured (the
+`X-Hub-Signature-256` downgrade guard sees to that), so every signed request the window applies to
+is covered.
+
+**The authoritative check stays in the `CANONICAL_V1` branch and still runs unconditionally.** The
+pre-check is an optimization; making it the guarantee would leave the window reachable-but-skipped
+if that branch ever accepted a header the pre-check does not inspect. A security property must not
+rest on an invariant held two functions apart, and re-parsing an integer is cheap insurance.
+
+`bound_ips` remains last. The ordering is now: client IP → key header present → **timestamp** → key
+lookup → signature → replay → `bound_ips`, matching the peer's pipeline exactly.
+
+### Convergence checker re-baselined
+
+`scripts/verify_convergence.sh` was reporting 2 drifted / exit 1 **before** any of today's edits
+(verified by stashing them) — the peer's own convergence pass landed after our `8b70b2c` and
+invalidated three of its recorded baselines. Two of the rationales had become factually false, which
+is worse than a red check:
+
+- **KNOWN-1 retired.** The peer's flat-snapshot restructure retired `is_literal_network`; the chain
+  walk is byte-identical now. Fingerprint kept so a *reappearance* of the old shape is drift.
+- **KNOWN-2 re-baselined** (`2455903075` → `3743579462`). "Peer aborts startup on pragma failure" is
+  no longer true — it converged on non-fatal and went further, returning `()` so the function cannot
+  abort by construction, where ours returns a `Result` the caller swallows. Same pragmas, same
+  values, same outcome; cosmetic, and worth folding into the next pass that touches `db.rs`.
+- **KNOWN-3 retired.** The peer adopted the 3 MiB ceiling and the shared signature-buffer constant.
+- **"Signature canonicalization" was a checker bug, not drift.** The normalizer mapped
+  `path_and_query` → `TARGET` but left the peer's `target` alone, so identical functions diffed on a
+  parameter name. Added the missing rename; both sides now compare equal, which is the truth.
+
+Now 4 converged, 1 known (cosmetic), 0 drifted, exit 0.
+
+### `AGENT.MD` updated
+
+Two directives were extended rather than overridden — both make the document stricter to match the
+code, and neither contradicts what was there:
+
+- §1's "Timestamp before HMAC" bullet now states the pre-lookup ordering, its header-shape scope,
+  and why the authoritative check stays where it is.
+- §2's RBAC matrix gained a row for per-verb proportionality, alongside the existing
+  "hook the caller does not `can_manage`" row it builds on.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **176 passed**, 0 failed (75 unit + 101 integration; was 71 + 97) |
+| `./scripts/test_e2e.sh` | **632/632**, 0 failed (was 608) |
+| `./scripts/verify_convergence.sh` | 4 converged, 1 known, 0 drifted, exit 0 |
+
+New tests: `a_delegated_grant_cannot_exceed_the_verbs_the_caller_holds`,
+`granting_on_a_hook_the_caller_does_not_manage_is_still_refused`,
+`a_stale_timestamp_is_refused_before_the_api_key_is_looked_up`,
+`hoisting_the_window_check_does_not_reach_unsigned_or_body_only_traffic`, four
+`prevalidate_timestamp_header` unit tests, and E2E §32 (24 new checks) covering both changes
+end-to-end including the "the blocked grant never reached the database" and "the key lookup was
+never reached" assertions.
+
+The ordering test asserts on the *message*, not the status: both orderings answer `401`, so only
+"does the error name the window or the key lookup?" actually distinguishes them.

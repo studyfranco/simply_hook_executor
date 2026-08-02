@@ -96,6 +96,58 @@ fn verify_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Rejects a stale `X-Timestamp` before the database is consulted, returning the header unchanged.
+///
+/// # Why this runs before the key lookup
+///
+/// A timestamp is self-contained: parsing it and comparing it against the server clock needs
+/// nothing from `api_keys`. Checking it only after the lookup meant every request carrying a stale
+/// or malformed one — a capture replayed hours later, a client with a broken clock, a scanner
+/// spraying garbage — first cost an indexed query. Rejecting here makes that traffic free to serve,
+/// which is the principle rather than the micro-optimization: the checks that cost us nothing
+/// belong in front of the ones that do, so an unauthenticated caller cannot choose how much work
+/// we perform on its behalf.
+///
+/// # Scope: the shape of the request, not the mode of the key
+///
+/// The window is applied only when [`SIGNATURE_HEADER`] is present alongside the timestamp, which
+/// is precisely the shape of a `CANONICAL_V1` request — the only mode that has a window at all.
+/// The mode itself lives in the row the lookup fetches, so it cannot be consulted here; the pair of
+/// headers is the closest thing to it that is free.
+///
+/// Widening this to "any request carrying a timestamp" was tried and is wrong. `BODY_ONLY` exists
+/// to accept senders whose format cannot be changed (`AGENT.MD` §1), and a stray `X-Timestamp` from
+/// one of them is documented as ignored — enforcing a window over it would reject a webhook for a
+/// header that is not even part of its signed material, buying nothing, since `BODY_ONLY` carries
+/// no replay protection to strengthen either way.
+///
+/// # This is an optimization, not the guarantee
+///
+/// The authoritative window check stays in the `CANONICAL_V1` branch below and runs unconditionally
+/// there. It would be reachable-but-skipped only if that branch ever accepted a signature header
+/// this function does not look at — and a security property must not rest on an invariant held two
+/// functions apart. Re-parsing an integer is worth not having that footgun.
+///
+/// `Ok(None)` means no header was sent. Whether *that* is an error depends on `hmac_mode`, so the
+/// judgement stays with the caller. The returned value is the header text **exactly as received**,
+/// never a re-serialized integer: it is fed to the HMAC verbatim, so normalizing it (stripping a
+/// leading zero, trimming padding) would invalidate a signature the client computed correctly over
+/// the bytes it actually sent.
+fn prevalidate_timestamp_header(
+    headers: &axum::http::HeaderMap,
+    max_age_seconds: i64,
+) -> Result<Option<String>, AppError> {
+    let Some(raw) = headers.get(TIMESTAMP_HEADER).and_then(|h| h.to_str().ok()) else {
+        return Ok(None);
+    };
+
+    if headers.contains_key(SIGNATURE_HEADER) {
+        verify_timestamp(raw, max_age_seconds)?;
+    }
+
+    Ok(Some(raw.to_owned()))
+}
+
 /// Verifies an `X-Signature-256: sha256=<hex>` header against the canonical request string.
 ///
 /// The HMAC key is the API key's `signing_secret`, recovered from storage via
@@ -175,6 +227,25 @@ fn recover_signing_secret(
 /// Enforces API key authentication, CIDR binding, and (when present) body signing for every
 /// `/api/*` and `/webhook/*` route.
 ///
+/// # Ordering: cheapest first, then authenticate, then authorize
+///
+/// 1. Resolve the client IP — no I/O beyond a possibly-cached DNS lookup.
+/// 2. Require an `X-API-Key` header to exist. No query yet; this is a header read.
+/// 3. **Validate `X-Timestamp` on a signed request.** Self-contained, so a stale or malformed
+///    timestamp is refused before it can cost a database round-trip.
+/// 4. Look up the key by `key_hash` — the first query, and the first step an unauthenticated caller
+///    can make us pay for.
+/// 5. Verify the HMAC (`CANONICAL_V1` also requires that step 3 found a header).
+/// 6. Reject a signature already used inside the window.
+/// 7. **Only then** check `bound_ips`.
+///
+/// Steps 3 and 7 are both load-bearing and neither may drift. Moving step 3 back after the lookup
+/// hands an unauthenticated caller a free query per request. Moving step 7 forward lets a caller
+/// holding nothing but a leaked `X-API-Key` distinguish `403 Client IP not allowed` from `401`, and
+/// so learn whether a key it merely found is bound to networks excluding it — a map of the
+/// deployment's topology handed to someone who has proven nothing. Both failures must look identical
+/// until the caller has proven it holds the signing secret.
+///
 /// On success the authenticated [`crate::entities::api_key::Model`] and the resolved [`ClientIp`]
 /// are placed in the request's extensions for handlers to consume.
 pub async fn auth_middleware(
@@ -202,6 +273,13 @@ pub async fn auth_middleware(
         .ok_or_else(|| {
             AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header"))
         })?;
+
+    // Freshness before the database. A stale or malformed timestamp on a signed request is refused
+    // here rather than after a query an unauthenticated caller provoked — see
+    // [`prevalidate_timestamp_header`]. Its *absence* cannot be judged yet: that depends on the
+    // key's `hmac_mode`, which is what the lookup below is for.
+    let presented_timestamp =
+        prevalidate_timestamp_header(&headers, state.config.signature_max_age_seconds)?;
 
     let mut hasher = Sha256::new();
     hasher.update(presented_key.as_bytes());
@@ -240,20 +318,18 @@ pub async fn auth_middleware(
             // window. BODY_ONLY signs the body alone, which is what GitHub-style senders produce —
             // it cannot resist replay, and deliberately does not pretend to by demanding a
             // timestamp it would not actually cover.
+            // Two things happen here that could not happen before the lookup. First, whether the
+            // header had to be present at all — that is what `hmac_mode` decides. Second, the
+            // authoritative window check: `prevalidate_timestamp_header` already applied it to
+            // every request shaped like this one, but the guarantee lives here, where it cannot be
+            // sidestepped by a future change to which signature headers this branch accepts.
             let timestamp = match key_record.hmac_mode {
                 HmacMode::CanonicalV1 => {
-                    let timestamp = headers
-                        .get(TIMESTAMP_HEADER)
-                        .and_then(|h| h.to_str().ok())
-                        .ok_or_else(|| {
-                            AppError::Unauthorized(format!(
-                                "A signed request must include an {TIMESTAMP_HEADER} header"
-                            ))
-                        })?
-                        .to_owned();
-
-                    // Checked before the HMAC: a stale request is rejected without spending the
-                    // work of recovering the secret and hashing the body.
+                    let timestamp = presented_timestamp.ok_or_else(|| {
+                        AppError::Unauthorized(format!(
+                            "A signed request must include an {TIMESTAMP_HEADER} header"
+                        ))
+                    })?;
                     verify_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
                     Some(timestamp)
                 }
@@ -531,4 +607,91 @@ mod tests {
         }
     }
 
+    /// Builds a header map carrying an optional timestamp and an optional signature header.
+    fn headers_with(
+        timestamp: Option<&str>,
+        signature_header: Option<&'static str>,
+    ) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(value) = timestamp {
+            headers.insert(TIMESTAMP_HEADER, value.parse().expect("a valid header value"));
+        }
+        if let Some(name) = signature_header {
+            headers.insert(name, "sha256=00".parse().expect("a valid header value"));
+        }
+        headers
+    }
+
+    /// An absent header is not an error *here*: whether it is required depends on the key's
+    /// `hmac_mode`, which this function deliberately runs before fetching.
+    #[test]
+    fn an_absent_timestamp_defers_the_verdict_rather_than_deciding_it() {
+        let headers = headers_with(None, Some(SIGNATURE_HEADER));
+        assert_eq!(
+            prevalidate_timestamp_header(&headers, 300).expect("absence is not a failure"),
+            None
+        );
+    }
+
+    /// The value is returned byte-for-byte, because it is fed to the HMAC verbatim. Normalizing it
+    /// here — trimming the padding, dropping a leading zero — would invalidate a signature the
+    /// client computed correctly over the bytes it actually sent.
+    #[test]
+    fn a_valid_timestamp_is_returned_exactly_as_received() {
+        let padded = format!("  {}  ", chrono::Utc::now().timestamp());
+        let headers = headers_with(Some(&padded), Some(SIGNATURE_HEADER));
+        assert_eq!(
+            prevalidate_timestamp_header(&headers, 300).expect("inside the window"),
+            Some(padded.clone()),
+            "the header text must survive validation unchanged"
+        );
+    }
+
+    /// The point of the reordering: a signed request whose timestamp cannot pass is refused with no
+    /// key record in hand, which is to say before the database is touched at all.
+    #[test]
+    fn a_stale_or_malformed_timestamp_fails_without_a_key_record() {
+        let now = chrono::Utc::now().timestamp();
+
+        for rejected in [
+            (now - 301).to_string(),
+            (now + 301).to_string(),
+            (now - 86_400).to_string(),
+            "not-a-number".to_owned(),
+            "1700000000.5".to_owned(),
+            String::new(),
+        ] {
+            let headers = headers_with(Some(&rejected), Some(SIGNATURE_HEADER));
+            let error = prevalidate_timestamp_header(&headers, 300)
+                .expect_err("a timestamp outside the window must be refused");
+            assert!(
+                matches!(error, AppError::Unauthorized(_)),
+                "{rejected:?} must be a 401, not a 400: authentication is what failed"
+            );
+        }
+    }
+
+    /// The pre-check is scoped to the shape of a `CANONICAL_V1` request, so it cannot reach into
+    /// `BODY_ONLY` traffic — whose senders `AGENT.MD` says we do not get to change, and whose stray
+    /// `X-Timestamp` is documented as ignored. A window enforced there would reject a webhook over
+    /// a header that is not part of its signed material.
+    #[test]
+    fn a_stray_timestamp_without_a_canonical_signature_is_carried_not_judged() {
+        let ancient = "1";
+
+        for shape in [None, Some(HUB_SIGNATURE_HEADER)] {
+            let headers = headers_with(Some(ancient), shape);
+            assert_eq!(
+                prevalidate_timestamp_header(&headers, 300)
+                    .expect("a body-only or unsigned request is not window-checked here"),
+                Some(ancient.to_owned()),
+                "{shape:?}: the header is passed through untouched"
+            );
+        }
+
+        // ...whereas the same value alongside `X-Signature-256` is the canonical shape, and is
+        // held to the window.
+        let canonical = headers_with(Some(ancient), Some(SIGNATURE_HEADER));
+        assert!(prevalidate_timestamp_header(&canonical, 300).is_err());
+    }
 }
