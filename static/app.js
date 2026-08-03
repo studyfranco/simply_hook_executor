@@ -189,7 +189,7 @@ class PagedCache {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Request signing — CANONICAL_V1, mandatory, Web Crypto only
+// Request signing — CANONICAL_V1, mandatory
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Every request this dashboard sends is signed. There is no unsigned path, no bearer-only path, and
@@ -204,25 +204,184 @@ class PagedCache {
 // covered by the anti-replay window and the single-use guard in `src/replay.rs`, which the previous
 // mode-following behaviour silently gave up whenever the operator logged in with a BODY_ONLY key.
 //
-// `crypto.subtle` is the only implementation. It exists **only in a secure context** — HTTPS, or a
-// `localhost` origin — so a dashboard reached over plain HTTP at a LAN address cannot sign and is
-// refused at the login screen with that stated plainly. See `SecureContextGate` below: an
-// unreachable dashboard that says why beats one that silently downgrades its own authentication.
+// **What is mandatory is the signature, not the implementation that computes it.** `crypto.subtle`
+// is exposed only in a secure context — HTTPS, or a `localhost` origin — and this daemon is
+// routinely reached over plain HTTP at a LAN address, which is a deployment choice rather than an
+// authentication one. Two implementations therefore stand behind one posture: Web Crypto where the
+// browser offers it, and the self-contained `PureCrypto` below where it does not. They produce
+// byte-identical signatures, so the backend cannot tell them apart and the security property does
+// not depend on which one ran.
 
-// Whether Web Crypto is usable in this context, and the message to show when it is not.
+// ───────────────────────────────────────────────────────────────────────────
+// Pure-JS HMAC-SHA256 fallback (FIPS 180-4 SHA-256 + RFC 2104 HMAC)
+// ───────────────────────────────────────────────────────────────────────────
 //
-// Checked once at startup rather than per request, because the answer cannot change for the lifetime
-// of the page and because a caller discovering it mid-flight can only report it as a failed request.
-const SecureContextGate = {
-    get available() {
+// Web Crypto's `crypto.subtle` is only exposed in a secure context (HTTPS or localhost). A
+// dashboard reached over plain HTTP on a LAN address therefore cannot use it at all. Rather than
+// silently dropping to unsigned requests — or pulling in a CDN dependency, which AGENT.MD forbids
+// outright — this is a self-contained implementation used only when `crypto.subtle` is absent.
+//
+// It is deliberately written against the specification's own structure so it can be checked line
+// by line, and `PureCrypto.selfTest()` verifies it against an RFC 4231 vector before it is ever
+// trusted with a real request.
+//
+// Security note: this fallback is not constant-time, and it computes the MAC in interpreted JS.
+// That is an accepted, explicit trade-off, and a narrow one — it runs *only* where `crypto.subtle`
+// is absent, which is to say only on a plain-HTTP origin, where the request and every header it
+// carries are already fully readable by anyone on the path. A timing side-channel in the browser is
+// not the weak link in that deployment. HTTPS remains the recommended posture, and on HTTPS this
+// code never executes.
+const PureCrypto = (() => {
+    // First 32 bits of the fractional parts of the cube roots of the first 64 primes.
+    const K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+
+    // First 32 bits of the fractional parts of the square roots of the first 8 primes.
+    const H0 = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    ];
+
+    // `>>> 0` after every arithmetic step: JS numbers are doubles, and without it intermediate
+    // sums exceed 2^32 and lose the wrap-around the algorithm depends on.
+    const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
+
+    // SHA-256 over a byte array, returning 32 bytes.
+    function sha256(bytes) {
+        const length = bytes.length;
+        // Padding: 0x80, then zeros, then the 64-bit big-endian bit length.
+        const withPadding = new Uint8Array((((length + 8) >> 6) + 1) << 6);
+        withPadding.set(bytes);
+        withPadding[length] = 0x80;
+
+        // Bit length as a 64-bit big-endian value. The high word is computed by division rather
+        // than a shift, because `<<` in JS is 32-bit and would silently truncate.
+        const bitLength = length * 8;
+        const view = new DataView(withPadding.buffer);
+        view.setUint32(withPadding.length - 8, Math.floor(bitLength / 0x100000000), false);
+        view.setUint32(withPadding.length - 4, bitLength >>> 0, false);
+
+        const h = H0.slice();
+        const w = new Uint32Array(64);
+
+        for (let offset = 0; offset < withPadding.length; offset += 64) {
+            for (let i = 0; i < 16; i++) {
+                w[i] = view.getUint32(offset + i * 4, false);
+            }
+            for (let i = 16; i < 64; i++) {
+                const s0 = (rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0;
+                const s1 = (rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0;
+                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+            }
+
+            let [a, b, c, d, e, f, g, hh] = h;
+
+            for (let i = 0; i < 64; i++) {
+                const S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+                const ch = ((e & f) ^ (~e & g)) >>> 0;
+                const temp1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
+                const S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+                const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+                const temp2 = (S0 + maj) >>> 0;
+
+                hh = g;
+                g = f;
+                f = e;
+                e = (d + temp1) >>> 0;
+                d = c;
+                c = b;
+                b = a;
+                a = (temp1 + temp2) >>> 0;
+            }
+
+            h[0] = (h[0] + a) >>> 0;
+            h[1] = (h[1] + b) >>> 0;
+            h[2] = (h[2] + c) >>> 0;
+            h[3] = (h[3] + d) >>> 0;
+            h[4] = (h[4] + e) >>> 0;
+            h[5] = (h[5] + f) >>> 0;
+            h[6] = (h[6] + g) >>> 0;
+            h[7] = (h[7] + hh) >>> 0;
+        }
+
+        const out = new Uint8Array(32);
+        const outView = new DataView(out.buffer);
+        h.forEach((word, i) => outView.setUint32(i * 4, word, false));
+        return out;
+    }
+
+    // RFC 2104 HMAC-SHA256. Block size is 64 bytes; a key longer than that is hashed first, and a
+    // shorter one is zero-padded.
+    function hmacSha256(keyBytes, messageBytes) {
+        const BLOCK = 64;
+        let key = keyBytes;
+        if (key.length > BLOCK) key = sha256(key);
+
+        const padded = new Uint8Array(BLOCK);
+        padded.set(key);
+
+        const inner = new Uint8Array(BLOCK + messageBytes.length);
+        const outer = new Uint8Array(BLOCK + 32);
+        for (let i = 0; i < BLOCK; i++) {
+            inner[i] = padded[i] ^ 0x36;
+            outer[i] = padded[i] ^ 0x5c;
+        }
+        inner.set(messageBytes, BLOCK);
+        outer.set(sha256(inner), BLOCK);
+
+        return sha256(outer);
+    }
+
+    // Lowercase hex, matching Rust's `hex::encode`. Both signing paths render through this one
+    // encoder, so they cannot disagree about the spelling of a digest they agree about the bytes of.
+    const toHex = bytes => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // RFC 4231 test case 2 ("Jefe" / "what do ya want for nothing?"). Chosen because its key is
+    // shorter than the block size and its message spans a padding boundary, so a mistake in either
+    // the padding or the ipad/opad construction shows up here.
+    function selfTest() {
+        const enc = new TextEncoder();
+        const digest = toHex(hmacSha256(enc.encode('Jefe'), enc.encode('what do ya want for nothing?')));
+        return digest === '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843';
+    }
+
+    return { sha256, hmacSha256, toHex, selfTest };
+})();
+
+// Which implementation signs, and whether signing is possible at all.
+//
+// Web Crypto wins wherever it exists: it is constant-time and orders of magnitude faster. The
+// fallback is consulted only in its absence, and only after `selfTest()` passes — an implementation
+// that cannot reproduce a published vector must not be trusted with a real credential, and failing
+// the login screen is better than emitting signatures the server will silently reject.
+const SigningBackend = {
+    // `crypto.subtle` is absent on any non-secure origin, which is exactly the case the fallback
+    // exists for. Read as a getter rather than captured at load, so nothing depends on script order.
+    get usesWebCrypto() {
         return typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined';
+    },
+
+    // Memoized. The answer cannot change for the lifetime of the page, and a property consulted on
+    // the login path should not recompute a MAC every time it is read.
+    get available() {
+        if (this._available === undefined) {
+            this._available = this.usesWebCrypto || PureCrypto.selfTest();
+        }
+        return this._available;
     },
 
     get reason() {
         return (
-            'This dashboard signs every request with HMAC-SHA256 and needs the Web Crypto API, ' +
-            'which browsers expose only in a secure context. Reach it over HTTPS, or via ' +
-            'http://localhost:<port> / http://127.0.0.1:<port>.'
+            'This dashboard signs every request with HMAC-SHA256, and neither the Web Crypto API ' +
+            'nor the built-in fallback is usable in this browser. Serving the dashboard over HTTPS ' +
+            '(or from http://localhost:<port>) restores the preferred implementation.'
         );
     }
 };
@@ -242,6 +401,9 @@ class RequestSigner {
     }
 
     // Imports the secret once and caches the resulting non-extractable CryptoKey.
+    //
+    // Web Crypto path only — the fallback keys each HMAC directly from the secret's bytes, since
+    // there is no opaque key object to hold on to.
     async key() {
         if (!this.cryptoKey) {
             this.cryptoKey = await crypto.subtle.importKey(
@@ -256,13 +418,23 @@ class RequestSigner {
     }
 
     // Hex HMAC-SHA256 of `message` under the signing secret.
+    //
+    // Two implementations, one output. Web Crypto is preferred wherever the browser exposes it;
+    // `PureCrypto` covers the plain-HTTP origins where it does not exist at all. Both render through
+    // `PureCrypto.toHex`, so the branch decides only *how* the MAC is computed and never how it is
+    // spelled — the server sees the same 64 hex characters either way.
     async digest(message) {
-        const signature = await crypto.subtle.sign(
-            'HMAC',
-            await this.key(),
-            new TextEncoder().encode(message)
+        const encoder = new TextEncoder();
+        const messageBytes = encoder.encode(message);
+
+        if (SigningBackend.usesWebCrypto) {
+            const signature = await crypto.subtle.sign('HMAC', await this.key(), messageBytes);
+            return PureCrypto.toHex(new Uint8Array(signature));
+        }
+
+        return PureCrypto.toHex(
+            PureCrypto.hmacSha256(encoder.encode(this.signingSecret), messageBytes)
         );
-        return [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
     // The two signature headers for one request.
@@ -331,12 +503,14 @@ class HookExecutorClient {
     async init() {
         this.bindEvents();
 
-        // Refuse before anything else if the page cannot sign. Every request below is signed, so a
-        // dashboard without Web Crypto has no working path at all — better to say so once, at the
-        // login screen, than to let the operator type credentials into a form that cannot use them.
-        if (!SecureContextGate.available) {
+        // Refuse before anything else if the page cannot sign at all. With the pure-JS fallback in
+        // place this now means Web Crypto is absent *and* the fallback failed its own RFC 4231
+        // vector — a broken build rather than an ordinary deployment — so it should fail loudly at
+        // the login screen instead of letting the operator type credentials into a form that would
+        // emit signatures the server rejects.
+        if (!SigningBackend.available) {
             this.showLogin();
-            this.showLoginError(SecureContextGate.reason);
+            this.showLoginError(SigningBackend.reason);
             document.getElementById('login-form').querySelectorAll('input, button')
                 .forEach(el => { el.disabled = true; });
             return;
@@ -463,7 +637,8 @@ class HookExecutorClient {
     }
 
     // Shows a message on the login screen. Used for the two failures that happen before any request
-    // is sent — an insecure context, and a half-filled form — which the 401 interceptor never sees.
+    // is sent — no usable signing backend, and a half-filled form — which the 401 interceptor never
+    // sees.
     showLoginError(message) {
         const box = document.getElementById('login-error');
         box.textContent = message;

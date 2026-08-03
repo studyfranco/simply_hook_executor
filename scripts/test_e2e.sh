@@ -2513,7 +2513,102 @@ check "200" "an unsigned request's stray timestamp is still ignored"
 
 # ── 33. WebUI mandates full-HMAC (CANONICAL_V1) signing ─────────────────────
 
-log_section "33. WebUI full-HMAC enforcement"
+log_section "33. TRUSTED_PROXIES syntax is fatal, unresolvable names are not"
+
+# The two failures look alike in a config file and are not alike at all — *typo versus timing*.
+#
+# A syntax error can only be fixed by a human editing configuration, and serving through it means
+# the operator believes a proxy is trusted while it is not: every request arriving via that proxy is
+# then authorized against the proxy's address instead of the client's, so `bound_ips` quietly stops
+# meaning what it says. That is a security boundary configured one way and enforced another, and the
+# daemon refuses to start.
+#
+# An unresolvable hostname is the opposite: `traefik` is well-formed, it just names a container that
+# has not finished starting. It is already fail-closed, it corrects itself, and aborting would turn
+# an ordinary startup race into a crash loop. The daemon serves.
+#
+# Asserted against the real binary rather than the parser, because "refuses to start" is a property
+# of the process, not of a function — a unit test cannot tell whether `main` actually honours it.
+ABORT_DB="$WORK_DIR/abort.db"
+ABORT_LOG="$WORK_DIR/abort_server.log"
+ABORT_PORT=$((SERVER_PORT + 2))
+while port_in_use "$ABORT_PORT"; do ABORT_PORT=$((ABORT_PORT + 1)); done
+
+DATABASE_URL="sqlite://$ABORT_DB?mode=rwc" RUST_LOG=info \
+    BIND_HOST="$BIND_HOST" PORT="$ABORT_PORT" TRUSTED_PROXIES="10.0.0.0/8x, 127.0.0.1" \
+    timeout 30 "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$ABORT_LOG" 2>&1
+ABORT_CODE=$?
+
+check_local "$ABORT_CODE" "1" "a malformed TRUSTED_PROXIES entry aborts startup"
+
+# The message is the operator's whole diagnostic, so its wording is pinned — including the offending
+# entry, which is what makes a multi-entry list actionable.
+if grep -qF "FATAL: TRUSTED_PROXIES entry '10.0.0.0/8x' is not a valid IP address, CIDR range, or hostname" "$ABORT_LOG"; then
+    check_local "stated" "stated" "the abort names the offending entry and the expected spellings"
+else
+    check_local "missing" "stated" "the abort names the offending entry and the expected spellings"
+fi
+if grep -qF "Refusing to start with an ambiguous trust boundary." "$ABORT_LOG"; then
+    check_local "stated" "stated" "the abort says why an ambiguous trust boundary is refused"
+else
+    check_local "missing" "stated" "the abort says why an ambiguous trust boundary is refused"
+fi
+
+# It aborts *before* touching the database, so a refused boot leaves nothing behind — no migrations
+# applied, and no bootstrap master key minted and printed for a daemon that never came up.
+if [ ! -f "$ABORT_DB" ]; then
+    check_local "clean" "clean" "the refused boot created no database"
+else
+    check_local "dirty" "clean" "the refused boot created no database"
+fi
+
+# The valid entry alongside the bad one is not silently kept: one bad entry condemns the list,
+# because a partially-applied trust boundary is precisely the ambiguity being refused.
+if grep -qF "Forwarding headers are honoured only from" "$ABORT_LOG"; then
+    check_local "applied" "refused" "a partial trust boundary is never applied"
+else
+    check_local "refused" "refused" "a partial trust boundary is never applied"
+fi
+
+# The other half of the split: a well-formed name that does not resolve must NOT abort. The main
+# instance is already running with TRUSTED_PROXIES="$BIND_HOST,localhost"; this covers the case the
+# grace period exists for.
+UNRESOLVED_DB="$WORK_DIR/unresolved.db"
+UNRESOLVED_LOG="$WORK_DIR/unresolved_server.log"
+UNRESOLVED_PORT=$((ABORT_PORT + 1))
+while port_in_use "$UNRESOLVED_PORT"; do UNRESOLVED_PORT=$((UNRESOLVED_PORT + 1)); done
+
+DATABASE_URL="sqlite://$UNRESOLVED_DB?mode=rwc" RUST_LOG=info \
+    INITIAL_MASTER_KEY="e2e_unresolved_master_key_for_testing_5555" \
+    BIND_HOST="$BIND_HOST" PORT="$UNRESOLVED_PORT" \
+    TRUSTED_PROXIES="no-such-proxy.invalid, 127.0.0.1" \
+    "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$UNRESOLVED_LOG" 2>&1 &
+UNRESOLVED_PID=$!
+
+UNRESOLVED_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$UNRESOLVED_PID" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://$BIND_HOST:$UNRESOLVED_PORT/api/hooks" 2>/dev/null)
+    case "$SC" in 200|401|404) UNRESOLVED_READY=1; break ;; esac
+    sleep 0.5
+done
+
+check_local "$UNRESOLVED_READY" "1" "an unresolvable but well-formed hostname still serves traffic"
+
+if [ "$UNRESOLVED_READY" = "1" ]; then
+    # And it is fail-closed while unresolved: the name contributes nothing, so a forwarding header
+    # from an untrusted peer is still ignored. Trust is withheld, not widened, by a DNS failure.
+    if grep -qF "could not be resolved at startup" "$UNRESOLVED_LOG"; then
+        check_local "reported" "reported" "the unresolved name is reported rather than fatal"
+    else
+        check_local "silent" "reported" "the unresolved name is reported rather than fatal"
+    fi
+fi
+
+kill "$UNRESOLVED_PID" 2>/dev/null || true
+wait "$UNRESOLVED_PID" 2>/dev/null || true
+
+log_section "34. WebUI full-HMAC enforcement"
 
 # Source invariants again, for the same reason section 26 uses them: there is no JS runtime and no
 # headless browser here (`AGENT.MD` forbids frontend dependencies), so the dashboard's signing
@@ -2531,15 +2626,19 @@ fi
 # Each pattern below marks a *client-side* behaviour that was removed. Deliberately precise rather
 # than a bare grep for "BODY_ONLY" or "hmacMode": both strings legitimately survive in the API-keys
 # table badge and the key-provisioning dropdowns, which describe the mode of *other* keys — the ones
-# an operator issues to webhook senders. What must not come back is this client choosing a mode for
-# its own traffic, or hashing with anything other than Web Crypto.
+# an operator issues to webhook senders. What must not come back is this client choosing a signing
+# mode for its own traffic, or skipping the signature altogether.
 # The patterns are anchored with \b so they cannot collide with the surviving display code:
 # `this.hmacModeBadge(...)` renders another key's mode in the API-keys table and must keep working.
 #   this.hmacMode\b        — the signer's own mode state, which drove the removed BODY_ONLY branch
 #   signatureHeaders       — the "sign if possible, otherwise don't" plumbing in apiFetch
-#   PureCrypto             — the hand-rolled SHA-256 fallback for insecure contexts
 #   X-Hub-Signature-256    — the GitHub-style header a browser must never send
-for FORBIDDEN in 'this\.hmacMode\b' 'signatureHeaders' 'PureCrypto' 'X-Hub-Signature-256'; do
+#
+# `PureCrypto` is deliberately NOT in this list. It was removed once and restored on purpose: it is
+# the pure-JS HMAC used where `crypto.subtle` does not exist, which is every plain-HTTP LAN origin.
+# Its presence is asserted positively below. What matters is that it is a *fallback* — the signature
+# stays mandatory either way — not that it is absent.
+for FORBIDDEN in 'this\.hmacMode\b' 'signatureHeaders' 'X-Hub-Signature-256'; do
     if grep -qE "$FORBIDDEN" "$SPA_JS"; then
         err "static/app.js still references '$FORBIDDEN'"
         check_local "found" "absent" "the SPA has no '$FORBIDDEN' path"
@@ -2547,6 +2646,67 @@ for FORBIDDEN in 'this\.hmacMode\b' 'signatureHeaders' 'PureCrypto' 'X-Hub-Signa
         check_local "absent" "absent" "the SPA has no '$FORBIDDEN' path"
     fi
 done
+
+# ── The pure-JS fallback ─────────────────────────────────────────────────────
+#
+# `crypto.subtle` exists only in a secure context, so a dashboard reached over plain HTTP at a LAN
+# address — the normal homelab deployment — cannot use Web Crypto at all. The fallback is what keeps
+# the mandatory signature achievable there. These checks pin that it exists, that it is genuinely a
+# *fallback* rather than the primary, and that it validates itself before signing anything.
+if grep -qF 'const PureCrypto' "$SPA_JS"; then
+    check_local "present" "present" "the SPA carries the pure-JS HMAC fallback"
+else
+    check_local "missing" "present" "the SPA carries the pure-JS HMAC fallback"
+fi
+
+# Web Crypto must still win where it exists: it is constant-time, the fallback is not.
+if grep -qF 'SigningBackend.usesWebCrypto' "$SPA_JS"; then
+    check_local "preferred" "preferred" "Web Crypto is preferred over the fallback"
+else
+    check_local "unconditional" "preferred" "Web Crypto is preferred over the fallback"
+fi
+
+# The fallback gates itself on a published vector before it is trusted with a real credential. This
+# is the RFC 4231 case 2 digest; if the implementation is ever broken, the login screen refuses
+# rather than the browser emitting signatures the server silently rejects.
+if grep -qF '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843' "$SPA_JS"; then
+    check_local "vector" "vector" "the fallback self-tests against the RFC 4231 vector"
+else
+    check_local "missing" "vector" "the fallback self-tests against the RFC 4231 vector"
+fi
+if grep -qF 'PureCrypto.selfTest()' "$SPA_JS"; then
+    check_local "gated" "gated" "the fallback is only used after its self-test passes"
+else
+    check_local "ungated" "gated" "the fallback is only used after its self-test passes"
+fi
+
+# Both signing paths render the digest through one hex encoder, so the branch decides only how the
+# MAC is computed and never how it is spelled. Two encoders is how the two paths drift apart — one
+# uppercase, one padded differently — while both remain "correct" in isolation.
+#
+# Matched with the opening paren so the prose reference in the doc comment above the function is not
+# counted as a call site.
+if [ "$(grep -cF 'PureCrypto.toHex(' "$SPA_JS")" -eq 2 ]; then
+    check_local "shared" "shared" "both signing paths call the same hex encoder"
+else
+    check_local "split" "shared" "both signing paths call the same hex encoder"
+fi
+
+# ...and there is only one hex encoder to call: the byte-to-hex idiom appears exactly once, inside
+# `PureCrypto.toHex` itself. A second inline copy is how a "small cleanup" reintroduces the split.
+if [ "$(grep -cF "toString(16).padStart(2, '0')" "$SPA_JS")" -eq 1 ]; then
+    check_local "single" "single" "the SPA defines exactly one hex encoder"
+else
+    check_local "duplicated" "single" "the SPA defines exactly one hex encoder"
+fi
+
+# The fallback must not have reintroduced an unsigned path: signing stays mandatory, and the login
+# screen still refuses when *neither* implementation is usable.
+if grep -qF 'SigningBackend.available' "$SPA_JS"; then
+    check_local "gated" "gated" "login still refuses when no signing backend is usable"
+else
+    check_local "ungated" "gated" "login still refuses when no signing backend is usable"
+fi
 
 # The signer takes a secret and nothing else — a second constructor argument was the mode.
 if grep -qE 'new RequestSigner\([^)]*,' "$SPA_JS"; then

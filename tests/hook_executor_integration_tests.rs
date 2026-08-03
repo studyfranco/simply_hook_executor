@@ -5146,6 +5146,189 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
     );
 }
 
+/// Revocation is proportional too: you cannot delete a grant conferring a verb you do not hold.
+///
+/// This is not an anti-escalation rule — removing a flag cannot raise anyone's authority. It closes
+/// an integrity gap instead: a `can_manage`-only holder could otherwise destroy another key's
+/// `can_execute` grant on a hook it merely administers, disabling automation it was deliberately
+/// withheld from. Managing a hook is authority to administer its grants, not to demolish a
+/// capability an operator handed to someone else.
+#[tokio::test]
+async fn revoking_a_verb_the_caller_does_not_hold_is_refused() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("revoke_verbs.sh", "#!/bin/sh\necho ran\n");
+
+    let hook = insert_hook(&db, "revoke_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    let (victim_id, victim) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+
+    // The caller administers the hook but was deliberately not given execution rights on it.
+    grant(&db, manager_id, hook, false, true).await;
+    // The victim holds exactly the verb the caller lacks.
+    grant(&db, victim_id, hook, true, false).await;
+
+    let over_revoke = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{victim_id}/permissions/{hook}"),
+            &manager,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        over_revoke.status,
+        StatusCode::FORBIDDEN,
+        "revoking a grant conferring a verb the caller lacks must be refused"
+    );
+    assert!(
+        over_revoke.raw.contains("can_execute"),
+        "the refusal names the verb, not just 'permission denied': {}",
+        over_revoke.raw
+    );
+
+    // The refusal was real: the grant survived, so the victim can still run the hook.
+    let still_runs = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &victim, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(still_runs.status, StatusCode::OK, "the blocked revocation never landed");
+
+    // Once the caller holds the verb, the identical request succeeds — proving the block was about
+    // the caller's own grant and nothing else about the request. The upgrade goes through the real
+    // upsert rather than a second seeded row, since one key may hold only one grant per hook.
+    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let upgraded = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{manager_id}/permissions"),
+            &master,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(upgraded.status, StatusCode::OK, "the master grants the caller the missing verb");
+
+    let permitted = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{victim_id}/permissions/{hook}"),
+            &manager,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(permitted.status, StatusCode::NO_CONTENT, "holding the verb makes the revoke legitimate");
+
+    // And it really was removed.
+    let now_denied = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &victim, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(now_denied.status, StatusCode::FORBIDDEN, "the permitted revocation did land");
+}
+
+/// A key cannot rewrite its own permission row in either direction.
+///
+/// The grant path already refused self-*grants* as escalation. Self-revocation is the other half of
+/// the same boundary: not an escalation, but still a key editing its own authority, which
+/// `AGENT.MD` reserves to a master. A peer administrator can always do it instead, so nothing
+/// legitimate is lost.
+#[tokio::test]
+async fn a_non_master_cannot_revoke_its_own_hook_permissions() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("self_revoke.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "self_revoke_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    // Full rights on the hook, so proportionality cannot be what refuses this.
+    grant(&db, manager_id, hook, true, true).await;
+
+    let self_revoke = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{manager_id}/permissions/{hook}"),
+            &manager,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        self_revoke.status,
+        StatusCode::FORBIDDEN,
+        "a non-master key must not edit its own permission row"
+    );
+    assert!(
+        self_revoke.raw.contains("own hook permissions"),
+        "the refusal is the self-administration one, not the proportionality one: {}",
+        self_revoke.raw
+    );
+
+    // The grant is untouched, so the key still holds what it tried to drop.
+    let me = send(&app, json_request("GET", "/api/auth/me", &manager, None)).await;
+    assert_eq!(me.json["hook_permissions"][0]["can_execute"], json!(true));
+
+    // A master may do it, which is what makes the rule about *self*-administration rather than a
+    // blanket ban on revoking this row.
+    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let by_master = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{manager_id}/permissions/{hook}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(by_master.status, StatusCode::NO_CONTENT, "a master administers any key's grants");
+}
+
+/// A caller holding no grant at all cannot revoke, and is refused in the entry gate's words.
+///
+/// Pinned separately from the per-verb test for the same reason the grant path pins it: the entry
+/// gate and the proportionality check live in one function, and that is exactly where a condition
+/// gets dropped by accident.
+#[tokio::test]
+async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("unmanaged_revoke.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "unmanaged_revoke_hook", &script, 30).await;
+    let (_manager_id, manager) = seed_key_manager(&db).await;
+    let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+    grant(&db, victim_id, hook, true, true).await;
+
+    let no_grant = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{victim_id}/permissions/{hook}"),
+            &manager,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(no_grant.status, StatusCode::FORBIDDEN);
+    assert!(
+        no_grant.raw.contains("manage access"),
+        "the entry gate's message is unchanged: {}",
+        no_grant.raw
+    );
+}
+
 /// `X-Timestamp` is validated before the API key is looked up.
 ///
 /// Both orderings answer `401`, so the status alone proves nothing. The *message* does: paired with

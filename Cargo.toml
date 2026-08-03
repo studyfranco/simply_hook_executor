@@ -41,3 +41,8 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 [dev-dependencies]
 # `ServiceExt::oneshot`, used to drive the real router in integration tests without binding a port.
 tower = { version = "0.5", features = ["util"] }
+# `test-util` unlocks the pausable clock (`tokio::time::pause`/`advance`). `src/replay.rs` expires
+# entries against `tokio::time::Instant`, so its window, sweep and capacity-backoff behaviour can be
+# driven exactly rather than by sleeping for real seconds in the test suite. Test-only: it is not
+# compiled into the daemon.
+tokio = { version = "1", features = ["full", "test-util"] }

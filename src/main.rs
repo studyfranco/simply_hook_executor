@@ -219,6 +219,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
+    // Read before the database is touched, because this is the step that can refuse to start. A
+    // malformed TRUSTED_PROXIES entry is a misconfigured trust boundary (see
+    // `config::parse_trusted_proxies`), and aborting *after* running migrations and possibly
+    // minting and printing a bootstrap master key would leave side effects behind from a boot that
+    // never completed. Every other override in here is lenient and cannot fail.
+    // Not `?`: returning the error from `main` would render it through `Debug`, printing the struct
+    // rather than the message. The message *is* the operator's entire diagnostic here, so it is
+    // logged through `Display` and the process exits deliberately. Nothing is open yet — no
+    // database handle, no listener — so there are no destructors worth unwinding for.
+    let config = match RuntimeConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        allowed_env_vars = ?config.allowed_env_vars,
+        log_retention_days = config.log_retention_days,
+        deleted_hook_retention_days = config.deleted_hook_retention_days,
+        max_output_bytes = config.max_output_bytes,
+        "Runtime configuration loaded."
+    );
+
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://simply_hook_executor.db?mode=rwc".to_owned());
 
@@ -260,15 +284,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     bootstrap_master_key(&db, &cipher).await?;
-
-    let config = RuntimeConfig::from_env();
-    tracing::info!(
-        allowed_env_vars = ?config.allowed_env_vars,
-        log_retention_days = config.log_retention_days,
-        deleted_hook_retention_days = config.deleted_hook_retention_days,
-        max_output_bytes = config.max_output_bytes,
-        "Runtime configuration loaded."
-    );
 
     prime_trusted_proxies(&config.trusted_proxies);
 

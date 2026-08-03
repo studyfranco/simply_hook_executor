@@ -310,14 +310,35 @@ mod tests {
         unsafe { std::env::remove_var(KEY_ENV_VAR_ALIAS) };
     }
 
+    /// Malformed input is rejected *as malformed*, not merely rejected.
+    ///
+    /// The variant is asserted rather than `is_err()` because the distinction between
+    /// [`CryptoError::MalformedCiphertext`] and [`CryptoError::DecryptionFailed`] is the whole
+    /// fail-closed contract of [`SecretCipher::open`]. A bare `is_err()` would keep passing if the
+    /// prefix check were ever loosened into a fall-through that reached the cipher and failed
+    /// authentication instead — the same red test result for a materially different code path, and
+    /// one that would accept formats this function is supposed to refuse outright.
     #[test]
     fn malformed_keys_and_values_are_rejected() {
         assert!(matches!(SecretCipher::from_hex_key("not-hex"), Err(CryptoError::InvalidKey)));
         assert!(matches!(SecretCipher::from_hex_key("00ff"), Err(CryptoError::InvalidKey)));
 
         let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        for malformed in ["", "garbage", "v1.xchacha20poly1305.nodot", "v1.plain.zz"] {
-            assert!(cipher.open(malformed).is_err(), "{malformed:?} should not open");
+        for malformed in [
+            "",                                   // no prefix at all
+            "garbage",                            // no prefix, non-empty
+            "v1.xchacha20poly1305.nodot",         // sealed prefix, missing the nonce/ciphertext split
+            "v1.plain.zz",                        // plaintext prefix, invalid hex
+            "v1.xchacha20poly1305.zz.00",         // sealed prefix, invalid nonce hex
+            "v1.xchacha20poly1305.00ff.00",       // sealed prefix, nonce of the wrong width
+            "v1.xchacha20poly1305..00",           // sealed prefix, empty nonce
+            "aesgcm256:deadbeef",                 // a format this service never wrote
+            "V1.PLAIN.6162",                      // right shape, wrong case: prefixes are exact
+        ] {
+            assert!(
+                matches!(cipher.open(malformed), Err(CryptoError::MalformedCiphertext)),
+                "{malformed:?} must be refused as malformed, not merely refused"
+            );
         }
     }
 }

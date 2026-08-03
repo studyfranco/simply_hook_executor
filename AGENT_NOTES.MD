@@ -2210,3 +2210,188 @@ code for *other* keys and must keep working; the first version of these checks f
 JS syntax was verified structurally (bracket/string/template/comment-aware balance check) rather than
 by execution: no `node`, `deno`, `bun` or other JS engine is installed on this machine, and `AGENT.MD`
 forbids adding one.
+
+---
+
+## Session 29 — final alignment pass
+
+Six items from the closing audit, in one pass: the WebUI HTTP fallback, a hard-fail on malformed
+proxy syntax, RBAC revoke alignment, the replay capacity backoff, a tightened ciphertext assertion,
+and property rules in the convergence verifier.
+
+### 1. `PureCrypto` restored as a fallback (`static/app.js`)
+
+Session 28 removed it. That was the wrong trade and this reverses it.
+
+The reasoning last time was that "remove any fallback" plus "use `window.crypto.subtle`" meant one
+implementation. But the thing that must be mandatory is the **signature**, not the code path that
+computes it — and `crypto.subtle` is exposed only in a secure context, so removing the fallback
+silently made every plain-HTTP LAN deployment unusable. That is a deployment constraint being
+enforced as if it were an authentication policy. `simply_ip_vault`, the higher-trust service, kept
+its equivalent throughout.
+
+What is restored is the same ~130-line IIFE (FIPS 180-4 SHA-256 + RFC 2104 HMAC, no dependencies),
+recovered from `git show e1669a5:static/app.js`. What is **not** restored is any relaxation of the
+posture: `CANONICAL_V1` signing is still unconditional, there is still no unsigned path, no
+bearer-only path, and no per-key mode selection in the browser.
+
+The selection logic is new. `SecureContextGate` became `SigningBackend`:
+
+- `usesWebCrypto` — a getter, so nothing depends on script load order.
+- `available` — memoized; `usesWebCrypto || PureCrypto.selfTest()`. The self-test is an RFC 4231
+  vector, checked before the fallback is ever trusted with a real credential. An implementation that
+  cannot reproduce a published vector must not sign, and failing at the login screen beats emitting
+  signatures the server rejects for reasons the operator cannot see.
+- The `init()` gate survives, but now fires only when *both* are unusable — a broken build rather
+  than an ordinary deployment.
+
+`RequestSigner.digest()` branches on `usesWebCrypto` and renders **both** paths through
+`PureCrypto.toHex`. One encoder, so the branch decides only how the MAC is computed and never how it
+is spelled.
+
+**Verification without a JS runtime.** There is still no `node`/`deno`/`bun` on this machine and
+`AGENT.MD` forbids adding one, so the restored code was checked two ways. Structurally, by a
+comment/string/template/regex-aware bracket balance check (also run against the peer's `app.js` as a
+known-good control). Behaviourally, by transliterating `PureCrypto` statement-for-statement into
+Python and differentially testing it against `hashlib`/`hmac`: 135 SHA-256 lengths spanning every
+padding boundary (0, 55, 56, 63, 64, 119, 120, multi-block), 64 HMAC key/message combinations
+including keys longer than the 64-byte block (which must be hashed down first), the exact
+`CANONICAL_V1` string shape with a UTF-8 body, and the self-test vector. All matched.
+
+### 2. `TRUSTED_PROXIES` syntax is fatal (`src/config.rs`, `src/main.rs`)
+
+Split into two failures that look alike in a config file and are not alike at all — **typo versus
+timing**:
+
+| | Syntax error (`10.0.0.0/8x`) | Unresolvable name (`traefik`) |
+| :--- | :--- | :--- |
+| Fixable by | a human editing configuration | itself, in seconds |
+| Cost of serving | operator believes a proxy is trusted while it is not | none; already fail-closed |
+| Behaviour | **abort startup** | serve, negative-cache, 60s grace re-check |
+
+The old behaviour dropped a malformed entry with a warning. That is a security boundary configured
+one way and enforced another: every request through the untrusted-by-accident proxy is authorized
+against the *proxy's* address rather than the client's, so `bound_ips` quietly stops meaning what it
+says and `audit_logs.client_ip` records the wrong caller.
+
+- `is_hostname_like` became `hostname_rejection`, returning *why* — the reason is what makes the
+  abort actionable. `is_hostname_like` remains as a `#[cfg(test)]` predicate.
+- `parse_trusted_proxies` → `Result`; `filter_map` → `map` + `collect::<Result<_,_>>`, so **one bad
+  entry condemns the list**. A partially-applied trust boundary is precisely the ambiguity refused.
+- `RuntimeConfig::from_env()` → `Result`, propagating only this one class of failure. Every other
+  override stays lenient, because every other override has a safe substitute.
+- **`main` now reads config before opening the database.** A refused boot applies no migrations and
+  mints/prints no bootstrap master key.
+- Not `?` in `main`: returning the error would render it through `Debug` and print the struct. It is
+  logged through `Display` and the process exits 1, so the required `FATAL: …` text actually appears.
+
+### 3. RBAC revoke alignment (`src/api.rs`)
+
+`revoke_key_hook_permission` now mirrors the grant path: `guard_delegated_hook_revoke` uses the same
+`verb && !held` shape, and self-revocation is refused for non-masters. The handler reads the grant
+row *before* deciding (the old code deleted by filter and inferred "not found" from `rows_affected`,
+which gave the guard nothing to compare against), then deletes by primary key.
+
+Note what this is: **not** an anti-escalation control. Removing a flag cannot raise anyone's
+authority, and `AGENT.MD` is right that revocation is never an escalation. It closes an *integrity*
+gap — a `can_manage`-only holder destroying another key's `can_execute` grant on a hook it merely
+administers.
+
+> **⚠ Known gap, deliberately left open.** `POST /api/keys/{id}/permissions` can still write
+> `can_execute: false` onto an existing row, and `AGENT.MD`'s "revoking is always allowed" rule
+> explicitly permits it (with its own integration test). So a determined `can_manage`-only holder
+> retains an equivalent effect by a different route, and **this guard is bypassable via POST**.
+> Closing it means changing a documented, separately-tested rule about the *grant* endpoint, which
+> is a spec decision rather than a bug fix, and was out of scope for a task naming only
+> `revoke_key_hook_permission`. Recorded here rather than papered over: the guard as it stands
+> raises the bar on the DELETE path but does not fully close the capability.
+
+### 4. Replay capacity backoff (`src/replay.rs`)
+
+`CAPACITY_BACKOFF_DIVISOR = 16`, converging on the peer's design. A saturated map whose entries are
+all still live previously swept on *every* request — an O(n) retain under the global mutex that
+freed nothing, turning memory pressure into a throughput collapse exactly when the daemon is
+busiest. `next_prune: Mutex<Instant>` became `schedule: Mutex<PruneSchedule>` holding both due-times
+under one lock, so two threads arriving together cannot each decide it is the one that sweeps.
+`next_capacity` starts at `now`, not `now + backoff`: the first time the ceiling is reached the
+sweep must be immediate.
+
+Also switched `std::time::Instant` → `tokio::time::Instant` (same monotonic source in production;
+pausable under test) and added `tokio = { features = ["full", "test-util"] }` to **dev**-dependencies
+only. `tracked()` is now `#[cfg(test)]` rather than `pub`.
+
+Three new tests, all `#[tokio::test(start_paused = true)]`, so 250k-entry saturation runs in 0.3s
+instead of sleeping out a real window:
+
+| Test | Asserts |
+| :--- | :--- |
+| `reaching_capacity_sweeps_and_warns_but_never_flushes` | the map grows past the ceiling; pre-existing entries stay enforced |
+| `a_saturated_guard_backs_off_instead_of_sweeping_every_request` | the sweep is deferred by `window/16`, and requests inside the backoff do not re-arm it |
+| `a_saturated_guard_recovers_once_its_entries_expire` | the map returns to normal size on its own |
+
+`entries_expire_and_are_swept` lost its 1.1s real sleep.
+
+### 5. Ciphertext assertion tightened (`src/crypto.rs`)
+
+`malformed_keys_and_values_are_rejected` now matches `CryptoError::MalformedCiphertext` explicitly
+and covers nine inputs (up from four): wrong-width nonce, empty nonce, invalid nonce hex, a foreign
+`aesgcm256:` format, and a wrong-case prefix. `is_err()` would have kept passing if the prefix check
+were ever loosened into a fall-through that reached the cipher and failed *authentication* instead —
+same red/green, materially different code path, and one that accepts formats `open()` must refuse.
+
+### 6. Convergence verifier property rules (`scripts/verify_convergence.sh`)
+
+`assert_absent` / `assert_present`, plus `production_source()` which strips comments and truncates at
+the first **column-zero** `#[cfg(test)]` (anchored, so an item-level `#[cfg(test)]` does not blind
+the rule to code below it).
+
+Why these are needed alongside the diffs: a function-level diff only fires when the two trees
+*disagree*, so a bug introduced in both — by the same person converging them on the same wrong idea —
+normalizes identical and reports OK. The peer's `seen.clear()` regression is exactly that shape.
+
+Ten rules, each **mutation-tested** by building a mutated copy of the tree under a scratch directory
+(the real repo was never modified) and confirming the rule reports DRIFT:
+
+| Rule | Mutation injected | Caught |
+| :--- | :--- | :--- |
+| Replay map is never flushed | `retain` → `seen.clear()` | ✅ |
+| Replay capacity sweep is throttled | constant renamed away | ✅ |
+| Replay digests are not compared as text | `digest.to_lowercase()` added | ✅ |
+| Signature comparison is constant-time | `verify_slice` → `==` | ✅ |
+| Signature verification uses verify_slice | same | ✅ |
+| SQLite pragma failure is never fatal | `panic!` added | ✅ |
+| Hooks are never spawned through a shell | `Command::new("/bin/sh")` added | ✅ |
+| Canonicalization reads the original URI | `OriginalUri` → `http::Uri` | ✅ |
+
+Two rules (`pragma failure is surfaced to the caller`, `sudo is invoked by absolute path`) are
+present-checks on stable text and were not separately mutated.
+
+One false start worth recording: `assert_present` first used `grep -q` in a pipeline. Under
+`pipefail`, `-q` exits on the first match, SIGPIPEs the upstream `awk`/`sed`, and the pipeline
+reports a **found** pattern as a failed command — so every satisfied rule read as DRIFT. Both helpers
+now capture through a substitution instead.
+
+### e2e additions
+
+New §33 (*TRUSTED_PROXIES syntax is fatal, unresolvable names are not*), 7 checks, asserted against
+the **real binary** rather than the parser, because "refuses to start" is a property of the process:
+exit code 1, both halves of the message verbatim, no database file created, no partial trust boundary
+applied — and, for contrast, a well-formed-but-unresolvable name that still serves.
+
+§33 (WebUI) renumbered to §34. `PureCrypto` was removed from its forbidden-pattern loop and is now
+asserted **positively**, alongside: Web Crypto still preferred, the RFC 4231 self-test present and
+gating, exactly two `PureCrypto.toHex(` call sites, and exactly one hex encoder defined.
+
+Of the 7 new WebUI guards, 6 fire against the pre-restore build. The "exactly one hex encoder" guard
+does not — that build also had exactly one — so it is a forward-looking guard against a future second
+encoder, not proven coverage. Recorded as such, same as §34's `X-Hub-Signature-256` guard.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **185 passed**, 0 failed (81 unit + 104 integration; was 177) |
+| `./scripts/test_e2e.sh` | **665/665**, 0 failed (was 652) |
+| `./scripts/verify_convergence.sh` | 14 converged, 1 known, 0 drifted, exit 0 |

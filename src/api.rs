@@ -502,6 +502,75 @@ async fn guard_delegated_hook_grant(
     Ok(())
 }
 
+/// Rejects a delegated *revocation* that would strip more authority than the caller holds.
+///
+/// The mirror of [`guard_delegated_hook_grant`], and deliberately the same `verb && !held` shape, so
+/// the two read as one rule rather than two policies that happen to sit next to each other.
+///
+/// What it protects is different, and worth being precise about: this is **not** an anti-escalation
+/// control. Removing a flag cannot raise anyone's authority, and `AGENT.MD` is right that revocation
+/// is never an escalation. The exposure is integrity and availability instead — a `can_manage`-only
+/// holder could otherwise delete another key's `can_execute` grant on a hook it manages, silently
+/// disabling automation that an operator granted and it was never given authority over. Being able
+/// to *administer* grants on a hook is not the same as being able to destroy a capability you were
+/// deliberately withheld.
+///
+/// The verbs compared are those the **existing grant confers**, not any the caller nominates: the
+/// endpoint deletes the whole row, so the authority actually being destroyed is whatever that row
+/// held. A grant conferring only `can_execute` therefore needs only `can_execute` to remove.
+///
+/// # What this does not cover
+///
+/// `POST /api/keys/{id}/permissions` can still write `can_execute: false` onto an existing row, and
+/// per `AGENT.MD`'s "revoking is always allowed" rule it is permitted to. That path zeroes a grant
+/// without deleting it, so a determined `can_manage`-only holder retains an equivalent effect by a
+/// different route. Closing that would change a documented, separately-tested rule about the grant
+/// endpoint and is left as a deliberate decision rather than taken here; see `AGENT_NOTES.MD`.
+///
+/// Master keys bypass, per `AGENT.MD`'s RBAC model.
+async fn guard_delegated_hook_revoke(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    hook: &hook::Model,
+    existing: &api_key_hook_permission::Model,
+) -> Result<(), AppError> {
+    if key.is_master {
+        return Ok(());
+    }
+
+    // The entry gate, read from the same row as the per-verb comparison below — one lookup, so the
+    // two answers cannot disagree if a grant is revoked between them. Worded identically to
+    // [`require_manage`] so a caller probing the two paths cannot tell them apart.
+    let Some(held) = hook_permission(db, key.id, hook.id).await?.filter(|p| p.can_manage) else {
+        return Err(AppError::Forbidden(
+            "Permission denied: You do not have manage access to this hook".to_owned(),
+        ));
+    };
+
+    let overreach = [
+        ("can_execute", existing.can_execute, held.can_execute),
+        ("can_manage", existing.can_manage, held.can_manage),
+    ]
+    .into_iter()
+    .find(|(_, removing, holds)| *removing && !*holds);
+
+    if let Some((verb, _, _)) = overreach {
+        tracing::warn!(
+            key = %key.prefix,
+            hook = %hook.name,
+            verb,
+            "Blocked delegated revocation: key attempted to strip a verb it does not hold itself"
+        );
+        return Err(AppError::Forbidden(format!(
+            "Permission denied: you cannot revoke '{verb}' on hook '{}' because you do not hold it \
+             yourself",
+            hook.name
+        )));
+    }
+
+    Ok(())
+}
+
 /// Renders a key's signature mode for an audit log entry.
 ///
 /// `BODY_ONLY` is called out as replay-vulnerable rather than merely named: choosing it is a
@@ -2367,27 +2436,37 @@ pub async fn revoke_key_hook_permission(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    // Symmetric with granting, and checked before the hook is resolved because it depends on
+    // neither the hook nor the grant. Editing your own permission row is not administration in
+    // either direction: the grant path refuses it as escalation, and this refuses it because a key
+    // rewriting its own authority is precisely the boundary `AGENT.MD` reserves to a master. It is
+    // also, prosaically, a self-lockout with no administrative purpose — a peer administrator can
+    // always do it instead.
+    if !key.is_master && id == key.id {
+        tracing::warn!(
+            key = %key.prefix,
+            "Non-master key attempted to revoke its own hook permissions"
+        );
+        return Err(AppError::Forbidden(
+            "Only master API keys can modify their own hook permissions".to_owned(),
+        ));
+    }
+
     let hook_model = resolve_hook(&state.db, &hook_identifier).await?;
 
-    // Symmetric with granting. Revoking is not an escalation, but leaving it ungated would mean a
-    // key manager could strip access to hooks it has no relationship with — cross-tenant tampering,
-    // and an odd asymmetry where a grant you could not create is one you could still destroy.
-    if !key.is_master {
-        require_manage(&state.db, &key, hook_model.id).await?;
-    }
+    // Read the grant before deciding, because *what it confers* is what the caller must be
+    // proportionate to. The previous code deleted by filter and inferred "not found" from
+    // `rows_affected`, which never gave the guard anything to compare against.
+    let existing = hook_permission(&state.db, id, hook_model.id)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
-    let result = ApiKeyHookPermission::delete_many()
-        .filter(
-            Condition::all()
-                .add(api_key_hook_permission::Column::ApiKeyId.eq(id))
-                .add(api_key_hook_permission::Column::HookId.eq(hook_model.id)),
-        )
-        .exec(&state.db)
-        .await?;
+    // Leaving this ungated would mean a key manager could strip access to hooks it has no
+    // relationship with — cross-tenant tampering, and an odd asymmetry where a grant you could not
+    // create is one you could still destroy.
+    guard_delegated_hook_revoke(&state.db, &key, &hook_model, &existing).await?;
 
-    if result.rows_affected == 0 {
-        return Err(AppError::NotFound);
-    }
+    ApiKeyHookPermission::delete_by_id(existing.id).exec(&state.db).await?;
 
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     create_audit_log(

@@ -203,6 +203,93 @@ compare_value() {
     DRIFT=$((DRIFT + 1))
 }
 
+# ── Structural properties ────────────────────────────────────────────────────
+#
+# The two checks above compare *this* service against the peer. These compare it against a rule.
+#
+# Both are needed, and for different reasons. A function-level diff only fires when the two trees
+# disagree, so a bug introduced in *both* — by the same person converging them on the same wrong
+# idea — normalizes identical and reports OK. That is not hypothetical: the peer's replay guard
+# once called `seen.clear()` at capacity, which made every signature accepted in the window
+# replayable at once, and a diff against a repo doing the same thing would have said "converged".
+#
+# So a handful of properties are asserted directly, as text that must NOT appear. They are chosen to
+# be things that are (a) always a bug in this codebase, (b) greppable without a parser, and (c) the
+# specific shapes real regressions have taken here. `assert_present` covers the inverse: a guard
+# whose absence is the bug.
+#
+#   assert_absent  <label> <file> <pattern> <why>
+#   assert_present <label> <file> <pattern> <why>
+#
+# `pattern` is an ERE passed to `grep -E`, matched against the file's *production* source only:
+#
+#   - Comments are stripped, so a rule named in prose — as several are, in the very doc comments
+#     explaining why the thing is wrong — does not trip its own check.
+#   - Everything from the first column-zero `#[cfg(test)]` onward is dropped. Test modules are full
+#     of `.expect()` and hand-built fixtures that are entirely correct there, and including them
+#     would make the rules either noisy or unwritable. The attribute is anchored to column zero so
+#     an *item*-level `#[cfg(test)]` (an indented test-only helper) does not truncate the module
+#     early and blind the rule to the code below it.
+production_source() {
+    awk '/^#\[cfg\(test\)\]/ { exit } { print }' "$1" | sed -E 's://.*$::'
+}
+
+assert_absent() {
+    local label="$1" file="$2" pattern="$3" why="$4"
+    local path="$REPO_ROOT/$file"
+
+    if [ ! -f "$path" ]; then
+        echo "${YELLOW}[SKIP]${RESET}  ${BOLD}$label${RESET}"
+        echo "         $file does not exist — update the paths in this script."
+        SKIPPED=$((SKIPPED + 1))
+        return
+    fi
+
+    # `grep -n` rather than `grep -q`, and via a substitution rather than a bare pipeline: `-q`
+    # exits on the first match, which SIGPIPEs the upstream `awk`/`sed` and — under `pipefail` —
+    # reports a *found* pattern as a failed command.
+    local hits
+    hits=$(production_source "$path" | grep -nE "$pattern" || true)
+
+    if [ -z "$hits" ]; then
+        echo "${GREEN}[OK]${RESET}    ${BOLD}$label${RESET} ${DIM}(absent from $file)${RESET}"
+        OK=$((OK + 1))
+        return
+    fi
+
+    echo "${RED}[DRIFT]${RESET} ${BOLD}$label${RESET}"
+    echo "         ${DIM}$why${RESET}"
+    echo "         ${DIM}found in $file:${RESET}"
+    echo "$hits" | sed 's/^/         /'
+    DRIFT=$((DRIFT + 1))
+}
+
+assert_present() {
+    local label="$1" file="$2" pattern="$3" why="$4"
+    local path="$REPO_ROOT/$file"
+
+    if [ ! -f "$path" ]; then
+        echo "${YELLOW}[SKIP]${RESET}  ${BOLD}$label${RESET}"
+        echo "         $file does not exist — update the paths in this script."
+        SKIPPED=$((SKIPPED + 1))
+        return
+    fi
+
+    local count
+    count=$(production_source "$path" | grep -cE "$pattern" || true)
+
+    if [ "${count:-0}" -gt 0 ]; then
+        echo "${GREEN}[OK]${RESET}    ${BOLD}$label${RESET} ${DIM}($count match(es) in $file)${RESET}"
+        OK=$((OK + 1))
+        return
+    fi
+
+    echo "${RED}[DRIFT]${RESET} ${BOLD}$label${RESET}"
+    echo "         ${DIM}$why${RESET}"
+    echo "         ${DIM}expected /$pattern/ in $file${RESET}"
+    DRIFT=$((DRIFT + 1))
+}
+
 echo "${CYAN}${BOLD}Convergence check${RESET} — this service vs ${DIM}$PEER_ROOT${RESET}"
 echo
 
@@ -249,6 +336,80 @@ compare_value "Soft-delete retention default (days)" \
     'RETENTION_DAYS: i64 = ([0-9]+)' 'RETENTION_DAYS: i64 = ([0-9]+)' \
     "-" \
     ""
+
+echo
+
+# ── Property rules ───────────────────────────────────────────────────────────
+
+# The regression that motivated this whole section. Flushing the replay map to honour the ceiling
+# makes every signature accepted in the current window replayable at once, and because the guard is
+# process-global, one key's burst disables replay protection for every other key. Growing past the
+# ceiling is the correct trade: over-retention costs memory, under-retention costs the property.
+assert_absent "Replay map is never flushed" \
+    "src/replay.rs" \
+    '\bseen(\.lock\(\)[^;]*)?\.clear\(\)|\*seen = HashMap::new' \
+    "Clearing the map at capacity makes every signature in the current window replayable."
+
+# The capacity branch must stay throttled. Without a backoff, a saturated map whose entries are all
+# still live retains on every request — an O(n) scan under the global mutex that frees nothing,
+# turning memory pressure into a throughput collapse exactly when the daemon is busiest.
+assert_present "Replay capacity sweep is throttled" \
+    "src/replay.rs" \
+    'CAPACITY_BACKOFF_DIVISOR' \
+    "A capacity sweep with no floor on its frequency reinstates the per-request O(n) scan."
+
+# Digests are compared as bytes through a HashMap key, never by string equality on the header text.
+# `SHA256=AB…` and `sha256=ab…` are the same signature spelled differently, and a string compare
+# would let the second be presented as a fresh single use of the first.
+assert_absent "Replay digests are not compared as text" \
+    "src/replay.rs" \
+    'digest\.to_lowercase|digest *== *|to_str\(\).*digest' \
+    "Digests must be keyed as raw bytes; comparing header text lets one signature be spelled two ways."
+
+# MAC comparison goes through `Mac::verify_slice`, which is constant-time. A `==` on the decoded
+# digest or the hex string leaks the expected signature a byte at a time under timing observation.
+assert_absent "Signature comparison is constant-time" \
+    "src/middleware.rs" \
+    'expected_?[Ss]ig[a-z_]* *== |signature *== *expected|\.eq\(&?expected_signature\)' \
+    "Comparing MACs with == leaks the signature byte by byte; use Mac::verify_slice."
+assert_present "Signature verification uses verify_slice" \
+    "src/middleware.rs" \
+    'verify_slice' \
+    "The constant-time comparison is what makes the HMAC check safe to expose to an attacker."
+
+# The SQLite pragmas are a performance optimization, not a correctness requirement. Aborting startup
+# over one trades a real outage — on a filesystem that cannot do WAL, or the in-memory database the
+# whole test suite uses — for a theoretical slowdown.
+assert_absent "SQLite pragma failure is never fatal" \
+    "src/db.rs" \
+    'panic!|unwrap\(\)|expect\(|process::exit' \
+    "A pragma failure must be logged and survived, not aborted on."
+assert_present "SQLite pragma failure is surfaced to the caller" \
+    "src/db.rs" \
+    'Result<' \
+    "The caller must be able to log the failure; a silently swallowed pragma is not observable."
+
+# AGENT.MD's hardest rule about the execution engine: a shell string is command injection by
+# construction. Arguments go through `Command::args`, never through `sh -c`.
+assert_absent "Hooks are never spawned through a shell" \
+    "src/executor.rs" \
+    'Command::new\("(sh|bash|/bin/sh|/bin/bash)"\)|arg\("-c"\)' \
+    "Evaluating a command inside a shell string is injection by construction (AGENT.MD §3)."
+
+# The elevation path must not follow PATH. `sudo` is hard-coded at its absolute location precisely
+# because PATH is an operator-configurable passthrough.
+assert_present "sudo is invoked by absolute path" \
+    "src/executor.rs" \
+    '"/usr/bin/sudo"' \
+    "Resolving sudo through PATH would make the elevation path itself an escalation vector."
+
+# The signature covers the target the *client* requested. `Router::nest` strips the prefix from the
+# URI inner layers observe, so reading `parts.uri` would sign a different string than the client did
+# — and would leave the query string freely rewritable on an otherwise-valid signed request.
+assert_present "Canonicalization reads the original URI" \
+    "src/middleware.rs" \
+    'OriginalUri' \
+    "parts.uri has the /api prefix stripped by nest(); signing it omits what the client signed."
 
 echo
 echo "${DIM}$OK converged, $KNOWN known divergence(s), $DRIFT drifted, $SKIPPED skipped${RESET}"

@@ -34,8 +34,9 @@
                         Every request is signed with HMAC-SHA256 over
                         <code>METHOD + PATH_AND_QUERY + TIMESTAMP + BODY</code> and sent as
                         <code>X-API-Key</code>, <code>X-Timestamp</code> and
-                        <code>X-Signature-256</code>. Signing uses the browser's Web Crypto API,
-                        which is available only over <strong>HTTPS or on localhost</strong>. Keys in
+                        <code>X-Signature-256</code>. Signing uses the browser's Web Crypto API over
+                        <strong>HTTPS or on localhost</strong>, and an identical built-in fallback on
+                        a plain-HTTP LAN address, where Web Crypto is not exposed at all. Keys in
                         <code>BODY_ONLY</code> mode are for third-party webhook senders and cannot
                         drive this dashboard.
                     </span>

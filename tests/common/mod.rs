@@ -107,7 +107,8 @@ pub fn test_state_with_trusted_proxies(db: &DatabaseConnection, proxies: &[&str]
     AppState::new(
         db.clone(),
         Arc::new(RuntimeConfig {
-            trusted_proxies: TrustedProxies::from_raw(&proxies.join(",")),
+            trusted_proxies: TrustedProxies::from_raw(&proxies.join(","))
+                .expect("test fixture proxies are syntactically valid"),
             ..(*test_config()).clone()
         }),
         test_cipher(),
