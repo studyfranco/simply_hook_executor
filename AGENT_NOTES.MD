@@ -2285,26 +2285,91 @@ says and `audit_logs.client_ip` records the wrong caller.
 - Not `?` in `main`: returning the error would render it through `Debug` and print the struct. It is
   logged through `Display` and the process exits 1, so the required `FATAL: …` text actually appears.
 
-### 3. RBAC revoke alignment (`src/api.rs`)
+### 3. Revoke-Authority Convergence (`src/api.rs`)
 
-`revoke_key_hook_permission` now mirrors the grant path: `guard_delegated_hook_revoke` uses the same
-`verb && !held` shape, and self-revocation is refused for non-masters. The handler reads the grant
-row *before* deciding (the old code deleted by filter and inferred "not found" from `rows_affected`,
-which gave the guard nothing to compare against), then deletes by primary key.
+> **Superseded.** This section replaces the "RBAC revoke alignment" writeup that stood here. That
+> change added per-verb proportionality and a self-revocation block to `revoke_key_hook_permission`;
+> both have been **removed**. What follows is the final decision, not a record of the intermediate
+> one.
 
-Note what this is: **not** an anti-escalation control. Removing a flag cannot raise anyone's
-authority, and `AGENT.MD` is right that revocation is never an escalation. It closes an *integrity*
-gap — a `can_manage`-only holder destroying another key's `can_execute` grant on a hook it merely
-administers.
+**The rule: `can_manage` on the hook confers full revoke authority — every verb, every key, including
+the caller's own row — on both the `DELETE` path and the `POST`/grant path.**
 
-> **⚠ Known gap, deliberately left open.** `POST /api/keys/{id}/permissions` can still write
-> `can_execute: false` onto an existing row, and `AGENT.MD`'s "revoking is always allowed" rule
-> explicitly permits it (with its own integration test). So a determined `can_manage`-only holder
-> retains an equivalent effect by a different route, and **this guard is bypassable via POST**.
-> Closing it means changing a documented, separately-tested rule about the *grant* endpoint, which
-> is a spec decision rather than a bug fix, and was out of scope for a task naming only
-> `revoke_key_hook_permission`. Recorded here rather than papered over: the guard as it stands
-> raises the bar on the DELETE path but does not fully close the capability.
+#### Why the lower bar is correct, not an oversight
+
+Granting and revoking are not mirror images, and building them as if they were was the error.
+
+Granting has to prove authority because it can **manufacture** a capability the caller was never
+given: a `can_manage`-only holder writing `can_execute` onto a second key it controls, then
+authenticating as that key, obtains in two requests a verb an operator deliberately withheld. That is
+escalation, and `guard_delegated_hook_grant` correctly refuses it verb by verb.
+
+Revoking has nothing to prove. Turning a flag off is a request for `false`, and **`false` exceeds
+nothing**. Whoever asks and whatever they hold, the outcome is a strict de-escalation of the target
+key. There is no state reachable by revocation in which anyone ends up with more authority than they
+started with — including the revoker, which the test asserts directly: stripping another key's
+`can_execute` does not confer `can_execute` on you.
+
+So the stricter guard was protecting against a category of harm that this operation cannot cause.
+
+#### Why it was actively harmful, not merely redundant
+
+`POST /api/keys/{id}/permissions` can write `can_execute: false` onto an existing row, and `AGENT.MD`
+permits it under "revoking is always allowed". `DELETE` reaches the same end state by removing the
+row. Two spellings, one operation — so a restriction on only one of them is not a restriction at all,
+just a detour. A caller refused by `DELETE` re-issues the request as `POST` and succeeds.
+
+That is worse than having no rule. It presents as a security boundary while enforcing nothing, and it
+makes two routes to one outcome disagree about who may take them — which reads as a bug to everyone
+who meets it and invites someone to "fix" it by tightening `POST`, spreading the mistake instead of
+removing it.
+
+The self-revocation block failed the same way, plus one more: it reasoned by analogy with
+self-*granting*, which genuinely is escalation. The analogy does not survive the direction change. Its
+only practical effect was that a key could not clean up after itself without finding a master.
+
+#### What still holds
+
+The entry gate — `can_manage` on the hook — is untouched, and it is where the real weight sits.
+Revocation needs no authority over the *verbs*, but it still needs authority over the *hook*.
+Otherwise any key manager could disable automation belonging to a tenant it has no relationship with.
+That is the genuine exposure on this path, and it is an **integrity** concern, never an escalation
+one. Naming it precisely matters: the guard exists to stop someone's automation being switched off,
+not to stop anyone gaining anything.
+
+This also restores convergence with `simply_ip_vault`, whose group-permission revoke has always
+required only the manage verb.
+
+#### The counterpart safeguard: ungoverned hooks
+
+Allowing self-revocation makes a new state reachable — the last manager drops its own grant and **no
+permission row references the hook at all**. If a master's view were derived from those rows, the hook
+would vanish from the API at the moment it became ungoverned, recoverable only by opening the
+database by hand.
+
+Verified that it does not: `visible_hook_ids` returns `None` for a master (no `IN` filter is applied
+at all), and `require_visibility` / `require_manage` / `require_execute` each return early before any
+row is read. A master's view is authority over the deployment, not a grant within it. **No fix was
+needed**, but the property was previously untested, which is how it would have been lost.
+
+`an_ungoverned_hook_stays_visible_and_manageable_by_a_master` now drives the whole path: last manager
+self-revokes → ex-manager sees nothing (`GET /api/hooks` empty, direct fetch `403`) → master still
+lists it, reads it by UUID *and* by name, executes it, and re-grants on it → the manager sees it
+again. Mutation-tested by disabling the `is_master` short-circuit in `visible_hook_ids`, which fails
+the test, so it is not vacuous.
+
+#### Tests
+
+| Test | Asserts |
+| :--- | :--- |
+| `a_can_manage_holder_may_revoke_a_verb_it_does_not_itself_hold` | `204`, the revocation lands, and the revoker gains nothing |
+| `a_key_may_revoke_its_own_hook_permissions` | self-revocation succeeds; re-granting to self is still `403` |
+| `delete_and_post_revocation_paths_agree_on_who_may_revoke` | identical actor/target/hook, both routes permitted — no asymmetry |
+| `an_ungoverned_hook_stays_visible_and_manageable_by_a_master` | list, read, execute, re-grant with zero permission rows |
+| `revoking_on_a_hook_the_caller_does_not_manage_is_refused` | *(kept)* the entry gate, the one real control here |
+
+The first two are the exact inverse of last session's assertions on the same fixtures, so they cannot
+pass under the reverted code.
 
 ### 4. Replay capacity backoff (`src/replay.rs`)
 
@@ -2395,3 +2460,19 @@ encoder, not proven coverage. Recorded as such, same as §34's `X-Hub-Signature-
 | `cargo test` | **185 passed**, 0 failed (81 unit + 104 integration; was 177) |
 | `./scripts/test_e2e.sh` | **665/665**, 0 failed (was 652) |
 | `./scripts/verify_convergence.sh` | 14 converged, 1 known, 0 drifted, exit 0 |
+
+Re-run after the Revoke-Authority Convergence revision above (§3), which is the state of the tree as
+committed:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check` / `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **187 passed**, 0 failed (81 unit + 106 integration) |
+| `./scripts/test_e2e.sh` | **665/665**, 0 failed |
+| `./scripts/verify_convergence.sh` | 14 converged, 1 known, 0 drifted, exit 0 |
+
+The integration count moves 104 → 106: two of last session's revoke tests were rewritten as their
+inverse rather than added to, and three new ones landed (`delete_and_post_revocation_paths_agree…`,
+`a_key_may_revoke_its_own_hook_permissions`, `an_ungoverned_hook_stays_visible…`). The e2e total is
+unchanged because the revoke rules were never asserted at that layer — worth noting as a gap, not a
+pass: the HTTP-level coverage for this rule lives entirely in the integration suite.

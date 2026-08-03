@@ -5146,15 +5146,16 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
     );
 }
 
-/// Revocation is proportional too: you cannot delete a grant conferring a verb you do not hold.
+/// `can_manage` alone confers full revoke authority — no per-verb proportionality.
 ///
-/// This is not an anti-escalation rule — removing a flag cannot raise anyone's authority. It closes
-/// an integrity gap instead: a `can_manage`-only holder could otherwise destroy another key's
-/// `can_execute` grant on a hook it merely administers, disabling automation it was deliberately
-/// withheld from. Managing a hook is authority to administer its grants, not to demolish a
-/// capability an operator handed to someone else.
+/// Granting has to prove authority because it can manufacture a capability the caller was never
+/// given. Revoking cannot: turning a flag off is a request for `false`, and `false` exceeds nothing,
+/// so the result is always a strict de-escalation of the target no matter who asks. Requiring the
+/// caller to hold each verb it strips bought nothing anyway — `POST` with a reduced permission set
+/// reaches the same state and `AGENT.MD` permits it — while making two routes to one outcome
+/// disagree about who may take them.
 #[tokio::test]
-async fn revoking_a_verb_the_caller_does_not_hold_is_refused() {
+async fn a_can_manage_holder_may_revoke_a_verb_it_does_not_itself_hold() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let scripts = ScriptDir::new();
@@ -5169,80 +5170,104 @@ async fn revoking_a_verb_the_caller_does_not_hold_is_refused() {
     // The victim holds exactly the verb the caller lacks.
     grant(&db, victim_id, hook, true, false).await;
 
-    let over_revoke = send(
+    let revoked = send(
         &app,
-        json_request(
-            "DELETE",
-            &format!("/api/keys/{victim_id}/permissions/{hook}"),
-            &manager,
-            None,
-        ),
+        json_request("DELETE", &format!("/api/keys/{victim_id}/permissions/{hook}"), &manager, None),
     )
     .await;
     assert_eq!(
-        over_revoke.status,
-        StatusCode::FORBIDDEN,
-        "revoking a grant conferring a verb the caller lacks must be refused"
-    );
-    assert!(
-        over_revoke.raw.contains("can_execute"),
-        "the refusal names the verb, not just 'permission denied': {}",
-        over_revoke.raw
+        revoked.status,
+        StatusCode::NO_CONTENT,
+        "can_manage is the whole requirement for revoking: {}",
+        revoked.raw
     );
 
-    // The refusal was real: the grant survived, so the victim can still run the hook.
-    let still_runs = send(
-        &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &victim, Some(json!({}))),
-    )
-    .await;
-    assert_eq!(still_runs.status, StatusCode::OK, "the blocked revocation never landed");
-
-    // Once the caller holds the verb, the identical request succeeds — proving the block was about
-    // the caller's own grant and nothing else about the request. The upgrade goes through the real
-    // upsert rather than a second seeded row, since one key may hold only one grant per hook.
-    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
-    let upgraded = send(
-        &app,
-        json_request(
-            "POST",
-            &format!("/api/keys/{manager_id}/permissions"),
-            &master,
-            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
-        ),
-    )
-    .await;
-    assert_eq!(upgraded.status, StatusCode::OK, "the master grants the caller the missing verb");
-
-    let permitted = send(
-        &app,
-        json_request(
-            "DELETE",
-            &format!("/api/keys/{victim_id}/permissions/{hook}"),
-            &manager,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(permitted.status, StatusCode::NO_CONTENT, "holding the verb makes the revoke legitimate");
-
-    // And it really was removed.
+    // It really landed: the victim can no longer run the hook.
     let now_denied = send(
         &app,
         json_request("POST", &format!("/api/hooks/{hook}/execute"), &victim, Some(json!({}))),
     )
     .await;
-    assert_eq!(now_denied.status, StatusCode::FORBIDDEN, "the permitted revocation did land");
+    assert_eq!(now_denied.status, StatusCode::FORBIDDEN, "the revocation took effect");
+
+    // And the caller gained nothing by it — de-escalating someone else does not escalate you.
+    let attempt = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &manager, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(
+        attempt.status,
+        StatusCode::FORBIDDEN,
+        "revoking another key's execute grant must not confer execute on the revoker"
+    );
 }
 
-/// A key cannot rewrite its own permission row in either direction.
+/// `DELETE` and `POST`-with-a-reduced-set are two spellings of one operation, so they must agree on
+/// who may perform it.
 ///
-/// The grant path already refused self-*grants* as escalation. Self-revocation is the other half of
-/// the same boundary: not an escalation, but still a key editing its own authority, which
-/// `AGENT.MD` reserves to a master. A peer administrator can always do it instead, so nothing
-/// legitimate is lost.
+/// The asymmetry this pins down is the reason the stricter guard was walked back: for the same
+/// actor, target and hook, a caller that can zero a grant through `POST` must also be able to delete
+/// it through `DELETE`. Anything else is a rule that a caller routes around rather than obeys.
 #[tokio::test]
-async fn a_non_master_cannot_revoke_its_own_hook_permissions() {
+async fn delete_and_post_revocation_paths_agree_on_who_may_revoke() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("parity.sh", "#!/bin/sh\necho ran\n");
+
+    let hook = insert_hook(&db, "parity_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+
+    // A caller holding *only* can_manage — the exact actor the old guard singled out.
+    grant(&db, manager_id, hook, false, true).await;
+
+    // Route A: zero the grant through the grant endpoint.
+    grant(&db, victim_id, hook, true, true).await;
+    let via_post = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+        ),
+    )
+    .await;
+
+    // Route B: delete the row outright, from the identical starting state.
+    let db2 = setup_test_db().await;
+    let app2 = create_app(test_state(&db2));
+    let hook2 = insert_hook(&db2, "parity_hook", &script, 30).await;
+    let (manager2_id, manager2) = seed_key_manager(&db2).await;
+    let (victim2_id, _) = insert_key(&db2, "victim", "", KeyScopes::plain()).await;
+    grant(&db2, manager2_id, hook2, false, true).await;
+    grant(&db2, victim2_id, hook2, true, true).await;
+    let via_delete = send(
+        &app2,
+        json_request("DELETE", &format!("/api/keys/{victim2_id}/permissions/{hook2}"), &manager2, None),
+    )
+    .await;
+
+    // Different status codes (200 vs 204) because they are different verbs; what must match is
+    // whether the caller was *allowed*.
+    assert!(via_post.status.is_success(), "POST route: {}", via_post.raw);
+    assert!(via_delete.status.is_success(), "DELETE route: {}", via_delete.raw);
+    assert_eq!(
+        via_post.status.is_client_error(),
+        via_delete.status.is_client_error(),
+        "the two revocation routes must not disagree about who may revoke"
+    );
+}
+
+/// Self-revocation is allowed: a key may drop its own grant.
+///
+/// It is a de-escalation like any other. The previous rule refused it by analogy with self-*granting*
+/// — which really is escalation — but the analogy does not hold in this direction, and refusing it
+/// meant a key could not clean up after itself without finding a master.
+#[tokio::test]
+async fn a_key_may_revoke_its_own_hook_permissions() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let scripts = ScriptDir::new();
@@ -5250,55 +5275,54 @@ async fn a_non_master_cannot_revoke_its_own_hook_permissions() {
 
     let hook = insert_hook(&db, "self_revoke_hook", &script, 30).await;
     let (manager_id, manager) = seed_key_manager(&db).await;
-    // Full rights on the hook, so proportionality cannot be what refuses this.
     grant(&db, manager_id, hook, true, true).await;
 
     let self_revoke = send(
         &app,
-        json_request(
-            "DELETE",
-            &format!("/api/keys/{manager_id}/permissions/{hook}"),
-            &manager,
-            None,
-        ),
+        json_request("DELETE", &format!("/api/keys/{manager_id}/permissions/{hook}"), &manager, None),
     )
     .await;
     assert_eq!(
         self_revoke.status,
-        StatusCode::FORBIDDEN,
-        "a non-master key must not edit its own permission row"
-    );
-    assert!(
-        self_revoke.raw.contains("own hook permissions"),
-        "the refusal is the self-administration one, not the proportionality one: {}",
+        StatusCode::NO_CONTENT,
+        "dropping your own grant is a de-escalation, not an escalation: {}",
         self_revoke.raw
     );
 
-    // The grant is untouched, so the key still holds what it tried to drop.
+    // The key really did give up its access, in both directions.
     let me = send(&app, json_request("GET", "/api/auth/me", &manager, None)).await;
-    assert_eq!(me.json["hook_permissions"][0]["can_execute"], json!(true));
+    assert_eq!(me.json["hook_permissions"], json!([]), "the grant is gone from the profile");
+    let execute = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &manager, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(execute.status, StatusCode::FORBIDDEN, "and the capability with it");
 
-    // A master may do it, which is what makes the rule about *self*-administration rather than a
-    // blanket ban on revoking this row.
-    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
-    let by_master = send(
+    // Having given it up, it cannot hand it back to itself — self-*granting* is still escalation.
+    let regrant = send(
         &app,
         json_request(
-            "DELETE",
-            &format!("/api/keys/{manager_id}/permissions/{hook}"),
-            &master,
-            None,
+            "POST",
+            &format!("/api/keys/{manager_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
         ),
     )
     .await;
-    assert_eq!(by_master.status, StatusCode::NO_CONTENT, "a master administers any key's grants");
+    assert_eq!(
+        regrant.status,
+        StatusCode::FORBIDDEN,
+        "the asymmetry that matters is preserved: giving up authority is free, taking it back is not"
+    );
 }
 
-/// A caller holding no grant at all cannot revoke, and is refused in the entry gate's words.
+/// A caller holding no grant at all cannot revoke.
 ///
-/// Pinned separately from the per-verb test for the same reason the grant path pins it: the entry
-/// gate and the proportionality check live in one function, and that is exactly where a condition
-/// gets dropped by accident.
+/// This is the check the relaxation did **not** touch, and the one carrying the actual security
+/// weight on this path. Revocation needs no proof of authority over the *verbs*, but it still needs
+/// authority over the *hook* — otherwise any key manager could disable automation belonging to a
+/// tenant it has no relationship with. That is the integrity concern the entry gate exists for.
 #[tokio::test]
 async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
     let db = setup_test_db().await;
@@ -5326,6 +5350,93 @@ async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
         no_grant.raw.contains("manage access"),
         "the entry gate's message is unchanged: {}",
         no_grant.raw
+    );
+}
+
+/// A hook nobody holds a permission row on is still fully visible and manageable by a master.
+///
+/// This is the counterpart safeguard to allowing self-revocation. Once the last manager can drop its
+/// own grant, a hook can reach a state where **no permission row references it at all** — and if
+/// master visibility were derived from those rows, the hook would vanish from the API the moment it
+/// became ungoverned. Recovering it would then mean opening the database by hand, which is not an
+/// administrative interface.
+///
+/// So the property asserted here is that a master's view never depends on a row existing: it is
+/// authority over the deployment, not a grant within it.
+#[tokio::test]
+async fn an_ungoverned_hook_stays_visible_and_manageable_by_a_master() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("ungoverned.sh", "#!/bin/sh\necho ran\n");
+
+    let hook = insert_hook(&db, "ungoverned_hook", &script, 30).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
+    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    grant(&db, manager_id, hook, true, true).await;
+
+    // The last manager drops its own grant, which this rule now permits. The hook is left with no
+    // permission row pointing at it from anyone.
+    let self_revoke = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{manager_id}/permissions/{hook}"), &manager, None),
+    )
+    .await;
+    assert_eq!(self_revoke.status, StatusCode::NO_CONTENT, "the last manager revoked itself");
+
+    // Nobody can see it through a grant any more — including the key that used to manage it.
+    let orphaned = send(&app, json_request("GET", "/api/hooks", &manager, None)).await;
+    assert_eq!(orphaned.json.as_array().map(Vec::len), Some(0), "the ex-manager sees nothing");
+    assert_eq!(
+        send(&app, json_request("GET", &format!("/api/hooks/{hook}"), &manager, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "and cannot reach it directly either"
+    );
+
+    // The master still lists it...
+    let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
+    let names: Vec<&str> =
+        listed.json.as_array().expect("a list").iter().filter_map(|h| h["name"].as_str()).collect();
+    assert!(
+        names.contains(&"ungoverned_hook"),
+        "an ungoverned hook must not disappear from the master's listing: {names:?}"
+    );
+
+    // ...can read it by id and by name...
+    for reference in [hook.to_string(), "ungoverned_hook".to_owned()] {
+        let detail =
+            send(&app, json_request("GET", &format!("/api/hooks/{reference}"), &master, None)).await;
+        assert_eq!(detail.status, StatusCode::OK, "master reads {reference} on an ungoverned hook");
+        assert_eq!(detail.json["name"], json!("ungoverned_hook"));
+    }
+
+    // ...can still execute and manage it, so it is not merely readable...
+    assert_eq!(
+        send(&app, json_request("POST", &format!("/api/hooks/{hook}/execute"), &master, Some(json!({}))))
+            .await
+            .status,
+        StatusCode::OK,
+        "an ungoverned hook is still executable by a master"
+    );
+
+    // ...and, decisively, can put it back under governance.
+    let regrant = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{manager_id}/permissions"),
+            &master,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(regrant.status, StatusCode::OK, "a master can re-grant on an ungoverned hook");
+
+    let restored = send(&app, json_request("GET", "/api/hooks", &manager, None)).await;
+    assert_eq!(
+        restored.json.as_array().map(Vec::len),
+        Some(1),
+        "the hook is governed again and visible to its manager"
     );
 }
 
