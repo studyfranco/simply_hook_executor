@@ -3839,6 +3839,24 @@ async fn seed_key_manager(db: &sea_orm::DatabaseConnection) -> (Uuid, String) {
     insert_key(db, "key-manager", "", scopes).await
 }
 
+/// Seeds a **local manager**: no global scopes at all, just `can_manage` on one specific hook.
+///
+/// This is the population the per-hook and per-verb delegation rules actually govern. A caller
+/// holding `can_manage_keys` takes the global-administrator route and is not bound by either, so a
+/// test that seeds one and then asserts a per-verb refusal is asserting nothing — which is exactly
+/// what happened to four tests when the override landed. Reach for this whenever the rule under test
+/// is "how much may a hook's manager hand out".
+async fn seed_local_manager(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+    hook_id: Uuid,
+    can_execute: bool,
+) -> (Uuid, String) {
+    let (id, plaintext) = insert_key(db, name, "", KeyScopes::plain()).await;
+    grant(db, id, hook_id, can_execute, true).await;
+    (id, plaintext)
+}
+
 /// Finding #1 — `can_manage_keys` could mint a key with `is_master: true` and become master.
 #[tokio::test]
 async fn regression_non_master_cannot_mint_a_master_key() {
@@ -3982,8 +4000,11 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
     .await;
     assert_eq!(self_grant_plain.status, StatusCode::FORBIDDEN);
 
-    // Granting to somebody else on a hook the caller does not manage is refused too — otherwise the
-    // exploit is one extra key away.
+    // Granting to somebody else on an *ordinary* hook the caller does not manage is now permitted:
+    // this caller holds `can_manage_keys`, which is a deployment-wide administrative scope and takes
+    // the global-administrator route. That widening is exactly why the privileged-hook guard above
+    // has to be independent of it — the self-grant block alone would leave the exploit one extra key
+    // away, and `can_manage_keys` is precisely the scope that can mint that key.
     let third_party = send(
         &app,
         json_request(
@@ -3994,7 +4015,29 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
         ),
     )
     .await;
-    assert_eq!(third_party.status, StatusCode::FORBIDDEN, "granting on an unmanaged hook must be refused");
+    assert_eq!(
+        third_party.status,
+        StatusCode::OK,
+        "can_manage_keys administers grants deployment-wide on ordinary hooks"
+    );
+
+    // The same request against the *privileged* hook is still refused, which is the boundary that
+    // actually contains the override.
+    let third_party_privileged = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{victim_id}/permissions"),
+            &manager,
+            Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        third_party_privileged.status,
+        StatusCode::FORBIDDEN,
+        "the override must never reach a hook that runs as another user"
+    );
 
     // The grant never landed: the manager still cannot reach the privileged hook.
     let probe = send(&app, json_request("POST", &format!("/api/hooks/{privileged}/test"), &manager, None)).await;
@@ -4980,7 +5023,7 @@ async fn the_hook_retention_window_is_configurable_and_independent_of_log_retent
 // Convergence: per-verb grant proportionality & pre-lookup freshness
 // ─────────────────────────────────────────────────────────────
 
-/// A delegated grant may not exceed the verbs the caller holds on that hook.
+/// A **local manager's** delegated grant may not exceed the verbs it holds on that hook.
 ///
 /// `require_manage` answers *whether* a caller may administer grants on a hook; it never answered
 /// *how much* of it may be handed out. `can_execute` and `can_manage` are separate columns in
@@ -4988,19 +5031,21 @@ async fn the_hook_retention_window_is_configurable_and_independent_of_log_retent
 /// this guard, that key could route the missing verb to itself through a second key it controls:
 /// mint a key, grant it `can_execute`, authenticate as it, run the hook. Two requests, and the
 /// withheld capability is in hand.
+///
+/// Seeded as a local manager rather than a `can_manage_keys` holder, and that distinction is now
+/// load-bearing: `can_manage_keys` takes the global-administrator route and is deliberately *not*
+/// bound by this rule. Using one here would make every assertion below vacuous.
 #[tokio::test]
-async fn a_delegated_grant_cannot_exceed_the_verbs_the_caller_holds() {
+async fn a_local_managers_delegated_grant_cannot_exceed_the_verbs_it_holds() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let scripts = ScriptDir::new();
     let script = scripts.write_script("verbs.sh", "#!/bin/sh\necho ran\n");
 
     let hook = insert_hook(&db, "delegated_hook", &script, 30).await;
-    let (manager_id, manager) = seed_key_manager(&db).await;
+    // Manages the hook, deliberately without execution rights on it.
+    let (manager_id, manager) = seed_local_manager(&db, "local-manager", hook, false).await;
     let (accomplice_id, accomplice) = insert_key(&db, "accomplice", "", KeyScopes::plain()).await;
-
-    // The caller manages the hook but was deliberately not given execution rights on it.
-    grant(&db, manager_id, hook, false, true).await;
 
     let over_grant = send(
         &app,
@@ -5093,11 +5138,15 @@ async fn a_delegated_grant_cannot_exceed_the_verbs_the_caller_holds() {
     assert_eq!(by_master.status, StatusCode::OK, "master keys bypass proportionality");
 }
 
-/// A caller holding *no* grant at all is still refused, and in the same words as before.
+/// A **local manager** holding no grant on the target hook is still refused.
 ///
-/// The entry gate moved inside `guard_delegated_hook_grant` when the per-verb check was added.
-/// Folding two checks into one function is exactly where a condition gets dropped by accident, so
-/// the pre-existing rule is pinned separately rather than left implied by the test above.
+/// The entry gate lives inside `guard_delegated_hook_grant` alongside the per-verb check. Folding
+/// two checks into one function is exactly where a condition gets dropped by accident, so the
+/// pre-existing rule is pinned separately rather than left implied by the test above.
+///
+/// The caller manages a *different* hook, which is what gets it past the coarse standing check on
+/// the handler and all the way to the real per-hook decision — a caller managing nothing at all is
+/// refused earlier and for a different reason, covered separately below.
 #[tokio::test]
 async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
     let db = setup_test_db().await;
@@ -5106,10 +5155,11 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
     let script = scripts.write_script("unmanaged.sh", "#!/bin/sh\nexit 0\n");
 
     let hook = insert_hook(&db, "unmanaged_hook", &script, 30).await;
-    let (manager_id, manager) = seed_key_manager(&db).await;
+    let elsewhere = insert_hook(&db, "some_other_hook", &script, 30).await;
+    let (manager_id, manager) = seed_local_manager(&db, "local-manager", elsewhere, true).await;
     let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
 
-    // No row at all.
+    // No row on the target hook at all.
     let no_grant = send(
         &app,
         json_request(
@@ -5143,6 +5193,143 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
         execute_only.status,
         StatusCode::FORBIDDEN,
         "can_execute alone does not authorize delegating anything"
+    );
+}
+
+/// A caller with no administrative standing anywhere is refused before any lookup happens.
+///
+/// The handler admits two routes — global key administrator, or manager of *some* hook — and this
+/// pins the third case: neither. It matters beyond the `403` itself. The refusal must land before
+/// the target key is fetched, or a caller holding nothing could distinguish a real key UUID from an
+/// invented one by reading `404` instead of `403`, turning a permission endpoint into a key-
+/// enumeration oracle.
+#[tokio::test]
+async fn a_caller_managing_nothing_is_refused_before_the_target_key_is_looked_up() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("nostanding.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "standing_hook", &script, 30).await;
+    let (nobody_id, nobody) = insert_key(&db, "nobody", "", KeyScopes::plain()).await;
+    let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+
+    // An execute-only row is not management, so this caller manages nothing.
+    grant(&db, nobody_id, hook, true, false).await;
+
+    for (label, target) in [("a real key", victim_id), ("a key that does not exist", Uuid::new_v4())] {
+        let refused = send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/keys/{target}/permissions"),
+                &nobody,
+                Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "{label}: a caller managing nothing must be refused, and indistinguishably"
+        );
+    }
+
+    // Same on the revoke path, which shares the standing check.
+    let revoke = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{victim_id}/permissions/{hook}"), &nobody, None),
+    )
+    .await;
+    assert_eq!(revoke.status, StatusCode::FORBIDDEN, "revoke shares the standing check");
+}
+
+/// `can_manage_keys` is a deployment-wide administrative scope, not a per-hook one.
+///
+/// It therefore grants on hooks the caller has no row for, and hands out verbs it does not itself
+/// hold — including on a hook nobody governs at all. This is the deliberate override, and it is a
+/// genuine widening of `can_manage_keys`: the scope is now transitively able to reach any
+/// non-privileged hook, because it can mint a second key and grant that key whatever it likes.
+/// `AGENT.MD` documents the trade; `require_master_for_privileged_hook` is what still bounds it.
+#[tokio::test]
+async fn a_can_manage_keys_holder_may_grant_on_any_hook_without_holding_a_row() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("override.sh", "#!/bin/sh\necho ran\n");
+
+    // Ungoverned: no permission row references this hook from anyone, including the admin.
+    let hook = insert_hook(&db, "ungoverned_for_grant", &script, 30).await;
+    let (_admin_id, admin) = seed_key_manager(&db).await;
+    let (worker_id, worker) = insert_key(&db, "worker", "", KeyScopes::plain()).await;
+
+    let granted = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{worker_id}/permissions"),
+            &admin,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        granted.status,
+        StatusCode::OK,
+        "can_manage_keys grants without a row of its own: {}",
+        granted.raw
+    );
+
+    // The grant is real, not merely accepted.
+    let ran = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &worker, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(ran.status, StatusCode::OK, "the granted verb actually works");
+
+    // ...and it can revoke on the same hook, equally without a row — the two directions agree.
+    let revoked = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{worker_id}/permissions/{hook}"), &admin, None),
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "revoke takes the same override route");
+
+    // The override stops at privileged hooks: distributing rights over a hook that runs as another
+    // user is the elevation itself, and stays master-only.
+    let privileged = insert_hook_as(&db, "root_hook_override", &script, 30, Some("root")).await;
+    let on_privileged = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{worker_id}/permissions"),
+            &admin,
+            Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        on_privileged.status,
+        StatusCode::FORBIDDEN,
+        "can_manage_keys must not reach a hook that runs as another user"
+    );
+
+    // And self-granting is still refused, so the override never applies to the caller's own row.
+    let self_grant = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{_admin_id}/permissions"),
+            &admin,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        self_grant.status,
+        StatusCode::FORBIDDEN,
+        "the override administers other keys, never the caller's own"
     );
 }
 
@@ -5331,7 +5518,11 @@ async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
     let script = scripts.write_script("unmanaged_revoke.sh", "#!/bin/sh\nexit 0\n");
 
     let hook = insert_hook(&db, "unmanaged_revoke_hook", &script, 30).await;
-    let (_manager_id, manager) = seed_key_manager(&db).await;
+    let elsewhere = insert_hook(&db, "a_hook_it_does_manage", &script, 30).await;
+    // A local manager: it manages *a* hook (so it has standing) but not the target one. A
+    // `can_manage_keys` holder would take the global-administrator route and be allowed, which is
+    // the deliberate override — this test is about the population the per-hook rule still governs.
+    let (_manager_id, manager) = seed_local_manager(&db, "local-manager", elsewhere, true).await;
     let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
     grant(&db, victim_id, hook, true, true).await;
 

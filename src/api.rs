@@ -431,19 +431,46 @@ fn require_master_for_privileged_hook(
     )))
 }
 
+/// Whether a key manages *any* hook at all.
+///
+/// A coarse, indexed pre-check used by the permission endpoints so that a caller with no
+/// administrative standing whatsoever is refused **before** a target key or hook is looked up.
+/// Without it, relaxing those endpoints to admit local managers would let a caller holding nothing
+/// learn whether an arbitrary key UUID exists, by reading `404` instead of `403`.
+///
+/// It deliberately does not say *which* hook — that question needs the resolved hook and is answered
+/// by [`guard_delegated_hook_grant`] and [`require_manage`]. This only establishes that the caller
+/// is a hook manager somewhere, which is enough to justify continuing.
+async fn manages_any_hook(
+    db: &sea_orm::DatabaseConnection,
+    key_id: Uuid,
+) -> Result<bool, AppError> {
+    Ok(ApiKeyHookPermission::find()
+        .filter(api_key_hook_permission::Column::ApiKeyId.eq(key_id))
+        .filter(api_key_hook_permission::Column::CanManage.eq(true))
+        .one(db)
+        .await?
+        .is_some())
+}
+
 /// Rejects a delegated grant that would hand out more authority over a hook than the caller holds.
 ///
-/// [`require_manage`] answers *whether* a caller may administer grants on a hook at all. This
-/// answers the separate question of *how much* it may hand out, and that question was previously
-/// never asked: a key holding `can_manage` but not `can_execute` could write `can_execute` onto a
-/// second key it also controls, authenticate as that key, and run the hook — obtaining in two
-/// requests a verb an operator had deliberately withheld from it. `SCHEMA.MD` models `can_execute`
-/// and `can_manage` as independent columns precisely so that combination is expressible; enforcing
-/// only one of them made the distinction advisory.
+/// # Two routes to administering a hook's grants
 ///
-/// Each verb is checked **independently** against the caller's own row, exactly as `AGENT.MD`'s
-/// least-privilege rule implies: holding `can_manage` confers no right to grant `can_execute`, and
-/// vice versa.
+/// - **Global key administrators** (`is_master`, or `can_manage_keys`) pass unconditionally. The
+///   scope is deployment-wide credential administration, so it is not scoped to a hook and is not
+///   bounded by what the caller happens to hold on one.
+/// - **Local managers** — no global key scope, but `can_manage` on *this* hook — may delegate only
+///   within their own authority: `can_manage` on the hook to act at all, and each verb checked
+///   independently against their own row.
+///
+/// The local-manager rule is the one that carries the least-privilege weight. Without the first half,
+/// a `can_manage`-only holder could distribute rights on hooks it has no relationship with — a
+/// cross-tenant hole in what is meant to be a per-hook M:N model. Without the second, it could write
+/// `can_execute` onto a second key, authenticate as that key, and run the hook, obtaining in two
+/// requests a verb an operator deliberately withheld. `SCHEMA.MD` models `can_execute` and
+/// `can_manage` as independent columns precisely so that combination is expressible; enforcing only
+/// one of them would make the distinction advisory.
 ///
 /// Two behaviours fall out of the `wanted && !held` shape and are deliberate:
 ///
@@ -457,7 +484,16 @@ fn require_master_for_privileged_hook(
 /// checks are about the same caller and the same hook, and reading it twice would invite the two
 /// answers to disagree if a grant were revoked between them.
 ///
-/// Master keys bypass, per `AGENT.MD`'s RBAC model.
+/// # What the `can_manage_keys` override costs
+///
+/// Stated plainly, because it is a deliberate policy choice rather than an oversight: a
+/// `can_manage_keys` holder can mint a second key and grant it any verb on any non-privileged hook,
+/// then authenticate as that key. `can_manage_keys` is therefore *transitively* able to execute any
+/// non-privileged hook, and per-hook RBAC does not constrain it. Two guards still stand in the way of
+/// the worst version: [`require_master_for_privileged_hook`] keeps every hook carrying `run_as_user`
+/// master-only, and self-granting remains refused, so the escalation always costs a second
+/// credential and leaves two audit-log entries. Operators should read `can_manage_keys` as
+/// "deputy master over non-privileged hooks", not as a scoped administrative role.
 async fn guard_delegated_hook_grant(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
@@ -465,7 +501,7 @@ async fn guard_delegated_hook_grant(
     requested_execute: bool,
     requested_manage: bool,
 ) -> Result<(), AppError> {
-    if key.is_master {
+    if key.is_master || key.can_manage_keys {
         return Ok(());
     }
 
@@ -2258,7 +2294,12 @@ pub async fn update_key_hook_permissions(
     Path(id): Path<Uuid>,
     Json(payload): Json<HookPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_keys {
+    // Admits both routes: a global key administrator, or a local manager of *some* hook. Which hook
+    // is not known yet — the payload has not been parsed — so this only establishes that the caller
+    // has administrative standing at all, and `guard_delegated_hook_grant` decides the rest once the
+    // hook is resolved. A caller holding neither is refused here, before any lookup, so it cannot
+    // learn whether a key UUID exists by reading `404` instead of `403`.
+    if !key.is_master && !key.can_manage_keys && !manages_any_hook(&state.db, key.id).await? {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
@@ -2363,17 +2404,19 @@ pub async fn revoke_key_hook_permission(
     Extension(client_ip): Extension<ClientIp>,
     Path((id, hook_identifier)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_keys {
+    // Same two routes as the grant path, and the same reason for checking standing before any
+    // lookup: a caller with no administrative role at all must not be able to probe key UUIDs.
+    if !key.is_master && !key.can_manage_keys && !manages_any_hook(&state.db, key.id).await? {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
     let hook_model = resolve_hook(&state.db, &hook_identifier).await?;
 
-    // `can_manage` on the hook is the *whole* requirement, and deliberately a lower bar than the
-    // grant path's. Granting has to prove authority because it can manufacture a capability the
-    // caller was never given; revoking cannot. Turning a flag off is a request for `false`, and
-    // `false` exceeds nothing — the result is always a strict de-escalation of the target key, no
-    // matter who asks or what they hold.
+    // `can_manage` on the hook is the *whole* requirement for a local manager, and deliberately a
+    // lower bar than the grant path's. Granting has to prove authority because it can manufacture a
+    // capability the caller was never given; revoking cannot. Turning a flag off is a request for
+    // `false`, and `false` exceeds nothing — the result is always a strict de-escalation of the
+    // target key, no matter who asks or what they hold.
     //
     // So there is no per-verb proportionality here and no self-revocation block. A `can_manage`
     // holder may strip any verb from any key including itself, exactly as it may already write
@@ -2382,10 +2425,13 @@ pub async fn revoke_key_hook_permission(
     // to the same outcome disagree about who may take them, which is the kind of asymmetry that
     // reads as a bug to everyone who meets it.
     //
-    // What the entry gate still prevents is the real exposure: a key manager with no relationship to
-    // the hook stripping access to it. That is an integrity concern — someone else's automation
-    // being disabled — and `can_manage` is the right authority to require for it.
-    if !key.is_master {
+    // What the entry gate still prevents is the real exposure: a *local* manager with no
+    // relationship to the hook stripping access to it. That is an integrity concern — someone else's
+    // automation being disabled — and `can_manage` is the right authority to require for it. A global
+    // key administrator is not scoped to a hook and so is not asked for a row here, matching the
+    // grant path exactly; the two directions must agree about who may act, or the stricter one is
+    // simply routed around.
+    if !key.is_master && !key.can_manage_keys {
         require_manage(&state.db, &key, hook_model.id).await?;
     }
 

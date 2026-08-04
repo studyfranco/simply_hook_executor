@@ -2358,6 +2358,85 @@ lists it, reads it by UUID *and* by name, executes it, and re-grants on it → t
 again. Mutation-tested by disabling the `is_master` short-circuit in `visible_hook_ids`, which fails
 the test, so it is not vacuous.
 
+#### Addendum — the `can_manage_keys` grant override
+
+A later pass added a **global administrative route** to the grant path, so both directions now read:
+
+| Caller | Grant | Revoke |
+| :--- | :--- | :--- |
+| `is_master` | unconditional | unconditional |
+| `can_manage_keys` | unconditional (non-privileged hooks) | unconditional |
+| Local manager (`can_manage` on the hook) | per-verb: may hand out only verbs it holds | unconditional on that hook |
+| Neither | refused before any lookup | refused before any lookup |
+
+Three things about it are worth recording precisely, because two of them contradict the brief that
+requested the change.
+
+**1. It required making local managers reachable at all.** Both handlers previously opened with
+`if !key.is_master && !key.can_manage_keys { return 403 }`. Every non-master caller that reached
+`guard_delegated_hook_grant` therefore *already* held `can_manage_keys` — so adding "`can_manage_keys`
+bypasses" on its own would have made the per-verb guard unreachable dead code and deleted the
+least-privilege rule outright rather than scoping it. The entry gates were widened to
+`is_master || can_manage_keys || manages_any_hook(..)` so that "local manager" became a real,
+reachable population for the guard to govern. `manages_any_hook` is a coarse indexed pre-check whose
+only job is to keep a caller with no standing from distinguishing `404` (key exists) from `403` by
+aiming the endpoint at invented UUIDs.
+
+**2. The revoke path was not "already `can_manage_keys` OR per-hook `can_manage`" — it was AND.** A
+`can_manage_keys` holder with no row on the hook could not revoke before this change, so the
+"regression check" for it was really a new capability. It now takes the same override route as grant,
+which is what keeps the two directions agreeing about who may act.
+
+**3. This moves *away* from `simply_ip_vault`, not toward it.** The peer's
+`guard_delegated_group_grant` bypasses for `is_master` **only**; `can_manage_keys` is bound by
+per-group verb holding exactly like anyone else, and its doc comment names the resulting escalation as
+the reason. The peer also applies that same predicate to *revocation* (it passes the grant being
+deleted through the grant guard with `action = "revoke"`). So on both counts the peer is now the
+stricter of the two services. The claim in the section above that the revoke relaxation "restores
+convergence with `simply_ip_vault`" was wrong when written and is corrected here: `simply_hook_executor`
+is deliberately the more permissive service on hook-permission administration, and that asymmetry
+should be treated as intentional rather than as drift to reconcile.
+
+**What the override costs, stated plainly.** `can_manage_keys` can mint a key, grant it any verb on
+any non-privileged hook, and authenticate as it — so the scope is *transitively* able to execute any
+non-privileged hook, and per-hook RBAC does not constrain it. It should be read as "deputy master
+over non-privileged hooks". Two bounds remain and are tested: `require_master_for_privileged_hook`
+keeps every hook carrying `run_as_user` master-only, and self-granting is still refused, so the
+escalation always costs a second credential and leaves two audit entries.
+
+Four existing tests had to be rewritten, and the reason is itself the lesson: each seeded its actor
+with `seed_key_manager` (which carries `can_manage_keys`) and then asserted a *per-hook* refusal.
+Under the override those actors take the global route, so every one of those assertions became
+vacuous — passing for the wrong reason, or failing loudly, which is how they were caught. A
+`seed_local_manager` helper now exists specifically so the per-hook rules are tested against the
+population that they govern.
+
+#### E2E coverage for the revoke rules
+
+The gap flagged in the previous entry — "the HTTP-level coverage for this rule lives entirely in the
+integration suite" — is closed. New §33 (*Revoke authority: can_manage is the whole requirement*), 27
+checks against the running daemon:
+
+- a `can_manage`-only holder revokes a verb it does not itself hold, via **`DELETE`** *and* via
+  **`POST`** with a reduced set — the two routes asserted permitted for the identical
+  actor/target/hook, which is the anti-asymmetry property the whole rule turns on;
+- the target is refused execution (`403`) afterwards, so the revocation is real over the wire and not
+  merely accepted;
+- the revoker does **not** gain the verb it stripped;
+- a caller lacking `can_manage` on that hook is refused on both routes, and the blocked revocations
+  are shown not to have landed;
+- self-revocation succeeds, then the ex-manager can no longer administer the hook, and a master can
+  still see and re-govern the now-ungoverned hook.
+
+Self-reduction runs **last** in the section by construction: every earlier check depends on the local
+manager still holding `can_manage`, so dropping it earlier would silently invalidate everything after
+it. The same ordering rule is why the §33 master-visibility checks sit after the self-revocation
+rather than before.
+
+Two pre-existing e2e blocks needed the same treatment as the integration tests — the proportionality
+delegator and the Finding #3 key manager were both created with `can_manage_keys` and were therefore
+asserting refusals that the override now permits.
+
 #### Tests
 
 | Test | Asserts |
@@ -2367,6 +2446,10 @@ the test, so it is not vacuous.
 | `delete_and_post_revocation_paths_agree_on_who_may_revoke` | identical actor/target/hook, both routes permitted — no asymmetry |
 | `an_ungoverned_hook_stays_visible_and_manageable_by_a_master` | list, read, execute, re-grant with zero permission rows |
 | `revoking_on_a_hook_the_caller_does_not_manage_is_refused` | *(kept)* the entry gate, the one real control here |
+| `a_local_managers_delegated_grant_cannot_exceed_the_verbs_it_holds` | per-verb rule, against a local manager (the population it governs) |
+| `granting_on_a_hook_the_caller_does_not_manage_is_still_refused` | per-hook entry gate on the grant path |
+| `a_can_manage_keys_holder_may_grant_on_any_hook_without_holding_a_row` | the override: grants and revokes with no row; still barred from privileged hooks and self-grants |
+| `a_caller_managing_nothing_is_refused_before_the_target_key_is_looked_up` | no standing ⇒ `403` before the key lookup, so the endpoint is not a UUID oracle |
 
 The first two are the exact inverse of last session's assertions on the same fixtures, so they cannot
 pass under the reverted code.
@@ -2469,6 +2552,15 @@ committed:
 | `cargo check` / `cargo clippy --all-targets -- -D warnings` | clean |
 | `cargo test` | **187 passed**, 0 failed (81 unit + 106 integration) |
 | `./scripts/test_e2e.sh` | **665/665**, 0 failed |
+| `./scripts/verify_convergence.sh` | 14 converged, 1 known, 0 drifted, exit 0 |
+
+After the `can_manage_keys` override and the new e2e §33:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` / `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **189 passed**, 0 failed (81 unit + 108 integration) |
+| `./scripts/test_e2e.sh` | **698/698**, 0 failed (+33) |
 | `./scripts/verify_convergence.sh` | 14 converged, 1 known, 0 drifted, exit 0 |
 
 The integration count moves 104 → 106: two of last session's revoke tests were rewritten as their

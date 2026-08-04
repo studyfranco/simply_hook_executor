@@ -2137,9 +2137,16 @@ api_call POST "/api/keys/$KEYMGR_ID/permissions" "$KEYMGR_KEY" \
     "$(jq -nc --arg h "$PLAIN_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
 check "403" "#3 self-granting is refused for an ordinary hook too"
 
+# `can_manage_keys` is a deployment-wide administrative scope, so granting to *another* key on an
+# ordinary hook it holds no row for is permitted — the deliberate global override. What must still
+# fail is the same request aimed at the root-running hook, and self-granting in either case.
 api_call POST "/api/keys/$ORDINARY_ID/permissions" "$KEYMGR_KEY" \
     "$(jq -nc --arg h "$PLAIN_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
-check "403" "#3 granting on a hook the caller does not manage is refused"
+check "200" "#3 can_manage_keys administers grants on an ordinary hook it does not manage"
+
+api_call POST "/api/keys/$ORDINARY_ID/permissions" "$KEYMGR_KEY" \
+    "$(jq -nc --arg h "$PRIVESC_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "403" "#3 the override stops at a hook that runs as another user"
 
 # The grant never landed, so the root hook is still out of reach.
 api_call POST "/api/hooks/$PRIVESC_HOOK_ID/test" "$KEYMGR_KEY" '{}'
@@ -2431,7 +2438,11 @@ api_call POST "/api/hooks" "$MASTER_KEY" \
 check "200" "create a hook for the proportionality checks"
 PROP_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-create_scoped_key "Proportionality Delegator" ',"can_manage_keys":true'
+# Deliberately WITHOUT can_manage_keys. That scope takes the global-administrator route and is not
+# bound by per-verb proportionality at all, so a delegator holding it would make every assertion in
+# this block vacuous. Its standing to call the endpoint comes from the per-hook `can_manage` grant
+# issued below.
+create_scoped_key "Proportionality Delegator"
 DELEGATOR_KEY="$CREATED_KEY"; DELEGATOR_ID="$CREATED_ID"
 create_scoped_key "Proportionality Accomplice"
 ACCOMPLICE_KEY="$CREATED_KEY"; ACCOMPLICE_ID="$CREATED_ID"
@@ -2473,13 +2484,34 @@ check "200" "the same grant is legitimate once the caller holds the verb"
 api_call POST "/api/hooks/$PROP_HOOK_ID/execute" "$ACCOMPLICE_KEY" '{"parameters":{}}'
 check "200" "the delegated execute right actually works"
 
-# The entry gate is unchanged: no grant at all is still refused, in the same words.
-create_scoped_key "Proportionality Outsider" ',"can_manage_keys":true'
-OUTSIDER_KEY="$CREATED_KEY"
+# The entry gate is unchanged for local managers: a caller that manages *some other* hook has the
+# standing to call the endpoint, but is still refused on a hook it holds no row for — and in the
+# same words as before.
+create_scoped_key "Proportionality Outsider"
+OUTSIDER_KEY="$CREATED_KEY"; OUTSIDER_ID="$CREATED_ID"
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$PROP_SCRIPT" '{name:"outsiders_own_hook",script_path:$p}')"
+check "200" "create a hook the outsider genuinely manages"
+OUTSIDER_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/keys/$OUTSIDER_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$OUTSIDER_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "the outsider manages a hook of its own, giving it standing"
+
 api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$OUTSIDER_KEY" \
     "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
 check "403" "a caller with no grant on the hook cannot administer its permissions"
 check_true '.error | contains("manage access")' "the entry gate's message is unchanged"
+
+# A caller with no administrative standing anywhere is refused earlier, and for a different reason:
+# before the target key is fetched, so it cannot tell a real key UUID from an invented one.
+create_scoped_key "No Standing At All"
+NOSTANDING_KEY="$CREATED_KEY"
+api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$NOSTANDING_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
+check "403" "a caller managing nothing is refused outright"
+api_call POST "/api/keys/00000000-0000-0000-0000-000000000000/permissions" "$NOSTANDING_KEY" \
+    "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
+check "403" "and indistinguishably for a key UUID that does not exist"
 
 # --- Freshness is checked before the API key is looked up ---
 # Both orderings answer 401, so the status proves nothing on its own. The *message* does: paired
@@ -2513,7 +2545,121 @@ check "200" "an unsigned request's stray timestamp is still ignored"
 
 # ── 33. WebUI mandates full-HMAC (CANONICAL_V1) signing ─────────────────────
 
-log_section "33. TRUSTED_PROXIES syntax is fatal, unresolvable names are not"
+log_section "33. Revoke authority: can_manage is the whole requirement"
+
+# The revoke rules had no HTTP-level coverage at all — they were asserted only in the integration
+# suite, against the router in-process. These drive the real daemon over the wire, because "who may
+# revoke" is a property of the deployed service, and the two revocation routes (`DELETE`, and `POST`
+# with a reduced set) have to agree when a real client picks either one.
+#
+# The actor throughout is a **local manager**: `can_manage` on the hook, and no `can_manage_keys`.
+# That is the population the rule governs. A key administrator takes the global-override route and
+# would make every check below vacuous.
+REV_SCRIPT=$(make_hook_script "revoke_rules.sh" 'echo "revoke ran"')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$REV_SCRIPT" '{name:"revoke_rules_hook",script_path:$p}')"
+check "200" "create a hook for the revoke-authority checks"
+REV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+create_scoped_key "Revoke Local Manager"
+REVMGR_KEY="$CREATED_KEY"; REVMGR_ID="$CREATED_ID"
+create_scoped_key "Revoke Target"
+REVTGT_KEY="$CREATED_KEY"; REVTGT_ID="$CREATED_ID"
+create_scoped_key "Revoke Bystander"
+REVBYS_KEY="$CREATED_KEY"; REVBYS_ID="$CREATED_ID"
+
+# Manage WITHOUT execute: the caller can administer the hook's grants but cannot run it. This is the
+# combination the old, stricter rule refused to let revoke `can_execute`.
+api_call POST "/api/keys/$REVMGR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:true}')"
+check "200" "the local manager holds manage-without-execute"
+api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVMGR_KEY" '{"parameters":{}}'
+check "403" "the local manager genuinely cannot execute the hook itself"
+
+# The target holds the verb the caller lacks.
+api_call POST "/api/keys/$REVTGT_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "200" "the target holds can_execute"
+api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVTGT_KEY" '{"parameters":{}}'
+check "200" "the target can run the hook before anything is revoked"
+
+# ── Route A: DELETE ──
+api_call DELETE "/api/keys/$REVTGT_ID/permissions/$REV_HOOK_ID" "$REVMGR_KEY"
+check "204" "a can_manage-only holder may DELETE a grant conferring a verb it lacks"
+
+# The revocation is real over the wire, not merely accepted: the target loses the capability.
+api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVTGT_KEY" '{"parameters":{}}'
+check "403" "the revoked key is refused execution afterwards"
+
+# ...and the revoker gained nothing by it. De-escalating someone else never escalates you.
+api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVMGR_KEY" '{"parameters":{}}'
+check "403" "revoking another key's execute grant does not confer it on the revoker"
+
+# ── Route B: POST with a reduced permission set ──
+api_call POST "/api/keys/$REVTGT_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "200" "master restores the target's execute grant"
+api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVTGT_KEY" '{"parameters":{}}'
+check "200" "the restored grant works again"
+
+api_call POST "/api/keys/$REVTGT_ID/permissions" "$REVMGR_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
+check "200" "the same holder may zero the grant through POST"
+api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVTGT_KEY" '{"parameters":{}}'
+check "403" "the POST route removes the capability just as DELETE does"
+
+# Both routes were permitted for the identical actor/target/hook: no asymmetry, which is the whole
+# point — a rule enforced on only one of two spellings is routed around rather than obeyed.
+
+# ── Callers without can_manage are refused ──
+# The bystander manages a hook of its own, so it has standing to call the endpoint; what it lacks is
+# a row on *this* hook.
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$REV_SCRIPT" '{name:"bystanders_hook",script_path:$p}')"
+check "200" "create a hook the bystander manages"
+REVBYS_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/keys/$REVBYS_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$REVBYS_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "the bystander manages its own hook"
+
+api_call POST "/api/keys/$REVMGR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:true}')"
+check "200" "re-assert the local manager's grant for the refusal checks"
+
+api_call DELETE "/api/keys/$REVMGR_ID/permissions/$REV_HOOK_ID" "$REVBYS_KEY"
+check "403" "a caller without can_manage on the hook cannot revoke via DELETE"
+check_true '.error | contains("manage access")' "the entry gate names the missing access"
+
+api_call POST "/api/keys/$REVMGR_ID/permissions" "$REVBYS_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
+check "403" "and cannot zero it via POST either — both routes refuse alike"
+
+# The refusals were real: the local manager still holds its grant.
+api_call GET "/api/auth/me" "$REVMGR_KEY"
+check "200" "the local manager's session still works"
+check_true '[.hook_permissions[] | select(.can_manage)] | length >= 1' \
+    "the blocked revocations never landed"
+
+# ── Self-revocation (LAST: it drops the actor's own authority) ──
+# Ordered at the end of this section deliberately. Everything above depends on the local manager
+# still holding `can_manage`; self-reduction invalidates that, so it runs once nothing follows it.
+api_call DELETE "/api/keys/$REVMGR_ID/permissions/$REV_HOOK_ID" "$REVMGR_KEY"
+check "204" "a manager may revoke its own grant — de-escalation needs no second party"
+
+# It really gave up the authority: it can no longer administer the hook it just released.
+api_call POST "/api/keys/$REVTGT_ID/permissions" "$REVMGR_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "403" "after self-revoking it can no longer administer that hook"
+
+# The hook is now ungoverned — no permission row references it from anyone. A master must still see
+# and administer it, or self-revocation would be a way to hide automation from its operator.
+api_call GET "/api/hooks/$REV_HOOK_ID" "$MASTER_KEY"
+check "200" "an ungoverned hook is still visible to a master"
+api_call POST "/api/keys/$REVTGT_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "and a master can put it back under governance"
+
+log_section "34. TRUSTED_PROXIES syntax is fatal, unresolvable names are not"
 
 # The two failures look alike in a config file and are not alike at all — *typo versus timing*.
 #
@@ -2608,7 +2754,7 @@ fi
 kill "$UNRESOLVED_PID" 2>/dev/null || true
 wait "$UNRESOLVED_PID" 2>/dev/null || true
 
-log_section "34. WebUI full-HMAC enforcement"
+log_section "35. WebUI full-HMAC enforcement"
 
 # Source invariants again, for the same reason section 26 uses them: there is no JS runtime and no
 # headless browser here (`AGENT.MD` forbids frontend dependencies), so the dashboard's signing
