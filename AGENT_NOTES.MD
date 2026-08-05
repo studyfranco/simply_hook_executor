@@ -2568,3 +2568,113 @@ inverse rather than added to, and three new ones landed (`delete_and_post_revoca
 `a_key_may_revoke_its_own_hook_permissions`, `an_ungoverned_hook_stays_visible…`). The e2e total is
 unchanged because the revoke rules were never asserted at that layer — worth noting as a gap, not a
 pass: the HTTP-level coverage for this rule lives entirely in the integration suite.
+
+---
+
+## RBAC_MODEL Gap Analysis
+
+Read-only pass against `RBAC_MODEL.md`. **Every verdict below was checked against `src/` directly**,
+not against `AGENT.MD`, this file, or commit history — several of which are now known to describe
+behaviour the code does not have. No handler, guard, migration or entity was modified.
+
+Scale, stated up front so the next pass is not surprised by it: of 7 numbered rules and 5
+specification sections, **2 comply, 5 are violated, and 8 are not implemented at all**. Three of the
+absent items are schema-level (`parent_key_id`, `owner_key_id`, the partial unique index), so this is
+a migration-bearing change, not a handler-only one.
+
+### Core Rules
+
+| Rule | Verdict | Evidence |
+| :--- | :--- | :--- |
+| **R1 — Non-amplification** | **VIOLATES** | `guard_delegated_hook_grant` (`src/api.rs:461`) opens `if key.is_master \|\| key.can_manage_keys { return Ok(()) }`. The per-verb `wanted && !held` comparison below it is therefore reached only by callers *without* `can_manage_keys`. A `can_manage_keys` holder grants any verb on any non-privileged hook regardless of what it holds. |
+| **R2 — Manage is a conjunction** | **VIOLATES** | Same line, plus `revoke_key_hook_permission` (`src/api.rs:2366`): `if !key.is_master && !key.can_manage_keys { require_manage(..) }`. `can_manage_keys` alone is currently sufficient on **both** paths — the exact global bypass R2 forbids. This is commit `2d62d1b`, and R2 replaces it. |
+| **R3 — Parentage confers no authority** | **DOES NOT IMPLEMENT** | No `parent_key_id` column exists on `api_keys` (`src/entities/api_key.rs`, fields at lines 43–83). Vacuously unviolated: no authority *can* be derived from parentage because parentage is not recorded. Nothing to remove; the column and its cascade/visibility semantics have to be added. |
+| **R4 — Only master creates parents** | **COMPLIES** | `require_master_to_grant_scopes` (`src/api.rs:343`) returns early for master and otherwise refuses any request setting `is_master`, `can_manage_keys` or `can_manage_hooks` to `true`. Enforced on both create and update. Note the naming difference: this service's resource-creation right is `can_manage_hooks`, which the model calls `can_create_hooks`. |
+| **R5 — Manage may propagate sideways** | **VIOLATES** | Sideways propagation itself works, but not *bounded by R1 and R2* as R5 requires — the `can_manage_keys` bypass in `guard_delegated_hook_grant` means a parent can grant manage on a resource it holds nothing on. Also unenforceable in the intended form while "parent" is not a modelled tier (see R3). |
+| **R6 — Revocation is never escalation** | **COMPLIES** | `revoke_key_hook_permission` requires only manage on the hook (`require_manage`, `src/api.rs:2388`), does not compare verbs, and has no self-revocation block. The "regardless of which endpoint it arrives at" clause holds too: `update_key_hook_permissions` reduces a row through the `wanted && !held` shape, which never fires on a `false`. |
+| **R7 — Granting bounded by R1 and R2 together** | **VIOLATES** | Follows directly from R1 and R2 both being violated by the same early return. |
+
+### Ownership and Resource Lifecycle
+
+| Item | Verdict | Evidence |
+| :--- | :--- | :--- |
+| `owner_key_id` on every resource | **DOES NOT IMPLEMENT** | Absent from `src/entities/hook.rs` (fields at lines 12–47) and from every migration in `src/migration/`. Ownership is not a concept this service has. |
+| Lifecycle restricted to master + owner | **VIOLATES** | `delete_hook` (`src/api.rs:1157`) and `update_hook` authorize on `require_manage`, so any manage-row holder can delete or rename a hook it does not own. This is precisely the "a parent that merely uses a hook must not be able to delete it" case. |
+| Master may reassign `owner_key_id` | **DOES NOT IMPLEMENT** | No owner column, so no reassignment endpoint. |
+
+### Visibility
+
+| Item | Verdict | Evidence |
+| :--- | :--- | :--- |
+| Master sees everything | **COMPLIES** | `visible_hook_ids` (`src/api.rs:262`) returns `None` for master, applying no filter; `require_visibility` short-circuits. Asserted by `an_ungoverned_hook_stays_visible_and_manageable_by_a_master`. |
+| Parent sees its own subtree | **DOES NOT IMPLEMENT** | No subtree exists to scope to (R3). `list_api_keys` (`src/api.rs:2063`) returns **every key in the deployment** to any `can_manage_keys` holder, unscoped. |
+| Shared-resource keys visible in minimal form only | **VIOLATES** | `ApiKeySummary` (`src/api.rs:1914`) carries `bound_ips`, `is_master`, `can_manage_keys`, `can_manage_hooks`, `max_concurrent_jobs`, `hmac_mode` and the full `hook_permissions` list, and `list_api_keys` hands that to every key manager for every key. This is exactly the keyhole the model forbids: one shared hook exposes another parent's entire configuration. |
+| Executors visible to creator + master only | **DOES NOT IMPLEMENT** | This service has no separate Executor/Webhook resource; hooks are the executable resource and are governed by permission rows. Worth an explicit decision in the next pass rather than silent omission. |
+| 404 vs 403 oracle discipline | **VIOLATES** | `get_hook` (`src/api.rs:1068`) calls `resolve_hook` first — `404` when the row is absent — then `require_visibility`, which returns `403`. The two are distinguishable, so a caller can confirm a hook exists without being able to see it. Same shape in `delete_api_key`/`update_api_key`, which `404` on an unknown id before any visibility judgement. **Note the tension with an existing, deliberate control:** `AGENT.MD`'s authenticate-then-authorize rule exists to stop a `403`/`401` oracle on `bound_ips`. That is about *unauthenticated* callers and is unaffected; this is about *authenticated* callers distinguishing absent from invisible. Both can hold, but the next pass should not "fix" one by regressing the other. |
+
+### Master Key Handling
+
+| Item | Verdict | Evidence |
+| :--- | :--- | :--- |
+| Exactly one master, DB-enforced | **DOES NOT IMPLEMENT** | No partial unique index anywhere in `src/migration/` — `grep -n "is_master" src/migration/*.rs` returns nothing, so the column carries no constraint at all. Uniqueness is application convention only: `bootstrap_master_key` (`src/main.rs:65`) mints one *if none exists*, and `CreateApiKeyPayload` (`src/api.rs:662`) accepts `is_master: bool`, so **a master can currently create a second master through the API**. |
+| Master immutable except own `bound_ips` | **VIOLATES** | `update_api_key` (`src/api.rs:2096`) gates master targets behind `require_master_to_administer`, but a master editing itself passes, and `UpdateApiKeyPayload` reaches `name`, `bound_ips`, `max_concurrent_jobs` and `hmac_mode`. `rotate_api_key` (`src/api.rs:2187`) is likewise reachable for a master on itself, which the model forbids outright. |
+| Master not deletable through the API | **COMPLIES**, incidentally | `delete_api_key` (`src/api.rs:2170`) refuses `id == key.id` ("Cannot delete yourself"), and `require_master_to_administer` blocks non-masters from deleting a master. With exactly one master those two combine to make it undeletable — but the guarantee rests on the uniqueness that is *not* enforced (row above). A second master could delete the first. Compliant today, fragile by construction. |
+
+### Key Deletion and Ownership Inventory
+
+| Item | Verdict | Evidence |
+| :--- | :--- | :--- |
+| Cascade to daughters | **DOES NOT IMPLEMENT** | No `parent_key_id`, so no subtree. `delete_api_key` removes exactly one row. |
+| No implicit data destruction | **VIOLATES** | Deleting a key drops its `api_key_hook_permissions` rows via the schema's cascade. Hooks themselves survive, so no hook is destroyed — but the hook can be left ungoverned with no inventory, no warning, and no record of what was released. |
+| Pre-flight ownership inventory | **DOES NOT IMPLEMENT** | No ownership concept and no inventory step; deletion is unconditional. |
+| Structured refusal payload | **DOES NOT IMPLEMENT** | Not present. |
+| Resolution map, all-or-nothing | **DOES NOT IMPLEMENT** | Not present. |
+
+### Schema and Indexing
+
+| Item | Verdict | Evidence |
+| :--- | :--- | :--- |
+| Partial unique index on `is_master = true` | **DOES NOT IMPLEMENT** | Absent (see above). Also worth flagging for the implementation pass: SQLite and PostgreSQL both support partial indexes, MySQL does not — and `Cargo.toml` enables `sqlx-mysql`. A portable equivalent will be needed, or the SQL-agnostic claim narrows. |
+| Index on `parent_key_id` | **DOES NOT IMPLEMENT** | Column absent. |
+| Index on `owner_key_id` | **DOES NOT IMPLEMENT** | Column absent. |
+| Index on key-hash lookup column | **COMPLIES** | `key_hash` is `#[sea_orm(unique)]` (`src/entities/api_key.rs:48`) and the initial migration creates a unique index on it — the single authentication lookup path. |
+| Indexes on permission-table join columns | **COMPLIES** | `src/migration/m20230101_000001_initial_schema.rs` creates indexes at lines 327/336 and 373/382 covering the junction table's join columns. |
+
+### Where `AGENT.MD` contradicts `RBAC_MODEL.md`
+
+To be reconciled in the implementation pass. `AGENT.MD` currently describes the code accurately; it
+is the *model* that has moved, so these are planned changes, not documentation bugs.
+
+1. **The `can_manage_keys` override.** The permission matrix (§2) states grant/revoke may be
+   authorized by "`is_master` **or** `can_manage_keys`", and spells out the override at length
+   including its cost. R2 abolishes it. **This is the single largest contradiction and the reason for
+   the pass.**
+2. **Two routes to administering grants.** `AGENT.MD` frames global key administrator and local
+   manager as alternatives (`||`); R2 makes them a conjunction (`&&`).
+3. **Naming.** `can_manage_hooks` throughout vs the model's `can_create_hooks`. The semantics already
+   match ("global right to create hooks"); only the name differs.
+4. **No tier vocabulary.** `AGENT.MD` has no notion of Master/Parent/Daughter, and no statement that a
+   daughter may never be a resource manager. Its model is flat: global scopes plus per-hook rows.
+5. **Lifecycle authority.** `AGENT.MD` assigns `PUT`/`PATCH`/`DELETE /api/hooks/{id}` to `can_manage`;
+   the model restricts deleting and renaming to master and owner.
+6. **Ownership is absent.** `AGENT.MD` says creation auto-provisions full rights on the new hook,
+   which is a *permission row*, not ownership. Nothing survives transfer, and nothing distinguishes
+   creator from any other manage-holder afterwards.
+7. **Deletion semantics.** `AGENT.MD` documents single-key deletion with no cascade, no inventory and
+   no resolution map.
+8. **Master key handling.** `AGENT.MD` documents master auto-generation but asserts no uniqueness
+   constraint, no immutability, and no regeneration procedure. It also documents master rotation as
+   available, which the model forbids.
+9. **Oracle discipline.** `AGENT.MD`'s rule is about authenticate-then-authorize for *unauthenticated*
+   callers (the `bound_ips` `403`/`401` oracle). It says nothing about invisible-vs-nonexistent for
+   authenticated ones. Complementary rather than contradictory — but see the R6/visibility note above
+   about not regressing one while implementing the other.
+
+### Sequencing note for the implementation pass
+
+R2 is cheap and self-contained: delete two `|| key.can_manage_keys` bypasses and repair the tests
+that depend on them (four integration tests and two e2e blocks were rewritten *to* the override in
+`2d62d1b` and will need rewriting back). Everything else — R3, ownership, visibility scoping, the
+deletion inventory — is blocked behind two new columns and an index, so it wants a migration first.
+Doing R2 alone, immediately, is worth considering: it is the item with a live security consequence,
+and it does not depend on any of the schema work.

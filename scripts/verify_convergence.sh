@@ -412,6 +412,54 @@ assert_present "Canonicalization reads the original URI" \
     "parts.uri has the /api prefix stripped by nest(); signing it omits what the client signed."
 
 echo
+
+# ── Canonical RBAC model ─────────────────────────────────────────────────────
+#
+# `RBAC_MODEL.md` is the single source of truth for the permission model both services implement,
+# and it is meant to be byte-identical in both repositories. That is the whole mechanism: the moment
+# the two copies differ, "converged" means two different things in two places and every downstream
+# comparison is measuring against a moving target.
+#
+# Compared byte-for-byte rather than fingerprinted, because unlike the normalized function
+# comparisons above there is no formatting here that may legitimately differ. A stray reflow is a
+# real divergence in a document whose entire job is to be the same text twice.
+rbac_model_identity() {
+    local ours="$REPO_ROOT/RBAC_MODEL.md" theirs="$PEER_ROOT/RBAC_MODEL.md"
+
+    if [ ! -f "$ours" ]; then
+        echo "${RED}[DRIFT]${RESET} ${BOLD}Canonical RBAC model${RESET}"
+        echo "         ${DIM}RBAC_MODEL.md is missing from this repository.${RESET}"
+        DRIFT=$((DRIFT + 1))
+        return
+    fi
+
+    # The peer adopts this file in its own pass. Until then the comparison has nothing to run
+    # against — which is a pending state, not a divergence, and deliberately not a silent pass:
+    # it stays visible on every run until the peer catches up.
+    if [ ! -f "$theirs" ]; then
+        echo "${YELLOW}[KNOWN]${RESET} ${BOLD}Canonical RBAC model${RESET} ${DIM}(peer copy absent)${RESET}"
+        echo "         ${DIM}This repo has RBAC_MODEL.md; the peer has not adopted it yet. Becomes a"
+        echo "         real byte comparison — and can then DRIFT — as soon as the peer's copy lands.${RESET}"
+        KNOWN=$((KNOWN + 1))
+        return
+    fi
+
+    if cmp -s "$ours" "$theirs"; then
+        echo "${GREEN}[OK]${RESET}    ${BOLD}Canonical RBAC model${RESET} ${DIM}(byte-identical)${RESET}"
+        OK=$((OK + 1))
+        return
+    fi
+
+    echo "${RED}[DRIFT]${RESET} ${BOLD}Canonical RBAC model${RESET}"
+    echo "         ${DIM}RBAC_MODEL.md differs between the two repositories. It is the source of"
+    echo "         truth for both, so it must be reconciled before anything else is compared.${RESET}"
+    diff -u "$ours" "$theirs" | tail -n +3 | head -40 | sed 's/^/         /'
+    DRIFT=$((DRIFT + 1))
+}
+
+rbac_model_identity
+
+echo
 echo "${DIM}$OK converged, $KNOWN known divergence(s), $DRIFT drifted, $SKIPPED skipped${RESET}"
 
 if [ "$SKIPPED" -gt 0 ]; then
