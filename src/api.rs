@@ -567,12 +567,12 @@ fn require_master_for_privileged_hook(
 ///
 /// A coarse, indexed pre-check used by the permission endpoints so that a caller with no
 /// administrative standing whatsoever is refused **before** a target key or hook is looked up.
-/// Without it, relaxing those endpoints to admit local managers would let a caller holding nothing
-/// learn whether an arbitrary key UUID exists, by reading `404` instead of `403`.
+/// Without it, those endpoints would let a caller holding nothing learn whether an arbitrary key
+/// UUID exists, by reading `404` instead of `403`.
 ///
-/// It deliberately does not say *which* hook — that question needs the resolved hook and is answered
-/// by [`guard_delegated_hook_grant`] and [`require_manage`]. This only establishes that the caller
-/// is a hook manager somewhere, which is enough to justify continuing.
+/// It deliberately does not say *which* hook — that question needs the resolved hook and is
+/// answered by [`require_hook_manage_conjunction`]. This only establishes that the caller holds a
+/// manage row somewhere, which is the half of R2 that can be checked without knowing the target.
 async fn manages_any_hook(
     db: &sea_orm::DatabaseConnection,
     key_id: Uuid,
@@ -585,47 +585,140 @@ async fn manages_any_hook(
         .is_some())
 }
 
-/// Rejects a delegated grant that would hand out more authority over a hook than the caller holds.
+/// Whether the caller has administrative *standing* on the permission routes at all, checked
+/// before any target key or hook is resolved.
 ///
-/// # Two routes to administering a hook's grants
+/// Both halves of R2 are required, so a caller failing this can never pass
+/// [`require_hook_manage_conjunction`] for any hook — which is what makes refusing here safe rather
+/// than merely early. The refusal must come before the `ApiKey::find_by_id` in either handler, or
+/// the endpoint becomes a key-UUID oracle: `404` for an id that does not exist, `403` for one that
+/// does.
+async fn has_permission_admin_standing(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+) -> Result<bool, AppError> {
+    if key.is_master {
+        return Ok(true);
+    }
+    if !key.can_manage_keys {
+        return Ok(false);
+    }
+    manages_any_hook(db, key.id).await
+}
+
+/// **R2 — manage is a conjunction.** Authorizes administering one specific hook's grants, and
+/// returns the caller's own permission row on it.
 ///
-/// - **Global key administrators** (`is_master`, or `can_manage_keys`) pass unconditionally. The
-///   scope is deployment-wide credential administration, so it is not scoped to a hook and is not
-///   bounded by what the caller happens to hold on one.
-/// - **Local managers** — no global key scope, but `can_manage` on *this* hook — may delegate only
-///   within their own authority: `can_manage` on the hook to act at all, and each verb checked
-///   independently against their own row.
+/// > *Managing a specific resource requires holding both global `can_manage_keys` AND a
+/// > `can_manage = true` row for that specific resource. Neither alone is sufficient.
+/// > `can_manage_keys` is never a global bypass of per-resource RBAC.*
 ///
-/// The local-manager rule is the one that carries the least-privilege weight. Without the first half,
-/// a `can_manage`-only holder could distribute rights on hooks it has no relationship with — a
-/// cross-tenant hole in what is meant to be a per-hook M:N model. Without the second, it could write
-/// `can_execute` onto a second key, authenticate as that key, and run the hook, obtaining in two
-/// requests a verb an operator deliberately withheld. `SCHEMA.MD` models `can_execute` and
-/// `can_manage` as independent columns precisely so that combination is expressible; enforcing only
-/// one of them would make the distinction advisory.
+/// Both halves this replaces were wrong in opposite directions, and each was reachable:
+///
+/// - **`can_manage_keys` alone** (the early return added in `2d62d1b`) made the flag a global
+///   bypass. A holder could grant any verb on any hook to any key — including one it had just
+///   minted — and then authenticate as that key. That is `is_master` with extra steps, and it is
+///   exactly the "global bypass of per-resource RBAC" R2 names.
+/// - **A `can_manage` row alone** (the "local manager" route) let a key with no
+///   deployment-wide standing hand out credentials-adjacent authority. Under the Tiers matrix a
+///   Daughter key — one without `can_manage_keys` — may never manage resources, so a manage row on
+///   its own confers operational rights over the hook, not the right to administer who else holds
+///   them.
+///
+/// The two failures return **one message**, deliberately. Distinguishing "you lack the global flag"
+/// from "you lack the row on this hook" would tell a caller which half to go acquire, and the row
+/// half doubles as a statement about which hooks exist and who manages them.
+async fn require_hook_manage_conjunction(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    hook_id: Uuid,
+) -> Result<api_key_hook_permission::Model, AppError> {
+    // Callers handle `is_master` before reaching here: master holds no rows and needs none.
+    debug_assert!(!key.is_master, "master bypasses R2 and must be short-circuited by the caller");
+
+    let denied = || {
+        AppError::Forbidden(
+            "Permission denied: You do not have manage access to this hook".to_owned(),
+        )
+    };
+
+    if !key.can_manage_keys {
+        tracing::warn!(
+            key = %key.prefix,
+            hook_id = %hook_id,
+            "R2: key holds a manage row but not can_manage_keys; manage is a conjunction"
+        );
+        return Err(denied());
+    }
+
+    match hook_permission(db, key.id, hook_id).await? {
+        Some(p) if p.can_manage => Ok(p),
+        _ => {
+            tracing::warn!(
+                key = %key.prefix,
+                hook_id = %hook_id,
+                "R2: key holds can_manage_keys but no can_manage row on this hook"
+            );
+            Err(denied())
+        }
+    }
+}
+
+/// Whether a permission write only ever *reduces* the target's rights.
+///
+/// **R6** classifies a reduction arriving at the general update endpoint as a revocation, "regardless
+/// of which endpoint it arrives at". Without this the two routes to the same outcome disagree about
+/// who may take them, and the stricter one is simply routed around: `DELETE .../permissions/{hook}`
+/// and a `POST` writing every verb to `false` produce an identical end state.
+///
+/// A verb is being *granted* only when it is requested `true` and is not already held by the
+/// target. Everything else — turning a verb off, leaving it as it was, or writing an all-`false`
+/// row where none existed — can only ever leave the target with less authority than it started
+/// with, and so needs no proof of authority beyond R2.
+fn is_permission_reduction(
+    existing: Option<&api_key_hook_permission::Model>,
+    requested_execute: bool,
+    requested_manage: bool,
+) -> bool {
+    let (had_execute, had_manage) =
+        existing.map_or((false, false), |p| (p.can_execute, p.can_manage));
+    // Named rather than folded into one expression: "this write grants a verb the target did not
+    // have" is the concept R1 is about, and it should be readable as such at the call site of the
+    // negation.
+    let grants_execute = requested_execute && !had_execute;
+    let grants_manage = requested_manage && !had_manage;
+    !grants_execute && !grants_manage
+}
+
+/// **R1 + R7** — rejects a grant handing out more authority over a hook than the caller holds.
+///
+/// > *R1 — A caller may only grant rights it currently holds itself. Applies at every tier below
+/// > Master.*
+/// > *R7 — Granting is bounded by R1 and R2 together, simultaneously and without exception.*
+///
+/// R2 is the entry gate ([`require_hook_manage_conjunction`]) and R1 is the per-verb bound applied
+/// on top of it. "Together, simultaneously and without exception" is the operative phrase: there is
+/// no caller below Master for whom one of the two is skipped. The `2d62d1b` early return skipped
+/// *both* for any `can_manage_keys` holder, so the per-verb comparison below was unreachable except
+/// by a key that did not hold the global flag.
+///
+/// Without R1, a caller managing one hook could write `can_execute` onto a second key it controls,
+/// authenticate as that key, and run the hook — obtaining in two requests a verb an operator
+/// deliberately withheld. `SCHEMA.MD` models `can_execute` and `can_manage` as independent columns
+/// precisely so that combination is expressible; checking only one of them would make the
+/// distinction advisory.
 ///
 /// Two behaviours fall out of the `wanted && !held` shape and are deliberate:
 ///
 /// - **Revocation is never blocked.** Turning a flag *off* is a request for `false`, which can never
-///   exceed anything. Removing authority is not an escalation and must not need a master.
+///   exceed anything. R6 says so directly, and [`is_permission_reduction`] classifies such a write
+///   before this function is reached.
 /// - **Re-asserting a verb you hold is a no-op**, so an idempotent re-submission of an existing
 ///   grant still succeeds rather than failing for a caller that changed nothing.
 ///
-/// The `can_manage` entry gate is folded in here rather than left to a separate
-/// [`require_manage`] call so that both questions are answered from **one** permission row: the
-/// checks are about the same caller and the same hook, and reading it twice would invite the two
-/// answers to disagree if a grant were revoked between them.
-///
-/// # What the `can_manage_keys` override costs
-///
-/// Stated plainly, because it is a deliberate policy choice rather than an oversight: a
-/// `can_manage_keys` holder can mint a second key and grant it any verb on any non-privileged hook,
-/// then authenticate as that key. `can_manage_keys` is therefore *transitively* able to execute any
-/// non-privileged hook, and per-hook RBAC does not constrain it. Two guards still stand in the way of
-/// the worst version: [`require_master_for_privileged_hook`] keeps every hook carrying `run_as_user`
-/// master-only, and self-granting remains refused, so the escalation always costs a second
-/// credential and leaves two audit-log entries. Operators should read `can_manage_keys` as
-/// "deputy master over non-privileged hooks", not as a scoped administrative role.
+/// The caller's row comes from the R2 check rather than a second lookup: both questions are about
+/// the same caller and the same hook, and reading the row twice would invite the two answers to
+/// disagree if a grant were revoked in between.
 async fn guard_delegated_hook_grant(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
@@ -633,18 +726,11 @@ async fn guard_delegated_hook_grant(
     requested_execute: bool,
     requested_manage: bool,
 ) -> Result<(), AppError> {
-    if key.is_master || key.can_manage_keys {
+    if key.is_master {
         return Ok(());
     }
 
-    // The entry gate first: per `AGENT.MD`, administering grants on a hook at all requires
-    // `can_manage` over it. A caller without that row is refused in the same words
-    // [`require_manage`] uses, so the two paths stay indistinguishable to a caller probing them.
-    let Some(held) = hook_permission(db, key.id, hook.id).await?.filter(|p| p.can_manage) else {
-        return Err(AppError::Forbidden(
-            "Permission denied: You do not have manage access to this hook".to_owned(),
-        ));
-    };
+    let held = require_hook_manage_conjunction(db, key, hook.id).await?;
 
     let overreach = [
         ("can_execute", requested_execute, held.can_execute),
@@ -2440,12 +2526,13 @@ pub async fn update_key_hook_permissions(
     Path(id): Path<Uuid>,
     Json(payload): Json<HookPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Admits both routes: a global key administrator, or a local manager of *some* hook. Which hook
-    // is not known yet — the payload has not been parsed — so this only establishes that the caller
-    // has administrative standing at all, and `guard_delegated_hook_grant` decides the rest once the
-    // hook is resolved. A caller holding neither is refused here, before any lookup, so it cannot
-    // learn whether a key UUID exists by reading `404` instead of `403`.
-    if !key.is_master && !key.can_manage_keys && !manages_any_hook(&state.db, key.id).await? {
+    // Both halves of R2, as far as they can be known before the payload is parsed: the global flag,
+    // and a manage row on *some* hook. Which hook is not known yet, so
+    // `require_hook_manage_conjunction` re-asks the second half against the resolved hook below.
+    // A caller failing this can pass neither, which is what makes refusing here safe rather than
+    // merely early — and it must happen before the `find_by_id`, or the endpoint reports `404` for
+    // a key id that does not exist and `403` for one that does.
+    if !has_permission_admin_standing(&state.db, &key).await? {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
@@ -2453,19 +2540,6 @@ pub async fn update_key_hook_permissions(
     if target_key.is_master {
         return Err(AppError::InvalidInput(
             "Cannot configure M:N permissions on a master key".to_owned(),
-        ));
-    }
-
-    // Granting rights to yourself is not administration, it is escalation: a `can_manage_keys` key
-    // could otherwise walk up to any hook — including one running as root — and write itself an
-    // `can_execute` row. Administering *other* keys stays available, which is what the scope is for.
-    if !key.is_master && id == key.id {
-        tracing::warn!(
-            key = %key.prefix,
-            "Non-master key attempted to grant itself hook permissions"
-        );
-        return Err(AppError::Forbidden(
-            "Only master API keys can modify their own hook permissions".to_owned(),
         ));
     }
 
@@ -2484,19 +2558,44 @@ pub async fn update_key_hook_permissions(
     };
     let hook_model = resolve_hook(&state.db, identifier).await?;
 
-    // You cannot hand out authority over a hook you do not yourself manage, nor hand out more of it
-    // than you hold. Without the first, `can_manage_keys` alone was enough to distribute execute
-    // rights on every hook in the system — a cross-tenant hole in what is meant to be a per-hook
-    // M:N model. Without the second, a `can_manage`-only holder could route `can_execute` to itself
-    // through a second key. Both are enforced verb by verb in `guard_delegated_hook_grant`.
-    guard_delegated_hook_grant(
-        &state.db,
-        &key,
-        &hook_model,
-        payload.can_execute,
-        payload.can_manage,
-    )
-    .await?;
+    // **R6 endpoint parity.** A `POST` that only turns verbs *off* reaches the same end state as
+    // `DELETE .../permissions/{hook}`, so the model classifies it as a revocation "regardless of
+    // which endpoint it arrives at". Holding the two routes to different standards achieves
+    // nothing: the stricter one is one request away from being routed around.
+    let existing = hook_permission(&state.db, id, hook_model.id).await?;
+    let reduction = is_permission_reduction(existing.as_ref(), payload.can_execute, payload.can_manage);
+
+    if key.is_master {
+        // Master bypasses both R1 and R2.
+    } else if reduction {
+        // R6: manage authority on the resource is the whole requirement. The revoker need not hold
+        // the verb being removed, and self-revocation is permitted — reducing your own row cannot
+        // raise anyone's authority, so there is nothing for it to prove.
+        require_hook_manage_conjunction(&state.db, &key, hook_model.id).await?;
+    } else {
+        // R7: R1 and R2 together. Self-granting is refused outright rather than left to R1 to
+        // reduce to a no-op — the intent is escalation even when the arithmetic happens to fail,
+        // and it deserves its own audit line and its own message.
+        if id == key.id {
+            tracing::warn!(
+                key = %key.prefix,
+                hook = %hook_model.name,
+                "Non-master key attempted to grant itself hook permissions"
+            );
+            return Err(AppError::Forbidden(
+                "Only master API keys can grant themselves hook permissions".to_owned(),
+            ));
+        }
+        guard_delegated_hook_grant(
+            &state.db,
+            &key,
+            &hook_model,
+            payload.can_execute,
+            payload.can_manage,
+        )
+        .await?;
+    }
+
     if !key.is_master {
         // Rights over a *privileged* hook are the elevation itself, so distributing them stays
         // master-only even for a caller who legitimately manages the hook and holds both verbs.
@@ -2550,35 +2649,28 @@ pub async fn revoke_key_hook_permission(
     Extension(client_ip): Extension<ClientIp>,
     Path((id, hook_identifier)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Same two routes as the grant path, and the same reason for checking standing before any
-    // lookup: a caller with no administrative role at all must not be able to probe key UUIDs.
-    if !key.is_master && !key.can_manage_keys && !manages_any_hook(&state.db, key.id).await? {
+    // Same standing check as the grant path, for the same reason: a caller with no administrative
+    // role at all must not be able to probe key UUIDs by reading `404` instead of `403`.
+    if !has_permission_admin_standing(&state.db, &key).await? {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
     let hook_model = resolve_hook(&state.db, &hook_identifier).await?;
 
-    // `can_manage` on the hook is the *whole* requirement for a local manager, and deliberately a
-    // lower bar than the grant path's. Granting has to prove authority because it can manufacture a
-    // capability the caller was never given; revoking cannot. Turning a flag off is a request for
-    // `false`, and `false` exceeds nothing — the result is always a strict de-escalation of the
-    // target key, no matter who asks or what they hold.
+    // **R6, scoped by R2.** Manage authority over this hook is the whole requirement — and under R2
+    // that authority is the conjunction, the same bar the grant path applies. What R6 removes,
+    // relative to granting, is everything *above* that bar:
     //
-    // So there is no per-verb proportionality here and no self-revocation block. A `can_manage`
-    // holder may strip any verb from any key including itself, exactly as it may already write
-    // `can_execute: false` through [`update_key_hook_permissions`]. Requiring more on this path than
-    // on that one bought nothing — the same effect was one `POST` away — while making the two routes
-    // to the same outcome disagree about who may take them, which is the kind of asymmetry that
-    // reads as a bug to everyone who meets it.
+    // - **No per-verb proportionality.** The revoker need not hold the verb being removed. Turning a
+    //   flag off is a request for `false`, and `false` exceeds nothing, so there is no authority to
+    //   prove. Granting needs proof because it can manufacture a capability that was withheld.
+    // - **Self-revocation is permitted.** Reducing your own row cannot raise anyone's authority.
     //
-    // What the entry gate still prevents is the real exposure: a *local* manager with no
-    // relationship to the hook stripping access to it. That is an integrity concern — someone else's
-    // automation being disabled — and `can_manage` is the right authority to require for it. A global
-    // key administrator is not scoped to a hook and so is not asked for a row here, matching the
-    // grant path exactly; the two directions must agree about who may act, or the stricter one is
-    // simply routed around.
-    if !key.is_master && !key.can_manage_keys {
-        require_manage(&state.db, &key, hook_model.id).await?;
+    // The two routes must agree about who may act. [`update_key_hook_permissions`] classifies an
+    // all-`false` write as a revocation and applies exactly this rule, so neither path can be used
+    // to route around the other.
+    if !key.is_master {
+        require_hook_manage_conjunction(&state.db, &key, hook_model.id).await?;
     }
 
     let result = ApiKeyHookPermission::delete_many()
@@ -2734,6 +2826,53 @@ pub async fn get_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a permission row carrying just the two verbs; the rest is irrelevant to
+    /// [`is_permission_reduction`].
+    fn row(can_execute: bool, can_manage: bool) -> api_key_hook_permission::Model {
+        api_key_hook_permission::Model {
+            id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            hook_id: Uuid::nil(),
+            can_execute,
+            can_manage,
+            created_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    /// **R6 endpoint parity.** The classification that decides whether a `POST` to the permissions
+    /// route is judged as a grant (R1 + R2) or as a revocation (R2 alone).
+    ///
+    /// Getting this backwards in either direction is a real bug: too strict and R6's "regardless of
+    /// which endpoint it arrives at" fails, so a caller entitled to revoke is refused on one route
+    /// and allowed on the other; too loose and R1 is bypassed by writing a grant that the
+    /// classifier mistakes for a reduction.
+    #[test]
+    fn a_write_is_a_reduction_exactly_when_it_turns_no_verb_on() {
+        // Turning a verb on that the target did not have is a grant, in every combination.
+        assert!(!is_permission_reduction(None, true, false));
+        assert!(!is_permission_reduction(None, false, true));
+        assert!(!is_permission_reduction(Some(&row(true, false)), true, true));
+        assert!(!is_permission_reduction(Some(&row(false, true)), true, true));
+
+        // Turning verbs off, in any combination, is a reduction.
+        assert!(is_permission_reduction(Some(&row(true, true)), false, false));
+        assert!(is_permission_reduction(Some(&row(true, true)), true, false));
+        assert!(is_permission_reduction(Some(&row(true, true)), false, true));
+
+        // Re-asserting exactly what the target already holds changes nothing, so it cannot be an
+        // escalation and must not demand a grant's proof of authority.
+        assert!(is_permission_reduction(Some(&row(true, true)), true, true));
+        assert!(is_permission_reduction(Some(&row(false, true)), false, true));
+
+        // An all-`false` write where no row exists is the same end state as no row at all.
+        assert!(is_permission_reduction(None, false, false));
+
+        // A mixed write — one verb up, one down — is a grant. The reduction of the other verb does
+        // not pay for the escalation, and treating "net less authority" as a reduction would let a
+        // caller trade `can_execute` for `can_manage` without holding it.
+        assert!(!is_permission_reduction(Some(&row(true, false)), false, true));
+    }
 
     #[test]
     fn accepts_both_execute_payload_shapes() {

@@ -2584,15 +2584,18 @@ a migration-bearing change, not a handler-only one.
 
 ### Core Rules
 
+**R1, R2, R5, R6 and R7 RESOLVED in Phase 1** — see "Phase 1 — R1/R2/R4/R6/R7" below. R3 remains
+open and is Phase 2's subject. Original verdicts retained for the record.
+
 | Rule | Verdict | Evidence |
 | :--- | :--- | :--- |
-| **R1 — Non-amplification** | **VIOLATES** | `guard_delegated_hook_grant` (`src/api.rs:461`) opens `if key.is_master \|\| key.can_manage_keys { return Ok(()) }`. The per-verb `wanted && !held` comparison below it is therefore reached only by callers *without* `can_manage_keys`. A `can_manage_keys` holder grants any verb on any non-privileged hook regardless of what it holds. |
-| **R2 — Manage is a conjunction** | **VIOLATES** | Same line, plus `revoke_key_hook_permission` (`src/api.rs:2366`): `if !key.is_master && !key.can_manage_keys { require_manage(..) }`. `can_manage_keys` alone is currently sufficient on **both** paths — the exact global bypass R2 forbids. This is commit `2d62d1b`, and R2 replaces it. |
+| **R1 — Non-amplification** | ~~**VIOLATES**~~ → **RESOLVED** | `guard_delegated_hook_grant` (`src/api.rs:461`) opens `if key.is_master \|\| key.can_manage_keys { return Ok(()) }`. The per-verb `wanted && !held` comparison below it is therefore reached only by callers *without* `can_manage_keys`. A `can_manage_keys` holder grants any verb on any non-privileged hook regardless of what it holds. |
+| **R2 — Manage is a conjunction** | ~~**VIOLATES**~~ → **RESOLVED** | Same line, plus `revoke_key_hook_permission` (`src/api.rs:2366`): `if !key.is_master && !key.can_manage_keys { require_manage(..) }`. `can_manage_keys` alone is currently sufficient on **both** paths — the exact global bypass R2 forbids. This is commit `2d62d1b`, and R2 replaces it. |
 | **R3 — Parentage confers no authority** | **DOES NOT IMPLEMENT** | No `parent_key_id` column exists on `api_keys` (`src/entities/api_key.rs`, fields at lines 43–83). Vacuously unviolated: no authority *can* be derived from parentage because parentage is not recorded. Nothing to remove; the column and its cascade/visibility semantics have to be added. |
 | **R4 — Only master creates parents** | **COMPLIES** | `require_master_to_grant_scopes` (`src/api.rs:343`) returns early for master and otherwise refuses any request setting `is_master`, `can_manage_keys` or `can_manage_hooks` to `true`. Enforced on both create and update. Note the naming difference: this service's resource-creation right is `can_manage_hooks`, which the model calls `can_create_hooks`. |
-| **R5 — Manage may propagate sideways** | **VIOLATES** | Sideways propagation itself works, but not *bounded by R1 and R2* as R5 requires — the `can_manage_keys` bypass in `guard_delegated_hook_grant` means a parent can grant manage on a resource it holds nothing on. Also unenforceable in the intended form while "parent" is not a modelled tier (see R3). |
-| **R6 — Revocation is never escalation** | **COMPLIES** | `revoke_key_hook_permission` requires only manage on the hook (`require_manage`, `src/api.rs:2388`), does not compare verbs, and has no self-revocation block. The "regardless of which endpoint it arrives at" clause holds too: `update_key_hook_permissions` reduces a row through the `wanted && !held` shape, which never fires on a `false`. |
-| **R7 — Granting bounded by R1 and R2 together** | **VIOLATES** | Follows directly from R1 and R2 both being violated by the same early return. |
+| **R5 — Manage may propagate sideways** | ~~**VIOLATES**~~ → **RESOLVED** | Sideways propagation itself works, but not *bounded by R1 and R2* as R5 requires — the `can_manage_keys` bypass in `guard_delegated_hook_grant` means a parent can grant manage on a resource it holds nothing on. Also unenforceable in the intended form while "parent" is not a modelled tier (see R3). |
+| **R6 — Revocation is never escalation** | **COMPLIES** (re-scoped by R2 in Phase 1) | `revoke_key_hook_permission` requires only manage on the hook (`require_manage`, `src/api.rs:2388`), does not compare verbs, and has no self-revocation block. The "regardless of which endpoint it arrives at" clause holds too: `update_key_hook_permissions` reduces a row through the `wanted && !held` shape, which never fires on a `false`. |
+| **R7 — Granting bounded by R1 and R2 together** | ~~**VIOLATES**~~ → **RESOLVED** | Follows directly from R1 and R2 both being violated by the same early return. |
 
 ### Ownership and Resource Lifecycle
 
@@ -2870,3 +2873,153 @@ DELETE FROM api_keys WHERE is_master = TRUE;
 | `cargo test` | **195 passed** (83 unit + 112 integration), was 189 |
 | `./scripts/test_e2e.sh` | **721/721**, 0 failed, exit 0 — was 698 |
 | `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted, exit 0 |
+
+---
+
+## Phase 1 — R1, R2, R4, R6, R7 (conjunction and non-amplification)
+
+Handler-only; no migration. Closes five of the seven core rules. R3 is Phase 2's subject.
+
+### The two errors R2 replaces, in opposite directions
+
+R2 says manage is a conjunction — `can_manage_keys` **AND** a `can_manage = true` row on the
+specific hook. The code had two separate routes, and each was one half of the conjunction acting
+alone:
+
+- **`can_manage_keys` alone** — the early return added in `2d62d1b`
+  (`if key.is_master || key.can_manage_keys { return Ok(()) }`). The reasoning at the time was that a
+  deployment-wide credential administrator is not scoped to any one hook. What that did not price in
+  is that the same scope can *mint the key it grants to*: hold `can_manage_keys`, create a key, grant
+  it `can_execute` on any hook, authenticate as it. That is `is_master` in two requests, and the
+  earlier notes recorded it as a "deliberate widening" with `require_master_for_privileged_hook` as
+  the bound — which only ever covered hooks carrying `run_as_user`. R2 names this case in as many
+  words: "`can_manage_keys` is never a global bypass of per-resource RBAC."
+- **A `can_manage` row alone** — the "local manager" route. The Tiers matrix is explicit that a
+  Daughter key (no `can_manage_keys`) *never* manages resources, so a manage row on its own is
+  operational authority over the hook, not the right to decide who else holds it. This population
+  could previously hand out credentials-adjacent authority with no deployment-wide standing at all.
+
+Both halves now fail with **one message** (`"...You do not have manage access to this hook"`).
+Distinguishing them would tell a caller which half to acquire, and the row half doubles as a
+statement about which hooks exist and who manages them.
+
+### What changed in `src/api.rs`
+
+| Function | Change |
+| :--- | :--- |
+| `require_hook_manage_conjunction` (new) | R2 in one place, returning the caller's own row so R1 can use it without a second lookup |
+| `has_permission_admin_standing` (new) | Both halves of R2 as far as they are knowable before the payload is parsed. Must run before `ApiKey::find_by_id`, or the endpoint is a key-UUID oracle |
+| `is_permission_reduction` (new) | R6 endpoint-parity classifier — grant vs revocation, decided by effect |
+| `guard_delegated_hook_grant` | Master-only early return; R1's per-verb check now sits on top of R2 rather than beside it |
+| `update_key_hook_permissions` | Classifies the write, then applies R6 (reduction) or R1+R2 (grant) |
+| `revoke_key_hook_permission` | `require_manage` → `require_hook_manage_conjunction` |
+
+**R7 is the reason the two are composed rather than alternated.** "Granting is bounded by R1 and R2
+together, simultaneously and without exception" — the `2d62d1b` early return skipped *both*, which
+is why the per-verb comparison had become unreachable for exactly the population most able to abuse
+it.
+
+**R4 was already satisfied** and is unchanged: `require_master_to_grant_scopes` refuses any
+non-master request setting `can_manage_keys` or `can_manage_hooks` to `true`, on create and update
+alike. Worth recording that this service's resource-creation right is spelled `can_manage_hooks`;
+`RBAC_MODEL.md`'s Terminology table calls it `can_create_executor`, which exists nowhere in `src/`.
+
+### Endpoint parity, and the classifier's one non-obvious case
+
+R6 classifies a reduction arriving at the general update endpoint as a revocation "regardless of
+which endpoint it arrives at". `DELETE .../permissions/{hook}` and a `POST` writing every verb to
+`false` reach the same end state, so holding them to different standards achieves nothing — the
+stricter one is one request away from being routed around.
+
+A write is a **grant** when it turns on a verb the target did not already hold, and a **reduction**
+otherwise. The case worth stating explicitly: a *mixed* write — one verb up, one down — is a grant.
+Treating "net less authority" as a reduction would let a caller trade away `can_execute` to acquire
+`can_manage` without holding it, which is R1 defeated by arithmetic.
+
+This also fixed a live asymmetry: `DELETE` had permitted self-revocation since `357a81b`, while
+`POST` refused *any* write targeting the caller's own key — so a key could drop its own grant with a
+`DELETE` and was refused for the `POST` that does strictly less. Self-*granting* remains refused.
+
+### Breaking changes
+
+| Change | Who is affected | Migration path |
+| :--- | :--- | :--- |
+| `POST`/`DELETE /api/keys/{id}/permissions*` now requires `can_manage_keys` **and** a `can_manage` row on that hook | Keys holding `can_manage_keys` but no manage row on the hook they administer | Master grants the missing per-hook `can_manage` row |
+| Same, from the other side | Keys holding a `can_manage` row but not `can_manage_keys` (the former "local managers") | Master grants `can_manage_keys` — a tier promotion, and deliberately a decision rather than a default |
+| A `POST` reducing the **caller's own** row now succeeds (was `403`) | Nobody adversely; a refusal became a success | None |
+| Grants of a verb the caller lacks are refused for `can_manage_keys` holders too (was permitted) | Automation relying on the `2d62d1b` override | The caller must hold the verb it hands out |
+
+### Operator SQL — who is affected
+
+```sql
+-- (1) Parents missing the per-hook half: hold can_manage_keys, administer hooks they have no
+--     can_manage row for. These keys keep working only on hooks where a row exists.
+SELECT k.id, k.name, k.prefix
+FROM api_keys k
+WHERE k.can_manage_keys = TRUE
+  AND k.is_master = FALSE
+  AND NOT EXISTS (
+      SELECT 1 FROM api_key_hook_permissions p
+      WHERE p.api_key_id = k.id AND p.can_manage = TRUE
+  );
+
+-- (2) Former "local managers": a can_manage row but no can_manage_keys. These lose grant/revoke
+--     authority entirely and need a deliberate promotion, not a repair.
+SELECT DISTINCT k.id, k.name, k.prefix
+FROM api_keys k
+JOIN api_key_hook_permissions p ON p.api_key_id = k.id
+WHERE p.can_manage = TRUE
+  AND k.can_manage_keys = FALSE
+  AND k.is_master = FALSE;
+
+-- (3) For a key in (1), the hooks it can still administer after the change.
+SELECT h.id, h.name
+FROM hooks h
+JOIN api_key_hook_permissions p ON p.hook_id = h.id
+WHERE p.api_key_id = '<key-id>' AND p.can_manage = TRUE;
+```
+
+### Scope boundary recorded deliberately: `require_manage` is unchanged
+
+R2 as written governs "managing a specific resource", and the Tiers matrix says a Daughter key never
+manages resources. Read at its widest, that would also make **editing a hook's own definition**
+(`PUT /api/hooks/{id}`, parameter CRUD — all gated by `require_manage`) require `can_manage_keys`.
+
+Phase 1 did **not** do that, because the phase brief scopes R2 to the grant and revoke paths
+explicitly, and the wider reading has a much larger blast radius: it would revoke hook-editing from
+every manage-only key in every deployment, and §9 of the e2e ("the manage-only key can modify the
+hook") encodes the current contract.
+
+**This is an open question, not a settled one.** It is recorded here rather than decided silently,
+and Phase 5's mutation report must not count R2 as fully covered on the strength of the grant/revoke
+tests alone.
+
+### Test changes
+
+- `seed_local_manager` → **`seed_daughter_with_manage_row`**, kept because that population still
+  exists and now has to be *refused*; **`seed_parent_manager`** added for the R2-compliant shape
+  (`can_manage_keys` + a manage row).
+- `a_can_manage_keys_holder_may_grant_on_any_hook_without_holding_a_row` — the `2d62d1b` test —
+  replaced by its exact inverse, `r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused`,
+  which also supplies the missing half at the end and asserts the same request then succeeds. Paired
+  with `r2_a_daughter_holding_only_a_manage_row_may_not_administer_grants` for the other half, which
+  additionally asserts the daughter keeps its *operational* rights — R2 governs who administers
+  grants, not who may use the hook.
+- New: `r6_a_post_that_only_reduces_is_judged_as_a_revocation` (same route, same caller, two
+  classifications decided purely by effect) and
+  `r6_a_key_may_reduce_its_own_row_through_the_update_endpoint`.
+- New unit test `a_write_is_a_reduction_exactly_when_it_turns_no_verb_on`, including the mixed-write
+  case.
+- e2e §30 finding #3, §32 and §33 all seeded actors deliberately *without* `can_manage_keys` —
+  correct under the old rules, vacuous under the new ones. Promoted to parents, with the daughter
+  case added to §32 as an explicit refusal.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **199 passed** (84 unit + 115 integration), was 195 |
+| `./scripts/test_e2e.sh` | **729/729**, 0 failed — was 721 |
+| `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |
