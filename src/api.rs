@@ -42,6 +42,47 @@ const MAX_CONCURRENT_JOBS: i32 = 1_000;
 /// Default page size for the paginated listing endpoints.
 const DEFAULT_PAGE_LIMIT: u64 = 50;
 
+/// A [`StrictJson`] whose body may be absent entirely, yielding `T::default()`.
+///
+/// `DELETE /api/keys/{id}` needs this: the *first* request carries no body at all — it is a
+/// question, and the answer is the pre-flight inventory — while the resubmission carries the
+/// resolution map. Axum's own `Option<Json<T>>` does not cover the case, and demanding an empty
+/// `{}` on the first request would make the common "delete a key that owns nothing" call require a
+/// body for no reason.
+///
+/// Emptiness is decided from the *bytes*, not from `Content-Type`, so a client that sends the
+/// header without a payload behaves the same as one that sends neither. Reading through
+/// [`axum::body::Bytes`] keeps the request under `DefaultBodyLimit`, so the `413` control still
+/// applies here as it does everywhere else.
+pub struct OptionalStrictJson<T>(pub T);
+
+impl<T, S> axum::extract::FromRequest<S> for OptionalStrictJson<T>
+where
+    T: serde::de::DeserializeOwned + Default,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|rejection| AppError::BodyRejected(rejection.status(), rejection.body_text()))?;
+
+        if bytes.is_empty() {
+            return Ok(Self(T::default()));
+        }
+
+        serde_json::from_slice(&bytes).map(Self).map_err(|e| {
+            AppError::InvalidInput(format!(
+                "Failed to deserialize the JSON body into the target type: {e}"
+            ))
+        })
+    }
+}
+
 /// A [`Json`] extractor whose deserialization failures come back as [`AppError::InvalidInput`].
 ///
 /// Axum's own `Json` rejection renders as a bare `text/plain` body, which would break the
@@ -2778,13 +2819,143 @@ pub async fn update_api_key(
     Ok(Json(build_api_key_summary(&state.db, updated).await?))
 }
 
-/// Handles `DELETE /api/keys/{id}`.
+/// One entity a key subtree owns, as reported by the pre-flight inventory (`RBAC_MODEL.md` §6:
+/// "type, id, name, and current owner").
+#[derive(Serialize)]
+pub struct OwnedEntity {
+    /// What kind of thing this is. Currently always `"hook"`: hooks are the only owned entity in
+    /// this service (see the terminology note in `AGENT_NOTES.MD`). The field is present anyway,
+    /// because §6 specifies it and because a second owned type must not change the payload shape.
+    #[serde(rename = "type")]
+    pub entity_type: &'static str,
+    /// The entity's id, and the key a resolution is addressed to.
+    pub id: Uuid,
+    /// Human-readable name, so an operator can decide without a second lookup.
+    pub name: String,
+    /// The key inside the doomed subtree that currently owns it.
+    pub current_owner: Uuid,
+}
+
+/// One key scheduled for deletion by the cascade.
+#[derive(Serialize)]
+pub struct DoomedKey {
+    /// Key id.
+    pub id: Uuid,
+    /// Key name.
+    pub name: String,
+}
+
+/// What the caller wants done with one inventoried entity.
+///
+/// Externally tagged on `action` so the two arms read as `{"action":"delete"}` and
+/// `{"action":"reassign","to":"<key-id>"}`. There is deliberately no "leave it" arm: §6 requires
+/// every entity to carry an *explicit* resolution, and "do nothing" would silently orphan it —
+/// which is the outcome the inventory exists to prevent.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EntityResolution {
+    /// Move the entity to the trash. Soft, like every other deletion in this service, so execution
+    /// history survives and the 92-day purge remains the only thing that destroys it.
+    Delete,
+    /// Hand the entity to another key, which must exist and must not itself be in the subtree.
+    Reassign {
+        /// The new owner.
+        to: Uuid,
+    },
+}
+
+/// Optional body for `DELETE /api/keys/{id}`, carrying the resolution map on resubmission.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteApiKeyPayload {
+    /// One entry per inventoried entity, keyed by its id. Partial maps are refused.
+    #[serde(default)]
+    pub resolutions: std::collections::HashMap<Uuid, EntityResolution>,
+}
+
+/// The structured refusal §6 specifies, returned as `409 Conflict` when the subtree owns anything.
+#[derive(Serialize)]
+struct InventoryRefusal {
+    /// Human-readable summary, in the same `error` field every other refusal uses.
+    error: String,
+    /// Every key the cascade would remove, so the caller sees the true blast radius rather than
+    /// just the id it named.
+    subtree: Vec<DoomedKey>,
+    /// Everything owned by any key in that subtree, each needing an explicit resolution.
+    inventory: Vec<OwnedEntity>,
+}
+
+/// Walks the subtree rooted at `root` and collects everything any key in it owns.
+///
+/// §6 is specific that the walk covers "the entire subtree being deleted", not just the named key.
+/// A daughter's hooks have to appear, or they are stranded silently — which is the failure the
+/// inventory exists to prevent, and the one a naive "what does *this* key own" query produces.
+async fn collect_subtree_inventory(
+    db: &sea_orm::DatabaseConnection,
+    root: Uuid,
+) -> Result<(Vec<Uuid>, Vec<DoomedKey>, Vec<OwnedEntity>), AppError> {
+    let mut subtree = vec![root];
+    subtree.extend(descendant_key_ids(db, root).await?);
+
+    let doomed = ApiKey::find()
+        .filter(api_key::Column::Id.is_in(subtree.clone()))
+        .order_by_asc(api_key::Column::CreatedAt)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|k| DoomedKey { id: k.id, name: k.name })
+        .collect();
+
+    // Soft-deleted hooks are included on purpose. A hook in the trash is still recoverable and
+    // still owned; letting the cascade leave it ownerless would quietly make it master-only
+    // forever, which is a decision the operator never made.
+    let inventory = Hook::find()
+        .filter(hook::Column::OwnerKeyId.is_in(subtree.clone()))
+        .order_by_asc(hook::Column::Name)
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|h| {
+            h.owner_key_id.map(|owner| OwnedEntity {
+                entity_type: "hook",
+                id: h.id,
+                name: h.name,
+                current_owner: owner,
+            })
+        })
+        .collect();
+
+    Ok((subtree, doomed, inventory))
+}
+
+/// Handles `DELETE /api/keys/{id}` — cascading deletion with the §6 pre-flight inventory.
+///
+/// # Two-step by design
+///
+/// The first request is a question, not a command. If the subtree owns anything, the service
+/// refuses with `409` and the full inventory; the caller resubmits with a resolution for every
+/// listed entity. §6 requires that shape because the alternative — deleting and letting the
+/// resources fall where they may — violates "data is never destroyed implicitly" in one direction
+/// and silently strands resources in the other.
+///
+/// A subtree owning nothing deletes in one request, as before.
+///
+/// # Why the resolution map must be total
+///
+/// "Deletion executes only when every entity in the inventory carries an explicit resolution;
+/// partial maps are refused." A partial map is almost always a stale one — the caller resolved the
+/// inventory it was shown, and something was created in between. Applying it would delete the keys
+/// and orphan whatever arrived late, which is precisely the outcome this whole mechanism exists to
+/// make impossible.
 pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, AppError> {
+    OptionalStrictJson(payload): OptionalStrictJson<DeleteApiKeyPayload>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse as _;
+
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
@@ -2800,7 +2971,94 @@ pub async fn delete_api_key(
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
 
-    let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
+    let (subtree, doomed, inventory) = collect_subtree_inventory(&state.db, id).await?;
+
+    // A resolution naming something not in the inventory is a mistake worth surfacing rather than
+    // ignoring: it usually means the caller is replaying a map built against a different subtree.
+    let inventoried: std::collections::HashSet<Uuid> = inventory.iter().map(|e| e.id).collect();
+    if let Some(stray) = payload.resolutions.keys().find(|k| !inventoried.contains(k)) {
+        return Err(AppError::InvalidInput(format!(
+            "resolution supplied for '{stray}', which this key subtree does not own"
+        )));
+    }
+
+    let unresolved: Vec<&OwnedEntity> =
+        inventory.iter().filter(|e| !payload.resolutions.contains_key(&e.id)).collect();
+    if !unresolved.is_empty() {
+        tracing::info!(
+            key = %key.prefix,
+            target = %target.prefix,
+            owned = inventory.len(),
+            unresolved = unresolved.len(),
+            "§6: key deletion refused pending an ownership resolution map"
+        );
+        return Ok((
+            axum::http::StatusCode::CONFLICT,
+            Json(InventoryRefusal {
+                error: format!(
+                    "Deletion refused: this key subtree owns {} entit{} with no resolution.                      Resubmit with a 'resolutions' map naming, for every id below, either                      {{\"action\":\"delete\"}} or {{\"action\":\"reassign\",\"to\":\"<key-id>\"}}.",
+                    unresolved.len(),
+                    if unresolved.len() == 1 { "y" } else { "ies" }
+                ),
+                subtree: doomed,
+                inventory,
+            }),
+        )
+            .into_response());
+    }
+
+    // Validate every reassignment *before* applying any of them, so a bad target in the middle of
+    // the map cannot leave the subtree half-resolved and half-deleted.
+    let doomed_ids: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
+    for (entity_id, resolution) in &payload.resolutions {
+        if let EntityResolution::Reassign { to } = resolution {
+            if doomed_ids.contains(to) {
+                return Err(AppError::InvalidInput(format!(
+                    "cannot reassign '{entity_id}' to '{to}': that key is inside the subtree being                      deleted"
+                )));
+            }
+            if ApiKey::find_by_id(*to).one(&state.db).await?.is_none() {
+                return Err(AppError::InvalidInput(format!(
+                    "cannot reassign '{entity_id}' to '{to}': no such API key"
+                )));
+            }
+        }
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut deleted_hooks = 0usize;
+    let mut reassigned_hooks = 0usize;
+    for (entity_id, resolution) in &payload.resolutions {
+        let Some(model) = Hook::find_by_id(*entity_id).one(&state.db).await? else {
+            continue;
+        };
+        let mut active: hook::ActiveModel = model.into();
+        match resolution {
+            EntityResolution::Delete => {
+                // Soft, like every other deletion here: the hook's parameters, permission grants
+                // and execution history survive, and the 92-day purge stays the only thing that
+                // destroys them. §6's "data is never destroyed implicitly" is about side effects,
+                // and this is an explicit instruction — but explicit does not have to mean
+                // irreversible.
+                active.is_deleted = Set(true);
+                active.deleted_at = Set(Some(now));
+                active.deleted_by = Set(Some(key.id.to_string()));
+                deleted_hooks += 1;
+            }
+            EntityResolution::Reassign { to } => {
+                active.owner_key_id = Set(Some(*to));
+                reassigned_hooks += 1;
+            }
+        }
+        active.updated_at = Set(now);
+        active.update(&state.db).await?;
+    }
+
+    // The cascade itself. Permission rows follow via the schema's existing `ON DELETE CASCADE`, and
+    // `executions.api_key_id` is `ON DELETE SET NULL`, so run history survives its author — which
+    // is what makes the audit trail worth keeping.
+    let result =
+        ApiKey::delete_many().filter(api_key::Column::Id.is_in(subtree.clone())).exec(&state.db).await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
@@ -2811,11 +3069,14 @@ pub async fn delete_api_key(
         client_ip.0,
         "KEY_DELETE",
         Some(name),
-        Some(format!("Deleted key {reference}")),
+        Some(format!(
+            "Deleted key {reference} and {} descendant key(s); {reassigned_hooks} hook(s)              reassigned, {deleted_hooks} hook(s) moved to the trash",
+            subtree.len().saturating_sub(1)
+        )),
     )
     .await?;
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(axum::http::StatusCode::NO_CONTENT.into_response())
 }
 
 /// Response after rotating an API key's secrets.

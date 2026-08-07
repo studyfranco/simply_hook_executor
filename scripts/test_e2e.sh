@@ -3269,6 +3269,117 @@ check "403" "§4 counterpart: a real key from outside its bound_ips is 403"
 # The asymmetry is the control: `403` is reachable only by someone already holding the secret, so
 # it cannot be used to confirm that a guessed key string exists.
 
+# ── 39. RBAC_MODEL.md §6: cascade deletion and pre-flight inventory ─────────
+
+log_section "39. Cascade deletion and pre-flight inventory (RBAC_MODEL.md §6)"
+
+CAS_SCRIPT=$(make_hook_script "cascade.sh" 'echo "cascade ran"')
+
+# A three-level subtree: parent → daughter → granddaughter. Two levels is the minimum that
+# distinguishes a real subtree walk from "what does this key own" — a one-level test passes against
+# a walk that never recurses.
+# Each key is created *by its parent*, so `parent_key_id` is real, and its global scopes are then
+# granted by master — R4 forbids a non-master handing out `can_manage_keys` or `can_manage_hooks`,
+# so a parent cannot mint a scoped daughter in one step. Two requests per level, deliberately.
+create_scoped_key "Cascade Parent" ',"can_manage_keys":true,"can_manage_hooks":true'
+CAS_PARENT_KEY="$CREATED_KEY"; CAS_PARENT_ID="$CREATED_ID"
+
+create_key_as "$CAS_PARENT_KEY" "Cascade Daughter"
+CAS_DAUGHTER_KEY="$CREATED_KEY"; CAS_DAUGHTER_ID="$CREATED_ID"
+api_call PUT "/api/keys/$CAS_DAUGHTER_ID" "$MASTER_KEY" '{"can_manage_keys":true,"can_manage_hooks":true}'
+check "200" "master grants the daughter its scopes"
+
+create_key_as "$CAS_DAUGHTER_KEY" "Cascade Granddaughter"
+CAS_GRAND_KEY="$CREATED_KEY"; CAS_GRAND_ID="$CREATED_ID"
+api_call PUT "/api/keys/$CAS_GRAND_ID" "$MASTER_KEY" '{"can_manage_hooks":true}'
+check "200" "master grants the granddaughter its scope"
+
+api_call POST "/api/hooks" "$CAS_GRAND_KEY" \
+    "$(jq -nc --arg p "$CAS_SCRIPT" '{name:"granddaughters_hook",script_path:$p}')"
+check "200" "the granddaughter creates a hook, two levels down"
+CAS_DEEP_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/hooks" "$CAS_DAUGHTER_KEY" \
+    "$(jq -nc --arg p "$CAS_SCRIPT" '{name:"daughters_hook",script_path:$p}')"
+check "200" "the daughter creates one too"
+CAS_MID_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# ── The pre-flight inventory ───────────────────────────────────────────────
+api_call DELETE "/api/keys/$CAS_PARENT_ID" "$MASTER_KEY"
+check "409" "§6 deletion is refused while the subtree owns anything"
+check_local "$(echo "$RESP_BODY" | jq -r '.inventory | length')" "2" \
+    "§6 both owned hooks are inventoried"
+check_local "$(echo "$RESP_BODY" | jq -r --arg h "$CAS_DEEP_HOOK_ID" '[.inventory[] | select(.id == $h) | select(.current_owner == "'"$CAS_GRAND_ID"'")] | length')" "1" \
+    "§6 the walk reaches two levels down and names the real owner"
+check_local "$(echo "$RESP_BODY" | jq -r '[.inventory[] | select(.type == "hook" and .name != null and .current_owner != null)] | length')" "2" \
+    "§6 every entry carries type, id, name and current_owner"
+check_local "$(echo "$RESP_BODY" | jq -r '.subtree | length')" "3" \
+    "§6 the reported blast radius is the whole subtree"
+
+# Nothing happened — the refusal is a question, not a partial execution.
+api_call GET "/api/auth/me" "$CAS_GRAND_KEY"
+check "200" "§6 the refusal deleted nothing"
+
+# ── Partial maps are refused ───────────────────────────────────────────────
+api_call DELETE "/api/keys/$CAS_PARENT_ID" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$CAS_DEEP_HOOK_ID" '{resolutions:{($h):{action:"delete"}}}')"
+check "409" "§6 a partial resolution map is refused"
+check_local "$(echo "$RESP_BODY" | jq -r '.inventory | length')" "2" \
+    "§6 and the full inventory comes back, not just the gap"
+
+# A resolution for something the subtree does not own is a mistake, not a no-op.
+api_call DELETE "/api/keys/$CAS_PARENT_ID" "$MASTER_KEY" \
+    "$(jq -nc --arg a "$CAS_DEEP_HOOK_ID" --arg b "$CAS_MID_HOOK_ID" --arg c "$ECHO_HOOK_ID" \
+        '{resolutions:{($a):{action:"delete"},($b):{action:"delete"},($c):{action:"delete"}}}')"
+check "400" "§6 a resolution naming an unowned entity is refused"
+
+# Reassigning into the doomed subtree resolves nothing, and is refused.
+api_call DELETE "/api/keys/$CAS_PARENT_ID" "$MASTER_KEY" \
+    "$(jq -nc --arg a "$CAS_DEEP_HOOK_ID" --arg b "$CAS_MID_HOOK_ID" --arg d "$CAS_DAUGHTER_ID" \
+        '{resolutions:{($a):{action:"reassign",to:$d},($b):{action:"delete"}}}')"
+check "400" "§6 reassigning to a key inside the doomed subtree is refused"
+check_true '.error | contains("inside the subtree")' "and says why"
+
+# ── The complete map executes ──────────────────────────────────────────────
+create_scoped_key "Cascade Successor"
+CAS_SUCCESSOR_ID="$CREATED_ID"
+
+api_call DELETE "/api/keys/$CAS_PARENT_ID" "$MASTER_KEY" \
+    "$(jq -nc --arg a "$CAS_DEEP_HOOK_ID" --arg b "$CAS_MID_HOOK_ID" --arg s "$CAS_SUCCESSOR_ID" \
+        '{resolutions:{($a):{action:"reassign",to:$s},($b):{action:"delete"}}}')"
+check "204" "§6 a total resolution map executes the cascade"
+
+# The whole subtree is gone — recursively, not just the key that was named.
+api_call GET "/api/auth/me" "$CAS_PARENT_KEY"
+check "401" "§6 the parent key is gone"
+api_call GET "/api/auth/me" "$CAS_DAUGHTER_KEY"
+check "401" "§6 so is the daughter"
+api_call GET "/api/auth/me" "$CAS_GRAND_KEY"
+check "401" "§6 and the granddaughter, two levels down"
+
+# The reassigned hook survives, owned by the successor. §6: hooks must never disappear as a side
+# effect of removing a key.
+api_call GET "/api/hooks/$CAS_DEEP_HOOK_ID" "$MASTER_KEY"
+check "200" "§6 the reassigned hook survives"
+check_jq ".owner_key_id" "$CAS_SUCCESSOR_ID" "§6 and ownership moved to the successor"
+check_jq ".is_deleted" "false" "§6 reassignment is not deletion"
+
+# The explicitly-deleted one is in the trash, not destroyed: history and definition both survive.
+api_call GET "/api/hooks/$CAS_MID_HOOK_ID?include_deleted=true" "$MASTER_KEY"
+check "200" "§6 the explicitly-deleted hook is still recoverable"
+check_jq ".is_deleted" "true" "§6 it went to the trash rather than being dropped"
+
+# ── A subtree owning nothing still deletes in one request ──────────────────
+create_scoped_key "Cascade Empty Parent" ',"can_manage_keys":true'
+CAS_EMPTY_KEY="$CREATED_KEY"; CAS_EMPTY_ID="$CREATED_ID"
+create_key_as "$CAS_EMPTY_KEY" "Cascade Empty Daughter"
+CAS_EMPTY_CHILD_KEY="$CREATED_KEY"
+CAS_EMPTY_CHILD_ID="$CREATED_ID"
+
+api_call DELETE "/api/keys/$CAS_EMPTY_ID" "$MASTER_KEY"
+check "204" "§6 a subtree owning nothing needs no resolution map"
+api_call GET "/api/auth/me" "$CAS_EMPTY_CHILD_KEY"
+check "401" "§6 and the cascade still ran"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

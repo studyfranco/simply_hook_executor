@@ -2633,6 +2633,8 @@ verdicts retained for the record.
 
 ### Key Deletion and Ownership Inventory
 
+**RESOLVED in Phase 4.** Original verdicts retained for the record.
+
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
 | Cascade to daughters | **DOES NOT IMPLEMENT** | No `parent_key_id`, so no subtree. `delete_api_key` removes exactly one row. |
@@ -3295,4 +3297,97 @@ UPDATE api_keys SET parent_key_id = '<parent-id>' WHERE id = '<child-id>';
 | `cargo clippy --all-targets -- -D warnings` | clean |
 | `cargo test` | **208 passed** (84 unit + 124 integration), was 203 |
 | `./scripts/test_e2e.sh` | **791/791**, 0 failed — was 754 |
+| `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |
+
+---
+
+## Phase 4 — Cascade Deletion & Pre-flight Inventory (§6)
+
+`DELETE /api/keys/{id}` deleted exactly one row. §6 requires it to delete a subtree, and to refuse
+until everything that subtree owns has been explicitly accounted for.
+
+### Two-step by design
+
+The first request is a **question**, not a command. If the subtree owns anything the service answers
+`409` with the full inventory; the caller resubmits with a resolution for every listed entity.
+
+That shape is forced by §6 pulling in two directions at once: "data is never destroyed implicitly"
+rules out deleting the resources along with the keys, and the inventory requirement rules out
+leaving them stranded. The only remaining move is to stop and ask.
+
+A subtree owning nothing still deletes in **one** request with no body. The inventory is a gate, not
+a toll — a mandatory second round-trip for the ordinary case would be a regression dressed as a
+safety feature.
+
+### The refusal payload
+
+```json
+{
+  "error": "Deletion refused: this key subtree owns 2 entities with no resolution. ...",
+  "subtree":   [ { "id": "...", "name": "parent" }, ... ],
+  "inventory": [ { "type": "hook", "id": "...", "name": "...", "current_owner": "..." } ]
+}
+```
+
+`inventory` carries the four fields §6 names. `subtree` is not required by §6 and is included
+anyway: the caller asked about one key and is about to remove several, and it should be able to see
+that before agreeing rather than after.
+
+### Four ways the resolution map is rejected
+
+| Case | Status | Why |
+| :--- | :--- | :--- |
+| An inventoried entity has no resolution | `409` + full inventory | §6: partial maps are refused. A partial map is almost always a *stale* one — the caller resolved what it was shown and something arrived in between. Applying it would delete the keys and orphan the late arrival, which is the exact outcome this mechanism exists to prevent |
+| A resolution names something the subtree does not own | `400` | Usually a map replayed against a different subtree. Ignoring it would let a caller believe it had resolved something it had not |
+| `reassign` to a key **inside** the doomed subtree | `400` | The new owner is about to cease to exist, so it resolves nothing |
+| `reassign` to a key that does not exist | `400` | Would leave the hook owned by nothing — §3's non-master path closed off permanently, and §6's inventory reporting an id that resolves to nothing |
+
+All reassignment targets are validated **before** any of them are applied, so a bad target halfway
+through the map cannot leave the subtree half-resolved and half-deleted.
+
+### `{"action":"delete"}` is a soft delete
+
+Explicit does not have to mean irreversible. A resolved deletion moves the hook to the trash like
+every other deletion in this service: its parameter contract, permission grants and execution
+history all survive, and the 92-day purge stays the only thing that destroys them. §6's "data is
+never destroyed implicitly" is about *side effects*, and this is an instruction — but an operator
+resolving forty hooks at 3am should be able to take one back.
+
+Soft-deleted hooks are also **included in the inventory**. A hook in the trash is still recoverable
+and still owned; letting the cascade leave it ownerless would quietly make it master-only forever,
+which is a decision nobody made.
+
+### What survives the cascade, and how
+
+- **Permission rows** follow the deleted keys via the initial schema's existing `ON DELETE CASCADE`.
+- **Executions** survive: `executions.api_key_id` is `ON DELETE SET NULL`, so a run outlives its
+  author and the attribution is nulled rather than cascaded away. That is what makes the audit trail
+  worth keeping — a deletion that erased the history of what a key did would be an attractive first
+  step for anyone with `can_manage_keys`.
+- **Hooks** survive by construction: they cannot reach the cascade unresolved.
+
+### `OptionalStrictJson`
+
+`DELETE` with no body is the common case and must stay that way, so the payload extractor treats an
+empty body as `Default`. Emptiness is decided from the **bytes**, not from `Content-Type`, so a
+client sending the header without a payload behaves like one sending neither. It reads through
+`axum::body::Bytes`, which keeps the request under `DefaultBodyLimit` — the `413` control from Phase
+0 still applies here as everywhere else.
+
+### Known gap, recorded rather than papered over
+
+`api_keys.owner_key_id` is **not** inventoried. Keys inside the subtree are being deleted, not
+owned-and-stranded, and a key *outside* the subtree owned by one inside it cannot currently arise:
+key ownership is set to the creator at creation and there is no route that reassigns it, so owner and
+parent are always the same key. If a key-ownership reassignment route is ever added, this walk has to
+grow a second arm or it will strand keys the way it currently cannot.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **213 passed** (84 unit + 129 integration), was 208 |
+| `./scripts/test_e2e.sh` | **823/823**, 0 failed — was 791 |
 | `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |

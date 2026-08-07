@@ -4200,6 +4200,319 @@ async fn the_master_may_edit_only_its_own_bound_ips() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §6 — cascade deletion and pre-flight inventory
+// ─────────────────────────────────────────────────────────────
+
+/// Builds a three-level subtree under `master`: parent → daughter → granddaughter, with a hook
+/// owned two levels down. Returns `(parent_id, parent_key, daughter_id, grand_id, deep_hook)`.
+///
+/// Two levels is the minimum that distinguishes a real subtree walk from "what does this key own".
+/// A one-level test passes against a walk that never recurses.
+async fn seed_three_level_subtree(
+    db: &sea_orm::DatabaseConnection,
+    script: &str,
+) -> (Uuid, String, Uuid, Uuid, Uuid) {
+    let (parent_id, parent) = insert_key(db, "parent", "", KeyScopes {
+        can_manage_keys: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    })
+    .await;
+    let (daughter_id, _daughter) = insert_key(db, "daughter", "", KeyScopes::plain()).await;
+    let (grand_id, _grand) = insert_key(db, "granddaughter", "", KeyScopes::plain()).await;
+    set_parent(db, daughter_id, parent_id).await;
+    set_parent(db, grand_id, daughter_id).await;
+
+    let deep_hook = insert_hook_owned_by(db, "granddaughters_hook", script, grand_id).await;
+    (parent_id, parent, daughter_id, grand_id, deep_hook)
+}
+
+/// **§6** — the inventory walks the *entire* subtree, not just the key named in the request.
+///
+/// "Before any key deletion, the service walks the entire subtree being deleted and collects every
+/// resource and dispatch target owned by any key within it." A hook owned two levels down must
+/// appear, or it is stranded silently — which is the failure a naive "what does *this* key own"
+/// query produces and this test exists to catch.
+#[tokio::test]
+async fn s6_the_inventory_reaches_resources_owned_two_levels_down() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("deep.sh", "#!/bin/sh\nexit 0\n");
+    let (parent_id, _parent, daughter_id, grand_id, deep_hook) =
+        seed_three_level_subtree(&db, &script).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let refused = send(&app, json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None)).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "deletion is refused, not performed");
+
+    // The inventory names the deep hook, with everything §6 requires.
+    let inventory = refused.json["inventory"].as_array().cloned().unwrap_or_default();
+    assert_eq!(inventory.len(), 1, "exactly the one owned hook: {}", refused.raw);
+    assert_eq!(inventory[0]["type"], json!("hook"));
+    assert_eq!(inventory[0]["id"], json!(deep_hook.to_string()));
+    assert_eq!(inventory[0]["name"], json!("granddaughters_hook"));
+    assert_eq!(
+        inventory[0]["current_owner"],
+        json!(grand_id.to_string()),
+        "and names the owner two levels down, not the key that was asked about"
+    );
+
+    // The blast radius is reported too, so the caller sees what it actually asked for.
+    let subtree: Vec<String> = refused.json["subtree"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|k| k["id"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(subtree.len(), 3, "parent, daughter, granddaughter");
+    for id in [parent_id, daughter_id, grand_id] {
+        assert!(subtree.contains(&id.to_string()), "{id} missing from the reported subtree");
+    }
+
+    // Nothing happened: the refusal is a question, not a partial execution.
+    assert!(ApiKey::find_by_id(parent_id).one(&db).await.expect("query").is_some());
+    assert!(ApiKey::find_by_id(grand_id).one(&db).await.expect("query").is_some());
+}
+
+/// **§6** — "Deletion executes only when every entity in the inventory carries an explicit
+/// resolution; partial maps are refused."
+///
+/// A partial map is almost always a stale one: the caller resolved the inventory it was shown and
+/// something arrived in between. Applying it would delete the keys and orphan the late arrival,
+/// which is exactly what the mechanism exists to prevent.
+#[tokio::test]
+async fn s6_a_partial_resolution_map_is_refused() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("partial.sh", "#!/bin/sh\nexit 0\n");
+    let (parent_id, _parent, daughter_id, _grand_id, deep_hook) =
+        seed_three_level_subtree(&db, &script).await;
+    let second_hook = insert_hook_owned_by(&db, "daughters_hook", &script, daughter_id).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // Resolve one of the two.
+    let partial = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": { deep_hook.to_string(): { "action": "delete" } } })),
+        ),
+    )
+    .await;
+    assert_eq!(partial.status, StatusCode::CONFLICT, "a partial map is refused: {}", partial.raw);
+    assert!(ApiKey::find_by_id(parent_id).one(&db).await.expect("query").is_some(), "nothing deleted");
+
+    // The still-unresolved entity is the one reported back, so the caller can complete the map
+    // rather than re-derive it.
+    let inventory = partial.json["inventory"].as_array().cloned().unwrap_or_default();
+    assert_eq!(inventory.len(), 2, "the full inventory comes back, not just the gap");
+
+    // A resolution naming something the subtree does not own is a mistake, not a no-op: it usually
+    // means the map was built against a different subtree.
+    let stray = insert_hook(&db, "unrelated_hook", &script, 30).await;
+    let bad = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": {
+                deep_hook.to_string(): { "action": "delete" },
+                second_hook.to_string(): { "action": "delete" },
+                stray.to_string(): { "action": "delete" },
+            } })),
+        ),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "a stray resolution is refused: {}", bad.raw);
+    assert!(bad.raw.contains(&stray.to_string()), "and names the offending id");
+
+    // The complete map succeeds.
+    let complete = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": {
+                deep_hook.to_string(): { "action": "delete" },
+                second_hook.to_string(): { "action": "delete" },
+            } })),
+        ),
+    )
+    .await;
+    assert_eq!(complete.status, StatusCode::NO_CONTENT, "a total map executes: {}", complete.raw);
+}
+
+/// **§6** — the cascade removes the whole subtree, and reassignment moves ownership rather than
+/// destroying anything.
+#[tokio::test]
+async fn s6_reassignment_moves_ownership_and_the_cascade_removes_the_subtree() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("reassign.sh", "#!/bin/sh\nexit 0\n");
+    let (parent_id, _parent, daughter_id, grand_id, deep_hook) =
+        seed_three_level_subtree(&db, &script).await;
+    let (successor_id, _successor) = insert_key(&db, "successor", "", KeyScopes::plain()).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // Reassigning *into* the doomed subtree is refused: the new owner is about to cease to exist,
+    // so it resolves nothing.
+    let into_subtree = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": {
+                deep_hook.to_string(): { "action": "reassign", "to": daughter_id.to_string() },
+            } })),
+        ),
+    )
+    .await;
+    assert_eq!(into_subtree.status, StatusCode::BAD_REQUEST, "{}", into_subtree.raw);
+    assert!(into_subtree.raw.contains("inside the subtree"), "{}", into_subtree.raw);
+
+    // A nonexistent successor is refused too — it would leave the hook owned by nothing.
+    let nowhere = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": {
+                deep_hook.to_string(): { "action": "reassign", "to": Uuid::new_v4().to_string() },
+            } })),
+        ),
+    )
+    .await;
+    assert_eq!(nowhere.status, StatusCode::BAD_REQUEST, "{}", nowhere.raw);
+
+    // The real thing.
+    let done = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": {
+                deep_hook.to_string(): { "action": "reassign", "to": successor_id.to_string() },
+            } })),
+        ),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{}", done.raw);
+
+    // The entire subtree is gone — recursively, not just the key that was named.
+    for id in [parent_id, daughter_id, grand_id] {
+        assert!(
+            ApiKey::find_by_id(id).one(&db).await.expect("query").is_none(),
+            "{id} should have been cascaded away"
+        );
+    }
+    assert!(ApiKey::find_by_id(successor_id).one(&db).await.expect("query").is_some());
+
+    // The hook survives, owned by the successor. §6: "Hooks must never disappear as a side effect
+    // of removing a key."
+    let survivor = fetch_hook_row(&db, deep_hook).await.expect("the hook must survive");
+    assert!(!survivor.is_deleted, "reassignment is not deletion");
+    assert_eq!(survivor.owner_key_id, Some(successor_id), "ownership moved to the successor");
+}
+
+/// **§6** — "Data is never destroyed implicitly."
+///
+/// Even when the caller *asks* for deletion, the hook goes to the trash rather than being dropped:
+/// its parameters, permission grants, and execution history survive, and the 92-day purge stays the
+/// only thing that destroys them. Explicit does not have to mean irreversible.
+#[tokio::test]
+async fn s6_resolving_by_delete_trashes_the_hook_without_destroying_its_history() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("history.sh", "#!/bin/sh\necho ran\n");
+
+    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
+    let (parent_id, _parent) = insert_key(&db, "parent", "", KeyScopes {
+        can_manage_keys: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    })
+    .await;
+    set_parent(&db, owner_id, parent_id).await;
+    let hook = insert_hook_owned_by(&db, "historic_hook", &script, owner_id).await;
+    insert_parameter(&db, hook, "p1", Some("v"), false).await;
+    grant(&db, owner_id, hook, true, true).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // Give it a run worth preserving.
+    let run = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &owner, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK);
+
+    let done = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": { hook.to_string(): { "action": "delete" } } })),
+        ),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{}", done.raw);
+
+    // The hook row survives, flagged.
+    let row = fetch_hook_row(&db, hook).await.expect("the row must survive a resolved delete");
+    assert!(row.is_deleted, "it went to the trash");
+
+    // ...and so did the history, even though the key that made it is gone.
+    let history = Execution::find().all(&db).await.expect("querying executions succeeds");
+    assert_eq!(history.len(), 1, "the run survives its author");
+    assert_eq!(history[0].api_key_id, None, "attribution is nulled, not cascaded away");
+
+    // Master can still see and restore it — nothing was silently destroyed.
+    let trashed = send(&app, json_request("GET", &format!("/api/hooks/{hook}?include_deleted=true"), &master, None)).await;
+    assert_eq!(trashed.status, StatusCode::OK, "master can still reach it: {}", trashed.raw);
+}
+
+/// **§6** — a subtree owning nothing still deletes in one request.
+///
+/// The inventory is a gate, not a toll: introducing a mandatory second round-trip for the ordinary
+/// case would be a regression dressed as a safety feature.
+#[tokio::test]
+async fn s6_a_subtree_owning_nothing_deletes_in_a_single_request() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    let (parent_id, _parent) = insert_key(&db, "parent", "", KeyScopes {
+        can_manage_keys: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    })
+    .await;
+    let (daughter_id, _daughter) = insert_key(&db, "daughter", "", KeyScopes::plain()).await;
+    set_parent(&db, daughter_id, parent_id).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let done = send(&app, json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None)).await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "no body required: {}", done.raw);
+    assert!(ApiKey::find_by_id(parent_id).one(&db).await.expect("query").is_none());
+    assert!(
+        ApiKey::find_by_id(daughter_id).one(&db).await.expect("query").is_none(),
+        "the cascade still ran"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
 // RBAC_MODEL.md §4 — visibility scopes and oracle discipline
 // ─────────────────────────────────────────────────────────────
 
