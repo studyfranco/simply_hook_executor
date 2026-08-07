@@ -42,6 +42,43 @@ const MAX_CONCURRENT_JOBS: i32 = 1_000;
 /// Default page size for the paginated listing endpoints.
 const DEFAULT_PAGE_LIMIT: u64 = 50;
 
+/// A [`Json`] extractor whose deserialization failures come back as [`AppError::InvalidInput`].
+///
+/// Axum's own `Json` rejection renders as a bare `text/plain` body, which would break the
+/// `{"error": "..."}` contract every other failure on these routes honours — a client parsing the
+/// refusal would see no `error` field at all. Since the key-administration payloads are
+/// `deny_unknown_fields` (see [`CreateApiKeyPayload`]), a rejected field is now a *routine,
+/// security-relevant* outcome rather than an exotic one, so it has to read like every other refusal.
+///
+/// The serde message is passed through verbatim, so a caller that sent `is_master` is told exactly
+/// which field was refused rather than being left to guess at a generic "bad request".
+///
+/// The rejection's own **status** is passed through too, which matters more than it looks: the
+/// 1 MiB body limit also arrives here as a `Json` rejection, and mapping every rejection to `400`
+/// would quietly demote `413 Payload Too Large` to an indistinguishable bad request. Only the
+/// response shape is normalized; the status is the extractor's to decide.
+pub struct StrictJson<T>(pub T);
+
+impl<T, S> axum::extract::FromRequest<S> for StrictJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                Err(AppError::BodyRejected(rejection.status(), rejection.body_text()))
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
@@ -342,7 +379,6 @@ fn normalize_run_as_user(
 /// to contain than it was to create.
 fn require_master_to_grant_scopes(
     key: &api_key::Model,
-    is_master: Option<bool>,
     can_manage_keys: Option<bool>,
     can_manage_hooks: Option<bool>,
 ) -> Result<(), AppError> {
@@ -350,8 +386,10 @@ fn require_master_to_grant_scopes(
         return Ok(());
     }
 
-    let requested: [(&str, bool); 3] = [
-        ("is_master", is_master.unwrap_or(false)),
+    // `is_master` is deliberately absent: it is no longer a field on either payload, so there is
+    // nothing here to gate. Refusing it is the deserializer's job now (`deny_unknown_fields`), and
+    // it applies to master callers too — which this guard, by design, does not.
+    let requested: [(&str, bool); 2] = [
         ("can_manage_keys", can_manage_keys.unwrap_or(false)),
         ("can_manage_hooks", can_manage_hooks.unwrap_or(false)),
     ];
@@ -392,6 +430,100 @@ fn require_master_to_administer(
     );
     Err(AppError::Forbidden(format!(
         "Only master API keys can {action} a master key"
+    )))
+}
+
+/// Refuses an action against the master key that no caller — **including the master itself** —
+/// may perform through the API.
+///
+/// [`require_master_to_administer`] answers a different question: it stops *other* keys from
+/// touching the master. Once the constraint in
+/// `m20230106_000001_master_key_uniqueness` guarantees there is exactly one master, "another key
+/// administering the master" and "the master administering itself" are the same request, and the
+/// second one was still permitted.
+///
+/// `RBAC_MODEL.md` §5 closes it: the master cannot be deleted or rotated through the API at all.
+/// Rotation is the sharper of the two — it returns the new plaintext secret in its response, so a
+/// single request against a stolen-but-IP-bound master credential both harvests a fresh secret and
+/// invalidates the operator's copy. Deletion is barred "regardless of row count" so that the rule
+/// does not silently depend on the uniqueness index for its safety: two independent controls, not
+/// one control leaning on another.
+///
+/// Regeneration remains possible, deliberately out of band: delete the row directly in the
+/// database and restart, and [`crate::main`] mints a fresh master against the empty table.
+fn refuse_master_lifecycle_action(target: &api_key::Model, action: &str) -> Result<(), AppError> {
+    if !target.is_master {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        target = %target.prefix,
+        action,
+        "Attempt to {action} the master key through the API"
+    );
+    Err(AppError::Forbidden(format!(
+        "The master API key cannot be {action}d through the API; remove its row directly in the \
+         database and restart to re-mint it"
+    )))
+}
+
+/// Restricts an update targeting the master key to its own `bound_ips`, and to the master itself.
+///
+/// `RBAC_MODEL.md` §5 makes the master immutable through the API "except for its own `bound_ips`".
+/// That exception is narrow on purpose. `bound_ips` is the one field an operator has a legitimate,
+/// recurring need to change from inside the running system — the network the master is reachable
+/// from moves — and it is the one field that can only ever *reduce* the credential's usefulness to
+/// an attacker who lacks the operator's network position.
+///
+/// Every other field fails that test. `name` rewrites what the audit log calls the root of trust;
+/// `max_concurrent_jobs` is a resource lever; `hmac_mode` could downgrade the master to
+/// `BODY_ONLY`, which carries no replay protection at all. None of them has a reason to be
+/// reachable, so none of them is.
+///
+/// The `key.id != target.id` arm is unreachable while exactly one master row exists, and is
+/// written anyway: it is the assertion that keeps §5's "which it alone may edit" true by
+/// construction rather than as a side effect of the uniqueness index holding.
+fn require_master_self_edit_is_bound_ips_only(
+    key: &api_key::Model,
+    target: &api_key::Model,
+    payload: &UpdateApiKeyPayload,
+) -> Result<(), AppError> {
+    if !target.is_master {
+        return Ok(());
+    }
+
+    if key.id != target.id {
+        return Err(AppError::Forbidden(
+            "Only the master API key itself may edit the master key's bound_ips".to_owned(),
+        ));
+    }
+
+    let other_fields: [(&str, bool); 4] = [
+        ("name", payload.name.is_some()),
+        ("max_concurrent_jobs", payload.max_concurrent_jobs.is_some()),
+        ("hmac_mode", payload.hmac_mode.is_some()),
+        ("can_manage_keys", payload.can_manage_keys.is_some()),
+    ];
+    let requested = other_fields
+        .into_iter()
+        .find(|(_, present)| *present)
+        .map(|(field, _)| field)
+        // Split out so the array stays a fixed-size literal: `can_manage_hooks` is checked on the
+        // same footing as the four above.
+        .or_else(|| payload.can_manage_hooks.is_some().then_some("can_manage_hooks"));
+
+    let Some(field) = requested else {
+        return Ok(());
+    };
+
+    tracing::warn!(
+        key = %key.prefix,
+        field,
+        "Attempt to modify a master key field other than bound_ips"
+    );
+    Err(AppError::Forbidden(format!(
+        "The master API key is immutable except for its own 'bound_ips'; '{field}' cannot be \
+         changed through the API"
     )))
 }
 
@@ -1871,7 +2003,18 @@ pub async fn purge_executions(
 // ─────────────────────────────────────────────────────────────
 
 /// Payload for creating an API key.
+///
+/// Carries **no `is_master` field**, per `RBAC_MODEL.md` §5: master status is not settable through
+/// any endpoint, and the only key that ever holds it is the one [`crate::main`] mints at bootstrap
+/// against an empty table.
+///
+/// `deny_unknown_fields` is what turns that omission into an actual refusal rather than a silent
+/// one. Serde ignores unknown fields by default, so without it `{"name":"x","is_master":true}`
+/// would return `200` and a perfectly ordinary key — leaving the caller believing it had minted a
+/// master, and leaving an operator reading the audit log with no record that anyone tried. Strict
+/// deserialization makes the attempt an explicit `400` naming the field.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateApiKeyPayload {
     /// Human-readable name.
     pub name: String,
@@ -1882,8 +2025,6 @@ pub struct CreateApiKeyPayload {
     /// Signature verification mode. Defaults to `CANONICAL_V1`; `BODY_ONLY` opts out of replay
     /// protection for third-party webhook senders whose format cannot be changed.
     pub hmac_mode: Option<HmacMode>,
-    /// Master flag.
-    pub is_master: Option<bool>,
     /// Global key-management scope.
     pub can_manage_keys: Option<bool>,
     /// Global hook-creation scope.
@@ -1987,7 +2128,7 @@ pub async fn create_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateApiKeyPayload>,
+    StrictJson(payload): StrictJson<CreateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -1996,12 +2137,7 @@ pub async fn create_api_key(
     // Checked before any field validation, for the same reason `run_as_user` is in the hook
     // handlers: an escalation attempt must surface as `403` rather than be masked by a `400` about
     // some unrelated field in the same payload.
-    require_master_to_grant_scopes(
-        &key,
-        payload.is_master,
-        payload.can_manage_keys,
-        payload.can_manage_hooks,
-    )?;
+    require_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
@@ -2027,7 +2163,9 @@ pub async fn create_api_key(
         hmac_mode: Set(hmac_mode),
         bound_ips: Set(payload.bound_ips.clone()),
         max_concurrent_jobs: Set(max_concurrent_jobs),
-        is_master: Set(payload.is_master.unwrap_or(false)),
+        // Hard-wired, not read from the payload. There is no field to read, and the database's
+        // `master_marker` unique index would reject the row even if there were.
+        is_master: Set(false),
         can_manage_keys: Set(payload.can_manage_keys.unwrap_or(false)),
         can_manage_hooks: Set(payload.can_manage_hooks.unwrap_or(false)),
         created_at: Set(now),
@@ -2077,8 +2215,12 @@ pub async fn list_api_keys(
 }
 
 /// Payload for updating an existing API key. Excludes `is_master`: promoting or demoting master
-/// status is deliberately not exposed through a generic update endpoint.
+/// status is deliberately not exposed through a generic update endpoint (`RBAC_MODEL.md` §5).
+///
+/// Strict for the same reason as [`CreateApiKeyPayload`] — an `is_master` here must be refused
+/// aloud, not dropped on the floor.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateApiKeyPayload {
     /// New name.
     pub name: Option<String>,
@@ -2100,7 +2242,7 @@ pub async fn update_api_key(
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateApiKeyPayload>,
+    StrictJson(payload): StrictJson<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -2111,9 +2253,11 @@ pub async fn update_api_key(
     // Editing a master key is master-only: `bound_ips` alone would otherwise let a key manager
     // widen (or strand) the network binding of the system's root credential.
     require_master_to_administer(&key, &target, "update")?;
+    // ...and even for the master itself, `bound_ips` is the *only* field it reaches.
+    require_master_self_edit_is_bound_ips_only(&key, &target, &payload)?;
     // `UpdateApiKeyPayload` deliberately carries no `is_master` field, so promotion is impossible
     // through this route regardless; the other two global scopes still need the gate.
-    require_master_to_grant_scopes(&key, None, payload.can_manage_keys, payload.can_manage_hooks)?;
+    require_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
@@ -2184,6 +2328,7 @@ pub async fn delete_api_key(
     // available for the audit entry below.
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     require_master_to_administer(&key, &target, "delete")?;
+    refuse_master_lifecycle_action(&target, "delete")?;
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
 
@@ -2234,6 +2379,7 @@ pub async fn rotate_api_key(
     // The response hands back the new plaintext secret, so rotating someone else's master key is
     // credential theft with a lockout attached rather than mere administration.
     require_master_to_administer(&key, &target, "rotate")?;
+    refuse_master_lifecycle_action(&target, "rotate")?;
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
 

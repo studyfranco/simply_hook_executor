@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::*;
-use sea_orm::EntityTrait;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::json;
 use simply_hook_executor::{
-    config::RuntimeConfig, create_app, entities::prelude::Execution,
+    config::RuntimeConfig, create_app,
+    entities::{api_key, prelude::ApiKey, prelude::Execution},
     retention::purge_expired_executions, spawn_retention_worker, state::AppState,
 };
 use uuid::Uuid;
@@ -3858,6 +3859,11 @@ async fn seed_local_manager(
 }
 
 /// Finding #1 — `can_manage_keys` could mint a key with `is_master: true` and become master.
+///
+/// `RBAC_MODEL.md` §5 widened the rule since: `is_master` is not a field on any payload, so the
+/// refusal now comes from the deserializer rather than from an authorization guard, and it applies
+/// to *every* caller rather than only to non-masters. That is the point — see
+/// [`even_a_master_cannot_mint_a_second_master`].
 #[tokio::test]
 async fn regression_non_master_cannot_mint_a_master_key() {
     let db = setup_test_db().await;
@@ -3869,8 +3875,12 @@ async fn regression_non_master_cannot_mint_a_master_key() {
         json_request("POST", "/api/keys", &manager, Some(json!({ "name": "escalated", "is_master": true }))),
     )
     .await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN, "minting a master key must be refused");
+    assert!(res.status.is_client_error(), "minting a master key must be refused");
     assert!(res.string("error").contains("is_master"), "the refusal names the offending scope");
+    assert!(
+        res.json.get("plaintext_key").is_none(),
+        "a refused creation must not have minted a credential"
+    );
 
     // The other two global scopes are self-amplifying in the same way and are gated identically.
     for scope in ["can_manage_keys", "can_manage_hooks"] {
@@ -3954,9 +3964,186 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.field("is_master"), &json!(true));
 
-    // A master peer may still administer it — the gate is "master only", not "nobody".
+    // `RBAC_MODEL.md` §5 closes the last door: rotation of a master key is refused for *every*
+    // caller, the master itself included. Previously the gate read "master only", which — now that
+    // exactly one master row can exist — meant "the master may rotate itself", and rotation hands
+    // back the new plaintext secret in its response. A stolen master credential could therefore
+    // mint itself a fresh one and lock the operator out with a single request.
     let by_master = send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &master, None)).await;
-    assert_eq!(by_master.status, StatusCode::OK);
+    assert_eq!(by_master.status, StatusCode::FORBIDDEN, "even the master may not rotate itself");
+    assert!(by_master.json.get("plaintext_key").is_none(), "no secret may leak in the refusal body");
+
+    let self_delete =
+        send(&app, json_request("DELETE", &format!("/api/keys/{master_id}"), &master, None)).await;
+    assert_eq!(self_delete.status, StatusCode::FORBIDDEN, "even the master may not delete itself");
+}
+
+// ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §5 — Master key guarantees
+// ─────────────────────────────────────────────────────────────
+
+/// §5: the master cannot mint a second master — and this is the *master's* refusal, not a
+/// non-master's.
+///
+/// The pre-existing guard was `require_master_to_grant_scopes`, which returns early for master
+/// callers. It stopped a `can_manage_keys` holder from escalating, but a master holding a stolen
+/// credential could mint a peer master and thereby survive the revocation of the original. §5
+/// makes "exactly one" mean exactly one, for everyone.
+#[tokio::test]
+async fn even_a_master_cannot_mint_a_second_master() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let res = send(
+        &app,
+        json_request("POST", "/api/keys", &master, Some(json!({ "name": "peer", "is_master": true }))),
+    )
+    .await;
+    assert!(res.status.is_client_error(), "a master minting a second master must be refused");
+    assert!(res.string("error").contains("is_master"), "the refusal names the offending field");
+
+    // Exactly one master row survives, and it is the original.
+    let masters = ApiKey::find()
+        .filter(api_key::Column::IsMaster.eq(true))
+        .all(&db)
+        .await
+        .expect("querying keys succeeds");
+    assert_eq!(masters.len(), 1, "the table still holds exactly one master");
+}
+
+/// §5: an update payload carrying `is_master` is refused rather than silently ignored.
+///
+/// Serde's default is to drop unknown fields, which would have returned `200` and an ordinary key,
+/// leaving the caller believing the promotion had taken and the audit log recording a successful
+/// update. `deny_unknown_fields` is what makes the refusal audible.
+#[tokio::test]
+async fn an_update_payload_carrying_is_master_is_refused_rather_than_ignored() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let (victim_id, _victim) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+
+    let res = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/keys/{victim_id}"),
+            &master,
+            Some(json!({ "is_master": true })),
+        ),
+    )
+    .await;
+    assert!(res.status.is_client_error(), "promotion through update must be refused");
+    assert!(res.string("error").contains("is_master"), "the refusal names the offending field");
+
+    let victim = ApiKey::find_by_id(victim_id)
+        .one(&db)
+        .await
+        .expect("querying the key succeeds")
+        .expect("the key still exists");
+    assert!(!victim.is_master, "the target key was not promoted");
+}
+
+/// §5: the *database* refuses a second master, independently of every handler.
+///
+/// This is the control that has to hold when application logic is wrong, bypassed, or not involved
+/// at all — a migration, a restored backup, an operator at a SQL prompt. It writes the row
+/// directly through SeaORM, taking the same path `tests/common` uses to seed fixtures, so nothing
+/// in `src/api.rs` participates in the refusal.
+#[tokio::test]
+async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
+    let db = setup_test_db().await;
+    let (_id, _master) = insert_key(&db, "the-master", "", KeyScopes::master()).await;
+
+    let plaintext = simply_hook_executor::api::generate_random_key();
+    let now = chrono::Utc::now().naive_utc();
+    let second = api_key::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        key_hash: Set(simply_hook_executor::api::hash_key(&plaintext)),
+        name: Set("smuggled-master".to_owned()),
+        prefix: Set(plaintext.chars().take(8).collect()),
+        key_id: Set(Some(simply_hook_executor::api::generate_key_id())),
+        signing_secret: Set(None),
+        hmac_mode: Set(simply_hook_executor::entities::api_key::HmacMode::CanonicalV1),
+        bound_ips: Set(Some(String::new())),
+        max_concurrent_jobs: Set(10),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_hooks: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await;
+
+    assert!(second.is_err(), "the unique index must refuse a second master row");
+
+    // ...while ordinary keys are entirely unaffected: the constraint is on the *marker*, which is
+    // NULL for every non-master, and NULLs do not collide. A constraint that also capped the
+    // number of ordinary keys at one would pass the assertion above and be catastrophic.
+    for name in ["ordinary-a", "ordinary-b", "ordinary-c"] {
+        insert_key(&db, name, "", KeyScopes::plain()).await;
+    }
+    let total = ApiKey::find().all(&db).await.expect("querying keys succeeds").len();
+    assert_eq!(total, 4, "one master plus three ordinary keys coexist");
+}
+
+/// §5: the master may edit its own `bound_ips`, and nothing else.
+#[tokio::test]
+async fn the_master_may_edit_only_its_own_bound_ips() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    // The one permitted edit. `127.0.0.0/8` still contains the test client, so the credential
+    // stays usable and the assertions below are about authorization, not about lockout.
+    let allowed = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/keys/{master_id}"),
+            &master,
+            Some(json!({ "bound_ips": "127.0.0.0/8,::1/128" })),
+        ),
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::OK, "the master may narrow its own bound_ips");
+    assert_eq!(allowed.string("bound_ips"), "127.0.0.0/8,::1/128");
+
+    // Everything else on the same payload shape is refused, one field at a time so a passing
+    // assertion cannot be an artifact of some *other* field in the same body being caught first.
+    for (field, value) in [
+        ("name", json!("renamed-master")),
+        ("max_concurrent_jobs", json!(999)),
+        ("hmac_mode", json!("BODY_ONLY")),
+        ("can_manage_keys", json!(false)),
+        ("can_manage_hooks", json!(false)),
+    ] {
+        let res = send(
+            &app,
+            json_request(
+                "PUT",
+                &format!("/api/keys/{master_id}"),
+                &master,
+                Some(json!({ field: value })),
+            ),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "the master's '{field}' must be immutable");
+        assert!(res.string("error").contains(field), "the refusal names '{field}'");
+    }
+
+    // None of the refusals partially applied.
+    let reloaded = ApiKey::find_by_id(master_id)
+        .one(&db)
+        .await
+        .expect("querying the key succeeds")
+        .expect("the master still exists");
+    assert_eq!(reloaded.name, "master");
+    assert_eq!(reloaded.max_concurrent_jobs, 10);
+    assert!(reloaded.can_manage_keys && reloaded.can_manage_hooks);
+    assert_eq!(reloaded.bound_ips.as_deref(), Some("127.0.0.0/8,::1/128"));
 }
 
 /// Finding #3 — `can_manage_keys` could write itself an execute grant on any hook, including one
@@ -4233,26 +4420,27 @@ async fn a_trusted_proxy_can_still_present_the_real_client_address() {
 /// decorative — while the dashboard displayed it as enforced.
 #[tokio::test]
 async fn bound_ips_restricts_master_keys_as_well() {
-    let db = setup_test_db().await;
-    let app = create_app(test_state(&db));
+    // One database per case. `RBAC_MODEL.md` §5 is now enforced by a unique index, so a single
+    // database can hold exactly one master row — seeding three side by side is no longer possible
+    // and, more to the point, no longer a state the service can ever be in.
+    async fn master_bound_to(allowlist: &str) -> StatusCode {
+        let db = setup_test_db().await;
+        let app = create_app(test_state(&db));
+        let (_id, master) = insert_key(&db, "the-master", allowlist, KeyScopes::master()).await;
+        send(&app, json_request("GET", "/api/auth/me", &master, None)).await.status
+    }
 
-    let (_id, bound_master) = insert_key(&db, "bound-master", "10.0.0.0/8", KeyScopes::master()).await;
-    let res = send(&app, json_request("GET", "/api/auth/me", &bound_master, None)).await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN, "a bound master key is held to its own allowlist");
+    assert_eq!(
+        master_bound_to("10.0.0.0/8").await,
+        StatusCode::FORBIDDEN,
+        "a bound master key is held to its own allowlist"
+    );
 
     // A master key that should reach the API from anywhere says so by leaving bound_ips empty...
-    let (_id, free_master) = insert_key(&db, "free-master", "", KeyScopes::master()).await;
-    assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &free_master, None)).await.status,
-        StatusCode::OK
-    );
+    assert_eq!(master_bound_to("").await, StatusCode::OK);
 
     // ...or by naming ranges that actually include the caller.
-    let (_id, local_master) = insert_key(&db, "local-master", "127.0.0.0/8,::1/128", KeyScopes::master()).await;
-    assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &local_master, None)).await.status,
-        StatusCode::OK
-    );
+    assert_eq!(master_bound_to("127.0.0.0/8,::1/128").await, StatusCode::OK);
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -2614,11 +2614,15 @@ a migration-bearing change, not a handler-only one.
 
 ### Master Key Handling
 
+**All four items RESOLVED in Phase 0** — see "Phase 0 — Master Key Integrity" below. Original
+verdicts retained for the record.
+
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
-| Exactly one master, DB-enforced | **DOES NOT IMPLEMENT** | No partial unique index anywhere in `src/migration/` — `grep -n "is_master" src/migration/*.rs` returns nothing, so the column carries no constraint at all. Uniqueness is application convention only: `bootstrap_master_key` (`src/main.rs:65`) mints one *if none exists*, and `CreateApiKeyPayload` (`src/api.rs:662`) accepts `is_master: bool`, so **a master can currently create a second master through the API**. |
-| Master immutable except own `bound_ips` | **VIOLATES** | `update_api_key` (`src/api.rs:2096`) gates master targets behind `require_master_to_administer`, but a master editing itself passes, and `UpdateApiKeyPayload` reaches `name`, `bound_ips`, `max_concurrent_jobs` and `hmac_mode`. `rotate_api_key` (`src/api.rs:2187`) is likewise reachable for a master on itself, which the model forbids outright. |
-| Master not deletable through the API | **COMPLIES**, incidentally | `delete_api_key` (`src/api.rs:2170`) refuses `id == key.id` ("Cannot delete yourself"), and `require_master_to_administer` blocks non-masters from deleting a master. With exactly one master those two combine to make it undeletable — but the guarantee rests on the uniqueness that is *not* enforced (row above). A second master could delete the first. Compliant today, fragile by construction. |
+| Exactly one master, DB-enforced | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** | No partial unique index anywhere in `src/migration/` — `grep -n "is_master" src/migration/*.rs` returns nothing, so the column carries no constraint at all. Uniqueness is application convention only: `bootstrap_master_key` (`src/main.rs:65`) mints one *if none exists*, and `CreateApiKeyPayload` (`src/api.rs:662`) accepts `is_master: bool`, so **a master can currently create a second master through the API**. |
+| Master immutable except own `bound_ips` | ~~**VIOLATES**~~ → **RESOLVED** | `update_api_key` (`src/api.rs:2096`) gates master targets behind `require_master_to_administer`, but a master editing itself passes, and `UpdateApiKeyPayload` reaches `name`, `bound_ips`, `max_concurrent_jobs` and `hmac_mode`. `rotate_api_key` (`src/api.rs:2187`) is likewise reachable for a master on itself, which the model forbids outright. |
+| Master not deletable through the API | ~~**COMPLIES**, incidentally~~ → **RESOLVED** (now unconditional) | `delete_api_key` (`src/api.rs:2170`) refuses `id == key.id` ("Cannot delete yourself"), and `require_master_to_administer` blocks non-masters from deleting a master. With exactly one master those two combine to make it undeletable — but the guarantee rests on the uniqueness that is *not* enforced (row above). A second master could delete the first. Compliant today, fragile by construction. |
+| `is_master` unsettable via any endpoint | ~~**VIOLATES**~~ → **RESOLVED** | `CreateApiKeyPayload` carried `is_master: Option<bool>` and `create_api_key` wrote `Set(payload.is_master.unwrap_or(false))`; `require_master_to_grant_scopes` returns early for masters, so a master could set it. |
 
 ### Key Deletion and Ownership Inventory
 
@@ -2634,7 +2638,7 @@ a migration-bearing change, not a handler-only one.
 
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
-| Partial unique index on `is_master = true` | **DOES NOT IMPLEMENT** | Absent (see above). Also worth flagging for the implementation pass: SQLite and PostgreSQL both support partial indexes, MySQL does not — and `Cargo.toml` enables `sqlx-mysql`. A portable equivalent will be needed, or the SQL-agnostic claim narrows. |
+| Partial unique index on `is_master = true` | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** (Phase 0, portable equivalent) | Absent (see above). Also worth flagging for the implementation pass: SQLite and PostgreSQL both support partial indexes, MySQL does not — and `Cargo.toml` enables `sqlx-mysql`. A portable equivalent will be needed, or the SQL-agnostic claim narrows. |
 | Index on `parent_key_id` | **DOES NOT IMPLEMENT** | Column absent. |
 | Index on `owner_key_id` | **DOES NOT IMPLEMENT** | Column absent. |
 | Index on key-hash lookup column | **COMPLIES** | `key_hash` is `#[sea_orm(unique)]` (`src/entities/api_key.rs:48`) and the initial migration creates a unique index on it — the single authentication lookup path. |
@@ -2678,3 +2682,191 @@ that depend on them (four integration tests and two e2e blocks were rewritten *t
 deletion inventory — is blocked behind two new columns and an index, so it wants a migration first.
 Doing R2 alone, immediately, is worth considering: it is the item with a live security consequence,
 and it does not depend on any of the schema work.
+
+---
+
+## Phase 0 — Master Key Integrity (`RBAC_MODEL.md` §5)
+
+First phase of the implementation pass that follows the gap analysis above. Scope is §5 and the §7
+row that depends on it; nothing about R1/R2/R7, ownership, visibility, or cascade deletion is
+touched here.
+
+### Terminology finding, reported before implementing
+
+`RBAC_MODEL.md`'s Terminology table maps **dispatch target** → *Executor* and the resource-creation
+right → `can_create_executor`. **Neither exists in this repository.** The tables are `api_keys`,
+`hooks`, `hook_parameters`, `api_key_hook_permissions`, `executions`, `audit_logs`; `src/executor.rs`
+is the process-spawning engine, a module rather than a persisted entity, and `grep -rn "can_create"
+src/` returns nothing.
+
+A `Hook` is behaving as **both** roles the specification separates:
+
+- *Managed resource*: `api_key_hook_permissions` carries `(api_key_id, hook_id, can_execute,
+  can_manage)` under a unique index; multiple keys hold rows on one hook.
+- *Dispatch target*: the same `hooks` row carries `script_path` and `run_as_user` — the "point it at
+  an arbitrary target" power §1 insists is a separate right from key management. There is nowhere
+  else for it to live.
+
+The repo's `can_manage_hooks` plays the resource-creation role (`create_hook`, `src/api.rs:877`).
+
+**Consequence for Phases 2–4, unresolved:** creator-privacy has no column to hang on.
+`grant_full_hook_permission` gives a creator an ordinary permission row, byte-identical to a
+delegated one; there is no `owner_key_id` and no `created_by`. §4's dispatch-target rule ("visible
+exclusively to creator and Master") and §4's shared-resource rule ("a parent sees any key holding a
+permission row on a resource it manages") give *contradictory* answers for a single `Hook`. This
+needs an architectural decision — split the entity, or drop the dispatch-target role for this
+service — and Phase 2 should stop for it rather than assume.
+
+### What changed
+
+**1. Database-level master uniqueness — `m20230106_000001_master_key_uniqueness` (new).**
+
+`api_keys` gains `master_marker`, an INTEGER column **generated by the engine** as
+`CASE WHEN is_master THEN 1 ELSE NULL END`, under a plain unique index
+`idx_api_keys_master_marker`.
+
+Two choices worth recording, both forced:
+
+- *Plain unique index on a nullable column, not a partial index.* The natural spelling is
+  `CREATE UNIQUE INDEX … WHERE is_master`. PostgreSQL and SQLite accept it; MySQL has no `WHERE`
+  clause on `CREATE INDEX`, and `Cargo.toml` enables `sqlx-mysql`. A partial index would have left
+  MySQL deployments silently unprotected while every test (SQLite) passed. §5 anticipates this and
+  names the nullable-marker form as the portable equivalent.
+- *Generated, not application-maintained.* A marker the application writes could be bypassed by
+  writing `is_master = true` and leaving the marker `NULL` — which is exactly the "application logic
+  alone" §5 rules out. Deriving it holds against any writer: a future handler, a migration, a
+  restored backup, an operator at a SQL prompt.
+
+One dialect split: PostgreSQL generated columns must be `STORED` (it gained `VIRTUAL` only in 18),
+SQLite permits only `VIRTUAL` for a column added via `ALTER TABLE`, MySQL takes either. Two unit
+tests in the migration pin the pairing, because getting it backwards would fail only against a real
+server the suite never starts.
+
+`master_marker` is deliberately **absent from `api_key::Model`**. SeaORM builds explicit column
+lists from the entity, so an undeclared column never appears in an `INSERT` — required, since the
+engine rejects writes to a generated column.
+
+**2. `is_master` removed from every payload — `src/api.rs`.**
+
+`CreateApiKeyPayload` no longer has the field (`UpdateApiKeyPayload` never did), `create_api_key`
+hard-wires `is_master: Set(false)`, and `require_master_to_grant_scopes` drops the parameter.
+
+Both key payloads are now `#[serde(deny_unknown_fields)]`. **This is the part that matters.** Serde's
+default is to ignore unknown fields, so removing the field alone would have returned `200` and a
+perfectly ordinary key — leaving the caller believing it had minted a master, and leaving an
+operator reading the audit log with no record that anyone tried. Strict deserialization turns it
+into `422` naming the field:
+
+```
+{"error":"Failed to deserialize the JSON body into the target type: is_master: unknown field
+ `is_master`, expected one of `name`, `bound_ips`, `max_concurrent_jobs`, `hmac_mode`,
+ `can_manage_keys`, `can_manage_hooks` at line 1 column 12"}
+```
+
+**3. `StrictJson` extractor + `AppError::BodyRejected` — `src/api.rs`, `src/error.rs`.**
+
+Axum's own `Json` rejection renders as bare `text/plain`, which would break the `{"error": …}`
+envelope every other refusal on these routes uses — a client parsing the refusal would find no
+`error` field. Now that a rejected field is a *routine, security-relevant* outcome rather than an
+exotic one, it has to read like every other refusal.
+
+The first cut mapped every rejection to `AppError::InvalidInput` and **broke a real control**: the
+1 MiB body limit also surfaces as a `Json` rejection, so `oversized_request_bodies_are_rejected_
+before_a_handler_runs` went from `413` to `400`. `BodyRejected(StatusCode, String)` passes the
+extractor's own status through and normalizes only the response *shape*.
+
+**4. Master lifecycle and mutation guards — `src/api.rs`.**
+
+- `refuse_master_lifecycle_action` — delete and rotate on a master target are refused for **every**
+  caller, the master included. The pre-existing `require_master_to_administer` only stopped *other*
+  keys; once exactly one master row can exist, "only a master may administer a master" had collapsed
+  into "the master may administer itself", and rotation returns the new plaintext secret in its
+  response. One request against a stolen (but IP-bound) master credential both harvested a fresh
+  secret and locked the operator out. Deletion is barred *regardless of row count*, deliberately, so
+  the rule is two independent controls rather than one leaning on the uniqueness index.
+- `require_master_self_edit_is_bound_ips_only` — the master reaches `bound_ips` and nothing else.
+  That exception is narrow on purpose: `bound_ips` is the one field an operator has a recurring need
+  to change from inside the running system, and the one that can only ever *reduce* a stolen
+  credential's usefulness. `hmac_mode` is the sharpest of the refused fields — it could downgrade
+  the master to `BODY_ONLY`, which carries no replay protection at all.
+
+### Breaking changes
+
+| Change | Who is affected | Migration path |
+| :--- | :--- | :--- |
+| `POST /api/keys` with `is_master` → `422` (was `200` for a master caller, `403` otherwise) | Any tooling that minted master keys through the API | Stop. Delete the master row directly and restart to re-mint; the bootstrap banner is the only source of a master credential. |
+| `POST`/`PUT /api/keys*` now reject **any** unknown field → `422` | Clients sending extra/typo'd fields that were previously ignored | Send only documented fields. The refusal names the offending one. |
+| `POST /api/keys/{id}/rotate` on the master → `403` for every caller | Operators rotating the master through the API | Out of band: delete the row, restart, capture the new banner. |
+| `DELETE /api/keys/{id}` on the master → `403` for every caller | As above | As above. |
+| `PUT /api/keys/{id}` on the master with any field but `bound_ips` → `403` | Tooling renaming or re-tuning the master | Only `bound_ips` is editable. |
+| Migration aborts startup if two master rows already exist | Deployments in that state | See the operator SQL below. |
+
+### Operator SQL
+
+Before upgrading, check for the one state that blocks the migration:
+
+```sql
+-- Must return 0 or 1. Anything higher aborts startup on the next boot.
+SELECT COUNT(*) FROM api_keys WHERE is_master = TRUE;
+
+-- If it returns more than 1, list them and pick the one to keep.
+SELECT id, name, prefix, key_id, bound_ips, created_at
+FROM api_keys WHERE is_master = TRUE ORDER BY created_at;
+
+-- Demote the extras (preferred: keeps the credential usable at a lower tier)...
+UPDATE api_keys SET is_master = FALSE, can_manage_keys = TRUE
+WHERE is_master = TRUE AND id <> '<id-of-the-master-to-keep>';
+
+-- ...or remove them outright.
+DELETE FROM api_keys WHERE is_master = TRUE AND id <> '<id-of-the-master-to-keep>';
+```
+
+To regenerate the master after this phase (the API can no longer do it):
+
+```sql
+DELETE FROM api_keys WHERE is_master = TRUE;
+-- then restart the daemon and capture the bootstrap banner, which prints the
+-- plaintext key and signing secret exactly once.
+```
+
+### Test and script fallout
+
+- `bound_ips_restricts_master_keys_as_well` seeded **three** master keys into one database. Now one
+  database per case, via a local `master_bound_to(allowlist)` helper — the previous shape is not
+  merely disallowed, it is a state the service can no longer be in.
+- `regression_non_master_cannot_mint_a_master_key` asserted `403` and a guard-authored message. The
+  refusal now comes from the deserializer (`422`) and applies to every caller, so it asserts
+  `is_client_error()` plus the field name, and gains a check that no credential was minted.
+- `regression_non_master_cannot_rotate_update_or_delete_a_master_key` ended with "a master peer may
+  still administer it — the gate is 'master only', not 'nobody'". That is now exactly wrong; it
+  asserts `403` for master self-rotation and self-deletion instead.
+- `scripts/test_e2e.sh` minted a second master **twice**: once as "Signing Master" (for a signing
+  pair on master-only routes) and once as "Bound Master" (to prove `bound_ips` binds masters). Both
+  are impossible now. The first scrapes the signing secret from the bootstrap banner — the path a
+  real operator takes on first boot. The second drives the *real* master through the one field §5
+  leaves editable: narrow its own binding to a range excluding the test client, prove the direct
+  path is refused, prove the trusted proxy's header gets back in, and restore through that same
+  header. No pipes in the scrape: `grep -o | head -1` would SIGPIPE the upstream `grep` under
+  `pipefail` and report a successful scrape as a failed command.
+
+### New tests
+
+| Test | Asserts |
+| :--- | :--- |
+| `even_a_master_cannot_mint_a_second_master` | The master's own attempt is refused and exactly one master row survives |
+| `an_update_payload_carrying_is_master_is_refused_rather_than_ignored` | Refused aloud, and the target was not promoted |
+| `the_database_rejects_a_second_master_row_with_no_handler_involved` | Direct SeaORM insert fails — **and** three ordinary keys still coexist, so the constraint is on the marker rather than a cap on keys |
+| `the_master_may_edit_only_its_own_bound_ips` | `bound_ips` succeeds; five other fields refused one at a time, each refusal naming its field; nothing partially applied |
+| `each_backend_gets_the_only_storage_class_it_accepts` (unit) | Postgres `STORED`, SQLite/MySQL `VIRTUAL` |
+| `the_marker_is_derived_from_is_master_on_every_backend` (unit) | The marker is `GENERATED ALWAYS AS` over `is_master`, not assignable |
+| e2e §36 (20 checks) | The whole §5 contract against the real binary and the real bootstrap master |
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **195 passed** (83 unit + 112 integration), was 189 |
+| `./scripts/test_e2e.sh` | **721/721**, 0 failed, exit 0 — was 698 |
+| `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted, exit 0 |

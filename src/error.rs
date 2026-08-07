@@ -43,6 +43,17 @@ pub enum AppError {
     #[error("Too Many Requests: {0}")]
     TooManyRequests(String),
 
+    /// A request body an extractor refused before any handler ran, carrying the extractor's own
+    /// status verbatim.
+    ///
+    /// Exists so wrapping `Json` in a strict extractor cannot silently flatten *unrelated*
+    /// rejections into `400`. The body-size limit surfaces as a `Json` rejection too, and
+    /// collapsing it would turn a `413 Payload Too Large` — a distinct, separately tested control
+    /// — into an indistinguishable "bad request". The status is passed through; only the response
+    /// *shape* is normalized to the `{"error": ...}` envelope every other refusal uses.
+    #[error("Request rejected: {1}")]
+    BodyRejected(StatusCode, String),
+
     /// Internal server error.
     #[error("Internal Server Error")]
     Internal,
@@ -63,6 +74,7 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "Resource not found".to_owned()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
+            AppError::BodyRejected(status, msg) => (status, msg),
             AppError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "An internal server error occurred".to_owned(),

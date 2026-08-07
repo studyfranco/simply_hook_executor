@@ -805,11 +805,19 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
         print_response_body
     }
 
-    # A dedicated master key, so the all-methods checks below can sign master-only routes without
-    # scraping the bootstrap banner for its randomly-generated secret.
-    create_scoped_key "Signing Master" ',"is_master":true'
-    SIGNING_MASTER_KEY="$CREATED_KEY"
-    MASTER_SIGNING_SECRET="$CREATED_SIGNING_SECRET"
+    # The master signing pair, taken from the bootstrap banner.
+    #
+    # This used to mint a second master key through the API purely for convenience. `RBAC_MODEL.md`
+    # §5 forbids that — exactly one master exists, and the API cannot create another — so the
+    # banner is now the only source, which is also the path a real operator takes on first boot.
+    # No pipes: `grep -o | head -1` would SIGPIPE the upstream `grep` under `pipefail` and report a
+    # successful scrape as a failed command.
+    SIGNING_MASTER_KEY="$MASTER_KEY"
+    BANNER_SECRET_LINES=$(grep -oE 'Secret:   [0-9a-f]+' "$SERVER_LOG" || true)
+    MASTER_SIGNING_SECRET=${BANNER_SECRET_LINES%%$'\n'*}
+    MASTER_SIGNING_SECRET=${MASTER_SIGNING_SECRET##* }
+    check_local "${#MASTER_SIGNING_SECRET}" "64" \
+        "the bootstrap banner published the master signing secret"
 
     SIGN_SECRET="$EXEC_SIGNING_SECRET"
     SIGN_AUTH="X-API-Key: $EXEC_KEY"
@@ -2080,9 +2088,13 @@ KEYMGR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
 KEYMGR_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 # ── Finding #1: minting a master key ───────────────────────────────────────
+# `is_master` is no longer a field on the payload at all (`RBAC_MODEL.md` §5), so the refusal now
+# comes from strict deserialization rather than from an authorization guard — 422 rather than 403,
+# and it applies to every caller including the master. §36 proves the master half.
 api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"escalated","is_master":true}'
-check "403" "#1 a non-master cannot mint a master key"
+check "422" "#1 a non-master cannot mint a master key"
 check_true '.error | contains("is_master")' "the refusal names the offending scope"
+check_true '.plaintext_key == null' "no credential is minted by the refused request"
 
 api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"escalated","can_manage_keys":true}'
 check "403" "#1 a non-master cannot grant can_manage_keys"
@@ -2305,14 +2317,24 @@ api_call GET "/api/auth/me" "$HOSTPROXY_KEY" "" "198.51.100.7, 203.0.113.9"
 check "403" "the rightmost non-proxy hop wins, so an untrusted last hop is the client"
 
 # bound_ips now applies to master keys too — previously is_master skipped the check entirely.
-api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Bound Master","is_master":true,"bound_ips":"10.10.10.0/24"}'
-check "200" "create a master key bound to a range that excludes the caller"
-BOUND_MASTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
-api_call GET "/api/auth/me" "$BOUND_MASTER_KEY"
+#
+# This used to mint a throwaway second master bound to an excluding range. `RBAC_MODEL.md` §5 makes
+# that impossible, so the check drives the *real* master through the one field §5 leaves editable:
+# it narrows its own binding to a range the test client is not in, proves it is locked out on the
+# direct path, proves the trusted proxy's header brings it back, and restores the range through
+# that same header — the only address it answers on while narrowed.
+api_call PUT "/api/keys/$BOOTSTRAP_ID" "$MASTER_KEY" '{"bound_ips":"10.10.10.0/24"}'
+check "200" "the master narrows its own bound_ips, the one field §5 leaves editable"
+api_call GET "/api/auth/me" "$MASTER_KEY"
 check "403" "a master key is held to its own bound_ips rather than bypassing them"
 # ...and honouring the trusted proxy's header brings it back inside the range.
-api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "10.10.10.5"
+api_call GET "/api/auth/me" "$MASTER_KEY" "" "10.10.10.5"
 check "200" "the same master key is accepted from inside its bound range"
+# Restore, from inside the range, before anything else in the suite needs the master.
+api_call PUT "/api/keys/$BOOTSTRAP_ID" "$MASTER_KEY" '{"bound_ips":"0.0.0.0/0,::/0"}' "10.10.10.5"
+check "200" "the master widens its binding again from inside it"
+api_call GET "/api/auth/me" "$MASTER_KEY"
+check "200" "the master is reachable on the direct path once more"
 
 # ── 31. Convergence: anti-replay, full-URI signing, auth-before-authz ───────
 
@@ -2929,6 +2951,63 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     api_call GET "/api/auth/me" "$SIGNING_MASTER_KEY"
     check "200" "the backend still accepts unsigned bearer traffic from non-browser callers"
 fi
+
+# ── 36. RBAC_MODEL.md §5: master key guarantees ─────────────────────────────
+
+log_section "36. Master key integrity (RBAC_MODEL.md §5)"
+
+# Everything here runs against the real binary and the real bootstrap master, because §5 is about
+# the one credential the integration suite has to fabricate. The unit and integration tests seed a
+# master row directly; only this section exercises the master the daemon actually minted.
+
+# ── §5: no second master, from any caller ──────────────────────────────────
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"peer master","is_master":true}'
+check "422" "§5 not even the master may mint a second master"
+check_true '.error | contains("is_master")' "the refusal names the offending field"
+check_true '.plaintext_key == null' "no credential is minted by the refused request"
+
+api_call PUT "/api/keys/$ORDINARY_ID" "$MASTER_KEY" '{"is_master":true}'
+check "422" "§5 promotion through the update route is refused too"
+check_true '.error | contains("is_master")' "the update refusal names the offending field"
+
+api_call GET "/api/keys" "$MASTER_KEY"
+check "200" "list keys to count master rows"
+check_local "$(echo "$RESP_BODY" | jq -r '[.[] | select(.is_master == true)] | length')" "1" \
+    "§5 exactly one master key exists after every attempt above"
+
+# ── §5: the master is immutable except for its own bound_ips ───────────────
+# `bound_ips` itself is exercised in §15, which narrows and restores the real binding. Here the
+# point is the complement: every *other* field is refused, one at a time so that a passing check
+# cannot be an artifact of some other field in the same body being caught first.
+for FIELD_BODY in \
+    '{"name":"renamed master"}' \
+    '{"max_concurrent_jobs":999}' \
+    '{"hmac_mode":"BODY_ONLY"}' \
+    '{"can_manage_keys":false}' \
+    '{"can_manage_hooks":false}'
+do
+    api_call PUT "/api/keys/$BOOTSTRAP_ID" "$MASTER_KEY" "$FIELD_BODY"
+    check "403" "§5 the master rejects $FIELD_BODY"
+done
+
+# ── §5: the master cannot be rotated or deleted, by anyone ─────────────────
+# §30 already proves a non-master is refused. What is new is that the master itself is refused:
+# with exactly one master row, "only a master may administer a master" had collapsed into "the
+# master may administer itself", and rotation returns the new plaintext secret in its response.
+api_call POST "/api/keys/$BOOTSTRAP_ID/rotate" "$MASTER_KEY"
+check "403" "§5 even the master may not rotate itself"
+check_true '.plaintext_key == null' "no secret leaks in the rotation refusal"
+
+api_call DELETE "/api/keys/$BOOTSTRAP_ID" "$MASTER_KEY"
+check "403" "§5 even the master may not delete itself"
+
+# The credential is untouched by every refusal above — nothing partially applied.
+api_call GET "/api/auth/me" "$MASTER_KEY"
+check "200" "§5 the master credential still authenticates"
+check_jq ".is_master" "true" "§5 it is still master"
+check_jq ".name" "System Master" "§5 its name was never rewritten"
+check_jq ".max_concurrent_jobs" "10" "§5 its concurrency budget was never rewritten"
+check_jq ".hmac_mode" "CANONICAL_V1" "§5 it was never downgraded to BODY_ONLY"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
