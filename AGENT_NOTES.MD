@@ -3478,3 +3478,56 @@ arose and neither is closed:
 | `cargo test` | **227 passed** (84 unit + 129 integration + 14 compliance), was 213 |
 | `./scripts/test_e2e.sh` | **823/823**, 0 failed — unchanged |
 | `./scripts/verify_convergence.sh` | 15 converged, 2 known, 0 drifted |
+
+---
+
+## Comparative security audit, 2026-08-07 (read-only)
+
+`SECURITY_COMPARISON_REPORT.md` rewritten against the peer's completed Phase 5. No source file
+touched. Three things from it belong in this log because they are findings about *this* repository,
+not about the comparison:
+
+**1. The `RBAC_MODEL.md` identity check has now run for real, and passes.** The peer carries a copy
+(`example/simply_ip_vault/RBAC_MODEL.md`, mtime 2026-08-07 09:47) and `cmp` reports byte-identical.
+Every prior note in this file describing that check as pending is now stale. `verify_convergence.sh`
+reports `[OK] Canonical RBAC model (byte-identical)` — 16 converged, 1 known, 0 drifted.
+
+**2. Phase 1's recorded open question is a genuine weakness relative to the peer, not just an
+unfinished reading.** The note in "Phase 1 — Scope boundary recorded deliberately" said R2's wider
+reading over `require_manage` was an open question. The comparison settles it: `simply_ip_vault`
+carries four permission verbs (`can_read`/`can_write`/`can_delete`/`can_manage`) and uses
+`can_manage` for **permission-row administration only**, so R2's conjunction governs everything that
+verb can do. This service's two-verb model overloads `can_manage` to mean administration *and*
+content editing, so the conjunction covers half of it.
+
+The concrete consequence, which the Phase 1 note understated: a Daughter key (no `can_manage_keys`)
+holding a `can_manage` row can `PUT /api/hooks/{id}` and change `script_path` — repointing what
+binary the daemon executes. `require_master_for_privileged_hook` bounds this only for hooks carrying
+`run_as_user`, and `validate_script_path` bounds it only when `ALLOWED_SCRIPT_ROOTS` is set, which
+`src/config.rs` defaults to empty (unrestricted, with a startup warning). Closing it means either
+requiring the conjunction in `require_manage`, or splitting `can_manage` into an administrative and
+an operational verb as the peer did. The second is the better fix and the larger one.
+
+**3. This repository is stronger than the peer on §5, for a reason worth keeping.** The peer's
+`master_marker` is a plain `VARCHAR(16)` maintained by application code, so `is_master = true` with a
+`NULL` marker is a second master the database will accept. Ours is
+`GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)`, which is why
+`the_database_rejects_a_second_master_row_with_no_handler_involved` can insert with `is_master: true`
+and never mention the marker. If anyone is ever tempted to "simplify" that migration to a plain
+column, this is the reason not to.
+
+**Two smaller items to consider adopting from the peer**, neither urgent:
+
+- Its `§7` mutation makes the master-marker index **non-unique** rather than omitting it. That is the
+  realistic regression (a dropped `.unique()` still passes a presence check); ours only tested
+  omission. Our `s5_` catches it behaviourally, so coverage exists — the probe is just blunter.
+- Its compliance suite is self-contained with its own harness, so a refactor of the functional test
+  helpers cannot silently weaken it. Ours shares `tests/common` under `#[allow(dead_code)]`.
+
+**Specification defect, actionable only in concert with the peer.** `RBAC_MODEL.md`'s Terminology
+table names `can_create_webhooks` and `can_create_executor` as the resource-creation rights. Neither
+string exists in either codebase: the real names are `can_manage_webhooks` and `can_create_groups`
+(two rights, where the table allows one) in the peer, and `can_manage_hooks` here. The same table
+names an "Executor" entity this service does not have, which is what forced the dispatch-target role
+onto `hooks` and scope 3 onto `executions`. Fixing either requires editing both copies together —
+a unilateral edit forks the spec and breaks the identity check that just started passing.
