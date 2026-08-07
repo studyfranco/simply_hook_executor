@@ -2609,6 +2609,8 @@ open and is Phase 2's subject. Original verdicts retained for the record.
 
 ### Visibility
 
+**RESOLVED in Phase 3.** Original verdicts retained for the record.
+
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
 | Master sees everything | **COMPLIES** | `visible_hook_ids` (`src/api.rs:262`) returns `None` for master, applying no filter; `require_visibility` short-circuits. Asserted by `an_ungoverned_hook_stays_visible_and_manageable_by_a_master`. |
@@ -3154,4 +3156,143 @@ here so Phase 5's mutation report does not count it as enforced.
 | `cargo clippy --all-targets -- -D warnings` | clean |
 | `cargo test` | **203 passed** (84 unit + 119 integration), was 199 |
 | `./scripts/test_e2e.sh` | **754/754**, 0 failed — was 729 |
+| `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |
+
+---
+
+## Phase 3 — Visibility Scopes & Oracle Discipline (§4)
+
+The largest behavioural change of the five phases, and the one with the widest test fallout:
+15 integration tests and 23 e2e checks moved, almost all `403 → 404`.
+
+### The over-disclosure that was there
+
+`GET /api/keys` returned a full `ApiKeySummary` — global flags, `bound_ips`, and **every hook
+membership** — for *every key in the deployment*, to any `can_manage_keys` holder. One shared hook
+was enough to read another tenant's entire configuration; so was holding the scope and sharing
+nothing at all. §4 names this shape exactly: "a single shared resource must never become a keyhole
+into another parent's whole configuration."
+
+### Three scopes
+
+| Scope | Who | What they see |
+| :--- | :--- | :--- |
+| 1 — own subtree | the caller, plus every key transitively below it via `parent_key_id` | the full summary, minus raw secrets |
+| 2 — shared resource | any key holding a row on a hook the caller `can_manage` | `id`, `name`, rights **on the shared hooks alone**, `partial: true` |
+| 3 — creator-private | executions | the requesting key, and master |
+
+`MinimalApiKeyView` is a **separate type**, not an `ApiKeySummary` with fields blanked out. That is
+deliberate: adding a field to the full summary must not silently widen the minimal one. The compiler
+has to be told, every time.
+
+`partial: true` is on the minimal view because without it an abridged entry is indistinguishable
+from a key that genuinely holds nothing — a client would render "no global scopes" where the truth
+is "not shown".
+
+Anything outside all three scopes is **omitted from the listing entirely**, which is the listing
+form of oracle discipline: absent and invisible look the same.
+
+This is the one place `parent_key_id` is read, and §4/R3 sanction exactly this use — "solely for
+cascading deletion and visibility scoping". `descendant_key_ids` walks breadth-first with a `seen`
+set, which is not an optimization: the column carries no FK (see Phase 2), so nothing at the
+database level prevents a cycle, and a cycle inside a request handler would spin forever.
+
+### Scope 3, and the terminology gap it sits in
+
+`RBAC_MODEL.md` maps the creator-private scope to a "dispatch target" and names it *Executor*. **No
+such entity exists in this service** — the terminology check for Phase 0 established that, and
+nothing since has changed it. `executions` is the closest analogue: each row already records
+`api_key_id`, the key that requested it, and its `parameters_json`/stdout/stderr are that caller's
+data.
+
+So scope 3 is implemented on `executions`, and the consequence is a real narrowing: **a hook's
+manager no longer sees runs it did not make.** It sees that the hook exists and what it does; it
+does not see the arguments another tenant passed or the output they got back. Hook visibility stays
+as a second bound, so history for a hook the caller can no longer see disappears even for its own
+runs.
+
+Recorded plainly because it is a judgement call, not a derivation: the Terminology table maps
+"resource data (contained records)" to `—` for this service, so neither reading is forced by the
+text.
+
+### Oracle discipline, and the line it draws
+
+The rule is that an out-of-scope id must produce what a nonexistent id produces — same status, same
+body. Implementing that meant splitting one question into two:
+
+- **No permission row at all** → the hook is outside the caller's visibility scope → `404`.
+- **A row exists, but not the verb needed** → the caller can already see the hook → `403`.
+
+Collapsing these, as the code did, made every hook endpoint an existence oracle: `403` for a hook
+that exists, `404` for one that does not, from a caller entitled to neither. `verb_denied` is the
+helper that makes the split explicit at each call site.
+
+The same split runs through `require_hook_manage_conjunction`, and it took two attempts to get
+right. The first version checked `can_manage` before deciding visibility, so a caller holding
+`can_execute` alone got a `404` for a hook it could demonstrably see — a lie it could disprove with
+`GET /api/auth/me`. Visibility is decided by whether *any* row exists; only then does the verb
+matter.
+
+Name-based resolution is covered too. Hook names are guessable in a way UUIDs are not, so
+`GET /api/hooks/{name}` had to be tested for the same indistinguishability.
+
+### The two controls that must both hold
+
+§4 is explicit that oracle discipline "is a distinct control from the authenticate-then-authorize
+ordering rule ... Both hold simultaneously; neither may be satisfied by regressing the other."
+
+They govern different populations and pull in opposite directions:
+
+| Control | Population | Rule |
+| :--- | :--- | :--- |
+| Oracle discipline | **authenticated** callers | invisible must look nonexistent → `404` |
+| Authenticate-then-authorize | **unauthenticated** callers | unknown credential is `401`, never `403`, so `403` cannot confirm a guessed key exists |
+
+Making every refusal `404` breaks the second; making every refusal `403` breaks the first. Two tests
+name their control in their own titles so the pair cannot be quietly collapsed later:
+`s4_an_invisible_hook_is_indistinguishable_from_a_nonexistent_one` and
+`s4_unauthenticated_callers_cannot_probe_bound_ips_via_401_vs_403`.
+
+### Consequence worth flagging: delegation is now subtree-shaped
+
+Because `POST /api/keys/{id}/permissions` refuses an invisible target with `404`, a parent can only
+grant to keys **in its own subtree**, or ones already sharing a hook it manages. Two keys both
+created by master are siblings and invisible to each other.
+
+This follows from §4 rather than being chosen, and it matches how a deployment actually works — a
+parent delegates to daughters it created. But it changed a lot of test fixtures, which seeded keys
+flat: `set_parent` was added to `tests/common`, and `create_key_as` to the e2e, so an actor that
+must administer a target now *creates* it, as it would in practice.
+
+### Breaking changes
+
+| Change | Who is affected | Migration path |
+| :--- | :--- | :--- |
+| Hook routes return `404` instead of `403` when the caller holds no row | Clients branching on `403` to mean "exists but denied" | Treat `404` as "no access"; the distinction was an information leak |
+| `GET /api/keys` no longer returns unrelated keys, and returns shared-resource peers abridged | Dashboards enumerating all keys via a `can_manage_keys` credential | Use the master key, or accept the scoped view. `partial: true` marks abridged entries |
+| `PUT`/`DELETE`/`rotate` on a key outside the caller's subtree returns `404` | Tooling administering keys it did not create | The administering key must be the target's parent, or master |
+| `GET /api/executions*` returns only the caller's own runs | Dashboards showing per-hook history to hook managers | Master sees all history |
+
+### Operator SQL — who loses visibility
+
+```sql
+-- Keys with no recorded parent. Every one of them is invisible to every non-master key, and
+-- (per Phase 2's backfill) that is every key predating lineage.
+SELECT id, name, prefix, can_manage_keys
+FROM api_keys
+WHERE parent_key_id IS NULL AND is_master = FALSE;
+
+-- Adopt an existing key into a parent's subtree, deliberately and one at a time. This grants
+-- visibility, not authority: R3 forbids deriving any right from lineage.
+UPDATE api_keys SET parent_key_id = '<parent-id>' WHERE id = '<child-id>';
+```
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **208 passed** (84 unit + 124 integration), was 203 |
+| `./scripts/test_e2e.sh` | **791/791**, 0 failed — was 754 |
 | `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |

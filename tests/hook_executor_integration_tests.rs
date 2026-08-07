@@ -1317,7 +1317,9 @@ async fn hooks_are_only_visible_to_keys_with_a_mapping() {
 
     let hidden = send(&app, json_request("GET", "/api/hooks", &unmapped, None)).await;
     assert_eq!(hidden.json.as_array().map(Vec::len), Some(0));
-    assert_eq!(send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &unmapped, None)).await.status, StatusCode::FORBIDDEN);
+    // §4 oracle discipline: an unmapped caller gets exactly what a nonexistent hook id gives, so
+    // the listing being empty and the direct fetch failing tell the same story.
+    assert_eq!(send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &unmapped, None)).await.status, StatusCode::NOT_FOUND);
 
     let all = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
     assert_eq!(all.json.as_array().map(Vec::len), Some(1));
@@ -1337,8 +1339,11 @@ async fn executing_without_can_execute_is_forbidden() {
     grant(&db, manage_only_id, hook_id, false, true).await;
 
     let uri = format!("/api/hooks/{hook_id}/execute");
+    // Two different refusals, and the difference is §4's whole point. The manage-only key *can*
+    // see the hook — it holds a row — so it is merely short a verb: `403`. The stranger holds
+    // nothing, so the hook is outside its visibility scope and must look nonexistent: `404`.
     assert_eq!(send(&app, json_request("POST", &uri, &manage_only, None)).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(send(&app, json_request("POST", &uri, &stranger, None)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(send(&app, json_request("POST", &uri, &stranger, None)).await.status, StatusCode::NOT_FOUND);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2342,9 +2347,11 @@ async fn granular_hook_permissions_separate_execute_from_manage() {
         ("DELETE", hook_uri.as_str()),
     ] {
         let body = if method == "PUT" { Some(json!({ "description": "x" })) } else { None };
+        // `404` throughout: the stranger holds no row, so §4 requires every one of these to be
+        // indistinguishable from a hook id that was never issued.
         assert_eq!(
             send(&app, json_request(method, uri, &stranger, body)).await.status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "{method} {uri} must be denied without a mapping"
         );
     }
@@ -2913,7 +2920,8 @@ async fn execution_history_is_scoped_and_filterable() {
     let bad_filter = send(&app, json_request("GET", "/api/executions?status=NOPE", &master, None)).await;
     assert_eq!(bad_filter.status, StatusCode::BAD_REQUEST);
 
-    // Reading another tenant's execution by id is forbidden, not merely filtered out.
+    // Reading another tenant's execution by id is refused, not merely filtered out — and refused
+    // as `404`, so the id cannot be used to confirm that a run happened at all (§4).
     let beta_exec_id = send(&app, json_request("GET", "/api/executions?hook=beta_hook", &master, None))
         .await
         .json[0]["id"]
@@ -2921,7 +2929,7 @@ async fn execution_history_is_scoped_and_filterable() {
         .unwrap_or_default()
         .to_owned();
     let cross_tenant = send(&app, json_request("GET", &format!("/api/executions/{beta_exec_id}"), &alpha, None)).await;
-    assert_eq!(cross_tenant.status, StatusCode::FORBIDDEN);
+    assert_eq!(cross_tenant.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3075,9 +3083,10 @@ async fn key_lifecycle_rotation_and_permission_assignment() {
     let worker_id = created.string("id");
     let worker_key = created.string("plaintext_key");
 
-    // No grant yet: execution denied.
+    // No grant yet: the hook is outside the worker's visibility scope entirely, so §4 requires the
+    // answer a nonexistent hook id gives.
     let uri = format!("/api/hooks/{hook_id}/execute");
-    assert_eq!(send(&app, json_request("POST", &uri, &worker_key, None)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(send(&app, json_request("POST", &uri, &worker_key, None)).await.status, StatusCode::NOT_FOUND);
 
     // Grant by hook name.
     let granted = send(
@@ -3112,7 +3121,8 @@ async fn key_lifecycle_rotation_and_permission_assignment() {
     )
     .await;
     assert_eq!(revoked.status, StatusCode::NO_CONTENT);
-    assert_eq!(send(&app, json_request("POST", &uri, &new_key, None)).await.status, StatusCode::FORBIDDEN);
+    // The row is gone, so the hook is invisible againrather than merely unusable (§4).
+    assert_eq!(send(&app, json_request("POST", &uri, &new_key, None)).await.status, StatusCode::NOT_FOUND);
 
     // A scoped key cannot manage keys at all.
     assert_eq!(
@@ -3942,8 +3952,11 @@ async fn regression_non_master_cannot_mint_a_master_key() {
 async fn regression_non_master_cannot_grant_global_scopes_by_update() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (_id, manager) = seed_key_manager(&db).await;
+    let (manager_id, manager) = seed_key_manager(&db).await;
     let (victim_id, _victim) = insert_key(&db, "ordinary", "", KeyScopes::plain()).await;
+    // The manager's own daughter, so the refusals below are about R4 rather than about §4 hiding
+    // an unrelated key behind a `404`.
+    set_parent(&db, victim_id, manager_id).await;
 
     for scope in ["can_manage_keys", "can_manage_hooks"] {
         let res = send(
@@ -3971,8 +3984,11 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
     let (master_id, master) = insert_key(&db, "system-master", "", KeyScopes::master()).await;
     let (_id, manager) = seed_key_manager(&db).await;
 
+    // `404` rather than `403` since §4 landed: the master is not in this manager's subtree and does
+    // not share a hook with it, so it is outside every visibility scope and must look like an id
+    // that was never issued. The refusal is no weaker — it is strictly less informative.
     let rotate = send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &manager, None)).await;
-    assert_eq!(rotate.status, StatusCode::FORBIDDEN, "rotating a master key must be refused");
+    assert_eq!(rotate.status, StatusCode::NOT_FOUND, "rotating a master key must be refused");
     assert!(rotate.json.get("plaintext_key").is_none(), "no secret may leak in the refusal body");
 
     let update = send(
@@ -3980,10 +3996,19 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
         json_request("PUT", &format!("/api/keys/{master_id}"), &manager, Some(json!({ "bound_ips": "0.0.0.0/0" }))),
     )
     .await;
-    assert_eq!(update.status, StatusCode::FORBIDDEN, "editing a master key must be refused");
+    assert_eq!(update.status, StatusCode::NOT_FOUND, "editing a master key must be refused");
 
     let delete = send(&app, json_request("DELETE", &format!("/api/keys/{master_id}"), &manager, None)).await;
-    assert_eq!(delete.status, StatusCode::FORBIDDEN, "deleting a master key must be refused");
+    assert_eq!(delete.status, StatusCode::NOT_FOUND, "deleting a master key must be refused");
+
+    // The `404`s above are §4 talking, not §5. To prove the master-specific guard still stands on
+    // its own, ask again as a caller the master *is* visible to — the master itself, whose refusals
+    // are `403` and name the reason.
+    assert_eq!(
+        send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &master, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "§5 still refuses rotation for a caller that can see the master"
+    );
 
     // The master credential still works, so none of the refused calls partially applied.
     let me = send(&app, json_request("GET", "/api/auth/me", &master, None)).await;
@@ -4172,6 +4197,275 @@ async fn the_master_may_edit_only_its_own_bound_ips() {
     assert_eq!(reloaded.max_concurrent_jobs, 10);
     assert!(reloaded.can_manage_keys && reloaded.can_manage_hooks);
     assert_eq!(reloaded.bound_ips.as_deref(), Some("127.0.0.0/8,::1/128"));
+}
+
+// ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §4 — visibility scopes and oracle discipline
+// ─────────────────────────────────────────────────────────────
+
+/// **§4** — "A single shared resource must never become a keyhole into another parent's whole
+/// configuration."
+///
+/// `GET /api/keys` previously returned a full summary — global flags, `bound_ips`, every hook
+/// membership — for *every key in the deployment* to any `can_manage_keys` holder. One shared hook
+/// was enough to read a competitor tenant's entire configuration; so was holding the scope and
+/// sharing nothing at all.
+#[tokio::test]
+async fn s4_a_shared_resource_discloses_only_id_name_and_rights_on_that_resource() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("shared.sh", "#!/bin/sh\nexit 0\n");
+
+    let shared = insert_hook(&db, "shared_hook", &script, 30).await;
+    let private = insert_hook(&db, "their_private_hook", &script, 30).await;
+
+    // Two unrelated parents, meeting only through `shared`.
+    let (ours_id, ours) = seed_parent_manager(&db, "our-parent", shared, true).await;
+    let (theirs_id, _theirs) = insert_key(&db, "their-parent", "10.9.8.0/24", KeyScopes {
+        can_manage_keys: true,
+        can_manage_hooks: true,
+        max_concurrent_jobs: 7,
+        ..Default::default()
+    })
+    .await;
+    grant(&db, theirs_id, shared, true, false).await;
+    grant(&db, theirs_id, private, true, true).await;
+
+    // ...and our own daughter, which we are entitled to see in full.
+    let (daughter_id, _daughter) = insert_key(&db, "our-daughter", "127.0.0.1/32", KeyScopes::plain()).await;
+    set_parent(&db, daughter_id, ours_id).await;
+    grant(&db, daughter_id, shared, true, false).await;
+
+    let listing = send(&app, json_request("GET", "/api/keys", &ours, None)).await;
+    assert_eq!(listing.status, StatusCode::OK);
+    let entries = listing.json.as_array().cloned().unwrap_or_default();
+
+    let find = |id: Uuid| {
+        entries
+            .iter()
+            .find(|e| e["id"].as_str() == Some(&id.to_string()))
+            .cloned()
+    };
+
+    // Ourselves and our daughter: full detail.
+    let self_view = find(ours_id).expect("the caller sees itself");
+    assert_eq!(self_view["bound_ips"], json!(""), "own entry is the full summary");
+    let daughter_view = find(daughter_id).expect("the caller sees its own daughter");
+    assert_eq!(daughter_view["bound_ips"], json!("127.0.0.1/32"), "own subtree is full detail");
+    assert_eq!(daughter_view["can_manage_keys"], json!(false), "including global flags");
+
+    // The other parent: minimal, and *only* because of the shared hook.
+    let their_view = find(theirs_id).expect("a key sharing a managed hook is visible in minimal form");
+    assert_eq!(their_view["partial"], json!(true), "the entry announces that it is abridged");
+    assert!(their_view.get("bound_ips").is_none(), "bound IPs stay hidden: {their_view}");
+    assert!(their_view.get("can_manage_keys").is_none(), "global flags stay hidden: {their_view}");
+    assert!(their_view.get("can_manage_hooks").is_none(), "...all of them: {their_view}");
+    assert!(their_view.get("prefix").is_none(), "and so does the key prefix: {their_view}");
+    assert!(their_view.get("max_concurrent_jobs").is_none(), "and the budget: {their_view}");
+
+    // The rights shown are on the shared hook alone — never the unrelated one.
+    let names: Vec<String> = their_view["hook_permissions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p["hook_name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(names, vec!["shared_hook".to_owned()], "unrelated memberships stay hidden");
+}
+
+/// **§4** — a key outside every scope is not listed at all. Omission is the listing form of oracle
+/// discipline: absent and invisible look the same.
+#[tokio::test]
+async fn s4_keys_outside_every_scope_are_omitted_from_the_listing() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("scope.sh", "#!/bin/sh\nexit 0\n");
+
+    let mine = insert_hook(&db, "my_hook", &script, 30).await;
+    let (ours_id, ours) = seed_parent_manager(&db, "our-parent", mine, true).await;
+    let (stranger_id, _stranger) = insert_key(&db, "unrelated", "", KeyScopes::plain()).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let listing = send(&app, json_request("GET", "/api/keys", &ours, None)).await;
+    let ids: Vec<String> = listing
+        .json
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e["id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(ids.contains(&ours_id.to_string()), "the caller sees itself");
+    assert!(!ids.contains(&stranger_id.to_string()), "an unrelated key is not listed at all");
+
+    // ...and is unreachable by id, with the answer a nonexistent id gives.
+    let by_id = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{stranger_id}"), &ours, Some(json!({ "name": "x" }))),
+    )
+    .await;
+    let invented = send(
+        &app,
+        json_request("PUT", &format!("/api/keys/{}", Uuid::new_v4()), &ours, Some(json!({ "name": "x" }))),
+    )
+    .await;
+    assert_eq!(by_id.status, StatusCode::NOT_FOUND, "an invisible key reads as nonexistent");
+    assert_eq!(by_id.status, invented.status, "identical status to an id that was never issued");
+    assert_eq!(by_id.raw, invented.raw, "and an identical body");
+
+    // Master sees everything, which is what makes the omission a scope rather than a bug.
+    let all = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+    assert_eq!(all.json.as_array().map(Vec::len), Some(3), "our parent, the stranger, and master");
+}
+
+/// **§4 oracle discipline** — an out-of-scope hook is byte-identical to a nonexistent one.
+///
+/// This is the control for *authenticated* callers distinguishing absent from invisible. Its
+/// counterpart, [`s4_unauthenticated_callers_cannot_probe_bound_ips_via_401_vs_403`], covers
+/// *unauthenticated* callers probing key bindings. Both must hold; neither may be satisfied by
+/// regressing the other.
+#[tokio::test]
+async fn s4_an_invisible_hook_is_indistinguishable_from_a_nonexistent_one() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("oracle.sh", "#!/bin/sh\nexit 0\n");
+
+    let real = insert_hook(&db, "a_real_hook", &script, 30).await;
+    let invented = Uuid::new_v4();
+    let (_id, outsider) = insert_key(&db, "outsider", "", KeyScopes::plain()).await;
+
+    for (method, suffix, body) in [
+        ("GET", "", None),
+        ("POST", "/execute", Some(json!({}))),
+        ("POST", "/test", None),
+        ("PUT", "", Some(json!({ "description": "x" }))),
+        ("DELETE", "", None),
+        ("GET", "/parameters", None),
+    ] {
+        let on_real = send(
+            &app,
+            json_request(method, &format!("/api/hooks/{real}{suffix}"), &outsider, body.clone()),
+        )
+        .await;
+        let on_invented = send(
+            &app,
+            json_request(method, &format!("/api/hooks/{invented}{suffix}"), &outsider, body),
+        )
+        .await;
+
+        assert_eq!(
+            on_real.status,
+            StatusCode::NOT_FOUND,
+            "{method} /api/hooks/{{id}}{suffix} on an invisible hook must read as nonexistent"
+        );
+        assert_eq!(
+            on_real.status, on_invented.status,
+            "{method}{suffix}: status differs between invisible and nonexistent"
+        );
+        assert_eq!(
+            on_real.raw, on_invented.raw,
+            "{method}{suffix}: body differs between invisible and nonexistent"
+        );
+    }
+
+    // Resolution by *name* must not leak either — names are guessable in a way UUIDs are not.
+    let by_name = send(&app, json_request("GET", "/api/hooks/a_real_hook", &outsider, None)).await;
+    let by_absent_name = send(&app, json_request("GET", "/api/hooks/no_such_hook", &outsider, None)).await;
+    assert_eq!(by_name.status, by_absent_name.status, "name lookup leaks existence by status");
+    assert_eq!(by_name.raw, by_absent_name.raw, "name lookup leaks existence by body");
+}
+
+/// **§4, third scope** — executions belong to the key that requested them.
+///
+/// Hook membership is not a licence to read another tenant's arguments and output. A manager sees
+/// *that a hook exists and what it does*; it does not see the `parameters_json`, stdout, or stderr
+/// of runs it did not make.
+#[tokio::test]
+async fn s4_executions_are_visible_only_to_the_key_that_requested_them() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("private.sh", "#!/bin/sh\necho secret-output\n");
+
+    let hook = insert_hook(&db, "shared_runner", &script, 30).await;
+    let (runner_id, runner) = insert_key(&db, "runner", "", KeyScopes::plain()).await;
+    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::plain()).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    grant(&db, runner_id, hook, true, false).await;
+    grant(&db, manager_id, hook, true, true).await;
+
+    let run = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &runner, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK);
+    let execution_id = run.string("id");
+
+    // The runner sees its own run.
+    let own = send(&app, json_request("GET", "/api/executions", &runner, None)).await;
+    assert_eq!(own.json.as_array().map(Vec::len), Some(1), "a key sees its own history");
+
+    // The manager holds *both* verbs on the hook and still sees nothing: it did not run it.
+    let theirs = send(&app, json_request("GET", "/api/executions", &manager, None)).await;
+    assert_eq!(
+        theirs.json.as_array().map(Vec::len),
+        Some(0),
+        "managing a hook is not licence to read another key's runs: {}",
+        theirs.raw
+    );
+    let by_id = send(&app, json_request("GET", &format!("/api/executions/{execution_id}"), &manager, None)).await;
+    assert_eq!(by_id.status, StatusCode::NOT_FOUND, "and reading one by id is refused as nonexistent");
+    assert!(!by_id.raw.contains("secret-output"), "no output leaks in the refusal: {}", by_id.raw);
+
+    // Master sees everything.
+    let all = send(&app, json_request("GET", "/api/executions", &master, None)).await;
+    assert_eq!(all.json.as_array().map(Vec::len), Some(1), "master sees all history");
+}
+
+/// **§4, the counterpart control** — authenticate before authorize, so an *unauthenticated* caller
+/// cannot probe `bound_ips` by reading `401` against `403`.
+///
+/// Named to say which control it covers, because the two are easy to confuse and each can be
+/// "fixed" by breaking the other. This one governs callers with no valid credential; the oracle
+/// discipline in [`s4_an_invisible_hook_is_indistinguishable_from_a_nonexistent_one`] governs
+/// callers who have one. Making every refusal a `404` would break this test; making every refusal a
+/// `403` would break that one.
+#[tokio::test]
+async fn s4_unauthenticated_callers_cannot_probe_bound_ips_via_401_vs_403() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    // A real key, bound to a range the test client is not in.
+    let (_id, bound) = insert_key(&db, "bound-elsewhere", "10.10.10.0/24", KeyScopes::plain()).await;
+
+    // No credential at all, and a credential that was never issued: both `401`, and identical.
+    let absent = send(&app, json_request("GET", "/api/hooks", "", None)).await;
+    let invented = send(&app, json_request("GET", "/api/hooks", "not-a-real-key", None)).await;
+    assert_eq!(absent.status, StatusCode::UNAUTHORIZED, "no credential is 401");
+    assert_eq!(invented.status, StatusCode::UNAUTHORIZED, "an unknown credential is 401");
+
+    // A *real* credential from the wrong network is `403`, not `401`. That difference is only
+    // reachable by someone already holding the secret, which is the point: the caller learns
+    // nothing it did not supply.
+    let wrong_network = send(&app, json_request("GET", "/api/hooks", &bound, None)).await;
+    assert_eq!(
+        wrong_network.status,
+        StatusCode::FORBIDDEN,
+        "a valid key from outside its bound_ips is 403: {}",
+        wrong_network.raw
+    );
+
+    // The ordering is the control: an unknown key from any address is 401, never 403, so `403`
+    // cannot be used to confirm that a guessed key string exists.
+    assert_ne!(
+        invented.status, wrong_network.status,
+        "authenticate-then-authorize: an unknown key must not answer like a bound one"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -4401,6 +4695,9 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
     let ordinary = insert_hook(&db, "ordinary_hook", &script, 30).await;
     let (manager_id, manager) = seed_key_manager(&db).await;
     let (victim_id, _victim) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+    // The manager's own daughter, so every refusal below is about the rule under test rather than
+    // about §4 hiding an unrelated key behind a `404`.
+    set_parent(&db, victim_id, manager_id).await;
 
     // Self-grant on the privileged hook: the original exploit.
     let self_grant = send(
@@ -4470,7 +4767,7 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
 
     // The grant never landed: the manager still cannot reach the privileged hook.
     let probe = send(&app, json_request("POST", &format!("/api/hooks/{privileged}/test"), &manager, None)).await;
-    assert_eq!(probe.status, StatusCode::FORBIDDEN);
+    assert_eq!(probe.status, StatusCode::NOT_FOUND);
 
     // A caller who *does* manage the hook may still delegate it — the scope keeps working.
     grant(&db, manager_id, ordinary, true, true).await;
@@ -5484,6 +5781,10 @@ async fn a_parents_delegated_grant_cannot_exceed_the_verbs_it_holds() {
     // Manages the hook, deliberately without execution rights on it.
     let (manager_id, manager) = seed_parent_manager(&db, "parent-manager", hook, false).await;
     let (accomplice_id, accomplice) = insert_key(&db, "accomplice", "", KeyScopes::plain()).await;
+    // The accomplice is the manager's own daughter, which is how a real deployment produces a key
+    // a parent delegates to. Without the lineage §4 makes the target invisible and the refusal
+    // below would be a `404` about visibility rather than the `403` about R1 under test.
+    set_parent(&db, accomplice_id, manager_id).await;
 
     let over_grant = send(
         &app,
@@ -5512,7 +5813,8 @@ async fn a_parents_delegated_grant_cannot_exceed_the_verbs_it_holds() {
         json_request("POST", &format!("/api/hooks/{hook}/execute"), &accomplice, Some(json!({}))),
     )
     .await;
-    assert_eq!(attempt.status, StatusCode::FORBIDDEN, "the blocked grant never landed");
+    // `404`, not `403`: with no row the accomplice cannot see the hook at all (§4).
+    assert_eq!(attempt.status, StatusCode::NOT_FOUND, "the blocked grant never landed");
 
     // Handing out a verb the caller *does* hold still works — this is proportionality, not a ban
     // on delegation.
@@ -5596,6 +5898,7 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
     let elsewhere = insert_hook(&db, "some_other_hook", &script, 30).await;
     let (manager_id, manager) = seed_parent_manager(&db, "parent-manager", elsewhere, true).await;
     let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+    set_parent(&db, victim_id, manager_id).await;
 
     // No row on the target hook at all.
     let no_grant = send(
@@ -5608,10 +5911,13 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
         ),
     )
     .await;
-    assert_eq!(no_grant.status, StatusCode::FORBIDDEN);
+    // §4: no row on the target hook means the hook is invisible to this caller, so the refusal is
+    // the one a nonexistent hook produces. The `403` "manage access" wording is reserved for a
+    // caller that *does* hold a row and is short the global half of R2.
+    assert_eq!(no_grant.status, StatusCode::NOT_FOUND);
     assert!(
-        no_grant.raw.contains("manage access"),
-        "the entry gate's message is unchanged: {}",
+        no_grant.raw.contains("not found") || no_grant.raw.contains("Not Found"),
+        "the entry gate is indistinguishable from a nonexistent hook: {}",
         no_grant.raw
     );
 
@@ -5627,6 +5933,8 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
         ),
     )
     .await;
+    // The caller now holds `can_execute` but not `can_manage` on this hook. It can *see* the hook,
+    // so §4 is satisfied and the refusal is R2's — the manage row is what is missing.
     assert_eq!(
         execute_only.status,
         StatusCode::FORBIDDEN,
@@ -5701,6 +6009,9 @@ async fn r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused() {
     let hook = insert_hook(&db, "ungoverned_for_grant", &script, 30).await;
     let (admin_id, admin) = seed_key_manager(&db).await;
     let (worker_id, worker) = insert_key(&db, "worker", "", KeyScopes::plain()).await;
+    // The admin's own daughter: §4 would otherwise make the target invisible, and every refusal
+    // below would be about visibility rather than about R2.
+    set_parent(&db, worker_id, admin_id).await;
 
     let granted = send(
         &app,
@@ -5725,7 +6036,7 @@ async fn r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused() {
         json_request("POST", &format!("/api/hooks/{hook}/execute"), &worker, Some(json!({}))),
     )
     .await;
-    assert_eq!(ran.status, StatusCode::FORBIDDEN, "the blocked grant never landed");
+    assert_eq!(ran.status, StatusCode::NOT_FOUND, "the blocked grant never landed");
 
     // Revocation takes the same route and is refused identically — the two directions agree about
     // who may act, or the stricter one is simply routed around.
@@ -5856,7 +6167,9 @@ async fn a_can_manage_holder_may_revoke_a_verb_it_does_not_itself_hold() {
         json_request("POST", &format!("/api/hooks/{hook}/execute"), &victim, Some(json!({}))),
     )
     .await;
-    assert_eq!(now_denied.status, StatusCode::FORBIDDEN, "the revocation took effect");
+    // `404` rather than `403`: with its row gone the victim is outside the hook's visibility scope,
+    // and §4 requires that to be indistinguishable from a hook that never existed.
+    assert_eq!(now_denied.status, StatusCode::NOT_FOUND, "the revocation took effect");
 
     // And the caller gained nothing by it — de-escalating someone else does not escalate you.
     let attempt = send(
@@ -6092,7 +6405,8 @@ async fn a_key_may_revoke_its_own_hook_permissions() {
         json_request("POST", &format!("/api/hooks/{hook}/execute"), &manager, Some(json!({}))),
     )
     .await;
-    assert_eq!(execute.status, StatusCode::FORBIDDEN, "and the capability with it");
+    // §4: having no row at all means the hook is invisible, not merely unusable.
+    assert_eq!(execute.status, StatusCode::NOT_FOUND, "and the capability with it");
 
     // Having given it up, it cannot hand it back to itself — self-*granting* is still escalation.
     let regrant = send(
@@ -6130,8 +6444,9 @@ async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
     // A local manager: it manages *a* hook (so it has standing) but not the target one. A
     // `can_manage_keys` holder would take the global-administrator route and be allowed, which is
     // the deliberate override — this test is about the population the per-hook rule still governs.
-    let (_manager_id, manager) = seed_parent_manager(&db, "parent-manager", elsewhere, true).await;
+    let (manager_id, manager) = seed_parent_manager(&db, "parent-manager", elsewhere, true).await;
     let (victim_id, _) = insert_key(&db, "victim", "", KeyScopes::plain()).await;
+    set_parent(&db, victim_id, manager_id).await;
     grant(&db, victim_id, hook, true, true).await;
 
     let no_grant = send(
@@ -6144,10 +6459,12 @@ async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
         ),
     )
     .await;
-    assert_eq!(no_grant.status, StatusCode::FORBIDDEN);
+    // §4: no row on the target hook makes it invisible, so the refusal is the one a nonexistent
+    // hook produces rather than a `403` confirming it is real.
+    assert_eq!(no_grant.status, StatusCode::NOT_FOUND);
     assert!(
-        no_grant.raw.contains("manage access"),
-        "the entry gate's message is unchanged: {}",
+        !no_grant.raw.contains("manage access"),
+        "the refusal must not confirm the hook exists: {}",
         no_grant.raw
     );
 }
@@ -6188,7 +6505,7 @@ async fn an_ungoverned_hook_stays_visible_and_manageable_by_a_master() {
     assert_eq!(orphaned.json.as_array().map(Vec::len), Some(0), "the ex-manager sees nothing");
     assert_eq!(
         send(&app, json_request("GET", &format!("/api/hooks/{hook}"), &manager, None)).await.status,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "and cannot reach it directly either"
     );
 

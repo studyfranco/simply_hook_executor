@@ -237,6 +237,24 @@ async fn hook_permission(
         .await?)
 }
 
+/// Splits "you cannot see this hook" from "you can see it but lack this verb".
+///
+/// **§4 oracle discipline** turns on exactly this distinction. A caller holding *no* row on a hook
+/// is outside its visibility scope, and must receive what a nonexistent hook id produces —
+/// `404`, with the same body. A caller that holds a row is inside the scope and is merely short a
+/// verb, which is an ordinary `403` and leaks nothing it did not already know.
+///
+/// Collapsing the two, as the code did before, made every hook endpoint an existence oracle: `403`
+/// for a hook that exists, `404` for one that does not, from a caller entitled to neither.
+fn verb_denied(held: Option<&api_key_hook_permission::Model>, verb: &str) -> AppError {
+    match held {
+        Some(_) => AppError::Forbidden(format!(
+            "Permission denied: You do not have {verb} access to this hook"
+        )),
+        None => AppError::NotFound,
+    }
+}
+
 /// Authorizes execution of a hook: master keys bypass, everyone else needs an explicit
 /// `can_execute` grant (`AGENT.MD` least-privilege rule).
 async fn require_execute(
@@ -247,11 +265,10 @@ async fn require_execute(
     if key.is_master {
         return Ok(());
     }
-    match hook_permission(db, key.id, hook_id).await? {
+    let held = hook_permission(db, key.id, hook_id).await?;
+    match &held {
         Some(p) if p.can_execute => Ok(()),
-        _ => Err(AppError::Forbidden(
-            "Permission denied: You do not have execute access to this hook".to_owned(),
-        )),
+        _ => Err(verb_denied(held.as_ref(), "execute")),
     }
 }
 
@@ -270,15 +287,18 @@ async fn require_manage(
     if key.is_master {
         return Ok(());
     }
-    match hook_permission(db, key.id, hook_id).await? {
+    let held = hook_permission(db, key.id, hook_id).await?;
+    match &held {
         Some(p) if p.can_manage => Ok(()),
-        _ => Err(AppError::Forbidden(
-            "Permission denied: You do not have manage access to this hook".to_owned(),
-        )),
+        _ => Err(verb_denied(held.as_ref(), "manage")),
     }
 }
 
 /// Authorizes read-only visibility of a hook (either grant suffices).
+///
+/// Every failure here is a `404` under §4: "visible" is precisely the question this asks, so a
+/// caller that fails it is outside the scope by definition and must not be able to tell the hook
+/// apart from one that never existed.
 async fn require_visibility(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
@@ -289,9 +309,7 @@ async fn require_visibility(
     }
     match hook_permission(db, key.id, hook_id).await? {
         Some(p) if p.can_execute || p.can_manage => Ok(()),
-        _ => Err(AppError::Forbidden(
-            "Permission denied: You have no access mapped to this hook".to_owned(),
-        )),
+        _ => Err(AppError::NotFound),
     }
 }
 
@@ -636,6 +654,27 @@ async fn require_hook_manage_conjunction(
     // Callers handle `is_master` before reaching here: master holds no rows and needs none.
     debug_assert!(!key.is_master, "master bypasses R2 and must be short-circuited by the caller");
 
+    // Which half is missing decides the *status*, and §4 is why. A caller with no row at all cannot
+    // see this hook, so it must receive what a nonexistent hook id produces. A caller that holds a
+    // row can see it and is merely short the global scope — an ordinary `403`.
+    //
+    // This does not reintroduce the "which half" leak the shared message exists to prevent: a
+    // caller always knows its own rows (`GET /api/auth/me` lists them), so the status tells it
+    // nothing it could not already read about itself. What stays hidden is the *hook* — a
+    // `can_manage_keys` holder probing hooks it has no relationship with gets `404` whether or not
+    // they exist.
+    // Visibility first, and it is decided by whether *any* row exists — not by whether that row
+    // grants `can_manage`. A caller holding `can_execute` alone can see the hook perfectly well, so
+    // hiding it behind a `404` would be a lie it can disprove with `GET /api/auth/me`.
+    let Some(row) = hook_permission(db, key.id, hook_id).await? else {
+        tracing::warn!(
+            key = %key.prefix,
+            hook_id = %hook_id,
+            "R2: no row at all on this hook; refused as invisible per §4"
+        );
+        return Err(AppError::NotFound);
+    };
+
     let denied = || {
         AppError::Forbidden(
             "Permission denied: You do not have manage access to this hook".to_owned(),
@@ -646,20 +685,144 @@ async fn require_hook_manage_conjunction(
         tracing::warn!(
             key = %key.prefix,
             hook_id = %hook_id,
-            "R2: key holds a manage row but not can_manage_keys; manage is a conjunction"
+            "R2: key holds a row but not can_manage_keys; manage is a conjunction"
+        );
+        return Err(denied());
+    }
+    if !row.can_manage {
+        tracing::warn!(
+            key = %key.prefix,
+            hook_id = %hook_id,
+            "R2: key holds can_manage_keys and a row, but the row is not can_manage"
         );
         return Err(denied());
     }
 
-    match hook_permission(db, key.id, hook_id).await? {
-        Some(p) if p.can_manage => Ok(p),
+    Ok(row)
+}
+
+/// How much of a key another key is entitled to see (`RBAC_MODEL.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyVisibility {
+    /// **Own subtree.** "A parent sees its own key subtree in full, minus raw secrets — its
+    /// daughters, their granted rights, and their bound IPs." Also covers the caller itself.
+    Full,
+    /// **Shared resource, minimal form.** "A parent sees, in minimal form only, any key holding a
+    /// permission row on a resource it manages: id, name, and that key's rights on that resource
+    /// alone. Global flags, bound IPs, and unrelated resource memberships remain hidden."
+    ///
+    /// The sentence that gives this scope its shape is the next one: "A single shared resource must
+    /// never become a keyhole into another parent's whole configuration."
+    Minimal,
+}
+
+/// Every key descended from `root`, transitively, **excluding `root` itself**.
+///
+/// Breadth-first over `parent_key_id`, one indexed query per level rather than one per key. The
+/// `seen` set is not an optimization: `parent_key_id` carries no database-level constraint
+/// preventing a cycle (see the migration's note on why there is no FK), and a cycle here would spin
+/// forever inside a request handler.
+async fn descendant_key_ids(
+    db: &sea_orm::DatabaseConnection,
+    root: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut frontier = vec![root];
+
+    while !frontier.is_empty() {
+        let children: Vec<Uuid> = ApiKey::find()
+            .filter(api_key::Column::ParentKeyId.is_in(frontier.clone()))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|k| k.id)
+            .collect();
+
+        frontier = children.into_iter().filter(|id| *id != root && seen.insert(*id)).collect();
+    }
+
+    Ok(seen.into_iter().collect())
+}
+
+/// The hooks this key holds a `can_manage` row on — the resources whose *other* holders it is
+/// entitled to see in minimal form.
+async fn managed_hook_ids(
+    db: &sea_orm::DatabaseConnection,
+    key_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    Ok(ApiKeyHookPermission::find()
+        .filter(api_key_hook_permission::Column::ApiKeyId.eq(key_id))
+        .filter(api_key_hook_permission::Column::CanManage.eq(true))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| p.hook_id)
+        .collect())
+}
+
+/// How much of `target` the caller may see, or `None` for "not visible at all".
+///
+/// `None` is the answer that has to be handled carefully by every caller: under §4's oracle
+/// discipline it must produce exactly what a nonexistent id produces, never a `403` that confirms
+/// the id is real.
+async fn key_visibility(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    target: &api_key::Model,
+) -> Result<Option<KeyVisibility>, AppError> {
+    // "Master: full visibility over all keys, resources, dispatch targets, and configuration."
+    if caller.is_master || caller.id == target.id {
+        return Ok(Some(KeyVisibility::Full));
+    }
+
+    // Own subtree, transitively. Note this reads `parent_key_id` for *visibility scoping*, which is
+    // the one use R3 explicitly sanctions — "`parent_key_id` exists solely for cascading deletion
+    // and visibility scoping" — and never to decide whether an action is permitted.
+    if descendant_key_ids(db, caller.id).await?.contains(&target.id) {
+        return Ok(Some(KeyVisibility::Full));
+    }
+
+    // Shared resource: does the target hold a row on any hook the caller manages?
+    let managed = managed_hook_ids(db, caller.id).await?;
+    if !managed.is_empty() {
+        let shares = ApiKeyHookPermission::find()
+            .filter(api_key_hook_permission::Column::ApiKeyId.eq(target.id))
+            .filter(api_key_hook_permission::Column::HookId.is_in(managed))
+            .one(db)
+            .await?
+            .is_some();
+        if shares {
+            return Ok(Some(KeyVisibility::Minimal));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Loads a key the caller is entitled to *administer*, or `404`.
+///
+/// Administering the key entity — updating, deleting, rotating it — needs
+/// [`KeyVisibility::Full`]: the caller's own subtree, or master. A key met only through a shared
+/// resource is visible in minimal form and is **not** administrable; §4 gives that scope precisely
+/// "id, name, and that key's rights on that resource alone", which is a window, not a handle.
+///
+/// Every refusal is `404`, matching what a key id that does not exist produces. A `403` here would
+/// turn `PUT /api/keys/{uuid}` into a key-enumeration oracle for any `can_manage_keys` holder.
+async fn load_administrable_key(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    id: Uuid,
+) -> Result<api_key::Model, AppError> {
+    let target = ApiKey::find_by_id(id).one(db).await?.ok_or(AppError::NotFound)?;
+    match key_visibility(db, caller, &target).await? {
+        Some(KeyVisibility::Full) => Ok(target),
         _ => {
             tracing::warn!(
-                key = %key.prefix,
-                hook_id = %hook_id,
-                "R2: key holds can_manage_keys but no can_manage row on this hook"
+                key = %caller.prefix,
+                target = %id,
+                "§4: key outside the caller's administrable scope; refused as nonexistent"
             );
-            Err(denied())
+            Err(AppError::NotFound)
         }
     }
 }
@@ -2060,11 +2223,19 @@ pub async fn list_executions(
 ) -> Result<impl IntoResponse, AppError> {
     let mut q = Execution::find().order_by_desc(execution::Column::Timestamp);
 
-    if let Some(ids) = visible_hook_ids(&state.db, &key).await? {
-        if ids.is_empty() {
-            return Ok(Json(Vec::<ExecutionView>::new()));
+    // §4, third scope: executions are creator-private. A hook's manager sees *that it is used* —
+    // the hook, its definition, its parameter contract — but not the arguments other keys passed to
+    // it or the output they got back. The hook-visibility filter below stays as a second bound, so
+    // history for a hook the caller can no longer see disappears even for runs it made itself.
+    if !key.is_master {
+        q = q.filter(execution::Column::ApiKeyId.eq(key.id));
+
+        if let Some(ids) = visible_hook_ids(&state.db, &key).await? {
+            if ids.is_empty() {
+                return Ok(Json(Vec::<ExecutionView>::new()));
+            }
+            q = q.filter(execution::Column::HookId.is_in(ids));
         }
-        q = q.filter(execution::Column::HookId.is_in(ids));
     }
 
     if let Some(identifier) = query.hook.as_deref().filter(|s| !s.is_empty()) {
@@ -2102,7 +2273,12 @@ pub async fn get_execution(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    require_visibility(&state.db, &key, model.hook_id).await?;
+    // §4, third scope: an execution belongs to the key that requested it. Its `parameters_json`,
+    // stdout and stderr are that caller's data — hook membership is not a licence to read another
+    // tenant's arguments and output. `404` rather than `403`, per oracle discipline.
+    if !key.is_master && model.api_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
+    }
 
     let hook_name = Hook::find_by_id(model.hook_id)
         .one(&state.db)
@@ -2276,6 +2452,65 @@ pub struct ApiKeySummary {
 
 /// Builds the public-safe summary for a single key, shared by every endpoint that returns key
 /// details so the shape stays consistent.
+/// The minimal form §4 permits a parent to see of a key it meets only through a shared resource:
+/// "id, name, and that key's rights on that resource alone."
+///
+/// A separate type rather than an `ApiKeySummary` with fields blanked out, so that adding a field
+/// to the full summary cannot silently widen this one. The compiler has to be told, every time.
+#[derive(Serialize)]
+pub struct MinimalApiKeyView {
+    /// Key ID.
+    pub id: Uuid,
+    /// Key name.
+    pub name: String,
+    /// This key's rights **on the shared hooks only** — never its other memberships.
+    pub hook_permissions: Vec<HookPermissionView>,
+    /// Marks the entry as abridged, so a client can tell "no global scopes" from "not shown".
+    /// Without it a minimal view is indistinguishable from a key that genuinely holds nothing.
+    pub partial: bool,
+}
+
+/// One entry in a key listing, at whichever detail §4 entitles the caller to.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ApiKeyView {
+    /// Own subtree, or master.
+    Full(Box<ApiKeySummary>),
+    /// Met only through a shared resource.
+    Minimal(MinimalApiKeyView),
+}
+
+/// Builds the minimal view, restricting the permission list to the shared hooks.
+async fn build_minimal_api_key_view(
+    db: &sea_orm::DatabaseConnection,
+    model: api_key::Model,
+    shared_hook_ids: &[Uuid],
+) -> Result<MinimalApiKeyView, AppError> {
+    let rows = ApiKeyHookPermission::find()
+        .filter(api_key_hook_permission::Column::ApiKeyId.eq(model.id))
+        .filter(api_key_hook_permission::Column::HookId.is_in(shared_hook_ids.to_vec()))
+        .find_also_related(Hook)
+        .all(db)
+        .await?;
+
+    Ok(MinimalApiKeyView {
+        id: model.id,
+        name: model.name,
+        hook_permissions: rows
+            .into_iter()
+            .filter_map(|(perm, hook)| {
+                hook.map(|h| HookPermissionView {
+                    hook_id: perm.hook_id,
+                    hook_name: h.name,
+                    can_execute: perm.can_execute,
+                    can_manage: perm.can_manage,
+                })
+            })
+            .collect(),
+        partial: true,
+    })
+}
+
 async fn build_api_key_summary(
     db: &sea_orm::DatabaseConnection,
     model: api_key::Model,
@@ -2401,12 +2636,50 @@ pub async fn list_api_keys(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    // §4. Previously this returned a full `ApiKeySummary` — global flags, `bound_ips`, and every
+    // hook membership — for *every key in the deployment* to any `can_manage_keys` holder. One
+    // shared hook was enough to read another parent's entire configuration, which is precisely the
+    // "keyhole" §4 names.
     let keys = ApiKey::find().order_by_asc(api_key::Column::CreatedAt).all(&state.db).await?;
-    let mut summaries = Vec::with_capacity(keys.len());
+    // Computed once for the whole listing rather than per key: the alternative is two extra queries
+    // per row, and neither answer changes within a single request.
+    let subtree = if key.is_master {
+        Vec::new()
+    } else {
+        descendant_key_ids(&state.db, key.id).await?
+    };
+    let managed = if key.is_master {
+        Vec::new()
+    } else {
+        managed_hook_ids(&state.db, key.id).await?
+    };
+    let shared_holders: std::collections::HashSet<Uuid> = if managed.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        ApiKeyHookPermission::find()
+            .filter(api_key_hook_permission::Column::HookId.is_in(managed.clone()))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|p| p.api_key_id)
+            .collect()
+    };
+
+    let mut views = Vec::with_capacity(keys.len());
     for model in keys {
-        summaries.push(build_api_key_summary(&state.db, model).await?);
+        if key.is_master || model.id == key.id || subtree.contains(&model.id) {
+            views.push(ApiKeyView::Full(Box::new(
+                build_api_key_summary(&state.db, model).await?,
+            )));
+        } else if shared_holders.contains(&model.id) {
+            views.push(ApiKeyView::Minimal(
+                build_minimal_api_key_view(&state.db, model, &managed).await?,
+            ));
+        }
+        // Otherwise omitted entirely — a key outside every scope is not listed at all, which is the
+        // listing form of oracle discipline: absent and invisible look the same.
     }
-    Ok(Json(summaries))
+    Ok(Json(views))
 }
 
 /// Payload for updating an existing API key. Excludes `is_master`: promoting or demoting master
@@ -2443,7 +2716,7 @@ pub async fn update_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = load_administrable_key(&state.db, &key, id).await?;
 
     // Editing a master key is master-only: `bound_ips` alone would otherwise let a key manager
     // widen (or strand) the network binding of the system's root credential.
@@ -2521,7 +2794,7 @@ pub async fn delete_api_key(
 
     // Fetched before deleting (rather than relying on rows_affected) so the name is still
     // available for the audit entry below.
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = load_administrable_key(&state.db, &key, id).await?;
     require_master_to_administer(&key, &target, "delete")?;
     refuse_master_lifecycle_action(&target, "delete")?;
     let reference = format_reference(&target.name, id);
@@ -2570,7 +2843,7 @@ pub async fn rotate_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = load_administrable_key(&state.db, &key, id).await?;
     // The response hands back the new plaintext secret, so rotating someone else's master key is
     // credential theft with a lockout attached rather than mere administration.
     require_master_to_administer(&key, &target, "rotate")?;
@@ -2645,7 +2918,14 @@ pub async fn update_key_hook_permissions(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    // Permission routes accept a *minimally* visible target too, and must: §4's shared-resource
+    // scope exists so a parent managing a hook can see who else holds rights on it, and R6 lets it
+    // revoke them. Administering the key *entity* still needs full visibility
+    // ([`load_administrable_key`]); this is administering one row of a hook it manages.
     let target_key = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if key_visibility(&state.db, &key, &target_key).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
     if target_key.is_master {
         return Err(AppError::InvalidInput(
             "Cannot configure M:N permissions on a master key".to_owned(),

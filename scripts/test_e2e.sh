@@ -645,6 +645,19 @@ create_scoped_key() {
     CREATED_SIGNING_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
 }
 
+# Creates a key *as* an arbitrary actor rather than as master, so `parent_key_id` records the real
+# parent. `RBAC_MODEL.md` §4 scopes visibility by subtree: two keys both created by master are
+# siblings and invisible to each other, so an actor that must administer a target has to have
+# created it — which is what a real deployment does anyway.
+create_key_as() {
+    local actor="$1" name="$2" extra="${3:-}"
+    api_call POST "/api/keys" "$actor" "{\"name\":\"$name\",\"bound_ips\":\"0.0.0.0/0\"$extra}"
+    check "200" "create key '$name' as its parent"
+    CREATED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    CREATED_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    CREATED_SIGNING_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+}
+
 create_scoped_key "Execute-Only Key"
 EXEC_KEY="$CREATED_KEY"; EXEC_ID="$CREATED_ID"
 EXEC_KEY_ID="$CREATED_KEY_ID"; EXEC_SIGNING_SECRET="$CREATED_SIGNING_SECRET"
@@ -677,10 +690,12 @@ api_call PUT "/api/hooks/$ECHO_HOOK_ID" "$MANAGE_KEY" '{"description":"managed"}
 check "200" "the manage-only key can modify the hook"
 
 api_call POST "/api/hooks/$ECHO_HOOK_ID/execute" "$NOACCESS_KEY" '{"parameters":{"target":"nope"}}'
-check "403" "the no-access key cannot run the hook"
+# §4 oracle discipline: no row at all means the hook is invisible, so the answer is the one a
+# hook id that was never issued gives. §38 proves the two are byte-identical.
+check "404" "the no-access key cannot run the hook"
 
 api_call GET "/api/hooks/$ECHO_HOOK_ID" "$NOACCESS_KEY"
-check "403" "the no-access key cannot even read the hook definition"
+check "404" "the no-access key cannot even read the hook definition"
 
 api_call GET "/api/hooks" "$NOACCESS_KEY"
 check "200" "listing hooks is allowed for any authenticated key"
@@ -718,13 +733,13 @@ api_call POST "/api/hooks/$CREATOR_HOOK_ID/execute" "$CREATOR_KEY" '{}'
 check "200" "the creator can immediately execute what it created"
 
 api_call PUT "/api/hooks/$ECHO_HOOK_ID" "$CREATOR_KEY" '{"description":"not mine"}'
-check "403" "can_manage_hooks does not grant control over someone else's hook"
+check "404" "can_manage_hooks does not grant control over someone else's hook"
 
 api_call DELETE "/api/keys/$CREATOR_ID/permissions/creator_hook" "$MASTER_KEY"
 check "204" "revoke the creator's mapping by hook name"
 
 api_call POST "/api/hooks/$CREATOR_HOOK_ID/execute" "$CREATOR_KEY" '{}'
-check "403" "the revoked key can no longer execute"
+check "404" "the revoked key can no longer execute"
 
 # ── 11. Concurrency throttling ──────────────────────────────────────────────
 
@@ -1005,7 +1020,7 @@ check "200" "the webhook alias executes a hook by name with a flat payload"
 check_jq ".stdout | rtrimstr(\"\n\")" "hello via-webhook" "the flat payload was resolved into parameters"
 
 api_call POST "/webhook/echo_hook" "$NOACCESS_KEY" '{"target":"x"}'
-check "403" "the webhook alias enforces the same RBAC as /api"
+check "404" "the webhook alias enforces the same RBAC as /api"
 
 api_call POST "/webhook/echo_hook"
 check "401" "the webhook alias enforces authentication"
@@ -1229,7 +1244,7 @@ check "403" "a non-master cannot view the trash"
 api_call POST "/api/hooks/$PARAM_HOOK_ID/restore" "$EXEC_KEY"
 check "403" "a non-master cannot restore"
 api_call DELETE "/api/hooks/$PARAM_HOOK_ID?hard=true" "$EXEC_KEY"
-check "403" "a non-master cannot hard-delete"
+check "404" "a non-master cannot hard-delete"
 
 api_call POST "/api/hooks/$PARAM_HOOK_ID/restore" "$MASTER_KEY"
 check "200" "master restores the hook"
@@ -2117,12 +2132,15 @@ check "200" "list keys to locate the bootstrap master"
 BOOTSTRAP_ID=$(echo "$RESP_BODY" | jq -r '.[] | select(.is_master == true) | .id' | head -1)
 
 api_call POST "/api/keys/$BOOTSTRAP_ID/rotate" "$KEYMGR_KEY"
-check "403" "#2 a non-master cannot rotate a master key"
+# §4: the master is in no other key's subtree and shares no hook, so it is outside every
+# visibility scope — refused as nonexistent rather than as forbidden. §36 proves §5's own guards
+# still stand for a caller the master *is* visible to.
+check "404" "#2 a non-master cannot rotate a master key"
 check_true '.plaintext_key == null' "no secret leaks in the refusal body"
 api_call PUT "/api/keys/$BOOTSTRAP_ID" "$KEYMGR_KEY" '{"bound_ips":"0.0.0.0/0"}'
-check "403" "#2 a non-master cannot edit a master key"
+check "404" "#2 a non-master cannot edit a master key"
 api_call DELETE "/api/keys/$BOOTSTRAP_ID" "$KEYMGR_KEY"
-check "403" "#2 a non-master cannot delete a master key"
+check "404" "#2 a non-master cannot delete a master key"
 
 # The master credential is untouched by any of the refused calls.
 api_call GET "/api/auth/me" "$MASTER_KEY"
@@ -2178,7 +2196,7 @@ check "200" "#3 with both halves of R2 present, the same grant succeeds"
 
 # The grant never landed, so the root hook is still out of reach.
 api_call POST "/api/hooks/$PRIVESC_HOOK_ID/test" "$KEYMGR_KEY" '{}'
-check "403" "#3 the root hook remains unreachable to the key manager"
+check "404" "#3 the root hook remains unreachable to the key manager"
 
 # ── Finding #4: repointing an elevated hook ────────────────────────────────
 create_scoped_key "Hook Editor"
@@ -2484,7 +2502,10 @@ PROP_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 # below for the wrong reason. Both mistakes are covered explicitly further down.
 create_scoped_key "Proportionality Delegator" ',"can_manage_keys":true'
 DELEGATOR_KEY="$CREATED_KEY"; DELEGATOR_ID="$CREATED_ID"
-create_scoped_key "Proportionality Accomplice"
+# Created *by* the delegator, not by master. Under §4 two keys both created by master are siblings
+# and invisible to each other, so a master-created accomplice would be refused as nonexistent and
+# every R1 assertion below would be testing visibility instead of proportionality.
+create_key_as "$DELEGATOR_KEY" "Proportionality Accomplice"
 ACCOMPLICE_KEY="$CREATED_KEY"; ACCOMPLICE_ID="$CREATED_ID"
 
 # Manage without execute — the combination `SCHEMA.MD` models as two columns so it is expressible.
@@ -2502,7 +2523,7 @@ check_true '.error | contains("can_execute")' "the refusal names the over-grante
 
 # The refusal was real, not cosmetic: no row landed, so the accomplice still cannot run it.
 api_call POST "/api/hooks/$PROP_HOOK_ID/execute" "$ACCOMPLICE_KEY" '{"parameters":{}}'
-check "403" "the blocked grant never reached the database"
+check "404" "the blocked grant never reached the database"
 
 # Handing out a verb the caller does hold still works — this is proportionality, not a ban.
 api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$DELEGATOR_KEY" \
@@ -2533,9 +2554,14 @@ DAUGHTER_KEY="$CREATED_KEY"; DAUGHTER_ID="$CREATED_ID"
 api_call POST "/api/keys/$DAUGHTER_ID/permissions" "$MASTER_KEY" \
     "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
 check "200" "the daughter holds both verbs on the hook, including can_manage"
+# The accomplice already holds a row on this same hook, so §4's shared-resource scope makes it
+# visible to the daughter in minimal form. The refusals below are therefore R2's, not §4's.
 api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$DAUGHTER_KEY" \
     "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
 check "403" "R2: a manage row without can_manage_keys cannot administer grants"
+# Refused at the coarse standing pre-check — before the hook is resolved, so the message is
+# deliberately uninformative. That ordering is what stops the endpoint being a key-UUID oracle.
+check_true '.error == "Permission denied"' "refused before the hook is even resolved"
 api_call DELETE "/api/keys/$ACCOMPLICE_ID/permissions/$PROP_HOOK_ID" "$DAUGHTER_KEY"
 check "403" "R2: and the revoke route enforces the same conjunction"
 # Its *operational* rights are untouched — R2 governs who administers grants, not who may use it.
@@ -2556,8 +2582,9 @@ check "200" "the outsider manages a hook of its own, giving it standing"
 
 api_call POST "/api/keys/$ACCOMPLICE_ID/permissions" "$OUTSIDER_KEY" \
     "$(jq -nc --arg h "$PROP_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
-check "403" "a caller with no grant on the hook cannot administer its permissions"
-check_true '.error | contains("manage access")' "the entry gate's message is unchanged"
+check "404" "a caller with no grant on the hook cannot administer its permissions"
+check_true '.error | contains("manage access") | not' \
+    "§4: the refusal must not confirm the hook exists"
 
 # A caller with no administrative standing anywhere is refused earlier, and for a different reason:
 # before the target key is fetched, so it cannot tell a real key UUID from an invented one.
@@ -2621,7 +2648,8 @@ REV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 create_scoped_key "Revoke Parent Manager" ',"can_manage_keys":true'
 REVMGR_KEY="$CREATED_KEY"; REVMGR_ID="$CREATED_ID"
-create_scoped_key "Revoke Target"
+# Created by the parent manager, so §4 makes it visible to the actor administering it.
+create_key_as "$REVMGR_KEY" "Revoke Target"
 REVTGT_KEY="$CREATED_KEY"; REVTGT_ID="$CREATED_ID"
 # Also a parent — it must clear the standing gate so its refusal comes from the *per-hook* half of
 # R2 and names the missing access, rather than from the coarse pre-check.
@@ -2649,7 +2677,7 @@ check "204" "R6: a manager may DELETE a grant conferring a verb it does not hold
 
 # The revocation is real over the wire, not merely accepted: the target loses the capability.
 api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVTGT_KEY" '{"parameters":{}}'
-check "403" "the revoked key is refused execution afterwards"
+check "404" "the revoked key is refused execution afterwards"
 
 # ...and the revoker gained nothing by it. De-escalating someone else never escalates you.
 api_call POST "/api/hooks/$REV_HOOK_ID/execute" "$REVMGR_KEY" '{"parameters":{}}'
@@ -2687,12 +2715,13 @@ api_call POST "/api/keys/$REVMGR_ID/permissions" "$MASTER_KEY" \
 check "200" "re-assert the parent manager's grant for the refusal checks"
 
 api_call DELETE "/api/keys/$REVMGR_ID/permissions/$REV_HOOK_ID" "$REVBYS_KEY"
-check "403" "a caller without can_manage on the hook cannot revoke via DELETE"
-check_true '.error | contains("manage access")' "the entry gate names the missing access"
+check "404" "a caller without can_manage on the hook cannot revoke via DELETE"
+check_true '.error | contains("manage access") | not' \
+    "§4: the refusal must not confirm the hook exists"
 
 api_call POST "/api/keys/$REVMGR_ID/permissions" "$REVBYS_KEY" \
     "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:false}')"
-check "403" "and cannot zero it via POST either — both routes refuse alike"
+check "404" "and cannot zero it via POST either — both routes refuse alike"
 
 # The refusals were real: the local manager still holds its grant.
 api_call GET "/api/auth/me" "$REVMGR_KEY"
@@ -3124,6 +3153,121 @@ for R3_PROBE in "GET:/api/hooks" "GET:/api/audit-logs" "GET:/api/settings" "GET:
     check_local "$RESP_STATUS" "$R3_STATUS_A" \
         "R3 $R3_METHOD $R3_PATH answers alike regardless of parentage"
 done
+
+# ── 38. RBAC_MODEL.md §4: visibility scopes and oracle discipline ───────────
+
+log_section "38. Visibility scopes and oracle discipline (RBAC_MODEL.md §4)"
+
+VIS_SCRIPT=$(make_hook_script "visibility.sh" 'echo "visible ran"')
+
+# Two unrelated parents meeting only through one shared hook.
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$VIS_SCRIPT" '{name:"shared_visibility_hook",script_path:$p}')"
+check "200" "create the shared hook"
+VIS_SHARED_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+create_scoped_key "Visibility Parent A" ',"can_manage_keys":true'
+VISA_KEY="$CREATED_KEY"; VISA_ID="$CREATED_ID"
+create_scoped_key "Visibility Parent B" ',"can_manage_keys":true,"can_manage_hooks":true'
+VISB_KEY="$CREATED_KEY"; VISB_ID="$CREATED_ID"
+
+api_call POST "/api/keys/$VISA_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$VIS_SHARED_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "parent A manages the shared hook"
+api_call POST "/api/keys/$VISB_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$VIS_SHARED_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "200" "parent B merely uses it"
+
+# B also has a hook of its own, and a daughter — neither of which A may learn about.
+api_call POST "/api/hooks" "$VISB_KEY" \
+    "$(jq -nc --arg p "$VIS_SCRIPT" '{name:"parent_b_private_hook",script_path:$p}')"
+check "200" "parent B creates a hook of its own"
+create_key_as "$VISB_KEY" "Parent B Daughter"
+VISB_DAUGHTER_ID="$CREATED_ID"
+
+create_key_as "$VISA_KEY" "Parent A Daughter"
+VISA_DAUGHTER_ID="$CREATED_ID"
+
+# ── Scope 1 and 2: what parent A's key listing contains ────────────────────
+api_call GET "/api/keys" "$VISA_KEY"
+check "200" "parent A lists keys"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISA_DAUGHTER_ID" '[.[] | select(.id == $i)] | length')" "1" \
+    "§4 scope 1: its own daughter is listed"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISA_DAUGHTER_ID" '[.[] | select(.id == $i) | select(.bound_ips != null)] | length')" "1" \
+    "§4 scope 1: in full detail, bound_ips included"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISB_ID" '[.[] | select(.id == $i)] | length')" "1" \
+    "§4 scope 2: the other parent is listed, via the shared hook"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISB_ID" '[.[] | select(.id == $i) | select(.partial == true)] | length')" "1" \
+    "§4 scope 2: and marked as abridged"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISB_ID" '[.[] | select(.id == $i) | select(.bound_ips != null or .can_manage_keys != null or .prefix != null)] | length')" "0" \
+    "§4 scope 2: no bound_ips, no global flags, no prefix"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISB_ID" '[.[] | select(.id == $i) | .hook_permissions[].hook_name] | unique | join(",")')" "shared_visibility_hook" \
+    "§4 scope 2: rights on the shared hook alone, not its other memberships"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VISB_DAUGHTER_ID" '[.[] | select(.id == $i)] | length')" "0" \
+    "§4: the other parent's daughter is not listed at all"
+# The master *does* appear — it created the shared hook, so it holds a permission row on it and is
+# a genuine shared-resource peer. What matters is that it appears abridged like any other: §4's
+# minimal form has no carve-out that would let the root credential's configuration leak.
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$BOOTSTRAP_ID" '[.[] | select(.id == $i) | select(.partial == true)] | length')" "1" \
+    "§4: even the master is abridged when met through a shared hook"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$BOOTSTRAP_ID" '[.[] | select(.id == $i) | select(.is_master != null or .bound_ips != null)] | length')" "0" \
+    "§4: and discloses neither its master flag nor its bound_ips"
+
+# ── Oracle discipline: invisible reads exactly like nonexistent ────────────
+# The other parent's daughter exists; the UUID below never did. Both must answer identically —
+# same status *and* same body — or the endpoint is a key-enumeration oracle.
+api_call PUT "/api/keys/$VISB_DAUGHTER_ID" "$VISA_KEY" '{"name":"probed"}'
+ORACLE_REAL_STATUS="$RESP_STATUS"; ORACLE_REAL_BODY="$RESP_BODY"
+api_call PUT "/api/keys/11111111-2222-3333-4444-555555555555" "$VISA_KEY" '{"name":"probed"}'
+check_local "$ORACLE_REAL_STATUS" "404" "§4 an invisible key reads as nonexistent"
+check_local "$ORACLE_REAL_STATUS" "$RESP_STATUS" "§4 identical status to an id never issued"
+check_local "$ORACLE_REAL_BODY" "$RESP_BODY" "§4 and an identical body"
+
+# Same for hooks, by UUID and by name — names are guessable in a way UUIDs are not.
+api_call GET "/api/hooks/parent_b_private_hook" "$VISA_KEY"
+ORACLE_HOOK_STATUS="$RESP_STATUS"; ORACLE_HOOK_BODY="$RESP_BODY"
+api_call GET "/api/hooks/a_hook_that_never_existed" "$VISA_KEY"
+check_local "$ORACLE_HOOK_STATUS" "404" "§4 an invisible hook reads as nonexistent"
+check_local "$ORACLE_HOOK_STATUS" "$RESP_STATUS" "§4 identical status for a name that never existed"
+check_local "$ORACLE_HOOK_BODY" "$RESP_BODY" "§4 and an identical body"
+
+# ── Scope 3: executions belong to the key that requested them ──────────────
+api_call POST "/api/hooks/$VIS_SHARED_ID/execute" "$VISB_KEY" '{"parameters":{}}'
+check "200" "parent B runs the shared hook"
+VIS_EXEC_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/executions" "$VISB_KEY"
+check "200" "parent B lists history"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VIS_EXEC_ID" '[.[] | select(.id == $i)] | length')" "1" \
+    "§4 scope 3: a key sees its own run"
+
+# A *manages* the hook and still sees nothing: it did not run it.
+api_call GET "/api/executions" "$VISA_KEY"
+check "200" "parent A lists history"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VIS_EXEC_ID" '[.[] | select(.id == $i)] | length')" "0" \
+    "§4 scope 3: managing a hook is not licence to read another key's runs"
+api_call GET "/api/executions/$VIS_EXEC_ID" "$VISA_KEY"
+check "404" "§4 scope 3: and reading one by id is refused as nonexistent"
+check_true '.stdout == null' "no captured output leaks in the refusal"
+
+# ── The counterpart control: 401 vs 403 for unauthenticated callers ────────
+# Making every refusal a 404 would break this; making every refusal a 403 would break the oracle
+# checks above. Both must hold at once.
+# `create_scoped_key` already sets `bound_ips`, and the key payloads are `deny_unknown_fields` with
+# no duplicate-key tolerance, so the range is narrowed by a follow-up update instead.
+create_scoped_key "Bound Elsewhere"
+BOUND_ELSEWHERE_KEY="$CREATED_KEY"
+api_call PUT "/api/keys/$CREATED_ID" "$MASTER_KEY" '{"bound_ips":"10.99.99.0/24"}'
+check "200" "narrow that key to a range the test client is not in"
+
+api_call GET "/api/hooks"
+check "401" "§4 counterpart: no credential is 401"
+api_call GET "/api/hooks" "a-key-that-was-never-issued"
+check "401" "§4 counterpart: an unknown credential is 401, never 403"
+api_call GET "/api/hooks" "$BOUND_ELSEWHERE_KEY"
+check "403" "§4 counterpart: a real key from outside its bound_ips is 403"
+# The asymmetry is the control: `403` is reachable only by someone already holding the secret, so
+# it cannot be used to confirm that a guessed key string exists.
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

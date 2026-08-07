@@ -245,6 +245,24 @@ pub async fn insert_key_with_mode(
     SeededKey { id, plaintext, key_id, signing_secret }
 }
 
+/// Records `child` as having been created by `parent`.
+///
+/// The seeding helpers insert keys with `parent_key_id` NULL, because R3 says lineage confers no
+/// authority and a test that accidentally depends on it should fail rather than pass quietly. But
+/// `RBAC_MODEL.md` §4 scopes *visibility* by subtree, and a key created through the API records its
+/// creator automatically — so a test whose actors would really be parent and daughter has to say
+/// so, or it is testing a shape no deployment produces.
+pub async fn set_parent(db: &DatabaseConnection, child: Uuid, parent: Uuid) {
+    let mut active: api_key::ActiveModel = api_key::Entity::find_by_id(child)
+        .one(db)
+        .await
+        .expect("querying the child key succeeds")
+        .expect("the child key exists")
+        .into();
+    active.parent_key_id = Set(Some(parent));
+    active.update(db).await.expect("recording lineage succeeds");
+}
+
 /// The current Unix timestamp, as a client would stamp a request.
 pub fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
