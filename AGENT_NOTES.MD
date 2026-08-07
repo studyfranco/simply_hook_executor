@@ -2591,13 +2591,15 @@ open and is Phase 2's subject. Original verdicts retained for the record.
 | :--- | :--- | :--- |
 | **R1 — Non-amplification** | ~~**VIOLATES**~~ → **RESOLVED** | `guard_delegated_hook_grant` (`src/api.rs:461`) opens `if key.is_master \|\| key.can_manage_keys { return Ok(()) }`. The per-verb `wanted && !held` comparison below it is therefore reached only by callers *without* `can_manage_keys`. A `can_manage_keys` holder grants any verb on any non-privileged hook regardless of what it holds. |
 | **R2 — Manage is a conjunction** | ~~**VIOLATES**~~ → **RESOLVED** | Same line, plus `revoke_key_hook_permission` (`src/api.rs:2366`): `if !key.is_master && !key.can_manage_keys { require_manage(..) }`. `can_manage_keys` alone is currently sufficient on **both** paths — the exact global bypass R2 forbids. This is commit `2d62d1b`, and R2 replaces it. |
-| **R3 — Parentage confers no authority** | **DOES NOT IMPLEMENT** | No `parent_key_id` column exists on `api_keys` (`src/entities/api_key.rs`, fields at lines 43–83). Vacuously unviolated: no authority *can* be derived from parentage because parentage is not recorded. Nothing to remove; the column and its cascade/visibility semantics have to be added. |
+| **R3 — Parentage confers no authority** | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** (Phase 2) | No `parent_key_id` column exists on `api_keys` (`src/entities/api_key.rs`, fields at lines 43–83). Vacuously unviolated: no authority *can* be derived from parentage because parentage is not recorded. Nothing to remove; the column and its cascade/visibility semantics have to be added. |
 | **R4 — Only master creates parents** | **COMPLIES** | `require_master_to_grant_scopes` (`src/api.rs:343`) returns early for master and otherwise refuses any request setting `is_master`, `can_manage_keys` or `can_manage_hooks` to `true`. Enforced on both create and update. Note the naming difference: this service's resource-creation right is `can_manage_hooks`, which the model calls `can_create_hooks`. |
 | **R5 — Manage may propagate sideways** | ~~**VIOLATES**~~ → **RESOLVED** | Sideways propagation itself works, but not *bounded by R1 and R2* as R5 requires — the `can_manage_keys` bypass in `guard_delegated_hook_grant` means a parent can grant manage on a resource it holds nothing on. Also unenforceable in the intended form while "parent" is not a modelled tier (see R3). |
 | **R6 — Revocation is never escalation** | **COMPLIES** (re-scoped by R2 in Phase 1) | `revoke_key_hook_permission` requires only manage on the hook (`require_manage`, `src/api.rs:2388`), does not compare verbs, and has no self-revocation block. The "regardless of which endpoint it arrives at" clause holds too: `update_key_hook_permissions` reduces a row through the `wanted && !held` shape, which never fires on a `false`. |
 | **R7 — Granting bounded by R1 and R2 together** | ~~**VIOLATES**~~ → **RESOLVED** | Follows directly from R1 and R2 both being violated by the same early return. |
 
 ### Ownership and Resource Lifecycle
+
+**RESOLVED in Phase 2.** Original verdicts retained for the record.
 
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
@@ -2642,8 +2644,8 @@ verdicts retained for the record.
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
 | Partial unique index on `is_master = true` | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** (Phase 0, portable equivalent) | Absent (see above). Also worth flagging for the implementation pass: SQLite and PostgreSQL both support partial indexes, MySQL does not — and `Cargo.toml` enables `sqlx-mysql`. A portable equivalent will be needed, or the SQL-agnostic claim narrows. |
-| Index on `parent_key_id` | **DOES NOT IMPLEMENT** | Column absent. |
-| Index on `owner_key_id` | **DOES NOT IMPLEMENT** | Column absent. |
+| Index on `parent_key_id`  | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** (Phase 2) | Column absent. |
+| Index on `owner_key_id`  | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** (Phase 2) | Column absent. |
 | Index on key-hash lookup column | **COMPLIES** | `key_hash` is `#[sea_orm(unique)]` (`src/entities/api_key.rs:48`) and the initial migration creates a unique index on it — the single authentication lookup path. |
 | Indexes on permission-table join columns | **COMPLIES** | `src/migration/m20230101_000001_initial_schema.rs` creates indexes at lines 327/336 and 373/382 covering the junction table's join columns. |
 
@@ -3022,4 +3024,134 @@ tests alone.
 | `cargo clippy --all-targets -- -D warnings` | clean |
 | `cargo test` | **199 passed** (84 unit + 115 integration), was 195 |
 | `./scripts/test_e2e.sh` | **729/729**, 0 failed — was 721 |
+| `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |
+
+---
+
+## Phase 2 — Lineage, Ownership & Lifecycle Authority (§3, §7, R3)
+
+Migration `m20230107_000001_key_lineage_and_resource_ownership` plus the §3 lifecycle guard.
+
+### Two columns that look alike and are not
+
+| Column | Meaning | Mutable? | Read by authorization? |
+| :--- | :--- | :--- | :--- |
+| `api_keys.parent_key_id` | Who **created** this key | No — lineage is a record, not a state | **Never** (R3) |
+| `api_keys.owner_key_id` | Who is **answerable** for this key | Master may reassign (§3) | Not yet — see the scope note below |
+| `hooks.owner_key_id` | Who is **answerable** for this hook | Master may reassign (§3) | Yes — §3 lifecycle authority |
+
+The distinction earns its keep at deletion time. §6 walks the subtree via `parent_key_id` to find
+every key being removed, then collects what those keys *own* via `owner_key_id`. Conflating them
+would make a key's creator permanently answerable for resources it had since handed over.
+
+### Backfill: explicit NULL, never a guess
+
+Every pre-existing row gets `NULL` for all three columns. This is a refusal, not a convenient
+default.
+
+There is no honest way to reconstruct lineage after the fact — `audit_logs` has `KEY_CREATE`
+entries, but they are retention-swept, absent for anything predating auditing, and name the actor by
+prefix rather than id. Ownership is worse: **a hook's creator was never recorded anywhere.**
+`grant_full_hook_permission` gives the creator an ordinary `can_manage` row, byte-identical to a
+delegated one, so "the key holding `can_manage`" is not evidence of authorship and is usually true of
+several keys.
+
+Backfilling ownership to the master was the tempting alternative and is worse than NULL: §3
+restricts lifecycle to master *and the owner*, so master-everywhere is behaviourally identical to
+no-owner while additionally asserting a fact nobody checked. NULL says the true thing — this
+predates ownership — and leaves lifecycle authority with master alone until an operator assigns it.
+
+Operators wanting to adopt ownership for existing hooks should do it deliberately:
+
+```sql
+-- Review first: which hooks have no owner, and who currently manages each.
+SELECT h.id, h.name, h.run_as_user,
+       (SELECT COUNT(*) FROM api_key_hook_permissions p
+        WHERE p.hook_id = h.id AND p.can_manage = TRUE) AS manager_count
+FROM hooks h
+WHERE h.owner_key_id IS NULL AND h.is_deleted = FALSE
+ORDER BY h.name;
+
+-- Assign one at a time, or scripted from the review above. Never blanket-assign.
+UPDATE hooks SET owner_key_id = '<key-id>' WHERE id = '<hook-id>';
+```
+
+### No database-level foreign keys, on purpose
+
+All three columns reference `api_keys.id` logically; none carries a DDL `REFERENCES` clause, because
+both available behaviours are wrong here:
+
+- `ON DELETE CASCADE` would delete a hook when its owner key is deleted. §6 forbids exactly that:
+  "Hooks must never disappear as a side effect of removing a key."
+- `ON DELETE SET NULL` would silently orphan resources at the moment of deletion — which is the
+  inventory step's whole reason for existing. The caller is meant to be *shown* what it is about to
+  strand and made to resolve it.
+
+§6's pre-flight inventory is the referential-integrity mechanism, and it is necessarily
+application-level because it is interactive: a database constraint fires before the inventory can
+refuse. SQLite also does not enforce foreign keys unless `PRAGMA foreign_keys` is on, so a DDL
+constraint would have been decorative on the default backend regardless.
+
+### §3 lifecycle authority
+
+`require_lifecycle_authority` sits **in front of** `require_manage`, narrowing rather than replacing
+it. `can_manage` remains the right to *operate* a hook — description, `script_path`, timeout,
+parameter contract. What it no longer carries is the right to make the hook cease to exist.
+
+**Renaming is grouped with deletion.** This service resolves hooks by name on
+`/webhook/{identifier}`, in `hook_name` grant payloads, and in operator runbooks, so a rename
+silently breaks every caller pointed at the old one. It changes the resource's identity, not its
+content — a lifecycle act wearing an edit's clothes.
+
+**Ownerless hooks are master-only**, which is the conservative direction. Reading "no owner" as
+"anyone who manages it" would make the un-migrated state *more* permissive than the migrated one, so
+every deployment would silently keep the old behaviour until someone remembered to assign ownership
+— a migration that changes nothing until it is noticed.
+
+**Reassignment is master-only and not delegable, not even to the current owner.** An owner able to
+hand ownership to an arbitrary key could walk away from a resource rather than resolve it, which is
+exactly the step §6's inventory exists to make impossible. The target key must exist: a dangling
+owner would put the hook permanently beyond §3's non-master path and make §6's inventory report an
+id resolving to nothing.
+
+### R3 — testing a negative
+
+R3 forbids deriving authority from lineage. Nothing derives authority from lineage *today*, so the
+test has to be built to catch a violation that does not exist yet:
+`r3_a_daughter_of_the_master_holds_no_authority_another_daughter_lacks` creates two keys identical
+in every respect except parentage — one by the master, one by an ordinary parent — first asserts
+that lineage really was recorded *differently* (or the comparison is vacuous), then asserts six
+authority-bearing routes answer identically for both. e2e §37 does the same over the wire.
+
+### Breaking changes
+
+| Change | Who is affected | Migration path |
+| :--- | :--- | :--- |
+| `DELETE /api/hooks/{id}` now requires master or `owner_key_id` | Keys holding `can_manage` on hooks they did not create | Master assigns ownership, or performs the deletion |
+| `PUT /api/hooks/{id}` with `name` now requires master or owner | As above | As above |
+| Every pre-existing hook is ownerless, so **all** non-master deletion of them is refused until ownership is assigned | Every deployment upgrading with existing hooks | The `UPDATE hooks SET owner_key_id` above, per hook |
+
+That last row is the one to watch: it is not a corner case, it is every hook in every existing
+database. It is stated plainly rather than softened because the alternative — backfilling a guess —
+would have made the upgrade quiet and wrong.
+
+### Scope note: `api_keys.owner_key_id` is recorded but not yet enforced
+
+The phase brief asked for `owner_key_id` on `api_keys` as well as `hooks`. It is added, indexed, and
+populated at creation, and Phase 4 reports it as `current_owner` for key entities in the §6
+inventory. It is **not** yet an authorization input: deleting or updating a key still runs on
+`can_manage_keys` plus `require_master_to_administer`, unchanged.
+
+Applying §3's lifecycle rule to keys themselves — "only master and the owner may delete this key" —
+is a coherent extension and a larger behavioural change than this phase's brief covers. Recorded
+here so Phase 5's mutation report does not count it as enforced.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **203 passed** (84 unit + 119 integration), was 199 |
+| `./scripts/test_e2e.sh` | **754/754**, 0 failed — was 729 |
 | `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |

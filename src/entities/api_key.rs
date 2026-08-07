@@ -77,6 +77,21 @@ pub struct Model {
     /// Global privilege to create new hooks. Managing an *existing* hook additionally requires an
     /// explicit `can_manage` grant in `api_key_hook_permissions` (AGENT.MD least-privilege rule).
     pub can_manage_hooks: bool,
+    /// The key that created this one. **Lineage only — never authority.**
+    ///
+    /// `RBAC_MODEL.md` R3 is emphatic: "`parent_key_id` exists solely for cascading deletion and
+    /// visibility scoping. A daughter of the Master key is an ordinary daughter key with no
+    /// elevated standing." No authorization decision may read this field. `None` for the bootstrap
+    /// master, which has no creator, and for every key issued before lineage was recorded.
+    pub parent_key_id: Option<Uuid>,
+    /// The key answerable for this one. Reassignable by master; distinct from [`Self::parent_key_id`],
+    /// which is immutable.
+    ///
+    /// Set to the creator at creation, and thereafter free to diverge from lineage: §6's inventory
+    /// reports it as `current_owner`, while the subtree walk that produces that inventory follows
+    /// `parent_key_id`. Conflating them would make a key's creator permanently answerable for
+    /// things it had since handed over.
+    pub owner_key_id: Option<Uuid>,
     /// Key generation timestamp.
     pub created_at: DateTime,
     /// Key last-update timestamp.

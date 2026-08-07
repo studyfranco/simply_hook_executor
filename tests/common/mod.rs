@@ -228,6 +228,11 @@ pub async fn insert_key_with_mode(
         bound_ips: Set(Some(bound_ips.to_owned())),
         max_concurrent_jobs: Set(scopes.max_concurrent_jobs.max(1)),
         is_master: Set(scopes.is_master),
+        // Seeded keys are lineage-less by default: R3 says lineage confers no authority, so a NULL
+        // parent must never change how a key behaves. Tests that care about the subtree set it
+        // explicitly via [`set_parent`].
+        parent_key_id: Set(None),
+        owner_key_id: Set(None),
         can_manage_keys: Set(scopes.can_manage_keys),
         can_manage_hooks: Set(scopes.can_manage_hooks),
         created_at: Set(now),
@@ -347,13 +352,40 @@ pub async fn insert_hook(
     insert_hook_as(db, name, script_path, timeout_seconds, None).await
 }
 
-/// Inserts a hook, optionally elevated to `run_as_user`.
+/// Inserts a hook, optionally elevated to `run_as_user`. Ownerless — see [`insert_hook_owned_by`].
 pub async fn insert_hook_as(
     db: &DatabaseConnection,
     name: &str,
     script_path: &str,
     timeout_seconds: i32,
     run_as_user: Option<&str>,
+) -> Uuid {
+    insert_hook_full(db, name, script_path, timeout_seconds, run_as_user, None).await
+}
+
+/// Inserts a hook owned by `owner`, the shape `RBAC_MODEL.md` §3's lifecycle rules govern.
+///
+/// The plain [`insert_hook`] family leaves `owner_key_id` NULL, matching a hook that predates
+/// ownership: lifecycle authority over it rests with master alone. Tests about *who may delete or
+/// rename* need a real owner, and tests about the un-owned fallback need the absence — so the two
+/// are separate helpers rather than one with a defaulted argument nobody reads.
+pub async fn insert_hook_owned_by(
+    db: &DatabaseConnection,
+    name: &str,
+    script_path: &str,
+    owner: Uuid,
+) -> Uuid {
+    insert_hook_full(db, name, script_path, 30, None, Some(owner)).await
+}
+
+/// The full hook seeder the three wrappers above delegate to.
+pub async fn insert_hook_full(
+    db: &DatabaseConnection,
+    name: &str,
+    script_path: &str,
+    timeout_seconds: i32,
+    run_as_user: Option<&str>,
+    owner_key_id: Option<Uuid>,
 ) -> Uuid {
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
@@ -365,6 +397,7 @@ pub async fn insert_hook_as(
         script_path: Set(script_path.to_owned()),
         default_timeout_seconds: Set(timeout_seconds),
         run_as_user: Set(run_as_user.map(str::to_owned)),
+        owner_key_id: Set(owner_key_id),
         is_deleted: Set(false),
         deleted_at: Set(None),
         deleted_by: Set(None),
@@ -401,6 +434,7 @@ pub async fn insert_hook_deleted_days_ago(
         script_path: Set(script_path.to_owned()),
         default_timeout_seconds: Set(30),
         run_as_user: Set(None),
+        owner_key_id: Set(None),
         is_deleted: Set(true),
         deleted_at: Set(Some(deleted_at)),
         deleted_by: Set(Some(deleted_by.to_string())),

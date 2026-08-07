@@ -3047,6 +3047,84 @@ check_jq ".name" "System Master" "§5 its name was never rewritten"
 check_jq ".max_concurrent_jobs" "10" "§5 its concurrency budget was never rewritten"
 check_jq ".hmac_mode" "CANONICAL_V1" "§5 it was never downgraded to BODY_ONLY"
 
+# ── 37. RBAC_MODEL.md §3/R3: ownership, lifecycle authority, lineage ────────
+
+log_section "37. Ownership and lifecycle authority (RBAC_MODEL.md §3, R3)"
+
+OWN_SCRIPT=$(make_hook_script "ownership.sh" 'echo "owned"')
+
+# A key that may create hooks, so it *owns* what it creates rather than being handed one.
+create_scoped_key "Hook Owner" ',"can_manage_hooks":true'
+OWNER_KEY="$CREATED_KEY"; OWNER_ID="$CREATED_ID"
+create_scoped_key "Hook Operator"
+OPERATOR_KEY="$CREATED_KEY"; OPERATOR_ID="$CREATED_ID"
+
+api_call POST "/api/hooks" "$OWNER_KEY" \
+    "$(jq -nc --arg p "$OWN_SCRIPT" '{name:"owned_hook",script_path:$p}')"
+check "200" "the owner creates a hook"
+OWNED_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+check_jq ".owner_key_id" "$OWNER_ID" "§3 the creator is recorded as the owner"
+check_jq ".is_owner" "true" "§3 and sees itself as the owner"
+
+# The operator gets *both* verbs — this is not a case of insufficient operational rights.
+api_call POST "/api/keys/$OPERATOR_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$OWNED_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "the operator is granted both verbs on the hook"
+api_call GET "/api/hooks/$OWNED_HOOK_ID" "$OPERATOR_KEY"
+check "200" "the operator can read the hook"
+check_jq ".can_manage" "true" "§3 it genuinely holds can_manage"
+check_jq ".is_owner" "false" "§3 and is genuinely not the owner"
+
+# manage still means manage: content edits work.
+api_call PUT "/api/hooks/$OWNED_HOOK_ID" "$OPERATOR_KEY" '{"description":"operated"}'
+check "200" "§3 a manage holder may still edit the hook's content"
+
+# ...but lifecycle actions are the owner's.
+api_call DELETE "/api/hooks/$OWNED_HOOK_ID" "$OPERATOR_KEY"
+check "403" "§3 managing a hook does not confer authority to delete it"
+check_true '.error | contains("owner")' "the refusal explains why"
+api_call PUT "/api/hooks/$OWNED_HOOK_ID" "$OPERATOR_KEY" '{"name":"renamed_by_operator"}'
+check "403" "§3 renaming is a lifecycle action, not an edit"
+
+# Ownership is not delegable by its holder — only master reassigns it (§3).
+api_call PUT "/api/hooks/$OWNED_HOOK_ID" "$OWNER_KEY" \
+    "$(jq -nc --arg o "$OPERATOR_ID" '{owner_key_id:$o}')"
+check "403" "§3 an owner cannot hand ownership on"
+api_call PUT "/api/hooks/$OWNED_HOOK_ID" "$MASTER_KEY" \
+    '{"owner_key_id":"00000000-0000-0000-0000-000000000000"}'
+check "400" "§3 reassignment to a key that does not exist is refused"
+
+api_call PUT "/api/hooks/$OWNED_HOOK_ID" "$MASTER_KEY" \
+    "$(jq -nc --arg o "$OPERATOR_ID" '{owner_key_id:$o}')"
+check "200" "§3 master reassigns ownership"
+check_jq ".owner_key_id" "$OPERATOR_ID" "the column moved"
+
+# Authority moved with it, in both directions.
+api_call DELETE "/api/hooks/$OWNED_HOOK_ID" "$OWNER_KEY"
+check "403" "§3 the former owner lost lifecycle authority"
+api_call DELETE "/api/hooks/$OWNED_HOOK_ID" "$OPERATOR_KEY"
+check "204" "§3 and the new owner gained it"
+
+# ── R3: lineage confers no authority ───────────────────────────────────────
+# Two keys identical in every respect but parentage. Every authority-bearing route must answer the
+# same for both, or `parent_key_id` has become a privilege rather than a record.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Daughter Of Master"}'
+check "200" "master creates a daughter"
+DAUGHTER_A_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+api_call POST "/api/keys" "$KEYMGR_KEY" '{"name":"Daughter Of Parent"}'
+check "200" "an ordinary parent creates a daughter"
+DAUGHTER_B_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+for R3_PROBE in "GET:/api/hooks" "GET:/api/audit-logs" "GET:/api/settings" "GET:/api/executions"; do
+    R3_METHOD="${R3_PROBE%%:*}"; R3_PATH="${R3_PROBE#*:}"
+    api_call "$R3_METHOD" "$R3_PATH" "$DAUGHTER_A_KEY"
+    R3_STATUS_A="$RESP_STATUS"
+    api_call "$R3_METHOD" "$R3_PATH" "$DAUGHTER_B_KEY"
+    check_local "$RESP_STATUS" "$R3_STATUS_A" \
+        "R3 $R3_METHOD $R3_PATH answers alike regardless of parentage"
+done
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

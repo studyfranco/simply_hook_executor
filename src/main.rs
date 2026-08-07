@@ -115,6 +115,11 @@ async fn bootstrap_master_key(
         bound_ips: Set(Some(bound_ip.clone())),
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
+        // The master has no creator and no owner: it is minted against an empty table. R3 makes
+        // that harmless — lineage confers no authority, so a NULL parent is not a missing
+        // privilege, and every key the master goes on to create records the master as its parent.
+        parent_key_id: Set(None),
+        owner_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
         created_at: Set(now),

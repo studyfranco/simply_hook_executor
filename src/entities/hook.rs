@@ -27,6 +27,18 @@ pub struct Model {
     /// through `sudo -n -u <user> --`, so what is actually permitted remains governed by
     /// `sudoers` — this field can request elevation, never grant it.
     pub run_as_user: Option<String>,
+    /// The key answerable for this hook: **the only non-master identity that may delete or rename
+    /// it** (`RBAC_MODEL.md` §3).
+    ///
+    /// Deliberately not derivable from `api_key_hook_permissions`. A creator receives an ordinary
+    /// `can_manage` row there, byte-identical to a delegated one, so "holds `can_manage`" says
+    /// nothing about authorship and is usually true of several keys. §3 draws the line exactly
+    /// here: holding manage rights, or any operational verb, confers no lifecycle authority — "a
+    /// parent that merely uses a resource must not be able to delete it."
+    ///
+    /// `None` for hooks that predate ownership, which leaves lifecycle authority with master alone
+    /// until an operator assigns it. Master may reassign it at any time.
+    pub owner_key_id: Option<Uuid>,
     /// Whether the hook is in the trash rather than live.
     ///
     /// A soft-deleted hook is invisible to every ordinary route and cannot be executed, but its row,

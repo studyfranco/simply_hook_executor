@@ -1147,6 +1147,7 @@ mod tests {
             script_path: "/usr/local/bin/demo.sh".to_owned(),
             default_timeout_seconds: 30,
             run_as_user: run_as_user.map(str::to_owned),
+            owner_key_id: None,
             is_deleted: false,
             deleted_at: None,
             deleted_by: None,

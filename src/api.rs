@@ -664,6 +664,50 @@ async fn require_hook_manage_conjunction(
     }
 }
 
+/// **§3 — resource lifecycle authority.** Authorizes deleting or renaming a hook.
+///
+/// > *Resource lifecycle actions — deleting or renaming the entity itself — are restricted
+/// > exclusively to Master and the designated `owner_key_id`. Holding manage rights or any
+/// > operational verb confers no lifecycle authority: a parent that merely uses a resource must not
+/// > be able to delete it.*
+///
+/// This is a **narrower** gate than [`require_manage`], and it sits in front of it rather than
+/// replacing it. `can_manage` remains what it always was — the right to *operate* a hook: edit its
+/// description, its script path, its timeout, its parameter contract. What it no longer carries is
+/// the right to make the hook cease to exist, or to rename it out from under everything that refers
+/// to it by name (`/webhook/{name}`, `hook_name` in a grant payload, an operator's runbook).
+///
+/// Renaming is grouped with deletion rather than with the other edits for that reason: this
+/// service resolves hooks by name on the webhook entry point, so a rename silently breaks every
+/// caller pointed at the old one. It is a lifecycle act wearing an edit's clothes.
+///
+/// An **ownerless** hook — `owner_key_id` NULL, meaning it predates ownership — is master-only.
+/// That is the conservative direction: the alternative, treating "no owner" as "anyone who manages
+/// it", would make the un-migrated state *more* permissive than the migrated one, so every
+/// deployment would silently keep the old behaviour until someone remembered to assign ownership.
+fn require_lifecycle_authority(
+    key: &api_key::Model,
+    hook: &hook::Model,
+    action: &str,
+) -> Result<(), AppError> {
+    if key.is_master || hook.owner_key_id == Some(key.id) {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        key = %key.prefix,
+        hook = %hook.name,
+        owner = ?hook.owner_key_id,
+        action,
+        "§3: lifecycle action attempted by a non-owner"
+    );
+    Err(AppError::Forbidden(format!(
+        "Permission denied: only the master key or hook '{}''s owner may {action} it; managing a \
+         hook does not confer lifecycle authority over it",
+        hook.name
+    )))
+}
+
 /// Whether a permission write only ever *reduces* the target's rights.
 ///
 /// **R6** classifies a reduction arriving at the general update endpoint as a revocation, "regardless
@@ -982,6 +1026,14 @@ pub struct UpdateHookPayload {
     /// New `run_as_user`. Send `""` to drop elevation and run as the daemon user again; omitting
     /// the field leaves the current setting untouched.
     pub run_as_user: Option<String>,
+    /// New owner (`RBAC_MODEL.md` §3: "Master may reassign `owner_key_id` on any resource ... at
+    /// any time"). **Master-only**, and the only way ownership ever moves.
+    ///
+    /// Reassignment is deliberately not delegable, not even to the current owner. Ownership is what
+    /// §3 hangs lifecycle authority on and what §6's inventory reports; letting an owner hand it to
+    /// an arbitrary key would let it walk away from a resource rather than resolve it, which is the
+    /// step §6 exists to make impossible.
+    pub owner_key_id: Option<Uuid>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -999,6 +1051,12 @@ pub struct HookDetail {
     pub default_timeout_seconds: i32,
     /// Account the script runs as via `sudo`, or `None` when it runs as the daemon user.
     pub run_as_user: Option<String>,
+    /// The key answerable for this hook under `RBAC_MODEL.md` §3, or `None` for a hook that
+    /// predates ownership (lifecycle authority then rests with master alone).
+    pub owner_key_id: Option<Uuid>,
+    /// Whether *this caller* may delete or rename the hook — master, or its owner. Distinct from
+    /// `can_manage`, which is the right to edit its content.
+    pub is_owner: bool,
     /// Whether the hook is in the trash. Only ever `true` in a master's `include_deleted` view.
     pub is_deleted: bool,
     /// When it was trashed, if it was.
@@ -1024,6 +1082,9 @@ async fn build_hook_detail(
     model: hook::Model,
 ) -> Result<HookDetail, AppError> {
     let parameters = load_parameters(db, model.id).await?;
+    // §3 authority, reported alongside the operational verbs so a dashboard can grey out "delete"
+    // rather than discovering the refusal only after the click.
+    let is_owner = key.is_master || model.owner_key_id == Some(key.id);
     let (can_execute, can_manage) = if key.is_master {
         (true, true)
     } else {
@@ -1040,6 +1101,8 @@ async fn build_hook_detail(
         script_path: model.script_path,
         default_timeout_seconds: model.default_timeout_seconds,
         run_as_user: model.run_as_user,
+        owner_key_id: model.owner_key_id,
+        is_owner,
         is_deleted: model.is_deleted,
         deleted_at: model.deleted_at,
         deleted_by: model.deleted_by,
@@ -1135,6 +1198,9 @@ pub async fn create_hook(
         script_path: Set(payload.script_path.clone()),
         default_timeout_seconds: Set(timeout),
         run_as_user: Set(run_as_user.clone()),
+        // The creator owns what it creates. §3 restricts deletion and renaming to master and this
+        // key, and the `can_manage` row auto-provisioned below deliberately does not imply it.
+        owner_key_id: Set(Some(key.id)),
         is_deleted: Set(false),
         deleted_at: Set(None),
         deleted_by: Set(None),
@@ -1291,6 +1357,38 @@ pub async fn update_hook(
         None => None,
     };
 
+    // §3: renaming is a lifecycle action, not an edit. This service resolves hooks by name on
+    // `/webhook/{identifier}` and in grant payloads, so a rename silently breaks every caller
+    // pointed at the old one — which is a change to the resource's identity, not its content.
+    if payload.name.is_some() {
+        require_lifecycle_authority(&key, &model, "rename")?;
+    }
+
+    // §3: only master reassigns ownership.
+    let requested_owner = match payload.owner_key_id {
+        Some(owner) => {
+            if !key.is_master {
+                tracing::warn!(
+                    key = %key.prefix,
+                    hook = %model.name,
+                    "§3: non-master attempted to reassign hook ownership"
+                );
+                return Err(AppError::Forbidden(
+                    "Only master API keys can reassign a hook's owner".to_owned(),
+                ));
+            }
+            // A dangling owner would put the hook permanently beyond §3's non-master path and make
+            // §6's inventory report an id that resolves to nothing.
+            if ApiKey::find_by_id(owner).one(&state.db).await?.is_none() {
+                return Err(AppError::InvalidInput(
+                    "owner_key_id does not name an existing API key".to_owned(),
+                ));
+            }
+            Some(owner)
+        }
+        None => None,
+    };
+
     if let Some(script_path) = &payload.script_path {
         executor::validate_script_path(script_path, &state.config.allowed_script_roots)?;
     }
@@ -1309,6 +1407,10 @@ pub async fn update_hook(
         }
         changes.push(format!("name={trimmed}"));
         active.name = Set(trimmed);
+    }
+    if let Some(owner) = requested_owner {
+        changes.push(format!("owner_key_id={owner}"));
+        active.owner_key_id = Set(Some(owner));
     }
     if let Some(description) = payload.description {
         changes.push("description".to_owned());
@@ -1388,6 +1490,8 @@ pub async fn delete_hook(
         resolve_hook(&state.db, &identifier).await?
     };
     require_manage(&state.db, &key, model.id).await?;
+    // §3: managing a hook is not authority to make it cease to exist.
+    require_lifecycle_authority(&key, &model, "delete")?;
     // Deleting a privileged hook is a change to a privileged hook like any other.
     require_master_for_privileged_hook(&key, &model, "delete")?;
 
@@ -2252,6 +2356,11 @@ pub async fn create_api_key(
         // Hard-wired, not read from the payload. There is no field to read, and the database's
         // `master_marker` unique index would reject the row even if there were.
         is_master: Set(false),
+        // Lineage and ownership both start at the creator. They may diverge later — master can
+        // reassign ownership (§3) — but lineage never changes, because §6's cascade has to be able
+        // to answer "which keys came from this one" long after custody has moved.
+        parent_key_id: Set(Some(key.id)),
+        owner_key_id: Set(Some(key.id)),
         can_manage_keys: Set(payload.can_manage_keys.unwrap_or(false)),
         can_manage_hooks: Set(payload.can_manage_hooks.unwrap_or(false)),
         created_at: Set(now),

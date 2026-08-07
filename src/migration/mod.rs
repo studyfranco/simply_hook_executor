@@ -8,6 +8,7 @@ mod m20230103_000001_add_signing_secret;
 mod m20230104_000001_add_hmac_mode;
 mod m20230105_000001_add_hook_soft_delete;
 mod m20230106_000001_master_key_uniqueness;
+mod m20230107_000001_key_lineage_and_resource_ownership;
 
 /// The ordered set of all schema migrations for `simply_hook_executor`.
 pub struct Migrator;
@@ -22,6 +23,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20230104_000001_add_hmac_mode::Migration),
             Box::new(m20230105_000001_add_hook_soft_delete::Migration),
             Box::new(m20230106_000001_master_key_uniqueness::Migration),
+            Box::new(m20230107_000001_key_lineage_and_resource_ownership::Migration),
         ]
     }
 }

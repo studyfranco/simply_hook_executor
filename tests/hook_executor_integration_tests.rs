@@ -1937,6 +1937,7 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         script_path: Set("/bin/true".to_owned()),
         default_timeout_seconds: Set(30),
         run_as_user: Set(None),
+        owner_key_id: Set(None),
         is_deleted: Set(false),
         deleted_at: Set(None),
         deleted_by: Set(None),
@@ -2273,7 +2274,10 @@ async fn granular_hook_permissions_separate_execute_from_manage() {
     let (manager_id, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::plain()).await;
     let (_, stranger) = insert_key(&db, "Stranger", "0.0.0.0/0", KeyScopes::plain()).await;
 
-    let hook_id = insert_hook(&db, "granular", &script, 30).await;
+    // Owned by the manager, so the closing assertion exercises the *permission* matrix rather than
+    // §3 ownership. The complement — a manage-holder who is not the owner being refused — is
+    // covered by `s3_managing_a_hook_does_not_confer_authority_to_delete_it`.
+    let hook_id = insert_hook_owned_by(&db, "granular", &script, manager_id).await;
     grant(&db, executor_id, hook_id, true, false).await;
     grant(&db, manager_id, hook_id, false, true).await;
 
@@ -4091,6 +4095,8 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
         bound_ips: Set(Some(String::new())),
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
+        parent_key_id: Set(None),
+        owner_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
         created_at: Set(now),
@@ -4166,6 +4172,220 @@ async fn the_master_may_edit_only_its_own_bound_ips() {
     assert_eq!(reloaded.max_concurrent_jobs, 10);
     assert!(reloaded.can_manage_keys && reloaded.can_manage_hooks);
     assert_eq!(reloaded.bound_ips.as_deref(), Some("127.0.0.0/8,::1/128"));
+}
+
+// ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §3 — ownership and lifecycle authority; R3 — lineage
+// ─────────────────────────────────────────────────────────────
+
+/// **§3** — "a parent that merely uses a resource must not be able to delete it."
+///
+/// The separation this creates did not exist before: `can_manage` was the whole requirement for
+/// deletion, so any key an operator gave editing rights to could also make the hook — and, via the
+/// 92-day purge, its entire execution history — cease to exist.
+#[tokio::test]
+async fn s3_managing_a_hook_does_not_confer_authority_to_delete_it() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("owned.sh", "#!/bin/sh\necho ok\n");
+
+    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
+    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::plain()).await;
+    let hook = insert_hook_owned_by(&db, "owned_hook", &script, owner_id).await;
+    grant(&db, owner_id, hook, true, true).await;
+    grant(&db, manager_id, hook, true, true).await;
+
+    // The manager holds *both* verbs — this is not a case of insufficient operational rights.
+    let edit = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook}"), &manager, Some(json!({ "description": "edited" }))),
+    )
+    .await;
+    assert_eq!(edit.status, StatusCode::OK, "manage still means manage: content edits work");
+
+    let delete = send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &manager, None)).await;
+    assert_eq!(delete.status, StatusCode::FORBIDDEN, "but deletion is the owner's: {}", delete.raw);
+    assert!(delete.raw.contains("owner"), "the refusal explains why: {}", delete.raw);
+
+    // Renaming is grouped with deletion, not with the edits above: this service resolves hooks by
+    // name on `/webhook/{identifier}`, so a rename silently breaks every caller pointed at the old
+    // one. It is a lifecycle act wearing an edit's clothes.
+    let rename = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook}"), &manager, Some(json!({ "name": "renamed" }))),
+    )
+    .await;
+    assert_eq!(rename.status, StatusCode::FORBIDDEN, "renaming is a lifecycle action");
+
+    // The owner may do both.
+    assert_eq!(
+        send(&app, json_request("PUT", &format!("/api/hooks/{hook}"), &owner, Some(json!({ "name": "renamed" })))).await.status,
+        StatusCode::OK,
+        "the owner may rename"
+    );
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &owner, None)).await.status,
+        StatusCode::NO_CONTENT,
+        "and delete"
+    );
+}
+
+/// **§3** — an ownerless hook is master-only, which is the conservative direction.
+///
+/// Every hook that predates the ownership column has `owner_key_id` NULL. Reading that as "anyone
+/// who manages it may delete it" would make the un-migrated state *more* permissive than the
+/// migrated one, so every existing deployment would silently keep the old behaviour until someone
+/// remembered to assign ownership — a migration that changes nothing until it is noticed.
+#[tokio::test]
+async fn s3_a_hook_with_no_owner_is_lifecycle_master_only() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("legacy.sh", "#!/bin/sh\necho ok\n");
+
+    let hook = insert_hook(&db, "ownerless_hook", &script, 30).await;
+    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::plain()).await;
+    grant(&db, manager_id, hook, true, true).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &manager, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "no owner means no non-master lifecycle authority"
+    );
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &master, None)).await.status,
+        StatusCode::NO_CONTENT,
+        "master is unaffected by ownership"
+    );
+}
+
+/// **§3** — "Master may reassign `owner_key_id` on any resource ... at any time", and only master.
+#[tokio::test]
+async fn s3_only_master_reassigns_ownership() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("reassign.sh", "#!/bin/sh\necho ok\n");
+
+    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
+    let (successor_id, successor) = insert_key(&db, "successor", "", KeyScopes::plain()).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let hook = insert_hook_owned_by(&db, "reassigned_hook", &script, owner_id).await;
+    grant(&db, owner_id, hook, true, true).await;
+    grant(&db, successor_id, hook, true, true).await;
+
+    // The current owner cannot hand ownership on. Letting it would let an owner walk away from a
+    // resource rather than resolve it — the step §6's inventory exists to make impossible.
+    let by_owner = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook}"), &owner, Some(json!({ "owner_key_id": successor_id }))),
+    )
+    .await;
+    assert_eq!(by_owner.status, StatusCode::FORBIDDEN, "ownership is not delegable by its holder");
+
+    // A dangling owner is refused: it would put the hook permanently beyond §3's non-master path
+    // and make §6's inventory report an id resolving to nothing.
+    let dangling = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook}"),
+            &master,
+            Some(json!({ "owner_key_id": Uuid::new_v4() })),
+        ),
+    )
+    .await;
+    assert_eq!(dangling.status, StatusCode::BAD_REQUEST, "the new owner must exist");
+
+    let by_master = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook}"), &master, Some(json!({ "owner_key_id": successor_id }))),
+    )
+    .await;
+    assert_eq!(by_master.status, StatusCode::OK, "master reassigns: {}", by_master.raw);
+
+    // Authority moved with the column, in both directions.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &owner, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "the former owner lost lifecycle authority"
+    );
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &successor, None)).await.status,
+        StatusCode::NO_CONTENT,
+        "and the new owner gained it"
+    );
+}
+
+/// **R3** — "A daughter of the Master key is an ordinary daughter key with no elevated standing."
+///
+/// The rule this pins is a *negative* one, so the test has to be constructed to catch a violation
+/// that does not exist yet: `parent_key_id` was added in this phase for cascade and visibility
+/// scoping, and the risk is that some future check reads it to decide authority. Two keys are made
+/// identical in every respect except parentage — one created by the master, one by an ordinary
+/// parent — and every authority-bearing route must answer the same for both.
+#[tokio::test]
+async fn r3_a_daughter_of_the_master_holds_no_authority_another_daughter_lacks() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("lineage.sh", "#!/bin/sh\necho ok\n");
+
+    let hook = insert_hook(&db, "lineage_hook", &script, 30).await;
+    let (master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let (parent_id, parent) = insert_key(&db, "ordinary-parent", "", KeyScopes {
+        can_manage_keys: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    })
+    .await;
+
+    // Two daughters, differing only in who created them.
+    let of_master = send(
+        &app,
+        json_request("POST", "/api/keys", &master, Some(json!({ "name": "daughter-of-master" }))),
+    )
+    .await;
+    assert_eq!(of_master.status, StatusCode::OK);
+    let of_parent = send(
+        &app,
+        json_request("POST", "/api/keys", &parent, Some(json!({ "name": "daughter-of-parent" }))),
+    )
+    .await;
+    assert_eq!(of_parent.status, StatusCode::OK);
+
+    // Lineage was recorded, and recorded differently — otherwise the comparison below is vacuous.
+    let id_of = |res: &TestResponse| -> Uuid {
+        res.json["id"].as_str().expect("id present").parse().expect("id parses")
+    };
+    let daughter_of_master =
+        ApiKey::find_by_id(id_of(&of_master)).one(&db).await.expect("query").expect("row");
+    let daughter_of_parent =
+        ApiKey::find_by_id(id_of(&of_parent)).one(&db).await.expect("query").expect("row");
+    assert_eq!(daughter_of_master.parent_key_id, Some(master_id), "lineage records the master");
+    assert_eq!(daughter_of_parent.parent_key_id, Some(parent_id), "and the ordinary parent");
+
+    // Every authority-bearing route answers identically for both.
+    let a = of_master.json["plaintext_key"].as_str().expect("key").to_owned();
+    let b = of_parent.json["plaintext_key"].as_str().expect("key").to_owned();
+    for (label, path, method, body) in [
+        ("execute the hook", format!("/api/hooks/{hook}/execute"), "POST", Some(json!({}))),
+        ("read the hook", format!("/api/hooks/{hook}"), "GET", None),
+        ("delete the hook", format!("/api/hooks/{hook}"), "DELETE", None),
+        ("create a key", "/api/keys".to_owned(), "POST", Some(json!({ "name": "x" }))),
+        ("read the audit log", "/api/audit-logs".to_owned(), "GET", None),
+        ("read settings", "/api/settings".to_owned(), "GET", None),
+    ] {
+        let from_master_line = send(&app, json_request(method, &path, &a, body.clone())).await;
+        let from_parent_line = send(&app, json_request(method, &path, &b, body)).await;
+        assert_eq!(
+            from_master_line.status, from_parent_line.status,
+            "R3: being the master's daughter changed the answer for '{label}'              ({} vs {})",
+            from_master_line.status, from_parent_line.status
+        );
+    }
 }
 
 /// Finding #3 — `can_manage_keys` could write itself an execute grant on any hook, including one
@@ -4481,9 +4701,11 @@ async fn a_non_master_delete_is_soft_and_leaves_the_row_intact() {
     let scripts = ScriptDir::new();
 
     let script = scripts.write_script("soft.sh", "echo ok");
-    let hook_id = insert_hook(&db, "soft_hook", &script, 30).await;
-    insert_parameter(&db, hook_id, "p1", Some("v"), false).await;
     let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    // Owned by the deleter: §3 restricts deletion to master and the owner, and this test is about
+    // what a *permitted* delete does to the row, not about who may issue one.
+    let hook_id = insert_hook_owned_by(&db, "soft_hook", &script, key_id).await;
+    insert_parameter(&db, hook_id, "p1", Some("v"), false).await;
     grant(&db, key_id, hook_id, true, true).await;
 
     // Run it once so there is history worth preserving.
@@ -4600,8 +4822,10 @@ async fn trash_management_is_master_only() {
     let scripts = ScriptDir::new();
 
     let script = scripts.write_script("guard.sh", "echo ok");
-    let hook_id = insert_hook(&db, "guard_hook", &script, 30).await;
     let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    // Owned by the editor, so the refusals below are about *trash* being master-only rather than
+    // about §3 ownership — which is covered separately.
+    let hook_id = insert_hook_owned_by(&db, "guard_hook", &script, key_id).await;
     grant(&db, key_id, hook_id, true, true).await;
 
     // A non-master cannot destroy the row even on a hook it fully manages: hard delete discards an
