@@ -457,7 +457,55 @@ rbac_model_identity() {
     DRIFT=$((DRIFT + 1))
 }
 
+# ── RBAC_MODEL rule coverage ────────────────────────────────────────────────
+#
+# `tests/rbac_model_compliance.rs` names every test after the rule it enforces. This turns that
+# convention into an invariant: if a rule R1–R7 or a section §3–§7 has no test carrying its prefix,
+# the run fails.
+#
+# What it does *not* claim is that the rule is correctly enforced — a test can be weak, and Phase 5's
+# mutation report is what speaks to that. What it does guarantee is that a rule can no longer be
+# silently *untested*: adding a rule to the model, or deleting the last test for one, breaks the
+# build rather than passing quietly.
+rbac_rule_coverage() {
+    local suite="$REPO_ROOT/tests/rbac_model_compliance.rs"
+
+    if [ ! -f "$suite" ]; then
+        echo "${RED}[DRIFT]${RESET} ${BOLD}RBAC rule coverage${RESET}"
+        echo "         ${DIM}tests/rbac_model_compliance.rs is missing — every rule is uncovered.${RESET}"
+        DRIFT=$((DRIFT + 1))
+        return
+    fi
+
+    # Test function names only, so a rule mentioned in a doc comment cannot satisfy its own check.
+    local names
+    names=$(grep -oE '^async fn [a-z0-9_]+' "$suite" | sed 's/^async fn //')
+
+    local missing=""
+    local rule
+    for rule in r1 r2 r3 r4 r5 r6 r7 s3 s4 s5 s6 s7; do
+        if ! printf '%s\n' "$names" | grep -qE "^${rule}_"; then
+            missing="$missing $rule"
+        fi
+    done
+
+    if [ -n "$missing" ]; then
+        echo "${RED}[DRIFT]${RESET} ${BOLD}RBAC rule coverage${RESET}"
+        echo "         ${DIM}No compliance test for:${RESET}${missing}"
+        echo "         ${DIM}Every rule R1-R7 and section 3-7 of RBAC_MODEL.md needs at least one"
+        echo "         test in tests/rbac_model_compliance.rs whose name starts with its prefix.${RESET}"
+        DRIFT=$((DRIFT + 1))
+        return
+    fi
+
+    local count
+    count=$(printf '%s\n' "$names" | grep -cE '^(r[1-7]|s[3-7])_')
+    echo "${GREEN}[OK]${RESET}    ${BOLD}RBAC rule coverage${RESET} ${DIM}(12 rules, $count test(s))${RESET}"
+    OK=$((OK + 1))
+}
+
 rbac_model_identity
+rbac_rule_coverage
 
 echo
 echo "${DIM}$OK converged, $KNOWN known divergence(s), $DRIFT drifted, $SKIPPED skipped${RESET}"

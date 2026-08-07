@@ -3391,3 +3391,90 @@ grow a second arm or it will strand keys the way it currently cannot.
 | `cargo test` | **213 passed** (84 unit + 129 integration), was 208 |
 | `./scripts/test_e2e.sh` | **823/823**, 0 failed — was 791 |
 | `./scripts/verify_convergence.sh` | 14 converged, 2 known, 0 drifted |
+
+---
+
+## Phase 5 — Compliance Suite & Mutation Validation
+
+`tests/rbac_model_compliance.rs`: 14 tests, every name prefixed with the rule it enforces
+(`r1_`…`r7_`, `s3_`…`s7_`). Coverage against the specification is now auditable by running
+`cargo test --test rbac_model_compliance -- --list`.
+
+`scripts/verify_convergence.sh` gained `rbac_rule_coverage`, which fails the run if any rule R1–R7
+or section §3–§7 has no test carrying its prefix. It reads **test function names only**
+(`grep -oE '^async fn ...'`), so a rule mentioned in a doc comment cannot satisfy its own check. It
+was mutation-tested by renaming `r5_manage_propagates_…` — the check reported
+`[DRIFT] No compliance test for: r5`.
+
+The check proves a rule is not *untested*. It cannot prove a rule is *enforced* — that is what the
+mutation results below are for, and the two must not be confused.
+
+### Mutation results
+
+Each enforcement site was disabled in turn, the corresponding compliance test run, and the source
+restored with `git checkout -- src/`. A mutation that **FIRED** means the test genuinely pins the
+rule; one that **SURVIVED** means the test would pass against unfixed code and proves nothing.
+
+| Rule | Mutation | Outcome |
+| :--- | :--- | :--- |
+| R1 | per-verb `wanted && !held` comparison always `None` | **FIRED** |
+| R2 (per-resource half) | `can_manage_keys` short-circuits to a synthetic full row | **FIRED** |
+| R2 (global half) | `!can_manage_keys` check removed from `has_permission_admin_standing` | *survived* |
+| R2 (global half) | same check removed from `require_hook_manage_conjunction` | *survived* |
+| R2 (global half) | **both sites at once** | **FIRED** |
+| R3 | `require_execute` grants when the caller's parent is master | **FIRED** |
+| R4 | `require_master_to_grant_scopes` returns `Ok` unconditionally | **FIRED** |
+| R5 | granting `can_manage` also sets `can_manage_keys` on the target | **FIRED** |
+| R6 | revoke path additionally requires the caller to hold `can_execute` | **FIRED** |
+| R7 | R2 gate replaced by a bare row lookup that passes on absence | **FIRED** |
+| §3 | `require_lifecycle_authority` returns `Ok` unconditionally | **FIRED** |
+| §4 (minimal view) | shared-resource peers rendered with the full summary | **FIRED** |
+| §4 (oracle) | `verb_denied` always returns `403` | **FIRED** |
+| §4 (401-vs-403) | unknown API key returns `403` instead of `401` | **FIRED** |
+| §5 | `refuse_master_lifecycle_action` returns `Ok` unconditionally | **FIRED** |
+| §6 | the unresolved-inventory gate is skipped | **FIRED** |
+| §7 | `idx_api_keys_parent_key_id` omitted from the migration | **FIRED** |
+
+**14 of 14 rules covered by a firing mutation.** The two single-site R2 survivors are not a test
+weakness and are recorded rather than hidden: the global half is enforced **twice**, at the coarse
+standing pre-check and again at the per-hook guard, so disabling either alone leaves the other
+holding the line. That is defence in depth working as intended — and it is exactly the situation a
+mutation report exists to distinguish from an untested rule, since both look identical from the
+outside.
+
+Two mutations changed behaviour in ways worth noting:
+
+- The **§4 oracle** mutation initially *survived*, and that was a real gap. The compliance test
+  probed only `GET /api/hooks/{id}`, which fails at `require_visibility` and never reaches
+  `verb_denied` — so the guard that handles execute/modify was unpinned. The test now walks six
+  routes, and the mutation fires. Left as written, the oracle would simply have migrated to whichever
+  endpoint the test had not visited.
+- The **R5** mutation is the only one that had to *add* a violation rather than remove a guard. R5 is
+  partly emergent — "manage may propagate sideways ... but this can never elevate a daughter key to
+  parent status" is upheld by R4 and by the grant handler never touching global scopes, not by a
+  guard of its own. The mutation makes the handler promote its target, which is the violation R5
+  names.
+
+### Rules covered but not fully enforced
+
+Recorded here so the table above is not read as a clean bill of health. Both were flagged when they
+arose and neither is closed:
+
+1. **R2's wider reading** (Phase 1). R2 governs "managing a specific resource"; the Tiers matrix says
+   a Daughter key never manages resources. Enforced on the grant and revoke paths. **Not** enforced on
+   `require_manage`, so a daughter holding a `can_manage` row can still edit a hook's `script_path`,
+   timeout and parameter contract. The phase brief scoped R2 to grant/revoke explicitly; widening it
+   would revoke hook-editing from every manage-only key in every deployment.
+2. **§3 applied to keys** (Phase 2). `api_keys.owner_key_id` is populated, indexed, and reported by
+   §6's inventory, but is not an authorization input: key deletion and update still run on
+   `can_manage_keys` plus `require_master_to_administer`.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **227 passed** (84 unit + 129 integration + 14 compliance), was 213 |
+| `./scripts/test_e2e.sh` | **823/823**, 0 failed — unchanged |
+| `./scripts/verify_convergence.sh` | 15 converged, 2 known, 0 drifted |

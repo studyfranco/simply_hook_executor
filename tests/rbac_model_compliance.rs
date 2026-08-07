@@ -1,0 +1,846 @@
+//! Compliance suite for `RBAC_MODEL.md`, indexed by rule.
+//!
+//! **Every test name in this file begins with the rule or section it enforces** — `r1_` through
+//! `r7_`, `s3_` through `s7_`. That is the entire point of the file existing separately from
+//! `hook_executor_integration_tests.rs`: coverage against the specification becomes auditable by
+//! reading `cargo test --test rbac_model_compliance -- --list`, rather than by trusting that
+//! somebody remembered to write a test when a rule was implemented.
+//!
+//! `scripts/verify_convergence.sh` enforces the invariant mechanically: it fails if any rule R1–R7
+//! or section §3–§7 has no test whose name carries its prefix. A rule can therefore be *unenforced*
+//! (that is a finding, recorded in `AGENT_NOTES.MD`) but it can no longer be silently *untested*.
+//!
+//! These tests are deliberately close to the specification's own wording, and deliberately
+//! redundant with the behavioural tests next door. The behavioural suite asks "does this endpoint
+//! do the right thing"; this one asks "is this sentence of the model true of the running service".
+//! When the two disagree, the model wins.
+
+#[allow(dead_code)]
+mod common;
+
+use axum::http::StatusCode;
+use common::*;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm_migration::SchemaManager;
+use serde_json::json;
+use simply_hook_executor::{
+    create_app,
+    entities::{api_key, prelude::ApiKey},
+};
+use uuid::Uuid;
+
+/// A key holding both halves of R2 on `hook`: `can_manage_keys`, and a `can_manage` row.
+async fn parent_managing(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+    hook: Uuid,
+    can_execute: bool,
+) -> (Uuid, String) {
+    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (id, plaintext) = insert_key(db, name, "", scopes).await;
+    grant(db, id, hook, can_execute, true).await;
+    (id, plaintext)
+}
+
+// ═════════════════════════════════════════════════════════════
+// R1 — Non-amplification
+// ═════════════════════════════════════════════════════════════
+
+/// > *A caller may only grant rights it currently holds itself. A holder of a single read-level
+/// > verb may grant that verb and nothing more. Applies at every tier below Master.*
+#[tokio::test]
+async fn r1_a_caller_may_only_grant_verbs_it_holds_itself() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r1.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "r1_hook", &script, 30).await;
+    // Manages the hook, deliberately without `can_execute` on it.
+    let (parent_id, parent) = parent_managing(&db, "r1-parent", hook, false).await;
+    let (daughter_id, _daughter) = insert_key(&db, "r1-daughter", "", KeyScopes::plain()).await;
+    set_parent(&db, daughter_id, parent_id).await;
+
+    let over = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{daughter_id}/permissions"),
+            &parent,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(over.status, StatusCode::FORBIDDEN, "R1 violated: {}", over.raw);
+    assert!(over.raw.contains("can_execute"), "the refusal names the verb: {}", over.raw);
+
+    // "...may grant that verb and nothing more": the verb it *does* hold still passes.
+    let within = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{daughter_id}/permissions"),
+            &parent,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(within.status, StatusCode::OK, "R1 is a bound, not a ban: {}", within.raw);
+}
+
+// ═════════════════════════════════════════════════════════════
+// R2 — Manage is a conjunction
+// ═════════════════════════════════════════════════════════════
+
+/// > *Managing a specific resource requires holding both global `can_manage_keys` AND a
+/// > `can_manage = true` row for that specific resource. Neither alone is sufficient.
+/// > `can_manage_keys` is never a global bypass of per-resource RBAC.*
+#[tokio::test]
+async fn r2_neither_half_of_the_conjunction_suffices_alone() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r2.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "r2_hook", &script, 30).await;
+    let (target_id, _target) = insert_key(&db, "r2-target", "", KeyScopes::plain()).await;
+    grant(&db, target_id, hook, true, false).await;
+
+    let payload = json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false });
+
+    // Half one: the global scope, and a manage row on some *other* hook — enough standing to reach
+    // the per-hook decision, and nothing on the hook actually being administered. §4 makes that a
+    // `404`: the refusal must not confirm the target hook is real.
+    let elsewhere = insert_hook(&db, "r2_elsewhere", &script, 30).await;
+    let scope_only = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (scope_id, scope_key) = insert_key(&db, "r2-scope-only", "", scope_only).await;
+    grant(&db, scope_id, elsewhere, true, true).await;
+    set_parent(&db, target_id, scope_id).await;
+    let a = send(
+        &app,
+        json_request("POST", &format!("/api/keys/{target_id}/permissions"), &scope_key, Some(payload.clone())),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "can_manage_keys alone must not suffice: {}", a.raw);
+
+    // Half two: a `can_manage` row, no global scope. This is a Daughter key, which the Tiers matrix
+    // says never manages resources.
+    let (row_id, row_key) = insert_key(&db, "r2-row-only", "", KeyScopes::plain()).await;
+    grant(&db, row_id, hook, true, true).await;
+    let b = send(
+        &app,
+        json_request("POST", &format!("/api/keys/{target_id}/permissions"), &row_key, Some(payload.clone())),
+    )
+    .await;
+    assert!(b.status.is_client_error(), "a manage row alone must not suffice: {}", b.raw);
+    let _ = row_id;
+
+    // Both halves: permitted. Without this the two refusals above could be caused by anything.
+    grant(&db, scope_id, hook, true, true).await;
+    let both = send(
+        &app,
+        json_request("POST", &format!("/api/keys/{target_id}/permissions"), &scope_key, Some(payload)),
+    )
+    .await;
+    assert_eq!(both.status, StatusCode::OK, "both halves present must be permitted: {}", both.raw);
+}
+
+// ═════════════════════════════════════════════════════════════
+// R3 — Parentage confers no authority
+// ═════════════════════════════════════════════════════════════
+
+/// > *`parent_key_id` exists solely for cascading deletion and visibility scoping. A daughter of the
+/// > Master key is an ordinary daughter key with no elevated standing. Rights are never derived from
+/// > key lineage.*
+///
+/// A negative rule, so the test constructs the violation it is looking for: two keys identical in
+/// every respect except who created them, compared across every authority-bearing route.
+#[tokio::test]
+async fn r3_a_daughter_of_the_master_has_no_elevated_standing() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r3.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "r3_hook", &script, 30).await;
+    let (master_id, _master) = insert_key(&db, "r3-master", "", KeyScopes::master()).await;
+    let (parent_id, _parent) = insert_key(&db, "r3-parent", "", KeyScopes::plain()).await;
+
+    let (of_master, key_a) = insert_key(&db, "r3-of-master", "", KeyScopes::plain()).await;
+    let (of_parent, key_b) = insert_key(&db, "r3-of-parent", "", KeyScopes::plain()).await;
+    set_parent(&db, of_master, master_id).await;
+    set_parent(&db, of_parent, parent_id).await;
+
+    // The lineage really differs, or every comparison below is vacuous.
+    let a_row = ApiKey::find_by_id(of_master).one(&db).await.expect("query").expect("row");
+    let b_row = ApiKey::find_by_id(of_parent).one(&db).await.expect("query").expect("row");
+    assert_eq!(a_row.parent_key_id, Some(master_id));
+    assert_eq!(b_row.parent_key_id, Some(parent_id));
+
+    for (label, method, path, body) in [
+        ("execute a hook", "POST", format!("/api/hooks/{hook}/execute"), Some(json!({}))),
+        ("read a hook", "GET", format!("/api/hooks/{hook}"), None),
+        ("delete a hook", "DELETE", format!("/api/hooks/{hook}"), None),
+        ("list hooks", "GET", "/api/hooks".to_owned(), None),
+        ("create a key", "POST", "/api/keys".to_owned(), Some(json!({ "name": "x" }))),
+        ("list keys", "GET", "/api/keys".to_owned(), None),
+        ("read the audit log", "GET", "/api/audit-logs".to_owned(), None),
+        ("read settings", "GET", "/api/settings".to_owned(), None),
+        ("list executions", "GET", "/api/executions".to_owned(), None),
+    ] {
+        let a = send(&app, json_request(method, &path, &key_a, body.clone())).await;
+        let b = send(&app, json_request(method, &path, &key_b, body)).await;
+        assert_eq!(
+            a.status, b.status,
+            "R3 violated: being the master's daughter changed '{label}' ({} vs {})",
+            a.status, b.status
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════
+// R4 — Only Master creates parents
+// ═════════════════════════════════════════════════════════════
+
+/// > *Only the Master key may grant `can_manage_keys` or resource-creation rights. A parent key can
+/// > never mint another parent key.*
+///
+/// This service spells the resource-creation right `can_manage_hooks`; `RBAC_MODEL.md`'s
+/// Terminology table calls it `can_create_executor`, which exists nowhere in `src/`.
+#[tokio::test]
+async fn r4_only_master_grants_can_manage_keys_or_resource_creation() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (parent_id, parent) = insert_key(&db, "r4-parent", "", scopes).await;
+    let (_master_id, master) = insert_key(&db, "r4-master", "", KeyScopes::master()).await;
+
+    for scope in ["can_manage_keys", "can_manage_hooks"] {
+        // At creation.
+        let minted = send(
+            &app,
+            json_request("POST", "/api/keys", &parent, Some(json!({ "name": "spawn", scope: true }))),
+        )
+        .await;
+        assert_eq!(minted.status, StatusCode::FORBIDDEN, "R4 violated at creation for {scope}");
+
+        // ...and by update, which must not become the back door creation just closed.
+        let (victim_id, _victim) = insert_key(&db, &format!("r4-victim-{scope}"), "", KeyScopes::plain()).await;
+        set_parent(&db, victim_id, parent_id).await;
+        let updated = send(
+            &app,
+            json_request("PUT", &format!("/api/keys/{victim_id}"), &parent, Some(json!({ scope: true }))),
+        )
+        .await;
+        assert_eq!(updated.status, StatusCode::FORBIDDEN, "R4 violated by update for {scope}");
+
+        // Master may.
+        let by_master = send(
+            &app,
+            json_request("POST", "/api/keys", &master, Some(json!({ "name": format!("ok-{scope}"), scope: true }))),
+        )
+        .await;
+        assert_eq!(by_master.status, StatusCode::OK, "master must be able to grant {scope}");
+    }
+}
+
+// ═════════════════════════════════════════════════════════════
+// R5 — Manage may propagate sideways
+// ═════════════════════════════════════════════════════════════
+
+/// > *A parent holding manage rights on a resource may grant manage rights on that resource to
+/// > another existing parent key (bounded by R1 and R2), but this can never elevate a daughter key
+/// > to parent status.*
+#[tokio::test]
+async fn r5_manage_propagates_sideways_between_parents_but_never_mints_one() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r5.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "r5_hook", &script, 30).await;
+    let (giver_id, giver) = parent_managing(&db, "r5-giver", hook, true).await;
+
+    // Another *existing* parent, met through the shared hook rather than through lineage — which is
+    // what "sideways" means. It already holds `can_manage_keys`; what it lacks is a manage row.
+    let peer_scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (peer_id, peer) = insert_key(&db, "r5-peer", "", peer_scopes).await;
+    grant(&db, peer_id, hook, true, false).await;
+
+    let sideways = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{peer_id}/permissions"),
+            &giver,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(sideways.status, StatusCode::OK, "R5: manage must propagate sideways: {}", sideways.raw);
+
+    // The peer now holds both halves of R2 and can administer the hook itself.
+    let (bystander_id, bystander) = insert_key(&db, "r5-bystander", "", KeyScopes::plain()).await;
+    set_parent(&db, bystander_id, peer_id).await;
+    let onward = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{bystander_id}/permissions"),
+            &peer,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(onward.status, StatusCode::OK, "the propagated manage right is real: {}", onward.raw);
+
+    // "...but this can never elevate a daughter key to parent status." Handing manage on a hook to
+    // a key without `can_manage_keys` leaves it a daughter: it gets the row and nothing else.
+    let promoted = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{bystander_id}/permissions"),
+            &giver,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+        ),
+    )
+    .await;
+    assert_eq!(promoted.status, StatusCode::OK, "granting the row itself is fine: {}", promoted.raw);
+    let bystander_row = ApiKey::find_by_id(bystander_id).one(&db).await.expect("query").expect("row");
+    assert!(!bystander_row.can_manage_keys, "R5 violated: a manage grant minted a parent");
+
+    // ...and it still cannot administer grants, because R2 needs the half it does not have.
+    let still_daughter = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{giver_id}/permissions"),
+            &bystander,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert!(
+        still_daughter.status.is_client_error(),
+        "R5/R2 violated: a daughter holding a manage row administered grants: {}",
+        still_daughter.raw
+    );
+}
+
+// ═════════════════════════════════════════════════════════════
+// R6 — Revocation is never escalation
+// ═════════════════════════════════════════════════════════════
+
+/// > *Removing a permission requires manage rights on the resource only; the revoker need not hold
+/// > the verb being removed, and may revoke its own permissions. Reducing an existing permission row
+/// > through a general update endpoint is classified as revocation under this rule, regardless of
+/// > which endpoint it arrives at.*
+#[tokio::test]
+async fn r6_revocation_needs_no_proof_and_both_routes_agree() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r6.sh", "#!/bin/sh\nexit 0\n");
+
+    let hook = insert_hook(&db, "r6_hook", &script, 30).await;
+    // Manages the hook, and deliberately cannot execute it.
+    let (parent_id, parent) = parent_managing(&db, "r6-parent", hook, false).await;
+    let (target_id, _target) = insert_key(&db, "r6-target", "", KeyScopes::plain()).await;
+    set_parent(&db, target_id, parent_id).await;
+    grant(&db, target_id, hook, true, false).await;
+
+    // Route A — `DELETE`. The revoker does not hold `can_execute` and does not need to.
+    let deleted = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{target_id}/permissions/{hook}"), &parent, None),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "R6 violated on DELETE: {}", deleted.raw);
+
+    // Route B — `POST` writing every verb to `false`, which reaches the same end state.
+    grant(&db, target_id, hook, true, false).await;
+    let zeroed = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{target_id}/permissions"),
+            &parent,
+            Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(zeroed.status, StatusCode::OK, "R6 violated on POST: {}", zeroed.raw);
+
+    // Self-revocation, last: it drops the authority everything above depends on.
+    let itself = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{parent_id}/permissions/{hook}"), &parent, None),
+    )
+    .await;
+    assert_eq!(itself.status, StatusCode::NO_CONTENT, "R6 violated for self-revocation: {}", itself.raw);
+}
+
+// ═════════════════════════════════════════════════════════════
+// R7 — Granting is bounded by R1 and R2 together
+// ═════════════════════════════════════════════════════════════
+
+/// > *Granting is bounded by R1 and R2 together, simultaneously and without exception.*
+///
+/// The "simultaneously" is what this test is for. Satisfying one rule must never be a way past the
+/// other — which is precisely what the `2d62d1b` early return did, skipping both for any
+/// `can_manage_keys` holder.
+#[tokio::test]
+async fn r7_satisfying_one_rule_is_never_a_way_past_the_other() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r7.sh", "#!/bin/sh\nexit 0\n");
+
+    // Three hooks, so each half of the bound can be isolated without re-granting anything.
+    let full = insert_hook(&db, "r7_full", &script, 30).await;
+    let theirs = insert_hook(&db, "r7_theirs", &script, 30).await;
+    let manage_only = insert_hook(&db, "r7_manage_only", &script, 30).await;
+
+    let (parent_id, parent) = parent_managing(&db, "r7-parent", full, true).await;
+    grant(&db, parent_id, manage_only, false, true).await;
+    let (target_id, _target) = insert_key(&db, "r7-target", "", KeyScopes::plain()).await;
+    set_parent(&db, target_id, parent_id).await;
+
+    // Control: both rules satisfied on `full`, so the grant lands. If this failed, the two refusals
+    // below would prove nothing.
+    let ok = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{target_id}/permissions"),
+            &parent,
+            Some(json!({ "hook_id": full.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "R7 over-applied: {}", ok.raw);
+
+    // R1 satisfied *somewhere* — the caller does hold `can_execute`, on `full` — but R2 is not
+    // satisfied *here*. Standing elsewhere must not carry.
+    let cross = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{target_id}/permissions"),
+            &parent,
+            Some(json!({ "hook_id": theirs.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(cross.status, StatusCode::NOT_FOUND, "R7: R1 standing elsewhere is not R2 here: {}", cross.raw);
+
+    // R2 satisfied here — a manage row on `manage_only` — but R1 is not: the caller does not hold
+    // the verb it is handing out on this hook.
+    let over = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{target_id}/permissions"),
+            &parent,
+            Some(json!({ "hook_id": manage_only.to_string(), "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(over.status, StatusCode::FORBIDDEN, "R7: R2 here is not R1 here: {}", over.raw);
+    assert!(over.raw.contains("can_execute"), "and the refusal names the verb: {}", over.raw);
+}
+
+// ═════════════════════════════════════════════════════════════
+// §3 — Resource lifecycle & ownership
+// ═════════════════════════════════════════════════════════════
+
+/// > *Resource lifecycle actions — deleting or renaming the entity itself — are restricted
+/// > exclusively to Master and the designated `owner_key_id`. Holding manage rights or any
+/// > operational verb confers no lifecycle authority ... Master may reassign `owner_key_id` on any
+/// > resource or dispatch target at any time.*
+#[tokio::test]
+async fn s3_lifecycle_is_the_owners_and_masters_alone() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s3.sh", "#!/bin/sh\nexit 0\n");
+
+    let (owner_id, owner) = insert_key(&db, "s3-owner", "", KeyScopes::plain()).await;
+    let (user_id, user) = insert_key(&db, "s3-user", "", KeyScopes::plain()).await;
+    let (_master_id, master) = insert_key(&db, "s3-master", "", KeyScopes::master()).await;
+    let hook = insert_hook_owned_by(&db, "s3_hook", &script, owner_id).await;
+    grant(&db, owner_id, hook, true, true).await;
+    grant(&db, user_id, hook, true, true).await;
+
+    // "a parent that merely uses a resource must not be able to delete it" — even holding both verbs.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &user, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "§3 violated: a manage holder deleted a hook it does not own"
+    );
+    assert_eq!(
+        send(&app, json_request("PUT", &format!("/api/hooks/{hook}"), &user, Some(json!({ "name": "taken" })))).await.status,
+        StatusCode::FORBIDDEN,
+        "§3 violated: a manage holder renamed a hook it does not own"
+    );
+    // ...while operational management is untouched.
+    assert_eq!(
+        send(&app, json_request("PUT", &format!("/api/hooks/{hook}"), &user, Some(json!({ "description": "d" })))).await.status,
+        StatusCode::OK,
+        "§3 over-applied: manage must still mean manage"
+    );
+
+    // "Master may reassign `owner_key_id` ... at any time", and only master.
+    assert_eq!(
+        send(&app, json_request("PUT", &format!("/api/hooks/{hook}"), &owner, Some(json!({ "owner_key_id": user_id })))).await.status,
+        StatusCode::FORBIDDEN,
+        "§3 violated: ownership is not delegable by its holder"
+    );
+    assert_eq!(
+        send(&app, json_request("PUT", &format!("/api/hooks/{hook}"), &master, Some(json!({ "owner_key_id": user_id })))).await.status,
+        StatusCode::OK,
+        "§3 violated: master must be able to reassign ownership"
+    );
+
+    // Authority moved with the column.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &owner, None)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &user, None)).await.status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+// ═════════════════════════════════════════════════════════════
+// §4 — Visibility & oracle discipline
+// ═════════════════════════════════════════════════════════════
+
+/// > *A parent sees, in minimal form only, any key holding a permission row on a resource it
+/// > manages: id, name, and that key's rights on that resource alone. Global flags, bound IPs, and
+/// > unrelated resource memberships remain hidden.*
+#[tokio::test]
+async fn s4_a_shared_resource_is_not_a_keyhole_into_a_whole_configuration() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s4.sh", "#!/bin/sh\nexit 0\n");
+
+    let shared = insert_hook(&db, "s4_shared", &script, 30).await;
+    let elsewhere = insert_hook(&db, "s4_elsewhere", &script, 30).await;
+    let (_ours_id, ours) = parent_managing(&db, "s4-ours", shared, true).await;
+
+    let their_scopes =
+        KeyScopes { can_manage_keys: true, can_manage_hooks: true, max_concurrent_jobs: 9, ..Default::default() };
+    let (theirs_id, _theirs) = insert_key(&db, "s4-theirs", "10.1.2.0/24", their_scopes).await;
+    grant(&db, theirs_id, shared, true, false).await;
+    grant(&db, theirs_id, elsewhere, true, true).await;
+
+    let listing = send(&app, json_request("GET", "/api/keys", &ours, None)).await;
+    let entry = listing
+        .json
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|e| e["id"].as_str() == Some(&theirs_id.to_string()))
+        .expect("§4: a key sharing a managed resource must be visible in minimal form");
+
+    for hidden in ["bound_ips", "can_manage_keys", "can_manage_hooks", "is_master", "prefix", "max_concurrent_jobs"] {
+        assert!(entry.get(hidden).is_none(), "§4 violated: '{hidden}' disclosed through a shared resource: {entry}");
+    }
+    let names: Vec<String> = entry["hook_permissions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p["hook_name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(names, vec!["s4_shared".to_owned()], "§4 violated: unrelated memberships disclosed");
+}
+
+/// > *Any key, resource, or dispatch target outside the caller's visibility scope must return the
+/// > identical status and body the service would return if that id did not exist.*
+#[tokio::test]
+async fn s4_out_of_scope_ids_are_byte_identical_to_nonexistent_ones() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s4o.sh", "#!/bin/sh\nexit 0\n");
+
+    let real_hook = insert_hook(&db, "s4_real", &script, 30).await;
+    let (real_key, _rk) = insert_key(&db, "s4-unrelated", "", KeyScopes::plain()).await;
+    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (_caller_id, caller) = insert_key(&db, "s4-caller", "", scopes).await;
+
+    let invented_hook = Uuid::new_v4();
+    let invented_key = Uuid::new_v4();
+
+    // Every hook route, not just the read. `GET` fails visibility outright, while execute/modify
+    // reach the per-verb guard — two different code paths that must give the same answer, or the
+    // oracle simply moves to whichever endpoint was left behind.
+    for (method, suffix, body) in [
+        ("GET", "", None),
+        ("POST", "/execute", Some(json!({}))),
+        ("POST", "/test", None),
+        ("PUT", "", Some(json!({ "description": "x" }))),
+        ("DELETE", "", None),
+        ("GET", "/parameters", None),
+    ] {
+        let a = send(
+            &app,
+            json_request(method, &format!("/api/hooks/{real_hook}{suffix}"), &caller, body.clone()),
+        )
+        .await;
+        let b = send(
+            &app,
+            json_request(method, &format!("/api/hooks/{invented_hook}{suffix}"), &caller, body),
+        )
+        .await;
+        assert_eq!(
+            a.status,
+            StatusCode::NOT_FOUND,
+            "§4 violated: {method}{suffix} makes an invisible hook distinguishable ({})",
+            a.raw
+        );
+        assert_eq!(a.status, b.status, "§4 violated: {method}{suffix} status differs");
+        assert_eq!(a.raw, b.raw, "§4 violated: {method}{suffix} body differs");
+    }
+
+    let c = send(&app, json_request("PUT", &format!("/api/keys/{real_key}"), &caller, Some(json!({ "name": "x" })))).await;
+    let d = send(&app, json_request("PUT", &format!("/api/keys/{invented_key}"), &caller, Some(json!({ "name": "x" })))).await;
+    assert_eq!(c.status, StatusCode::NOT_FOUND, "§4 violated: an invisible key is distinguishable");
+    assert_eq!(c.status, d.status, "§4 violated: status differs");
+    assert_eq!(c.raw, d.raw, "§4 violated: body differs");
+}
+
+/// > *It is a distinct control from the authenticate-then-authorize ordering rule, which governs
+/// > unauthenticated callers probing key bindings via 401-vs-403. Both hold simultaneously; neither
+/// > may be satisfied by regressing the other.*
+///
+/// The companion to [`s4_out_of_scope_ids_are_byte_identical_to_nonexistent_ones`]. Making every
+/// refusal `404` would break this test; making every refusal `403` would break that one.
+#[tokio::test]
+async fn s4_the_401_vs_403_ordering_still_holds_for_unauthenticated_callers() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_id, bound) = insert_key(&db, "s4-bound", "10.10.10.0/24", KeyScopes::plain()).await;
+
+    let unknown = send(&app, json_request("GET", "/api/hooks", "never-issued", None)).await;
+    let none = send(&app, json_request("GET", "/api/hooks", "", None)).await;
+    let wrong_network = send(&app, json_request("GET", "/api/hooks", &bound, None)).await;
+
+    assert_eq!(none.status, StatusCode::UNAUTHORIZED, "no credential must be 401");
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "an unknown credential must be 401, never 403");
+    assert_eq!(wrong_network.status, StatusCode::FORBIDDEN, "a real key outside its bound_ips must be 403");
+    assert_ne!(
+        unknown.status, wrong_network.status,
+        "authenticate-then-authorize violated: 403 can now confirm a guessed key exists"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════
+// §5 — Master key guarantees
+// ═════════════════════════════════════════════════════════════
+
+/// > *Exactly one Master key exists, enforced by a database constraint rather than by application
+/// > logic alone. `is_master` must not be settable or clearable through any API endpoint ... The
+/// > Master key is immutable through the API except for its own `bound_ips` ... cannot be deleted.*
+#[tokio::test]
+async fn s5_exactly_one_master_immutable_and_undeletable() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (master_id, master) = insert_key(&db, "s5-master", "", KeyScopes::master()).await;
+
+    // Enforced by the database, not by application logic alone: a direct insert must fail.
+    let now = chrono::Utc::now().naive_utc();
+    let plaintext = simply_hook_executor::api::generate_random_key();
+    let second = api_key::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        key_hash: Set(simply_hook_executor::api::hash_key(&plaintext)),
+        name: Set("s5-smuggled".to_owned()),
+        prefix: Set(plaintext.chars().take(8).collect()),
+        key_id: Set(Some(simply_hook_executor::api::generate_key_id())),
+        signing_secret: Set(None),
+        hmac_mode: Set(simply_hook_executor::entities::api_key::HmacMode::CanonicalV1),
+        bound_ips: Set(Some(String::new())),
+        max_concurrent_jobs: Set(10),
+        is_master: Set(true),
+        parent_key_id: Set(None),
+        owner_key_id: Set(None),
+        can_manage_keys: Set(true),
+        can_manage_hooks: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await;
+    assert!(second.is_err(), "§5 violated: the database accepted a second master row");
+
+    // Not settable through any endpoint, by any caller.
+    let minted = send(
+        &app,
+        json_request("POST", "/api/keys", &master, Some(json!({ "name": "peer", "is_master": true }))),
+    )
+    .await;
+    assert!(minted.status.is_client_error(), "§5 violated: is_master was accepted on create");
+    assert_eq!(
+        ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).all(&db).await.expect("query").len(),
+        1,
+        "§5 violated: more than one master exists"
+    );
+
+    // Immutable except its own bound_ips.
+    assert_eq!(
+        send(&app, json_request("PUT", &format!("/api/keys/{master_id}"), &master, Some(json!({ "bound_ips": "127.0.0.0/8" })))).await.status,
+        StatusCode::OK,
+        "§5 over-applied: the master must be able to edit its own bound_ips"
+    );
+    for field in ["name", "hmac_mode"] {
+        let value = if field == "name" { json!("renamed") } else { json!("BODY_ONLY") };
+        assert_eq!(
+            send(&app, json_request("PUT", &format!("/api/keys/{master_id}"), &master, Some(json!({ field: value })))).await.status,
+            StatusCode::FORBIDDEN,
+            "§5 violated: the master's '{field}' was mutable"
+        );
+    }
+
+    // Neither deletable nor rotatable, by anyone.
+    assert_eq!(
+        send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &master, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "§5 violated: the master rotated itself"
+    );
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/keys/{master_id}"), &master, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "§5 violated: the master deleted itself"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════
+// §6 — Cascade deletion & pre-flight inventory
+// ═════════════════════════════════════════════════════════════
+
+/// > *Deleting a key cascades recursively through its entire daughter subtree ... Before any key
+/// > deletion, the service walks the entire subtree being deleted and collects every resource and
+/// > dispatch target owned by any key within it ... Deletion executes only when every entity in the
+/// > inventory carries an explicit resolution; partial maps are refused.*
+#[tokio::test]
+async fn s6_the_cascade_is_recursive_and_gated_on_a_total_resolution_map() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s6.sh", "#!/bin/sh\nexit 0\n");
+
+    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let (parent_id, _parent) = insert_key(&db, "s6-parent", "", scopes).await;
+    let (daughter_id, _daughter) = insert_key(&db, "s6-daughter", "", KeyScopes::plain()).await;
+    let (grand_id, _grand) = insert_key(&db, "s6-grand", "", KeyScopes::plain()).await;
+    set_parent(&db, daughter_id, parent_id).await;
+    set_parent(&db, grand_id, daughter_id).await;
+    let deep = insert_hook_owned_by(&db, "s6_deep_hook", &script, grand_id).await;
+    let (successor_id, _successor) = insert_key(&db, "s6-successor", "", KeyScopes::plain()).await;
+    let (_master_id, master) = insert_key(&db, "s6-master", "", KeyScopes::master()).await;
+
+    // The walk reaches two levels down, or the deep hook is stranded silently.
+    let refused = send(&app, json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None)).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "§6 violated: deletion proceeded with an unresolved inventory");
+    let inventory = refused.json["inventory"].as_array().cloned().unwrap_or_default();
+    assert_eq!(inventory.len(), 1, "§6 violated: the inventory missed a resource: {}", refused.raw);
+    assert_eq!(inventory[0]["current_owner"], json!(grand_id.to_string()), "§6: the walk must reach the real owner");
+    for field in ["type", "id", "name", "current_owner"] {
+        assert!(inventory[0].get(field).is_some(), "§6 violated: inventory entry lacks '{field}'");
+    }
+
+    // Partial maps are refused — here, an empty one against a non-empty inventory.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, Some(json!({ "resolutions": {} })))).await.status,
+        StatusCode::CONFLICT,
+        "§6 violated: a partial map executed"
+    );
+
+    // A total map executes, and the resource survives rather than being destroyed.
+    let done = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{parent_id}"),
+            &master,
+            Some(json!({ "resolutions": { deep.to_string(): { "action": "reassign", "to": successor_id.to_string() } } })),
+        ),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "§6: a total map must execute: {}", done.raw);
+
+    for id in [parent_id, daughter_id, grand_id] {
+        assert!(
+            ApiKey::find_by_id(id).one(&db).await.expect("query").is_none(),
+            "§6 violated: the cascade did not reach {id}"
+        );
+    }
+    let survivor = fetch_hook_row(&db, deep).await.expect("§6 violated: the hook was destroyed with the key");
+    assert_eq!(survivor.owner_key_id, Some(successor_id), "§6: reassignment must move ownership");
+    assert!(!survivor.is_deleted, "§6: reassignment is not deletion");
+}
+
+// ═════════════════════════════════════════════════════════════
+// §7 — Database constraints & indexing
+// ═════════════════════════════════════════════════════════════
+
+/// > *A database-level constraint guaranteeing Master uniqueness, per §5. Indexes on
+/// > `parent_key_id`, `owner_key_id`, the key-hash lookup column, and the permission-table join
+/// > columns — every column the authenticated hot paths search on.*
+///
+/// Asserted through SeaORM's `SchemaManager` rather than by querying `sqlite_master`, so the check
+/// stays backend-agnostic and does not become the vendor-specific SQL `AGENT.MD` forbids.
+#[tokio::test]
+async fn s7_every_required_index_and_constraint_exists() {
+    let db = setup_test_db().await;
+    let manager = SchemaManager::new(&db);
+
+    for (table, index) in [
+        // §5's master-uniqueness constraint, as the portable generated-column form.
+        ("api_keys", "idx_api_keys_master_marker"),
+        ("api_keys", "idx_api_keys_parent_key_id"),
+        ("api_keys", "idx_api_keys_owner_key_id"),
+        ("hooks", "idx_hooks_owner_key_id"),
+    ] {
+        assert!(
+            manager.has_index(table, index).await.expect("index lookup succeeds"),
+            "§7 violated: {table}.{index} is missing"
+        );
+    }
+
+    // The key-hash lookup column and the permission-table join columns predate this work and carry
+    // unique indexes from the initial migration. Asserted by *behaviour* rather than by name,
+    // because their index names are backend-generated from the UNIQUE constraints: a duplicate must
+    // be rejected, which is only possible if the index exists.
+    let (_id, _plain) = insert_key(&db, "s7-probe", "", KeyScopes::plain()).await;
+    let existing = ApiKey::find().one(&db).await.expect("query").expect("row");
+    let now = chrono::Utc::now().naive_utc();
+    let clash = api_key::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        key_hash: Set(existing.key_hash.clone()),
+        name: Set("s7-clash".to_owned()),
+        prefix: Set("clash".to_owned()),
+        key_id: Set(Some(simply_hook_executor::api::generate_key_id())),
+        signing_secret: Set(None),
+        hmac_mode: Set(simply_hook_executor::entities::api_key::HmacMode::CanonicalV1),
+        bound_ips: Set(Some(String::new())),
+        max_concurrent_jobs: Set(10),
+        is_master: Set(false),
+        parent_key_id: Set(None),
+        owner_key_id: Set(None),
+        can_manage_keys: Set(false),
+        can_manage_hooks: Set(false),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await;
+    assert!(clash.is_err(), "§7 violated: api_keys.key_hash is not uniquely indexed");
+}
