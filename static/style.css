@@ -280,6 +280,28 @@ body {
     transform: scale(0.97);
 }
 
+/*
+ * Keyboard focus ring.
+ *
+ * Buttons previously had no focus style at all, leaving only the browser default — which against
+ * these surface colours is somewhere between faint and invisible. That matters most in the
+ * confirmation dialog: `showConfirmModal` puts focus on *Cancel* for destructive actions, and a
+ * user who cannot see where focus landed gains nothing from it being in the safe place.
+ *
+ * `:focus-visible` rather than `:focus`, so a mouse click does not leave a ring behind.
+ */
+.btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* The destructive ring is red, so a focused Delete never looks like a focused Cancel. */
+.btn-danger:focus-visible,
+.btn-logout:focus-visible,
+.btn-batch-delete:focus-visible {
+    outline-color: var(--danger);
+}
+
 .btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
@@ -1054,6 +1076,12 @@ body {
     margin-top: 0.5rem;
 }
 
+/*
+ * `space-between` is deliberate and should not be "tidied" to `flex-end`. It drives Cancel and the
+ * destructive Confirm to opposite edges of the card, which is the cheapest possible defence against
+ * a mis-click on an action that cannot be undone. Grouping them into an adjacent pair puts two
+ * buttons a few pixels apart where one deletes data and the other does not.
+ */
 .modal-actions {
     display: flex;
     justify-content: space-between;

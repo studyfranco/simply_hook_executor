@@ -617,8 +617,19 @@
         </div>
     </div>
 
-    <!-- Custom Confirmation Modal (replaces native window.confirm()) -->
-    <div id="confirm-modal" class="modal-overlay hidden">
+    <!--
+      Custom Confirmation Modal (replaces native window.confirm()).
+
+      `role="alertdialog"` rather than `dialog`: this interrupts to confirm a consequence, which is
+      what tells a screen reader to announce it immediately rather than waiting to be visited.
+      `aria-labelledby`/`aria-describedby` point at the title and message so the announcement is the
+      question being asked, not the word "dialog".
+
+      Cancel is first in the DOM so it is the first thing tab order reaches, and — for destructive
+      actions — the button `app.js` focuses on open. See `showConfirmModal`.
+    -->
+    <div id="confirm-modal" class="modal-overlay hidden" role="alertdialog" aria-modal="true"
+         aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-message">
         <div class="modal-card card">
             <h3 id="confirm-modal-title">Are you sure?</h3>
             <p id="confirm-modal-message" class="subtitle"></p>

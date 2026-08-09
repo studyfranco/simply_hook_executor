@@ -34,6 +34,24 @@ To keep this context clean and modular, responsibilities are split across three 
 
 ## 🏛️ Core Architectural Rules
 
+### 0. Module Layout
+
+`src/api/` is split by domain, with two modules whose existence was decided by measuring coupling rather than by taste (the audit is in `AGENT_NOTES.MD`):
+
+| Module | Holds | Rule |
+| :--- | :--- | :--- |
+| `api/mod.rs` | Module wiring, router-facing re-exports, shared policy constants | Every handler is re-exported here, so `api::create_hook` resolves as it always did and `src/lib.rs`'s router is untouched by the layout |
+| `api/support.rs` | Shared plumbing used by three or more domains — audit-log writing, hook resolution, parameter loading, validation, formatting — plus the strict JSON extractors | **Decides nothing.** Nothing here returns a refusal that depends on *who* is calling. A helper that starts deciding moves to `guards` |
+| `api/guards.rs` | Every authorization decision: hook verbs, R2's conjunction, master guards, §3 lifecycle, key visibility, delegation bounds | **Writes nothing.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no state |
+| `api/keys.rs` | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade | Identity lives with keys because it shares its view types with the key listing |
+| `api/hooks.rs` | Hook definitions, parameter contracts, trash/restore/purge | What a hook *is*, not what happens when one fires |
+| `api/executions.rs` | Triggering hooks, and reading the records that result | Together because they share `ExecutionView` and nothing else does |
+| `api/system.rs` | Audit log, settings | Master-only introspection |
+
+**`guards` is one module, not one per domain, and must stay that way.** `RBAC_MODEL.md`'s rules are cross-cutting: R2's conjunction governs hooks, parameters and execution records alike, and §3's ownership test is consulted from three domains. Splitting guards by caller would put a single sentence of the specification in three files and invite the copies to drift — which is the exact failure the compliance suite exists to catch, and so must not be designed in.
+
+Handlers keep their exact Axum signatures, extractors, error responses and guard calls regardless of which file they live in. A move that changes a signature is not a move.
+
 ### 1. Security & Network (Zero-Trust)
 
 - **Middleware Protection:** All `/api/*` and `/webhook/*` routes pass through custom authentication middleware (`src/middleware.rs`). There are no unauthenticated API routes; only the static SPA is public.
@@ -101,7 +119,7 @@ Rules the implementation MUST hold to:
   - A key is a **Daughter** iff `can_manage_keys == false`. A Daughter holding `can_manage_hooks` is still a Daughter — it may *create* hooks and may never *manage* anyone else's.
   - **Only Master may set either global right**, on create or on update (R4). A non-master request for one is refused with `403` rather than silently downgraded: a `200` carrying a key that lacks what was asked for is the worse failure, because the caller walks away believing it provisioned a Parent and discovers otherwise in production. Enforced by `require_master_to_grant_scopes`, which gates *granting* only — clearing a scope stays available to any key manager, since removing authority is not escalation.
   - **Therefore every key minted by a Parent is a Daughter**, necessarily and without a separate rule to enforce it.
-- **The Master's identity is pinned at boot, not read per request** (`src/master.rs`). Every authorization decision branches on `is_master`, which is a column; an attacker who reaches the database needs one `UPDATE` to become Master. §5's uniqueness constraint refuses that statement, and pinning is the layer behind it for the case where the constraint itself is dropped. At startup `MasterPin::pin_at_boot` asserts the §5 index exists and that exactly one master row exists, then freezes that id for the process lifetime; startup fails loudly on either. The check is applied at **one choke point** — `auth_middleware` demotes any authenticated key whose `is_master` column is set but whose id is not the pinned one, before any handler sees it. That is deliberate: there are dozens of `key.is_master` reads across `api.rs`, and a scheme requiring each to also compare an id would be one forgotten call site away from worthless. Handlers keep reading `key.is_master` and are automatically correct, because the principal they receive is the *effective* one. Restoring a tampered flag to meaning requires a restart, which is an event an operator can see.
+- **The Master's identity is pinned at boot, not read per request** (`src/master.rs`). Every authorization decision branches on `is_master`, which is a column; an attacker who reaches the database needs one `UPDATE` to become Master. §5's uniqueness constraint refuses that statement, and pinning is the layer behind it for the case where the constraint itself is dropped. At startup `MasterPin::pin_at_boot` asserts the §5 index exists and that exactly one master row exists, then freezes that id for the process lifetime; startup fails loudly on either. The check is applied at **one choke point** — `auth_middleware` demotes any authenticated key whose `is_master` column is set but whose id is not the pinned one, before any handler sees it. That is deliberate: there are dozens of `key.is_master` reads across `src/api/`, and a scheme requiring each to also compare an id would be one forgotten call site away from worthless. Handlers keep reading `key.is_master` and are automatically correct, because the principal they receive is the *effective* one. Restoring a tampered flag to meaning requires a restart, which is an event an operator can see.
 - **Exactly one master exists,** and the guarantee is a **database constraint**, not application logic (`RBAC_MODEL.md` §5). `api_keys` carries a `master_marker` column *generated by the engine* from `is_master`, under a plain unique index — see `SCHEMA.MD` and `m20230106_000001_master_key_uniqueness`. The marker is derived rather than assigned precisely so no writer can bypass it, and a plain unique index on a nullable column is used rather than a partial index because MySQL has no `WHERE` clause on `CREATE INDEX` and the MySQL driver is enabled. A database that somehow already holds two masters fails the migration and refuses to boot: which master is legitimate is an operator's judgement, not a schema change's.
 - **Hook Rights:** Managed via junction table `ApiKeyHookPermission` linking keys to `Hook` with three explicit flags (`can_execute`, `can_manage`, `can_view_execution`).
 - **Least Privilege:** any of the three verbs requires a valid key mapping unless `is_master`.

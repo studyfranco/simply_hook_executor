@@ -874,6 +874,8 @@ class HookExecutorClient {
         messageEl.textContent = message;
         confirmBtn.textContent = confirmText;
         cancelBtn.textContent = cancelText;
+        // Destructive confirmations are solid red; ordinary ones take the accent. Cancel is always
+        // `.btn-secondary`, so the two never read as a matched pair of equally-weighted choices.
         confirmBtn.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`;
 
         modal.classList.remove('hidden');
@@ -892,14 +894,23 @@ class HookExecutorClient {
             const onBackdropClick = (e) => { if (e.target === modal) cleanup(false); };
             const onKeydown = (e) => {
                 if (e.key === 'Escape') cleanup(false);
-                if (e.key === 'Enter') cleanup(true);
+                // Enter confirms only a *non-destructive* action. A dialog that both auto-focuses
+                // "Delete" and treats a bare Enter as agreement will eventually destroy something
+                // for a user who was still typing when it opened, and will do it in the one place
+                // where the action cannot be undone. Escape still cancels either way, so the safe
+                // answer remains the reflexive one.
+                //
+                // Destructive dialogs are not left without a keyboard path: Cancel holds focus, so
+                // Enter activates *it*, and Tab reaches Confirm in one step.
+                if (e.key === 'Enter' && !danger) cleanup(true);
             };
 
             confirmBtn.addEventListener('click', onConfirm);
             cancelBtn.addEventListener('click', onCancel);
             modal.addEventListener('click', onBackdropClick);
             document.addEventListener('keydown', onKeydown);
-            confirmBtn.focus();
+            // The safe choice takes focus when the consequence is irreversible.
+            (danger ? cancelBtn : confirmBtn).focus();
         });
     }
 

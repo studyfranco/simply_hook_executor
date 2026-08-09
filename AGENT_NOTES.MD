@@ -4173,3 +4173,141 @@ SELECT id, name, prefix, is_master FROM api_keys WHERE is_master = true;
 `cargo test` **255 passed / 0 failed** (88 unit + 133 integration + 23 compliance + 8 source hygiene +
 3 doc) · `./scripts/test_e2e.sh` **875 / 875** (was 841) ·
 `./scripts/verify_convergence.sh` exit 0.
+
+---
+
+## Architecture pass — `src/api.rs` modularization, UI safety, audit baseline
+
+`refactor(arch): modularize api routes, update ui design, pin master and add source hygiene`
+
+Tasks 1, 3 and 5 of this brief were already satisfied by the previous commit (`9a1c499`) and were
+**verified rather than reimplemented** — including the dialect unit test, which already asserts all
+three backends:
+
+```
+Migration::add_marker_column(Postgres) ends_with "STORED"
+Migration::add_marker_column(Sqlite)   ends_with "VIRTUAL"
+Migration::add_marker_column(MySql)    ends_with "VIRTUAL"
+```
+
+The new work is the audit, the split, and the dialog-safety fix.
+
+### Codebase audit — baseline before this pass
+
+| File | Lines | Assessment |
+| :--- | ---: | :--- |
+| **`src/api.rs`** | **3,847** | **Monolithic.** Eight distinct responsibilities in one file |
+| `src/executor.rs` | 1,389 | Coherent: one subject (spawning and bounding a child process) |
+| `src/config.rs` | 1,374 | Coherent: environment parsing and proxy/CIDR resolution |
+| `src/middleware.rs` | 704 | Coherent: authentication, one pipeline |
+| `src/replay.rs` | 406 | Coherent |
+| `src/crypto.rs` | 344 | Coherent |
+| `src/main.rs` | 329 | Coherent: bootstrap and shutdown |
+| `src/master.rs` | 291 | Coherent |
+| `src/db.rs` | 204 | Coherent |
+| everything else | ≤160 each | Entities and migrations, one subject each |
+
+Line count alone is not the test — `executor.rs` is 1,389 lines about *one thing* and splitting it
+would be churn. `api.rs` was the only file where the count tracked a real responsibility problem.
+
+### Assessment of the proposed layout
+
+The brief's baseline was `keys / hooks / executions / audit / guards / mod`. Before adopting it I
+measured which private helpers are used from more than one handler domain, because that — not
+intuition about naming — determines whether a shared module is needed. Result: **17 helpers cross
+domain boundaries**, with these standing out:
+
+| Helper | Used by |
+| :--- | :--- |
+| `create_audit_log` | hooks, params, keys, exec-trigger, exec-history |
+| `resolve_hook` | hooks, params, keys, exec-trigger, exec-history |
+| `format_reference` | hooks, params, keys, exec-trigger |
+| `load_parameters` | hooks, params, exec-trigger |
+| `require_manage`, `require_visibility` | hooks, params, exec-history |
+| `require_master_for_privileged_hook` | hooks, params, keys |
+| `HookPermissionView`, `load_hook_permissions` | auth, keys |
+| `ExecutionView` | exec-trigger, exec-history |
+
+Three conclusions, and **three deviations from the proposed baseline, each earned by a measurement**:
+
+1. **Added `support.rs`.** `create_audit_log`, `resolve_hook`, `format_reference` and
+   `load_parameters` are used by three to five domains each and **decide nothing**. With no support
+   module they would have had to live in `guards.rs`, which would make "guards" mean "guards, plus
+   everything else that turned out to be shared" — the monolith problem again, one level down. The
+   boundary is stated and checkable: *nothing in `support` returns a refusal that depends on who is
+   calling.* A helper that starts deciding moves to `guards`.
+
+2. **Folded `auth` into `keys.rs` rather than giving it a module.** `get_me` is ~95 lines and shares
+   both its view type (`HookPermissionView`) and its loader (`load_hook_permissions`) with the key
+   listing. A separate `auth.rs` would have put a type in one module and both its consumers in
+   another. "What does this key hold" is the same question in both places.
+
+3. **Renamed `audit.rs` → `system.rs`.** The module is `list_audit_logs` *and* `get_settings`.
+   Settings is not audit, and a file called `audit.rs` whose second half reports runtime
+   configuration sends the next reader to the wrong place.
+
+**Confirmed without change:** one `guards.rs` rather than per-domain guards, and `executions.rs`
+holding both triggering and history. The first because `RBAC_MODEL.md`'s rules are cross-cutting —
+R2's conjunction governs hooks, parameters and execution records alike, and §3's ownership test is
+consulted from three domains; splitting guards by caller would put one sentence of the specification
+in three files and invite the copies to drift, which is exactly the failure the compliance suite
+exists to catch and therefore should not be designed in. The second because `ExecutionView` is shared
+by the two halves and by nothing else.
+
+### Result
+
+| Module | Lines | Holds |
+| :--- | ---: | :--- |
+| `api/mod.rs` | 85 | Module wiring, router-facing re-exports, shared policy constants |
+| `api/system.rs` | 144 | Audit log, settings |
+| `api/support.rs` | 399 | Shared plumbing, strict JSON extractors. Decides nothing |
+| `api/executions.rs` | 436 | Trigger + history |
+| `api/hooks.rs` | 892 | Hook CRUD, parameters, trash/restore/purge |
+| `api/guards.rs` | 1,030 | Every authorization decision. Writes nothing |
+| `api/keys.rs` | 1,102 | Key CRUD, `get_me`, grants, §6 cascade |
+
+3,847 lines in one file → 4,088 across seven (the delta is module headers and import blocks).
+
+**`src/lib.rs` is byte-identical.** Every handler is re-exported from `mod.rs`, so `api::create_hook`
+resolves exactly as before and the router never learned this happened. That was a deliberate
+constraint: a refactor that forces every call site to change has a blast radius nobody can review.
+
+**Zero behaviour change.** Code moved verbatim; the only edits were visibility widening
+(`pub(crate)` on the 17 cross-domain items) and import blocks. Verified by the suite: 252 tests and
+875 e2e checks pass unchanged, including all 23 RBAC compliance tests and the adversarial suite.
+
+**One class of defect the mechanical split introduced and the compiler caught:** four doc comments
+landed on the wrong side of a line boundary and attached themselves to the *next* item — the
+`load_parameters` doc ended up above `normalize_run_as_user`, and so on in a four-way rotation.
+Clippy's `empty line after doc comment` found all four. Worth knowing for any future range-based
+split: item boundaries are not line boundaries, and a doc comment is part of its item.
+
+### UI: a real safety defect in the confirmation dialog
+
+The confirm modal already used `.btn-danger` for the destructive action and `.btn-secondary` for
+Cancel, at opposite edges of the card. What it also did was **auto-focus the destructive button and
+bind Enter to confirm**. A user who was typing when the dialog opened, or who hit Enter reflexively,
+destroyed data — in the one place where the action cannot be undone.
+
+Fixed: for `danger: true`, focus moves to **Cancel**, and Enter no longer confirms. Escape still
+cancels either way, so the safe answer stays the reflexive one, and the destructive path is one Tab
+away rather than unreachable. Non-destructive dialogs keep Enter-to-confirm.
+
+That change depends on the user being able to *see* where focus landed, and buttons had **no
+`:focus-visible` style at all** — only the browser default, which against these surface colours is
+somewhere between faint and invisible. Added an accent ring, with a red variant for `.btn-danger`,
+`.btn-logout` and `.btn-batch-delete` so a focused Delete never looks like a focused Cancel.
+
+The dialog also gained `role="alertdialog"`, `aria-modal`, and `aria-labelledby`/`aria-describedby`
+pointing at its title and message, so a screen reader announces the question rather than the word
+"dialog".
+
+`justify-content: space-between` on `.modal-actions` now carries a comment explaining that it is
+deliberate — it drives the safe and destructive choices to opposite edges, and "tidying" it to
+`flex-end` would put two buttons a few pixels apart where one deletes data and the other does not.
+
+### Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **252 passed / 0 failed** · `./scripts/test_e2e.sh` **875 / 875** ·
+`./scripts/verify_convergence.sh` exit 0.
