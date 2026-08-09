@@ -313,13 +313,32 @@ async fn require_execute(
     }
 }
 
-/// Authorizes management of an *existing* hook.
+/// Authorizes management of an *existing* hook — **R2 in full**.
 ///
-/// Note the deliberate asymmetry with the global `can_manage_hooks` scope, which authorizes
-/// *creating* hooks: per `AGENT.MD`, `can_manage` over an already-existing hook requires a valid
-/// key mapping unless the key is master. Since creating a hook auto-provisions full rights on it,
-/// a `can_manage_hooks` key always retains control of everything it created — just not of hooks
-/// belonging to someone else.
+/// Master bypasses. Everyone else needs *both* conjuncts: global `can_manage_keys` **and** a
+/// `can_manage = true` row for this specific hook. This function is a thin master short-circuit in
+/// front of [`require_hook_manage_conjunction`], which is the single place R2 is evaluated; see its
+/// documentation for why the two halves produce different statuses and one shared message.
+///
+/// # Why this used to accept a bare row, and why that was a remote-code-execution hole
+///
+/// It previously read `is_master || row.can_manage`, dropping the global half. Under §1's Tiers
+/// matrix a Daughter key — one without `can_manage_keys` — "may manage resources: **Never**", so
+/// that spelling let precisely the tier the specification forbids manage a hook. The consequence
+/// was not abstract: [`update_hook`] is gated by this function, and `script_path` is one of the
+/// fields it writes. A Daughter holding a single `can_manage` row could repoint a hook at any
+/// binary on the host and then trigger it with the `can_execute` half of the same row.
+/// `require_master_for_privileged_hook` bounded that only for hooks already carrying a
+/// `run_as_user`, and `ALLOWED_SCRIPT_ROOTS` is empty by default.
+///
+/// # The asymmetry with `can_manage_hooks`
+///
+/// Creating a hook still needs only the global `can_manage_hooks` scope, because R2 is written
+/// about "a `can_manage = true` row for that specific resource" and a resource that does not yet
+/// exist can have no row. The consequence is deliberate and is the specification's design, not an
+/// oversight: creation rights and management rights are separate powers, so a `can_manage_hooks`
+/// Daughter can define automation but not go back and edit it. It does not silently retain control
+/// of what it created, which is what the previous version of this comment claimed.
 async fn require_manage(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
@@ -328,11 +347,8 @@ async fn require_manage(
     if key.is_master {
         return Ok(());
     }
-    let held = hook_permission(db, key.id, hook_id).await?;
-    match &held {
-        Some(p) if p.can_manage => Ok(()),
-        _ => Err(verb_denied(held.as_ref(), "manage")),
-    }
+    require_hook_manage_conjunction(db, key, hook_id).await?;
+    Ok(())
 }
 
 /// Authorizes read-only visibility of a hook (either grant suffices).
@@ -665,8 +681,13 @@ async fn has_permission_admin_standing(
     manages_any_hook(db, key.id).await
 }
 
-/// **R2 — manage is a conjunction.** Authorizes administering one specific hook's grants, and
-/// returns the caller's own permission row on it.
+/// **R2 — manage is a conjunction.** The single evaluation point for "may this key manage this
+/// hook", and returns the caller's own permission row on it.
+///
+/// Every manage-level route reaches this function: the grant-administration routes call it
+/// directly for the row it returns, and every content route ([`update_hook`], the parameter CRUD,
+/// [`delete_hook`], [`delete_execution`]) arrives through [`require_manage`]. There is deliberately
+/// no second implementation of R2 to drift from this one.
 ///
 /// > *Managing a specific resource requires holding both global `can_manage_keys` AND a
 /// > `can_manage = true` row for that specific resource. Neither alone is sufficient.

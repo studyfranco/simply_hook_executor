@@ -149,8 +149,38 @@ impl KeyScopes {
     }
 
     /// A scoped key allowed to create hooks.
+    ///
+    /// Note this is a **Daughter** under `RBAC_MODEL.md` §1: `can_manage_hooks` is a
+    /// resource-*creation* right, and creation rights "are never implied by `can_manage_keys` or by
+    /// resource management rights" — nor do they imply either. A key seeded this way may define a
+    /// hook and will never afterwards be able to edit it; see [`Self::parent`].
     pub fn hook_manager() -> Self {
         Self { can_manage_hooks: true, max_concurrent_jobs: 10, ..Self::default() }
+    }
+
+    /// A **Parent** key: `can_manage_keys`, and nothing else global.
+    ///
+    /// This is the global half of R2's conjunction. Pair it with a `can_manage = true` row from
+    /// [`grant`] to seed the only non-master shape that may manage a specific hook — §1's Tiers
+    /// matrix says a Daughter "may manage resources: **Never**", so a manage row without this flag
+    /// buys operational rights over the hook and no authority over its definition.
+    pub fn parent() -> Self {
+        Self { can_manage_keys: true, max_concurrent_jobs: 10, ..Self::default() }
+    }
+
+    /// A Parent that may **also** create hooks — `can_manage_keys` and `can_manage_hooks` together.
+    ///
+    /// Post-R2 this is the shape an operator needs to both define a hook and go on maintaining it.
+    /// Creation takes `can_manage_hooks`; every later edit takes the R2 conjunction, whose global
+    /// half is `can_manage_keys`. Neither right implies the other (§1), so a key that does the whole
+    /// job holds both explicitly. Both are Master-granted only, under R4.
+    pub fn parent_hook_manager() -> Self {
+        Self {
+            can_manage_keys: true,
+            can_manage_hooks: true,
+            max_concurrent_jobs: 10,
+            ..Self::default()
+        }
     }
 
     /// Overrides the concurrency budget.

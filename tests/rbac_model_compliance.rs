@@ -145,6 +145,220 @@ async fn r2_neither_half_of_the_conjunction_suffices_alone() {
     assert_eq!(both.status, StatusCode::OK, "both halves present must be permitted: {}", both.raw);
 }
 
+/// > *Where it lives on a shared managed resource, editing it is a management action on that
+/// > resource and is governed by R2 in full — holding an operational verb, or a `can_manage` row
+/// > without the global conjunct, does not authorise changing what the service executes or where it
+/// > dispatches.* (§Terminology, Dispatch configuration)
+///
+/// The single highest-value assertion in this file. `script_path` is this service's dispatch
+/// configuration: it names the binary the daemon runs. A Daughter holding a `can_manage` row could
+/// once rewrite it and then trigger the hook with `can_execute` from the same row — arbitrary code
+/// execution reachable from a key the Tiers matrix says "may manage resources: **Never**".
+///
+/// `require_master_for_privileged_hook` was never a defence here: it fires only for a hook that
+/// *already* carries a `run_as_user`, and this attack works on an ordinary one. `ALLOWED_SCRIPT_ROOTS`
+/// was not one either — it is empty by default, which means unrestricted.
+#[tokio::test]
+async fn r2_daughter_cannot_repoint_script_path() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let benign = scripts.write_script("r2_benign.sh", "#!/bin/sh\nexit 0\n");
+    let attacker = scripts.write_script("r2_attacker.sh", "#!/bin/sh\nid > /tmp/pwned\n");
+
+    let hook = insert_hook(&db, "r2_dispatch_hook", &benign, 30).await;
+
+    // A Daughter: a `can_manage` row and no `can_manage_keys`. This is exactly half of R2, and the
+    // half that used to be enough.
+    let (daughter_id, daughter) = insert_key(&db, "r2-daughter", "", KeyScopes::plain()).await;
+    grant(&db, daughter_id, hook, true, true).await;
+
+    let repoint = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook}"),
+            &daughter,
+            Some(json!({ "script_path": attacker })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        repoint.status,
+        StatusCode::FORBIDDEN,
+        "R2: a Daughter repointed a hook's script_path — this is remote code execution: {}",
+        repoint.raw
+    );
+
+    // The refusal must be real, not merely a status code: read the row back and confirm the daemon
+    // would still run the original binary. A handler that refuses after writing has refused nothing.
+    let row = fetch_hook_row(&db, hook).await.expect("hook row survives the refusal");
+    assert_eq!(row.script_path, benign, "R2: the write landed despite the 403");
+
+    // The same key may still *run* it — the operational verb is untouched, which is what makes this
+    // a conjunction rather than a blanket demotion.
+    assert_eq!(
+        send(&app, json_request("POST", &format!("/api/hooks/{hook}/execute"), &daughter, None))
+            .await
+            .status,
+        StatusCode::OK,
+        "R2 over-applied: can_execute is not what this rule governs"
+    );
+
+    // And a Parent holding the same row may repoint it. Without this the refusal above could be
+    // caused by anything — a broken payload, an unrelated guard, a typo in the URI.
+    let (_parent_id, parent) = parent_managing(&db, "r2-parent", hook, false).await;
+    let permitted = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook}"),
+            &parent,
+            Some(json!({ "script_path": attacker })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        permitted.status,
+        StatusCode::OK,
+        "both halves of R2 must still permit the edit: {}",
+        permitted.raw
+    );
+}
+
+/// > *This conjunction governs every action `can_manage` authorises on that resource — delegation of
+/// > permissions, lifecycle where §3 permits it, and editing dispatch configuration held on the
+/// > resource itself.* (R2)
+///
+/// R2 was once enforced only on the delegation routes, leaving the *content* routes on a bare
+/// `can_manage` row. This walks every one of them, because "governs every action" is a claim about a
+/// set of endpoints and a test that probes one member of that set proves nothing about the rest —
+/// the same gap that let a mutation survive in the §4 oracle suite.
+#[tokio::test]
+async fn r2_the_conjunction_governs_content_routes_not_only_delegation() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r2_content.sh", "#!/bin/sh\nexit 0\n");
+
+    // The Parent owns the hook, so the lifecycle route in the positive pass clears §3 as well as R2.
+    let (parent_id, parent) = insert_key(&db, "r2-content-parent", "", KeyScopes::parent()).await;
+    let hook = insert_hook_owned_by(&db, "r2_content_hook", &script, parent_id).await;
+    grant(&db, parent_id, hook, false, true).await;
+    let param = insert_parameter(&db, hook, "existing", Some("v"), false).await;
+
+    let (daughter_id, daughter) = insert_key(&db, "r2-content-daughter", "", KeyScopes::plain()).await;
+    grant(&db, daughter_id, hook, true, true).await;
+
+    let hook_uri = format!("/api/hooks/{hook}");
+    let params_uri = format!("{hook_uri}/parameters");
+    let param_uri = format!("{params_uri}/{param}");
+
+    // Every content route behind `require_manage`. A Daughter holds a row on this hook, so it can
+    // see the hook — §4 is satisfied by a `403`, and a `404` here would be a lie it could disprove.
+    let refusals: [(&str, &str, Option<serde_json::Value>); 5] = [
+        ("PUT", &hook_uri, Some(json!({ "description": "seized" }))),
+        ("POST", &params_uri, Some(json!({ "param_key": "injected", "default_value": "x" }))),
+        ("PUT", &param_uri, Some(json!({ "default_value": "rewritten" }))),
+        ("DELETE", &param_uri, None),
+        ("DELETE", &hook_uri, None),
+    ];
+    for (method, uri, body) in refusals {
+        let response = send(&app, json_request(method, uri, &daughter, body)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "R2: {method} {uri} accepted a Daughter holding only a can_manage row: {}",
+            response.raw
+        );
+    }
+
+    // The positive path, so the five refusals above cannot be explained by the routes being broken.
+    for (method, uri, body) in [
+        ("PUT", hook_uri.as_str(), Some(json!({ "description": "managed" }))),
+        ("POST", params_uri.as_str(), Some(json!({ "param_key": "declared", "default_value": "x" }))),
+        ("PUT", param_uri.as_str(), Some(json!({ "default_value": "rewritten" }))),
+    ] {
+        let response = send(&app, json_request(method, uri, &parent, body)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "both halves of R2 must permit {method} {uri}: {}",
+            response.raw
+        );
+    }
+    assert_eq!(
+        send(&app, json_request("DELETE", &hook_uri, &parent, None)).await.status,
+        StatusCode::NO_CONTENT,
+        "R2 plus §3 ownership must permit the lifecycle route"
+    );
+}
+
+/// > *...lifecycle where §3 permits it...* (R2)
+///
+/// R2 is a gate in *front* of §3, never a substitute for it. The phrase "where §3 permits it" makes
+/// the conjunction necessary for a lifecycle action, and §3 independently makes ownership necessary;
+/// a caller must clear both. This pins the direction that a careless reading of R2 would break —
+/// treating the conjunction as sufficient authority to delete.
+#[tokio::test]
+async fn r2_the_conjunction_is_not_a_substitute_for_section_3_ownership() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("r2_owned.sh", "#!/bin/sh\nexit 0\n");
+
+    let (owner_id, owner) = insert_key(&db, "r2-owner", "", KeyScopes::parent()).await;
+    let hook = insert_hook_owned_by(&db, "r2_owned_hook", &script, owner_id).await;
+    grant(&db, owner_id, hook, true, true).await;
+
+    // Holds *both* halves of R2 on this hook, and is not its owner.
+    let (_intruder_id, intruder) = parent_managing(&db, "r2-intruder", hook, true).await;
+
+    for (method, body, what) in [
+        ("DELETE", None, "delete"),
+        ("PUT", Some(json!({ "name": "seized" })), "rename"),
+    ] {
+        let response =
+            send(&app, json_request(method, &format!("/api/hooks/{hook}"), &intruder, body)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "§3: a full R2 holder performed a {what} on a hook it does not own: {}",
+            response.raw
+        );
+        assert!(
+            response.raw.contains("owner"),
+            "the refusal must name ownership, not the conjunction: {}",
+            response.raw
+        );
+    }
+
+    // Content management is untouched — the intruder really does manage this hook, which is what
+    // makes the refusals above about §3 rather than about R2 firing a second time.
+    assert_eq!(
+        send(
+            &app,
+            json_request(
+                "PUT",
+                &format!("/api/hooks/{hook}"),
+                &intruder,
+                Some(json!({ "description": "managed" }))
+            )
+        )
+        .await
+        .status,
+        StatusCode::OK,
+        "§3 over-applied: a manage holder may still edit content"
+    );
+
+    // The owner, holding both halves itself, may delete.
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &owner, None)).await.status,
+        StatusCode::NO_CONTENT,
+        "the owner holding R2 in full may run the lifecycle action"
+    );
+}
+
 // ═════════════════════════════════════════════════════════════
 // R3 — Parentage confers no authority
 // ═════════════════════════════════════════════════════════════
@@ -459,7 +673,11 @@ async fn r7_satisfying_one_rule_is_never_a_way_past_the_other() {
 /// > *Resource lifecycle actions — deleting or renaming the entity itself — are restricted
 /// > exclusively to Master and the designated `owner_key_id`. Holding manage rights or any
 /// > operational verb confers no lifecycle authority ... Master may reassign `owner_key_id` on any
-/// > resource or dispatch target at any time.*
+/// > resource or creator-private entity at any time.*
+///
+/// Both non-master callers are Parents. R2 says the conjunction governs "lifecycle where §3 permits
+/// it", so it sits *in front of* §3 rather than beside it — and a Daughter here would be refused by
+/// R2 before §3 was ever consulted, turning every assertion below into a restatement of R2.
 #[tokio::test]
 async fn s3_lifecycle_is_the_owners_and_masters_alone() {
     let db = setup_test_db().await;
@@ -467,8 +685,8 @@ async fn s3_lifecycle_is_the_owners_and_masters_alone() {
     let scripts = ScriptDir::new();
     let script = scripts.write_script("s3.sh", "#!/bin/sh\nexit 0\n");
 
-    let (owner_id, owner) = insert_key(&db, "s3-owner", "", KeyScopes::plain()).await;
-    let (user_id, user) = insert_key(&db, "s3-user", "", KeyScopes::plain()).await;
+    let (owner_id, owner) = insert_key(&db, "s3-owner", "", KeyScopes::parent()).await;
+    let (user_id, user) = insert_key(&db, "s3-user", "", KeyScopes::parent()).await;
     let (_master_id, master) = insert_key(&db, "s3-master", "", KeyScopes::master()).await;
     let hook = insert_hook_owned_by(&db, "s3_hook", &script, owner_id).await;
     grant(&db, owner_id, hook, true, true).await;

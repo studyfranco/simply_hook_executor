@@ -1214,7 +1214,11 @@ async fn hook_crud_lifecycle_and_creator_auto_provisioning() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (_, manager) = insert_key(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    // Creation takes `can_manage_hooks`; the edits later in this lifecycle take R2's conjunction,
+    // whose global half is `can_manage_keys`. Neither right implies the other, so a key that walks
+    // the whole CRUD lifecycle holds both.
+    let (_, manager) =
+        insert_key(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
 
     let created = send(
         &app,
@@ -1846,7 +1850,8 @@ async fn positional_argument_order_is_deterministic_and_append_only() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
+    // A Parent: declaring parameters is a management action, gated by R2's conjunction.
+    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::parent()).await;
     let hook_id = insert_hook(&db, "ordered", &script, 30).await;
     grant(&db, key_id, hook_id, true, true).await;
 
@@ -2092,8 +2097,9 @@ async fn only_master_keys_may_assign_run_as_user() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    // A fully-scoped non-master: it may create hooks, it simply may not elevate them.
-    let (_, manager) = insert_key(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    // A fully-scoped non-master: it may create *and* maintain hooks, it simply may not elevate them.
+    let (_, manager) =
+        insert_key(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
 
     // Creating a *standard* hook is allowed and must keep working.
@@ -2276,7 +2282,9 @@ async fn granular_hook_permissions_separate_execute_from_manage() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let (executor_id, executor) = insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
-    let (manager_id, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::plain()).await;
+    // A Parent, not a plain Daughter: R2 makes management a conjunction, so the manage row granted
+    // below is only half of what editing this hook takes. The other half is this flag.
+    let (manager_id, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::parent()).await;
     let (_, stranger) = insert_key(&db, "Stranger", "0.0.0.0/0", KeyScopes::plain()).await;
 
     // Owned by the manager, so the closing assertion exercises the *permission* matrix rather than
@@ -2601,7 +2609,11 @@ async fn path_traversal_payloads_are_blocked_at_definition_time() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (_, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    // Both rights: the traversal payloads are asserted at creation *and* on update below, and each
+    // path sits behind a different gate. A key short of either would produce a 403 that masks the
+    // 400 this test is actually about.
+    let (_, manager) =
+        insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
 
     let payloads = [
         "/scripts/../../etc/shadow",
@@ -2676,7 +2688,9 @@ async fn script_paths_are_confined_to_allowed_roots() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state_with_roots(&db, vec![allowed.root()]));
-    let (_, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    // Both rights: containment is asserted at creation and on re-pointing an existing hook.
+    let (_, manager) =
+        insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
 
     let ok = send(
         &app,
@@ -3198,7 +3212,10 @@ async fn hook_parameter_crud_is_guarded_by_manage_rights() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (manager_id, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::plain()).await;
+    // A Parent: parameter CRUD is a management action on the hook, so it needs both halves of R2.
+    // A parameter is argv for whatever `script_path` names, which is why it sits behind the same
+    // gate as the definition rather than behind the operational verb.
+    let (manager_id, manager) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::parent()).await;
     let (executor_id, executor) = insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
 
     let hook_id = insert_hook(&db, "paramful", &script, 30).await;
@@ -4797,8 +4814,10 @@ async fn s3_managing_a_hook_does_not_confer_authority_to_delete_it() {
     let scripts = ScriptDir::new();
     let script = scripts.write_script("owned.sh", "#!/bin/sh\necho ok\n");
 
-    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
-    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::plain()).await;
+    // Both are Parents: this test is about §3 ownership, so both callers must clear R2 first or the
+    // refusals below would prove only that the conjunction works — which is a different test.
+    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::parent()).await;
+    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::parent()).await;
     let hook = insert_hook_owned_by(&db, "owned_hook", &script, owner_id).await;
     grant(&db, owner_id, hook, true, true).await;
     grant(&db, manager_id, hook, true, true).await;
@@ -4876,8 +4895,10 @@ async fn s3_only_master_reassigns_ownership() {
     let scripts = ScriptDir::new();
     let script = scripts.write_script("reassign.sh", "#!/bin/sh\necho ok\n");
 
-    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
-    let (successor_id, successor) = insert_key(&db, "successor", "", KeyScopes::plain()).await;
+    // Parents both: the point here is that *ownership* moves, so each caller must already clear R2
+    // and differ only in whether it holds the column.
+    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::parent()).await;
+    let (successor_id, successor) = insert_key(&db, "successor", "", KeyScopes::parent()).await;
     let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
     let hook = insert_hook_owned_by(&db, "reassigned_hook", &script, owner_id).await;
     grant(&db, owner_id, hook, true, true).await;
@@ -5122,7 +5143,9 @@ async fn regression_non_master_cannot_repoint_a_privileged_hook() {
     let safe = scripts.write_script("safe.sh", "echo safe");
     let attacker = scripts.write_script("attacker.sh", "echo pwned");
     let hook_id = insert_hook_as(&db, "root_hook", &safe, 30, Some("root")).await;
-    let (key_id, editor) = insert_key(&db, "hook-editor", "", KeyScopes::plain()).await;
+    // A Parent, so R2 is satisfied and the refusals below can only come from the privileged-hook
+    // guard. A Daughter would now be refused one step earlier, which would prove a different rule.
+    let (key_id, editor) = insert_key(&db, "hook-editor", "", KeyScopes::parent()).await;
     grant(&db, key_id, hook_id, true, true).await;
 
     // The original exploit: swap the binary, leave `run_as_user` untouched.
@@ -5311,7 +5334,9 @@ async fn a_non_master_delete_is_soft_and_leaves_the_row_intact() {
     let scripts = ScriptDir::new();
 
     let script = scripts.write_script("soft.sh", "echo ok");
-    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    // A Parent: R2 now gates lifecycle too ("lifecycle where §3 permits it"), so a permitted delete
+    // needs the conjunction *and* ownership. This test is about what a permitted delete does.
+    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::parent()).await;
     // Owned by the deleter: §3 restricts deletion to master and the owner, and this test is about
     // what a *permitted* delete does to the row, not about who may issue one.
     let hook_id = insert_hook_owned_by(&db, "soft_hook", &script, key_id).await;
@@ -5432,7 +5457,9 @@ async fn trash_management_is_master_only() {
     let scripts = ScriptDir::new();
 
     let script = scripts.write_script("guard.sh", "echo ok");
-    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
+    // A Parent, so the soft delete below is permitted and the hard delete is refused for the reason
+    // this test is named after rather than for want of the R2 conjunction.
+    let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::parent()).await;
     // Owned by the editor, so the refusals below are about *trash* being master-only rather than
     // about §3 ownership — which is covered separately.
     let hook_id = insert_hook_owned_by(&db, "guard_hook", &script, key_id).await;

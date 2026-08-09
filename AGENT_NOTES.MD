@@ -3531,3 +3531,228 @@ string exists in either codebase: the real names are `can_manage_webhooks` and `
 names an "Executor" entity this service does not have, which is what forced the dispatch-target role
 onto `hooks` and scope 3 onto `executions`. Fixing either requires editing both copies together —
 a unilateral edit forks the spec and breaks the identity check that just started passing.
+
+---
+
+## Phase 1 — Closing the R2 conjunction gap on resource content
+
+`fix(rbac): enforce R2 conjunction on require_manage and dispatch configuration`
+
+The audit's finding #2 above, closed. `RBAC_MODEL.md` was amended by the operator before this phase
+ran, and the amendment settles two things the audit had recorded as open: the Terminology table now
+resolves this service's nouns without inventing entities (*resource data* = Hook parameter,
+*creator-private entity* = Execution record, *resource-creation rights* = `can_manage_hooks`), and a
+new **Dispatch configuration** paragraph names `script_path` and `run_as_user` explicitly:
+
+> *Where it lives on a shared managed resource, editing it is a management action on that resource
+> and is governed by R2 in full — holding an operational verb, or a `can_manage` row without the
+> global conjunct, does not authorise changing what the service executes or where it dispatches.*
+
+R2 itself gained a closing sentence: the conjunction "governs every action `can_manage` authorises on
+that resource — delegation of permissions, **lifecycle where §3 permits it**, and editing dispatch
+configuration held on the resource itself." So this is no longer an inference from the Tiers matrix;
+it is the specification's own words, and the fix is mandatory rather than advisable.
+
+### What changed
+
+`require_manage` was `is_master || row.can_manage`. It is now a master short-circuit in front of
+`require_hook_manage_conjunction` — **one** evaluation point for R2 in the whole service, rather than
+two implementations to drift apart. All six call sites inherit the fix without individual edits:
+
+| Call site | Route | Was | Now |
+| :--- | :--- | :--- | :--- |
+| `update_hook` | `PUT`/`PATCH /api/hooks/{id}` | bare row | conjunction |
+| `create_hook_parameter` | `POST /api/hooks/{id}/parameters` | bare row | conjunction |
+| `update_hook_parameter` | `PUT /api/hooks/{id}/parameters/{pid}` | bare row | conjunction |
+| `delete_hook_parameter` | `DELETE /api/hooks/{id}/parameters/{pid}` | bare row | conjunction |
+| `delete_execution` | `DELETE /api/executions/{id}` | bare row | conjunction |
+| `delete_hook` | `DELETE /api/hooks/{id}` | bare row, then §3 | conjunction, then §3 |
+
+Status codes are unchanged in shape and still §4-correct, because the conjunction helper already
+made the distinction: **no row at all → `404`** (the hook is invisible, so it must answer as a
+nonexistent id does), **a row short of a conjunct → `403`**. The caller always knows its own rows via
+`GET /api/auth/me`, so the status leaks nothing about itself; what stays hidden is the hook.
+
+### Option 1 chosen: uniform conjunction, no verb split
+
+The peer service solves this differently — it splits `can_manage` (administrative) from
+`can_read`/`can_write`/`can_delete` (operational), so its `can_manage` never edits content and the
+conjunction lands naturally. That is the better long-term model and it is what the audit recommended.
+It is **not** what this phase does.
+
+**Option 1 — uniform enforcement without splitting the verb — was chosen deliberately**, because it
+closes a remote-code-execution path today with no schema migration, no change to
+`api_key_hook_permissions`, no rewrite of every grant payload, and no coordination with the peer's
+column set. A verb split is a data-model change that would have to be designed, migrated, backfilled
+with a policy decision about what an existing `can_manage = true` row becomes, and reflected in every
+grant route and its R1 per-verb comparison. Shipping that is a phase of its own; shipping *this* is
+an edit to one function. The RCE does not wait for the better refactor.
+
+The cost is honest and should be recorded rather than argued away: `can_manage` in this service still
+means two things at once, and the conjunction is what compensates. **A verb split remains the correct
+follow-up**, and if it happens, `require_manage` collapses into the operational verb and
+`require_hook_manage_conjunction` keeps the administrative one.
+
+### Sibling guards audited
+
+The instruction was to check for the same omission elsewhere before assuming `require_manage` was the
+only site. Every authorization helper in `src/api.rs` was read. Findings:
+
+| Guard | Verdict | Reasoning |
+| :--- | :--- | :--- |
+| `require_manage` | **Was defective — fixed** | The subject of this phase |
+| `require_hook_manage_conjunction` | Correct | Already both halves; now the single R2 site |
+| `has_permission_admin_standing` | Correct | Both halves as far as knowable pre-payload |
+| `manages_any_hook` | Correct by role | Deliberately the row half only; its caller supplies the global half. Not a guard on its own and never called as one |
+| `guard_delegated_hook_grant` | Correct | Enters through `require_hook_manage_conjunction` |
+| `require_execute` | Correct — **must not** change | R2 governs *managing*. `can_execute` is operational, and a Daughter is entitled to it. Adding the conjunction here would break the Tiers matrix in the opposite direction |
+| `require_visibility` | Correct — **must not** change | Read access is derived from *either* verb; §4 governs it, not R2 |
+| `visible_hook_ids` | Correct | The listing form of `require_visibility`; same reasoning |
+| `require_lifecycle_authority` | Correct | §3 master-or-owner, independent of R2 and now stacked behind it |
+| `require_master_for_privileged_hook` | Correct | Master-only for `run_as_user` hooks; narrower than R2, never a substitute — it does not fire on ordinary hooks, which is exactly why the gap was exploitable |
+| `require_master_to_grant_scopes` | Correct | R4 |
+| `require_master_to_administer` | Correct | R1 non-amplification over key administration |
+| `refuse_master_lifecycle_action` | Correct | §5 |
+| `require_master_self_edit_is_bound_ips_only` | Correct | §5 |
+| `is_permission_reduction` | Correct | R6, classification by effect |
+| `create_hook`'s `can_manage_hooks` check | Correct — **not** an omission | R2 is written about "a `can_manage = true` row for that specific resource"; a resource that does not exist yet can have no row. Creation is governed by the global scope alone, by construction |
+| The key-administration routes (`create_api_key`, `list_api_keys`, `update_api_key`, `delete_api_key`, `rotate_api_key`) | Correct | `is_master \|\| can_manage_keys`. These administer *keys*, not a per-resource entity; there is no row for R2 to require. §3 and §4 govern them via `require_lifecycle_authority` and `key_visibility` |
+
+**No second omission was found.** `require_manage` was the only guard missing a conjunct.
+
+### Breaking change
+
+**A key holding a `can_manage` row but not `can_manage_keys` loses the ability to edit hooks,
+parameters, and execution records.** Under §1 this is the Daughter tier, which "may manage resources:
+Never" — so the previous behaviour was the bug and this is the correction. It is nonetheless a
+behavioural break for any deployment that leaned on it, and there are two distinct affected shapes:
+
+1. **Delegated managers** — keys granted `can_manage` on someone else's hook.
+2. **Self-provisioned creators** — `can_manage_hooks` keys that created a hook, received the
+   auto-provisioned full row, and have been editing their own work ever since. These are easy to
+   overlook because nobody ever granted them anything. They also lose *deletion* of hooks they own,
+   since R2 now gates lifecycle in front of §3.
+
+Operator queries to find them before upgrading:
+
+```sql
+-- 1. Every key that would lose hook-management authority: holds a manage row, lacks the global half.
+SELECT k.id, k.name, k.prefix, COUNT(p.hook_id) AS manage_rows
+FROM api_keys k
+JOIN api_key_hook_permissions p ON p.api_key_id = k.id AND p.can_manage = true
+WHERE k.is_master = false AND k.can_manage_keys = false
+GROUP BY k.id, k.name, k.prefix
+ORDER BY manage_rows DESC;
+
+-- 2. Which hooks each of them would stop being able to edit.
+SELECT k.name AS key_name, k.prefix, h.name AS hook_name, h.id AS hook_id,
+       (h.owner_key_id = k.id) AS is_owner
+FROM api_key_hook_permissions p
+JOIN api_keys k ON k.id = p.api_key_id
+JOIN hooks h   ON h.id = p.hook_id
+WHERE p.can_manage = true AND k.is_master = false AND k.can_manage_keys = false
+ORDER BY k.name, h.name;
+
+-- 3. The self-provisioned creators specifically — they own the hook and will lose deletion of it
+--    too, which the query above flags as is_owner = true. Worth reviewing separately.
+SELECT k.id, k.name, k.prefix, COUNT(h.id) AS hooks_owned
+FROM api_keys k
+JOIN hooks h ON h.owner_key_id = k.id
+WHERE k.is_master = false AND k.can_manage_keys = false
+GROUP BY k.id, k.name, k.prefix
+ORDER BY hooks_owned DESC;
+```
+
+**Remediation** is one of three, and it is a policy decision, not a mechanical one:
+
+```sql
+-- (a) Promote the key to Parent — restores its previous authority in full. Note this also grants
+--     the right to create and administer daughter keys, which is a real widening: do not reach for
+--     it by default just because it is the one-line fix.
+UPDATE api_keys SET can_manage_keys = true WHERE id = '<key-uuid>';
+
+-- (b) Demote the row to operational-only — the key keeps running the hook, loses editing it.
+--     This is the right answer whenever the key was only ever a caller.
+UPDATE api_key_hook_permissions SET can_manage = false WHERE api_key_id = '<key-uuid>';
+
+-- (c) Leave it. Editing moves to master or to a Parent, which for most deployments is where the
+--     specification wants it.
+```
+
+There is no migration for this, deliberately. Any automatic choice would either widen authority
+without being asked (a) or silently remove it (b), and the service cannot know which a given
+deployment meant.
+
+### Tests
+
+Three new compliance tests under `r2_`, plus fixture corrections across the existing suites.
+
+- **`r2_daughter_cannot_repoint_script_path`** — the named requirement. A Daughter with both verbs on
+  an *ordinary* (unelevated) hook is refused `PUT {script_path}`; the row is then re-read to confirm
+  the write never landed, since a handler that refuses after writing has refused nothing. It then
+  asserts the same key may still *execute* the hook (the conjunction is not a blanket demotion) and
+  that a Parent holding the same row may perform the edit (so the refusal is attributable to the
+  missing conjunct, not to a broken route).
+- **`r2_the_conjunction_governs_content_routes_not_only_delegation`** — walks all five content routes
+  behind `require_manage`, then the positive path for each. Written this way because "governs every
+  action" is a claim about a *set* of endpoints, and the §4 mutation survivor in Phase 5 was caused
+  precisely by probing one member of a set and generalising.
+- **`r2_the_conjunction_is_not_a_substitute_for_section_3_ownership`** — the required deletion case:
+  a key holding **both** halves of R2 and not the `owner_key_id` is refused `DELETE` and rename with
+  a message naming ownership, while its content edits still succeed. R2 is a gate in front of §3, not
+  a replacement for it.
+
+Existing fixtures were corrected rather than weakened. Twelve integration tests and one compliance
+test seeded `KeyScopes::plain()` keys with manage rows and asserted they could edit — they were
+encoding the defect. Each was re-seeded as a Parent, with a comment recording *why* the tier matters
+to that specific test. Two new helpers make the tiers explicit at the call site:
+`KeyScopes::parent()` and `KeyScopes::parent_hook_manager()`.
+
+The distinction is load-bearing in the §3 tests especially: with a Daughter, R2 refuses before
+ownership is ever consulted, so every §3 assertion would still pass while testing nothing about §3.
+
+### E2E updates
+
+`scripts/test_e2e.sh`: 823 → **841 checks**, all passing. Four existing scenarios were seeded with
+Daughter keys and asserted the old looser behaviour:
+
+| Scenario | Change |
+| :--- | :--- |
+| Granular permission matrix (§ scoped keys) | "Manage-Only Key" is now created with `can_manage_keys` |
+| Non-master elevation guard | "Hook Creator No Elevation" gains `can_manage_keys` so the refusals remain attributable to the elevation guard |
+| Finding #4 (repointing an elevated hook) | "Hook Editor" gains `can_manage_keys`, same reason |
+| §37 ownership and lifecycle | "Hook Owner" and "Hook Operator" both become Parents, or R2 would mask every §3 assertion |
+
+Plus a **new §40** asserting the Daughter side directly on an ordinary hook: refusals across `PUT`,
+`PATCH`, parameter creation and lifecycle; confirmation the write never landed; that `can_execute`
+still works; and the Parent positive path.
+
+### Mutation verification
+
+`require_manage` was reverted to its pre-fix body (`is_master || row.can_manage`) and the suite re-run:
+
+| Test | Under mutation | Verdict |
+| :--- | :--- | :--- |
+| `r2_daughter_cannot_repoint_script_path` | **FAILED** | Catches the regression |
+| `r2_the_conjunction_governs_content_routes_not_only_delegation` | **FAILED** | Catches the regression |
+| `r2_the_conjunction_is_not_a_substitute_for_section_3_ownership` | passed | **Expected** — §3 is enforced independently by `require_lifecycle_authority`, so removing R2 does not affect it. Recorded rather than hidden: this test pins §3, and its passing under an R2 mutation is the correct result, not a blind spot |
+| `r2_neither_half_of_the_conjunction_suffices_alone` | passed | Expected — it exercises the delegation routes, which never went through `require_manage` |
+
+The mutation was restored immediately and the full suite re-run green.
+
+### Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **230 passed / 0 failed** (84 unit + 129 integration + 17 compliance) ·
+`./scripts/test_e2e.sh` **841 / 841**.
+
+### Deferred, and why
+
+**Execution records are now creator-private under the amended spec** (Terminology: *creator-private
+entity* = Execution record), and §4 says such an entity is "visible exclusively to their creator and
+Master" and is "never exposed by the shared-resource visibility rule". Today `list_executions` and
+`get_execution` gate on `require_visibility` over the parent hook, so **any** row-holder on a hook
+sees every execution of it regardless of who ran it. That is a genuine new divergence created by the
+amendment, not by this phase, and closing it is a visibility change with its own §3 question (an
+execution has an acting key but no `owner_key_id` column). It is out of scope for a phase whose remit
+is R2 and is recorded here as the next candidate.

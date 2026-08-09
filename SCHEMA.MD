@@ -56,7 +56,7 @@ Stores authentication keys, global scopes, and network restrictions.
 | `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage **other** API keys. Explicitly *not* the right to grant global scopes, to administer a key that is itself `is_master`, or to alter the caller's own hook permissions — all three are master-only, or the scope would be self-amplifying and thus equivalent to `is_master`. |
 | `parent_key_id` | UUID / String | NULLABLE, INDEXED (`idx_api_keys_parent_key_id`) | The key that created this one. **Lineage only — never authority** (`RBAC_MODEL.md` R3): it exists for cascading deletion and visibility scoping, and no authorization decision may read it. A daughter of the master is an ordinary daughter. `NULL` for the bootstrap master and for keys predating lineage. |
 | `owner_key_id` | UUID / String | NULLABLE, INDEXED (`idx_api_keys_owner_key_id`) | The key answerable for this one. Set to the creator at creation and thereafter free to diverge from lineage: §6's inventory reports it as `current_owner`, while the subtree walk producing that inventory follows `parent_key_id`. |
-| `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create hooks (creation auto-provisions full rights on the new hook). Never confers rights over a hook created by someone else, and never over a hook carrying `run_as_user`. |
+| `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create hooks (creation auto-provisions a full permission row on the new hook and records the creator as its `owner_key_id`). Never confers rights over a hook created by someone else, and never over a hook carrying `run_as_user`. **Nor does it confer the right to edit what it created:** every later edit is governed by `RBAC_MODEL.md` R2, whose global half is `can_manage_keys` — a resource-creation right and a resource-management right are separate powers and neither implies the other (§1). A key that must both define and maintain hooks holds both flags, and both are Master-granted only (R4). |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
 
@@ -184,7 +184,7 @@ Junction table managing M:N permissions between API Keys and Hooks.
 | `api_key_id` | UUID / String | NOT NULL, FOREIGN KEY (`api_keys.id` ON DELETE CASCADE) | Target API key. |
 | `hook_id` | UUID / String | NOT NULL, FOREIGN KEY (`hooks.id` ON DELETE CASCADE) | Target hook. |
 | `can_execute` | Boolean | NOT NULL, DEFAULT `true` | Permission to invoke `POST /api/hooks/:id/execute`, `POST /api/hooks/:id/test`, and `POST /webhook/:id`. |
-| `can_manage` | Boolean | NOT NULL, DEFAULT `false` | Permission to edit or delete this hook configuration, its parameters, and its execution records. |
+| `can_manage` | Boolean | NOT NULL, DEFAULT `false` | **Half** of the permission to edit this hook's configuration, its parameters, and its execution records. Never sufficient alone: `RBAC_MODEL.md` **R2** makes management a conjunction of this row and the *global* `api_keys.can_manage_keys`, because §1's Tiers matrix says a Daughter key (one without that flag) may never manage resources. On its own this row grants read visibility (below) and nothing more; it is a necessary condition, not a grant. Deleting or renaming the hook needs the conjunction **and** `hooks.owner_key_id` (§3). |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 
 *Unique Index:* `(api_key_id, hook_id)`
@@ -196,8 +196,10 @@ This table stores exactly **two** flags. Read access is *derived* rather than st
 > A key may read a hook's details, its parameter contract, and its execution history if it is
 > `is_master`, **or** holds `can_execute = true`, **or** holds `can_manage = true` on that hook.
 
-A key with no mapping for a hook can read nothing about it — `GET /api/hooks/{id}` returns `403`,
-and `GET /api/hooks` / `GET /api/executions` simply omit it rather than erroring.
+A key with no mapping for a hook can read nothing about it — `GET /api/hooks/{id}` returns `404`,
+byte-identical to the answer for a hook id that was never issued (`RBAC_MODEL.md` §4 oracle
+discipline; a `403` here would confirm the hook exists), and `GET /api/hooks` / `GET /api/executions`
+simply omit it rather than erroring.
 
 Deriving read access this way keeps the two natural roles coherent with two columns: an executor can
 inspect what it runs, and a manager can inspect what it configures. A stored `can_read` flag would

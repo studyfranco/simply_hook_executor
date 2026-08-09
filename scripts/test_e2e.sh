@@ -661,7 +661,11 @@ create_key_as() {
 create_scoped_key "Execute-Only Key"
 EXEC_KEY="$CREATED_KEY"; EXEC_ID="$CREATED_ID"
 EXEC_KEY_ID="$CREATED_KEY_ID"; EXEC_SIGNING_SECRET="$CREATED_SIGNING_SECRET"
-create_scoped_key "Manage-Only Key"
+# A Parent, not a Daughter. R2 makes managing a hook a conjunction of `can_manage_keys` and a
+# `can_manage` row, so a "manage-only" key in the pre-R2 sense — the row alone — can no longer edit
+# anything. §1's Tiers matrix is explicit that a Daughter never manages resources. The Daughter-side
+# refusals are asserted in §40 below.
+create_scoped_key "Manage-Only Key" ',"can_manage_keys":true'
 MANAGE_KEY="$CREATED_KEY"; MANAGE_ID="$CREATED_ID"
 create_scoped_key "No-Access Key"
 NOACCESS_KEY="$CREATED_KEY"; NOACCESS_ID="$CREATED_ID"
@@ -1510,7 +1514,10 @@ check "200" "dry-run after dropping elevation"
 check_jq ".command.program" "$PRIV_SCRIPT" "the sudo wrapper is gone"
 
 # --- Master-only guard: a non-master may create hooks but never elevate them ---
-create_scoped_key "Hook Creator No Elevation" ',"can_manage_hooks":true'
+# Both rights: `can_manage_hooks` to create the hook, `can_manage_keys` for the global half of R2 on
+# every later edit. Neither implies the other (§1), and this section asserts what a *fully* entitled
+# non-master still may not do, so it must clear every gate except the one under test.
+create_scoped_key "Hook Creator No Elevation" ',"can_manage_hooks":true,"can_manage_keys":true'
 NOELEV_KEY="$CREATED_KEY"; NOELEV_ID="$CREATED_ID"
 
 NOELEV_SCRIPT=$(make_hook_script "noelev_hook.sh" 'echo ok')
@@ -2199,7 +2206,9 @@ api_call POST "/api/hooks/$PRIVESC_HOOK_ID/test" "$KEYMGR_KEY" '{}'
 check "404" "#3 the root hook remains unreachable to the key manager"
 
 # ── Finding #4: repointing an elevated hook ────────────────────────────────
-create_scoped_key "Hook Editor"
+# A Parent: this section is about the *privileged-hook* guard, so the editor must clear R2 first or
+# the refusals below would prove the conjunction works rather than the elevation guard.
+create_scoped_key "Hook Editor" ',"can_manage_keys":true'
 EDITOR_KEY="$CREATED_KEY"; EDITOR_ID="$CREATED_ID"
 api_call POST "/api/keys/$EDITOR_ID/permissions" "$MASTER_KEY" \
     "$(jq -nc --arg h "$PRIVESC_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
@@ -3082,10 +3091,13 @@ log_section "37. Ownership and lifecycle authority (RBAC_MODEL.md §3, R3)"
 
 OWN_SCRIPT=$(make_hook_script "ownership.sh" 'echo "owned"')
 
-# A key that may create hooks, so it *owns* what it creates rather than being handed one.
-create_scoped_key "Hook Owner" ',"can_manage_hooks":true'
+# A key that may create hooks, so it *owns* what it creates rather than being handed one. Both are
+# Parents: R2 gates lifecycle too ("lifecycle where §3 permits it"), so it sits in front of §3. A
+# Daughter here would be refused by R2 before ownership was ever consulted, and every check in this
+# section would silently become a restatement of R2 instead of a test of §3.
+create_scoped_key "Hook Owner" ',"can_manage_hooks":true,"can_manage_keys":true'
 OWNER_KEY="$CREATED_KEY"; OWNER_ID="$CREATED_ID"
-create_scoped_key "Hook Operator"
+create_scoped_key "Hook Operator" ',"can_manage_keys":true'
 OPERATOR_KEY="$CREATED_KEY"; OPERATOR_ID="$CREATED_ID"
 
 api_call POST "/api/hooks" "$OWNER_KEY" \
@@ -3379,6 +3391,77 @@ api_call DELETE "/api/keys/$CAS_EMPTY_ID" "$MASTER_KEY"
 check "204" "§6 a subtree owning nothing needs no resolution map"
 api_call GET "/api/auth/me" "$CAS_EMPTY_CHILD_KEY"
 check "401" "§6 and the cascade still ran"
+
+# ── 40. RBAC_MODEL.md R2: the conjunction over resource content ─────────────
+#
+# The dispatch-configuration clause in the Terminology section names `script_path` and `run_as_user`
+# as this service's dispatch configuration and puts editing them under "R2 in full". Everything here
+# is a Daughter — a `can_manage` row and no `can_manage_keys` — which is the population that could
+# once rewrite `script_path` on an ordinary hook and then run it with `can_execute` from the same
+# row. `require_master_for_privileged_hook` never covered this: it fires only for a hook that
+# already carries a `run_as_user`, and the hook below deliberately does not.
+
+log_section "40. Manage is a conjunction over resource content (RBAC_MODEL.md R2)"
+
+R2_SCRIPT=$(make_hook_script "r2_benign.sh" 'echo benign')
+R2_ATTACKER=$(make_hook_script "r2_attacker.sh" 'echo pwned')
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$R2_SCRIPT" '{name:"r2_dispatch_hook",script_path:$p}')"
+check "200" "R2 master creates an ordinary, unelevated hook"
+R2_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# A Daughter holding *both* verbs on the hook. Half of R2, and the half that used to be enough.
+create_scoped_key "R2 Daughter"
+R2_DAUGHTER_KEY="$CREATED_KEY"; R2_DAUGHTER_ID="$CREATED_ID"
+api_call POST "/api/keys/$R2_DAUGHTER_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$R2_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
+check "200" "R2 the daughter is granted execute and manage on the hook"
+
+# It really does hold the row — otherwise the refusals below would be about visibility, not R2.
+api_call GET "/api/hooks/$R2_HOOK_ID" "$R2_DAUGHTER_KEY"
+check "200" "R2 the daughter can see the hook it holds a row on"
+check_jq ".can_manage" "true" "R2 and genuinely holds can_manage"
+
+api_call PUT "/api/hooks/$R2_HOOK_ID" "$R2_DAUGHTER_KEY" \
+    "$(jq -nc --arg p "$R2_ATTACKER" '{script_path:$p}')"
+check "403" "R2 a daughter cannot repoint script_path — this is the RCE path"
+api_call PATCH "/api/hooks/$R2_HOOK_ID" "$R2_DAUGHTER_KEY" \
+    "$(jq -nc --arg p "$R2_ATTACKER" '{script_path:$p}')"
+check "403" "R2 ...nor via PATCH"
+api_call PUT "/api/hooks/$R2_HOOK_ID" "$R2_DAUGHTER_KEY" '{"description":"seized"}'
+check "403" "R2 no field of the definition is editable without the global conjunct"
+api_call POST "/api/hooks/$R2_HOOK_ID/parameters" "$R2_DAUGHTER_KEY" \
+    '{"param_key":"injected","default_value":"-c"}'
+check "403" "R2 a parameter is argv for script_path, and is gated with it"
+api_call DELETE "/api/hooks/$R2_HOOK_ID" "$R2_DAUGHTER_KEY"
+check "403" "R2 the lifecycle route is gated too"
+
+# §4 is satisfied by a 403 rather than a 404 here, and deliberately: the daughter holds a row, so it
+# can see this hook and a 404 would be a lie it could disprove with GET /api/auth/me.
+api_call PUT "/api/hooks/$R2_HOOK_ID" "$R2_DAUGHTER_KEY" '{"description":"seized"}'
+check_true '.error | contains("manage")' "R2 the refusal names the missing verb, not which half"
+
+# The write never landed. A handler that refuses after writing has refused nothing.
+api_call GET "/api/hooks/$R2_HOOK_ID" "$MASTER_KEY"
+check "200" "R2 re-read the hook as master"
+check_jq ".script_path" "$R2_SCRIPT" "R2 the script path was not repointed"
+
+# The operational verb is untouched — this is a conjunction, not a blanket demotion.
+api_call POST "/api/hooks/$R2_HOOK_ID/execute" "$R2_DAUGHTER_KEY" '{}'
+check "200" "R2 the daughter may still run the hook"
+
+# And a Parent holding the same row may edit it, so the refusals above are about the missing
+# conjunct rather than about the route being broken.
+create_scoped_key "R2 Parent" ',"can_manage_keys":true'
+R2_PARENT_KEY="$CREATED_KEY"; R2_PARENT_ID="$CREATED_ID"
+api_call POST "/api/keys/$R2_PARENT_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$R2_HOOK_ID" '{hook_id:$h,can_execute:false,can_manage:true}')"
+check "200" "R2 the parent is granted manage on the same hook"
+api_call PUT "/api/hooks/$R2_HOOK_ID" "$R2_PARENT_KEY" \
+    "$(jq -nc --arg p "$R2_ATTACKER" '{script_path:$p}')"
+check "200" "R2 both halves present, the same edit succeeds"
+check_jq ".script_path" "$R2_ATTACKER" "R2 and it took effect"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
