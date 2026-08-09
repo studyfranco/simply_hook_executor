@@ -285,12 +285,19 @@ pub async fn auth_middleware(
     hasher.update(presented_key.as_bytes());
     let key_hash = hex::encode(hasher.finalize());
 
-    let key_record = ApiKey::find()
+    let mut key_record = ApiKey::find()
         .filter(crate::entities::api_key::Column::KeyHash.eq(key_hash))
         .one(&state.db)
         .await
         .map_err(AppError::DbError)?
         .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
+
+    // The authenticated principal is *derived*, not copied out of the row. A key whose `is_master`
+    // column says `true` but which is not the identity this process pinned at boot is demoted here,
+    // once, before any handler sees it — so the dozens of `key.is_master` reads downstream stay
+    // correct without each having to remember to compare an id. See [`crate::master`] for why the
+    // check lives at this choke point rather than at the decision sites.
+    state.master_pin.authenticate(&state.db, &mut key_record).await;
 
     // Signature verification requires the raw body, which means buffering it and rebuilding the
     // request. That only happens when a signature is actually presented — unsigned requests keep

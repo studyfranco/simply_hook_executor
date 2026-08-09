@@ -14,9 +14,10 @@ This document defines the official database schema, SeaORM entity models, relati
 | name              |       | hook_id (UUID)            |       | name              |
 | plaintext_prefix  |       | can_execute (BOOL)        |       | script_path       |
 | key_hash          |       | can_manage (BOOL)         |       | default_timeout_s |
-| bound_ips         |       +---------------------------+       +-------------------+
-| max_concurrent    |                                             | 1
-| is_master         |                                             | M
+| bound_ips         |       | can_view_execution (BOOL) |       | owner_key_id      |
+| max_concurrent    |       +---------------------------+       +-------------------+
+| is_master         |                                             | 1
+| master_marker     |                                             | M
 +-------------------+                                           +-------------------+
   | 1                                                           | hook_parameters   |
   |                                                             +-------------------+
@@ -184,7 +185,8 @@ Junction table managing M:N permissions between API Keys and Hooks.
 | `api_key_id` | UUID / String | NOT NULL, FOREIGN KEY (`api_keys.id` ON DELETE CASCADE) | Target API key. |
 | `hook_id` | UUID / String | NOT NULL, FOREIGN KEY (`hooks.id` ON DELETE CASCADE) | Target hook. |
 | `can_execute` | Boolean | NOT NULL, DEFAULT `true` | Permission to invoke `POST /api/hooks/:id/execute`, `POST /api/hooks/:id/test`, and `POST /webhook/:id`. |
-| `can_manage` | Boolean | NOT NULL, DEFAULT `false` | **Half** of the permission to edit this hook's configuration, its parameters, and its execution records. Never sufficient alone: `RBAC_MODEL.md` **R2** makes management a conjunction of this row and the *global* `api_keys.can_manage_keys`, because §1's Tiers matrix says a Daughter key (one without that flag) may never manage resources. On its own this row grants read visibility (below) and nothing more; it is a necessary condition, not a grant. Deleting or renaming the hook needs the conjunction **and** `hooks.owner_key_id` (§3). |
+| `can_manage` | Boolean | NOT NULL, DEFAULT `false` | **Half** of the permission to edit this hook's configuration, its parameters, and its execution records. Never sufficient alone: `RBAC_MODEL.md` **R2** makes management a conjunction of this row and the *global* `api_keys.can_manage_keys`, because §1's Tiers matrix says a Daughter key (one without that flag) may never manage resources. On its own this row grants read visibility (below) and nothing more; it is a necessary condition, not a grant. The one route around the conjunction is **ownership**: `hooks.owner_key_id` may edit its own hook with no permission row at all. Deleting or renaming still needs ownership (§3). |
+| `can_view_execution` | Boolean | NOT NULL, DEFAULT `false` | Permission to read this hook's **execution records** — the runs, their output streams, exit codes, and the parameters each was called with. Deliberately a third verb rather than a facet of the other two. `RBAC_MODEL.md` names the Execution record a *creator-private entity*, so history is **not** covered by the shared-resource visibility rule: a key sees its own runs and every run of a hook it owns without this flag, and needs it only to read runs that are neither. Folding it into `can_execute` would hand every caller entitled to run a hook the output of everyone else's runs; folding it into `can_manage` would put read-only audit access behind R2's conjunction, so an auditor could be granted logs only by first being made a Parent with editing rights. **Read-only in every direction**: it never confers running, editing, or deleting a record. Not indexed — it is never searched on, only read from a row already fetched by the `(api_key_id, hook_id)` unique index. |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 
 *Unique Index:* `(api_key_id, hook_id)`

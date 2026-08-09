@@ -35,6 +35,30 @@ set -uo pipefail
 # Not using `set -e`: assertions on purpose expect non-2xx responses (400/401/403/404/409/429), so
 # a non-zero curl/jq exit inside a check must not abort the whole run.
 
+# ── Working-directory guard ──────────────────────────────────────────────────
+#
+# This suite `cd`s around, builds with cargo, and reads fixtures by relative path. Run from the
+# wrong directory it does not fail loudly — it silently exercises *something else*, or skips work
+# and reports a green run over checks that never executed. A previous session lost time to exactly
+# that shape of false positive, so the check is first and unconditional.
+#
+# Two assertions rather than one. The directory name catches an inherited `cd` from another repo;
+# the marker files catch the case the name alone would wave through — a directory that happens to
+# be called `simply_hook_executor` but is not this checkout (a stale copy, an extracted archive, a
+# sibling worktree). Either failing means the run cannot be trusted, so neither is a warning.
+if [[ "$(basename "$PWD")" != "simply_hook_executor" ]]; then
+  echo "ERROR: Script must be executed from the simply_hook_executor repository root." >&2
+  echo "       Current directory: $PWD" >&2
+  exit 1
+fi
+for marker in Cargo.toml AGENT.MD RBAC_MODEL.md src/main.rs scripts/test_e2e.sh; do
+  if [[ ! -e "$marker" ]]; then
+    echo "ERROR: '$PWD' is named simply_hook_executor but is not this repository." >&2
+    echo "       Expected to find '$marker' and did not." >&2
+    exit 1
+  fi
+done
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -3253,14 +3277,16 @@ check "200" "parent B lists history"
 check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VIS_EXEC_ID" '[.[] | select(.id == $i)] | length')" "1" \
     "§4 scope 3: a key sees its own run"
 
-# A *manages* the hook and still sees nothing: it did not run it.
+# A holds `can_manage` on the hook, which is one of the three named exceptions to creator-privacy:
+# a key already entitled to rewrite the hook's dispatch configuration and delete its history cannot
+# meaningfully be denied *reading* that history. The population that must still see nothing is an
+# execute-only holder — asserted in §41, along with the byte-identical 404.
 api_call GET "/api/executions" "$VISA_KEY"
 check "200" "parent A lists history"
-check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VIS_EXEC_ID" '[.[] | select(.id == $i)] | length')" "0" \
-    "§4 scope 3: managing a hook is not licence to read another key's runs"
+check_local "$(echo "$RESP_BODY" | jq -r --arg i "$VIS_EXEC_ID" '[.[] | select(.id == $i)] | length')" "1" \
+    "§4 scope 3: a can_manage holder may read the history it may already delete"
 api_call GET "/api/executions/$VIS_EXEC_ID" "$VISA_KEY"
-check "404" "§4 scope 3: and reading one by id is refused as nonexistent"
-check_true '.stdout == null' "no captured output leaks in the refusal"
+check "200" "§4 scope 3: and may read one by id"
 
 # ── The counterpart control: 401 vs 403 for unauthenticated callers ────────
 # Making every refusal a 404 would break this; making every refusal a 403 would break the oracle
@@ -3462,6 +3488,127 @@ api_call PUT "/api/hooks/$R2_HOOK_ID" "$R2_PARENT_KEY" \
     "$(jq -nc --arg p "$R2_ATTACKER" '{script_path:$p}')"
 check "200" "R2 both halves present, the same edit succeeds"
 check_jq ".script_path" "$R2_ATTACKER" "R2 and it took effect"
+
+# ── 41. Daughter keys, hook ownership, and execution privacy ────────────────
+
+log_section "41. Daughter keys, ownership, and can_view_execution"
+
+# ── R4: a Parent may only mint Daughters ────────────────────────────────────
+create_scoped_key "R41 Parent" ',"can_manage_keys":true'
+R41_PARENT_KEY="$CREATED_KEY"; R41_PARENT_ID="$CREATED_ID"
+
+api_call POST "/api/keys" "$R41_PARENT_KEY" '{"name":"R41 Would-Be Parent","can_manage_keys":true}'
+check "403" "R4 a Parent cannot mint another Parent"
+check_true '.error | contains("can_manage_keys")' "R4 the refusal names the scope"
+api_call POST "/api/keys" "$R41_PARENT_KEY" '{"name":"R41 Would-Be Creator","can_manage_hooks":true}'
+check "403" "R4 a Parent cannot mint a hook creator either"
+
+api_call POST "/api/keys" "$R41_PARENT_KEY" '{"name":"R41 Daughter","bound_ips":"0.0.0.0/0"}'
+check "200" "R4 a Parent may mint a Daughter"
+R41_DAUGHTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+# Asserted from the key listing rather than the creation response: the latter deliberately carries
+# only the freshly-minted credentials, so scope fields are not there to check.
+api_call GET "/api/keys" "$MASTER_KEY"
+check "200" "R4 list keys as master"
+check_true "[.[] | select(.id == \"$R41_DAUGHTER_ID\") | .can_manage_keys == false and .can_manage_hooks == false] | length == 1" \
+    "R4 the minted key is a Daughter, holding neither global right"
+
+api_call PUT "/api/keys/$R41_DAUGHTER_ID" "$R41_PARENT_KEY" '{"can_manage_keys":true}'
+check "403" "R4 nor can a Parent promote one afterwards"
+
+# ── §3: a Daughter that owns a hook may maintain it ─────────────────────────
+OWN_E2E_SCRIPT=$(make_hook_script "owner_edit.sh" 'echo owned')
+OWN_E2E_REPLACEMENT=$(make_hook_script "owner_edit_v2.sh" 'echo replaced')
+
+# `can_manage_hooks` and nothing else — a Daughter by definition, since it lacks can_manage_keys.
+create_scoped_key "R41 Hook Owner" ',"can_manage_hooks":true'
+R41_OWNER_KEY="$CREATED_KEY"; R41_OWNER_ID="$CREATED_ID"
+
+api_call POST "/api/hooks" "$R41_OWNER_KEY" \
+    "$(jq -nc --arg p "$OWN_E2E_SCRIPT" '{name:"r41_owned_hook",script_path:$p}')"
+check "200" "§3 the daughter creates a hook"
+R41_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+check_jq ".is_owner" "true" "§3 and is recorded as its owner"
+
+api_call PUT "/api/hooks/$R41_HOOK_ID" "$R41_OWNER_KEY" \
+    "$(jq -nc --arg p "$OWN_E2E_REPLACEMENT" '{script_path:$p}')"
+check "200" "§3 the owner may repoint its own hook's script_path without can_manage_keys"
+api_call POST "/api/hooks/$R41_HOOK_ID/parameters" "$R41_OWNER_KEY" \
+    '{"param_key":"owned_param","default_value":"v"}'
+check "200" "§3 ...and declare parameters on it"
+api_call PUT "/api/hooks/$R41_HOOK_ID" "$R41_OWNER_KEY" '{"name":"r41_renamed_hook"}'
+check "200" "§3 ...and rename it, which is a lifecycle action the owner holds"
+
+# ── R2: owning is not delegating ────────────────────────────────────────────
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"R41 Grantee","bound_ips":"0.0.0.0/0"}'
+check "200" "create a grantee key"
+R41_GRANTEE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+R41_GRANTEE_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+api_call POST "/api/keys/$R41_GRANTEE_ID/permissions" "$R41_OWNER_KEY" \
+    "$(jq -nc --arg h "$R41_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "403" "R2 the owner cannot delegate rights on its own hook without can_manage_keys"
+
+api_call POST "/api/keys/$R41_GRANTEE_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$R41_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "200" "R2 master delegates the same grant"
+
+# ── §4 scope 3: execution privacy and can_view_execution ───────────────────
+api_call POST "/api/hooks/$R41_HOOK_ID/execute" "$R41_GRANTEE_KEY" '{}'
+check "200" "the grantee runs the hook"
+R41_EXECUTION_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/executions/$R41_EXECUTION_ID" "$R41_GRANTEE_KEY"
+check "200" "§4 the acting key reads its own execution"
+api_call GET "/api/executions/$R41_EXECUTION_ID" "$R41_OWNER_KEY"
+check "200" "§4 the hook's owner reads it too"
+
+# An execute-only key that did not run it: inside the shared-resource scope, outside scope 3.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"R41 Peer Executor","bound_ips":"0.0.0.0/0"}'
+check "200" "create a peer executor key"
+R41_PEER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+R41_PEER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+api_call POST "/api/keys/$R41_PEER_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$R41_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false}')"
+check "200" "grant the peer execute-only rights"
+
+api_call GET "/api/executions/$R41_EXECUTION_ID" "$R41_PEER_KEY"
+check "404" "§4 can_execute is not licence to read another key's run"
+R41_UNREADABLE_BODY="$RESP_BODY"
+api_call GET "/api/executions/00000000-0000-0000-0000-000000000000" "$R41_PEER_KEY"
+check "404" "§4 ...and a record that never existed answers the same"
+if [ "$R41_UNREADABLE_BODY" = "$RESP_BODY" ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} §4 the two refusals are byte-identical (oracle discipline)" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} §4 unreadable and nonexistent executions differ in body" >&2
+fi
+api_call GET "/api/executions" "$R41_PEER_KEY"
+check "200" "§4 the peer may list executions"
+check_true 'length == 0' "§4 ...and sees none of them"
+
+# Granting can_view_execution turns exactly that around, and nothing else.
+api_call POST "/api/keys/$R41_PEER_ID/permissions" "$MASTER_KEY" \
+    "$(jq -nc --arg h "$R41_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:false,can_view_execution:true}')"
+check "200" "grant the peer can_view_execution"
+
+api_call GET "/api/executions/$R41_EXECUTION_ID" "$R41_PEER_KEY"
+check "200" "§4 with can_view_execution the same record is readable"
+api_call GET "/api/executions" "$R41_PEER_KEY"
+check "200" "§4 and it appears in the listing"
+check_true 'length >= 1' "§4 ...with at least the one run"
+
+api_call DELETE "/api/executions/$R41_EXECUTION_ID" "$R41_PEER_KEY"
+check "403" "§4 can_view_execution is read-only: it may not delete the record"
+api_call PUT "/api/hooks/$R41_HOOK_ID" "$R41_PEER_KEY" '{"description":"seized"}'
+check "403" "§4 nor edit the hook"
+
+# The verb round-trips through the API rather than only through the database.
+api_call GET "/api/auth/me" "$R41_PEER_KEY"
+check "200" "§4 fetch the peer's own profile"
+check_true '[.hook_permissions[] | select(.can_view_execution == true)] | length == 1' \
+    "§4 the profile reports can_view_execution so a client can render it"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

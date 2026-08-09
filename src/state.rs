@@ -7,6 +7,7 @@ use sea_orm::DatabaseConnection;
 use crate::config::RuntimeConfig;
 use crate::crypto::SecretCipher;
 use crate::executor::ConcurrencyLimiter;
+use crate::master::MasterPin;
 use crate::replay::ReplayGuard;
 
 /// Global application state.
@@ -27,6 +28,12 @@ pub struct AppState {
     pub cipher: Arc<SecretCipher>,
     /// Enforces single use of `CANONICAL_V1` signatures inside the anti-replay window.
     pub replay_guard: Arc<ReplayGuard>,
+    /// The Master key identity, fixed for the life of the process.
+    ///
+    /// Shared behind [`Arc`] and *not* copied per clone, which is the whole point: every clone of
+    /// this state must see the same pinned id, or a request served by one clone could reach a
+    /// different conclusion about who the Master is than a request served by another.
+    pub master_pin: Arc<MasterPin>,
 }
 
 impl AppState {
@@ -51,6 +58,23 @@ impl AppState {
             limiter: Arc::new(ConcurrencyLimiter::new()),
             cipher,
             replay_guard,
+            // Left unresolved here rather than queried, because state is routinely built before the
+            // master row exists — `main.rs` migrates and bootstraps around this call, and the test
+            // fixtures seed keys afterwards. Production pins it explicitly via
+            // [`MasterPin::pin_at_boot`] before the listener binds; anything else resolves it on
+            // first authenticated request. Both store the same value and neither can replace it.
+            master_pin: Arc::new(MasterPin::new()),
         }
+    }
+
+    /// Builds state whose Master identity is fixed to `master_key_id` without a database lookup.
+    ///
+    /// Exists for tests that need a pin pointing at something *other* than the real Master row, in
+    /// order to assert that a key claiming mastery it was not pinned with is refused. That situation
+    /// cannot be constructed through the ordinary path by design — resolution only ever pins a row
+    /// that genuinely is the sole Master — so it has to be injectable.
+    pub fn with_pinned_master(mut self, master_key_id: uuid::Uuid) -> Self {
+        self.master_pin = Arc::new(MasterPin::pinned_to(master_key_id));
+        self
     }
 }

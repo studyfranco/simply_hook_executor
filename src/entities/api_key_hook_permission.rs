@@ -19,6 +19,19 @@ pub struct Model {
     pub can_execute: bool,
     /// Permission to edit or delete this hook and its parameter contract.
     pub can_manage: bool,
+    /// Permission to read this hook's **execution records** — the runs, their output streams, and
+    /// their exit codes.
+    ///
+    /// Separate from both other verbs on purpose. `RBAC_MODEL.md` names the Execution record as a
+    /// creator-private entity, so history is not covered by the shared-resource visibility rule that
+    /// governs the hook itself: a key sees its *own* runs and every run of a hook it owns without
+    /// this flag, and needs it only to read runs that are neither. Folding that into `can_execute`
+    /// would hand every caller entitled to run a hook the output of everyone else's runs; folding it
+    /// into `can_manage` would put read-only audit access behind R2's conjunction, so an auditor
+    /// could be granted logs only by first being made a Parent with editing rights.
+    ///
+    /// Defaults to `false`, including for rows that predate the column.
+    pub can_view_execution: bool,
     /// Assignment timestamp.
     pub created_at: DateTime,
 }

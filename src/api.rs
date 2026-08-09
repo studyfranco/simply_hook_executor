@@ -313,12 +313,43 @@ async fn require_execute(
     }
 }
 
-/// Authorizes management of an *existing* hook — **R2 in full**.
+/// Authorizes editing the *content* of an existing hook — its definition, its dispatch
+/// configuration, its parameter contract, and its execution records.
 ///
-/// Master bypasses. Everyone else needs *both* conjuncts: global `can_manage_keys` **and** a
-/// `can_manage = true` row for this specific hook. This function is a thin master short-circuit in
-/// front of [`require_hook_manage_conjunction`], which is the single place R2 is evaluated; see its
-/// documentation for why the two halves produce different statuses and one shared message.
+/// Three routes in, and they are not interchangeable:
+///
+/// 1. **Master.** Bypasses everything.
+/// 2. **The hook's owner** (`hooks.owner_key_id`), with no further requirement.
+/// 3. **R2 in full** — global `can_manage_keys` *and* a `can_manage = true` row on this hook —
+///    for everyone else, via [`require_hook_manage_conjunction`].
+///
+/// # Why ownership is sufficient on its own
+///
+/// §3 makes the owner "the key answerable for this hook", and the only non-Master identity that may
+/// delete or rename it. A model in which you may destroy a resource outright but may not edit its
+/// description is not a model anyone would design on purpose; it is what falls out of applying R2
+/// to content without noticing that §3 already grants the owner a strictly larger authority over
+/// the same object.
+///
+/// It also restores a workflow the conjunction had broken. `can_manage_hooks` is a resource-creation
+/// right that sits at Daughter tier, so a key holding it could create a hook and then never touch
+/// it again — not even the hook it had just written, whose `owner_key_id` names it. Ownership as a
+/// third route makes creation coherent: you may maintain what you are answerable for.
+///
+/// # What ownership is *not* sufficient for
+///
+/// **Delegation.** Granting or revoking another key's rights on this hook is not reachable through
+/// this function at all — those routes call [`require_hook_manage_conjunction`] directly and so
+/// still require R2 in full. Owning a hook makes you answerable for it; it does not make you an
+/// administrator of credentials, which is what handing out verbs on it amounts to. A Daughter owner
+/// can therefore edit its own hook and cannot widen anyone's access to it, including its own.
+///
+/// # Why the owner check runs before the conjunction
+///
+/// Ordering is load-bearing for §4. [`require_hook_manage_conjunction`] answers `404` when the
+/// caller holds no permission row at all, and an owner need not hold one — ownership lives in a
+/// column on `hooks`, not in `api_key_hook_permissions`. Asking the conjunction first would hide a
+/// hook from the very key answerable for it.
 ///
 /// # Why this used to accept a bare row, and why that was a remote-code-execution hole
 ///
@@ -335,19 +366,21 @@ async fn require_execute(
 ///
 /// Creating a hook still needs only the global `can_manage_hooks` scope, because R2 is written
 /// about "a `can_manage = true` row for that specific resource" and a resource that does not yet
-/// exist can have no row. The consequence is deliberate and is the specification's design, not an
-/// oversight: creation rights and management rights are separate powers, so a `can_manage_hooks`
-/// Daughter can define automation but not go back and edit it. It does not silently retain control
-/// of what it created, which is what the previous version of this comment claimed.
+/// exist can have no row. Creation rights and management rights remain separate powers — but a
+/// creator is recorded as `owner_key_id`, so route 2 above is what lets it keep maintaining its own
+/// work without also being made a Parent.
 async fn require_manage(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
-    hook_id: Uuid,
+    hook: &hook::Model,
 ) -> Result<(), AppError> {
     if key.is_master {
         return Ok(());
     }
-    require_hook_manage_conjunction(db, key, hook_id).await?;
+    if hook.owner_key_id == Some(key.id) {
+        return Ok(());
+    }
+    require_hook_manage_conjunction(db, key, hook.id).await?;
     Ok(())
 }
 
@@ -359,15 +392,113 @@ async fn require_manage(
 async fn require_visibility(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
-    hook_id: Uuid,
+    hook: &hook::Model,
 ) -> Result<(), AppError> {
     if key.is_master {
         return Ok(());
     }
-    match hook_permission(db, key.id, hook_id).await? {
-        Some(p) if p.can_execute || p.can_manage => Ok(()),
+    // Ownership confers visibility on its own. §3 makes the owner answerable for the hook and
+    // [`require_manage`] lets it edit one, so a hook invisible to the key that owns it would be
+    // editable-but-unreadable — `PUT` succeeding while `GET` answers `404`. Ownership lives in a
+    // column on `hooks`, not in `api_key_hook_permissions`, so it has to be asked for separately;
+    // master may reassign `owner_key_id` to a key holding no row at all.
+    if hook.owner_key_id == Some(key.id) {
+        return Ok(());
+    }
+    match hook_permission(db, key.id, hook.id).await? {
+        // Any verb confers the derived read. `can_view_execution` is included because history is
+        // unreadable without knowing which hook produced it: an auditor holding only that verb still
+        // has to be able to name the hook, or `GET /api/executions?hook=deploy` would answer `404`
+        // for a hook whose runs it is entitled to read.
+        Some(p) if p.can_execute || p.can_manage || p.can_view_execution => Ok(()),
         _ => Err(AppError::NotFound),
     }
+}
+
+/// Whether this caller may read `execution` — `RBAC_MODEL.md` §4's third scope, in full.
+///
+/// > *Creator-private entities: visible exclusively to their creator and Master. They are never
+/// > exposed by the shared-resource rule above.*
+///
+/// The Terminology table names the **Execution record** as this service's creator-private entity, so
+/// holding a verb on a hook is deliberately *not* enough to read what other keys' runs of it printed.
+/// An execution carries the arguments a caller passed and the stdout and stderr it got back; that is
+/// the caller's data, and a shared hook is not a licence to read it.
+///
+/// Four routes in, and each answers a different question:
+///
+/// 1. **Master** — full visibility over everything.
+/// 2. **The acting key** (`executions.api_key_id`) — its own run. This is the "creator" §4 names.
+/// 3. **The hook's owner** (`hooks.owner_key_id`) — §3 makes the owner answerable for the hook, and
+///    being answerable for what a hook does without being able to see what it did is not a coherent
+///    position to put an operator in.
+/// 4. **An explicit grant** — `can_view_execution`, or `can_manage` on the hook. The latter is
+///    included because a key already entitled to rewrite `script_path` and delete the history
+///    outright cannot meaningfully be denied *reading* it; withholding that would be theatre.
+///
+/// Everything else is `404`, never `403`: an execution the caller may not read must be
+/// indistinguishable from one that does not exist, or the endpoint becomes an oracle for how often a
+/// hook runs and how many records exist.
+async fn may_read_execution(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    execution: &execution::Model,
+) -> Result<bool, AppError> {
+    if key.is_master || execution.api_key_id == Some(key.id) {
+        return Ok(true);
+    }
+
+    // Loaded rather than passed in: the ownership answer lives on `hooks`, and a hook that has since
+    // been hard-deleted leaves history nobody but Master and the acting key can read — which is the
+    // conservative direction, and the only one available once the owning row is gone.
+    if let Some(hook_model) = Hook::find_by_id(execution.hook_id).one(db).await?
+        && hook_model.owner_key_id == Some(key.id)
+    {
+        return Ok(true);
+    }
+
+    Ok(hook_permission(db, key.id, execution.hook_id)
+        .await?
+        .is_some_and(|p| p.can_view_execution || p.can_manage))
+}
+
+/// The hooks whose executions this caller may read *whoever ran them* — ownership plus explicit
+/// grants, as routes 3 and 4 of [`may_read_execution`].
+///
+/// Exists so the listing endpoint can express the same rule as a single indexed `WHERE` rather than
+/// by fetching every row and filtering in memory, which would page wrongly: a `LIMIT 50` applied
+/// before a visibility filter returns fewer than fifty visible rows and hides the rest behind an
+/// offset that never advances past them.
+async fn execution_visible_hook_ids(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+) -> Result<Vec<Uuid>, AppError> {
+    let owned: Vec<Uuid> = Hook::find()
+        .filter(hook::Column::OwnerKeyId.eq(key.id))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+
+    let granted: Vec<Uuid> = ApiKeyHookPermission::find()
+        .filter(api_key_hook_permission::Column::ApiKeyId.eq(key.id))
+        .filter(
+            Condition::any()
+                .add(api_key_hook_permission::Column::CanViewExecution.eq(true))
+                .add(api_key_hook_permission::Column::CanManage.eq(true)),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| p.hook_id)
+        .collect();
+
+    let mut ids = owned;
+    ids.extend(granted);
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// The set of hook ids the caller may see, or `None` for a master key (meaning "no restriction").
@@ -378,18 +509,34 @@ async fn visible_hook_ids(
     if key.is_master {
         return Ok(None);
     }
-    let ids = ApiKeyHookPermission::find()
+    let mut ids: Vec<Uuid> = ApiKeyHookPermission::find()
         .filter(api_key_hook_permission::Column::ApiKeyId.eq(key.id))
         .filter(
             Condition::any()
                 .add(api_key_hook_permission::Column::CanExecute.eq(true))
-                .add(api_key_hook_permission::Column::CanManage.eq(true)),
+                .add(api_key_hook_permission::Column::CanManage.eq(true))
+                .add(api_key_hook_permission::Column::CanViewExecution.eq(true)),
         )
         .all(db)
         .await?
         .into_iter()
         .map(|p| p.hook_id)
         .collect();
+
+    // Owned hooks, whether or not a permission row exists — the listing form of the same rule
+    // [`require_visibility`] applies to a single hook. Without this a key could edit a hook that
+    // never appeared in its own hook list.
+    ids.extend(
+        Hook::find()
+            .filter(hook::Column::OwnerKeyId.eq(key.id))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|h| h.id),
+    );
+
+    ids.sort_unstable();
+    ids.dedup();
     Ok(Some(ids))
 }
 
@@ -948,15 +1095,21 @@ fn is_permission_reduction(
     existing: Option<&api_key_hook_permission::Model>,
     requested_execute: bool,
     requested_manage: bool,
+    requested_view_execution: bool,
 ) -> bool {
-    let (had_execute, had_manage) =
-        existing.map_or((false, false), |p| (p.can_execute, p.can_manage));
+    let (had_execute, had_manage, had_view) = existing
+        .map_or((false, false, false), |p| (p.can_execute, p.can_manage, p.can_view_execution));
     // Named rather than folded into one expression: "this write grants a verb the target did not
     // have" is the concept R1 is about, and it should be readable as such at the call site of the
     // negation.
     let grants_execute = requested_execute && !had_execute;
     let grants_manage = requested_manage && !had_manage;
-    !grants_execute && !grants_manage
+    // `can_view_execution` is a verb like the others here. Omitting it would have made a write that
+    // *adds* history access classify as a pure reduction whenever it also turned another verb off,
+    // and reductions skip R1 entirely — so a caller could have traded a verb it held for one it did
+    // not.
+    let grants_view = requested_view_execution && !had_view;
+    !grants_execute && !grants_manage && !grants_view
 }
 
 /// **R1 + R7** — rejects a grant handing out more authority over a hook than the caller holds.
@@ -994,6 +1147,7 @@ async fn guard_delegated_hook_grant(
     hook: &hook::Model,
     requested_execute: bool,
     requested_manage: bool,
+    requested_view_execution: bool,
 ) -> Result<(), AppError> {
     if key.is_master {
         return Ok(());
@@ -1001,9 +1155,13 @@ async fn guard_delegated_hook_grant(
 
     let held = require_hook_manage_conjunction(db, key, hook.id).await?;
 
+    // Every verb the permission row carries is compared independently. A verb missing from this
+    // array is a verb R1 does not bound, which is how a new column becomes a delegation hole the
+    // day it is added — the caller would be free to grant history access it does not hold itself.
     let overreach = [
         ("can_execute", requested_execute, held.can_execute),
         ("can_manage", requested_manage, held.can_manage),
+        ("can_view_execution", requested_view_execution, held.can_view_execution),
     ]
     .into_iter()
     .find(|(_, wanted, holds)| *wanted && !*holds);
@@ -1126,6 +1284,13 @@ pub struct HookPermissionView {
     pub can_execute: bool,
     /// Whether the key may edit or delete the hook.
     pub can_manage: bool,
+    /// Whether the key may read the hook's execution records.
+    ///
+    /// Reported so a caller can tell why it can or cannot see history without guessing. The
+    /// dashboard renders it as a `V` badge alongside `X` and `M`, and the §4 status split depends on
+    /// callers being able to read their own rows: a `403` rather than a `404` on a manage route is
+    /// only non-leaking because `GET /api/auth/me` already told the caller what it holds.
+    pub can_view_execution: bool,
 }
 
 /// Identity and permission payload returned to the client.
@@ -1174,6 +1339,7 @@ async fn load_hook_permissions(
                 hook_name: h.name,
                 can_execute: perm.can_execute,
                 can_manage: perm.can_manage,
+                can_view_execution: perm.can_view_execution,
             })
         })
         .collect())
@@ -1354,6 +1520,12 @@ async fn grant_full_hook_permission(
         hook_id: Set(hook_id),
         can_execute: Set(true),
         can_manage: Set(true),
+        // The creator sees its own hook's history. It would anyway — it owns the hook, and ownership
+        // is one of the four routes to execution visibility — but the row should say so rather than
+        // leaving the creator's access dependent on the ownership column staying where it is. Master
+        // may reassign `owner_key_id` at any time (§3), and a creator that has handed ownership on
+        // still holds the grant it was given.
+        can_view_execution: Set(true),
         created_at: Set(Utc::now().naive_utc()),
     };
     ApiKeyHookPermission::insert(model)
@@ -1555,7 +1727,7 @@ pub async fn get_hook(
     } else {
         resolve_hook(&state.db, &identifier).await?
     };
-    require_visibility(&state.db, &key, model.id).await?;
+    require_visibility(&state.db, &key, &model).await?;
     Ok(Json(build_hook_detail(&state.db, &key, model).await?))
 }
 
@@ -1568,7 +1740,7 @@ pub async fn update_hook(
     Json(payload): Json<UpdateHookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, model.id).await?;
+    require_manage(&state.db, &key, &model).await?;
     // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
     // elevate. `script_path`, the timeout, and the name all decide what executes with the borrowed
     // privileges, so guarding one field while leaving the rest writable protected nothing.
@@ -1714,7 +1886,7 @@ pub async fn delete_hook(
     } else {
         resolve_hook(&state.db, &identifier).await?
     };
-    require_manage(&state.db, &key, model.id).await?;
+    require_manage(&state.db, &key, &model).await?;
     // §3: managing a hook is not authority to make it cease to exist.
     require_lifecycle_authority(&key, &model, "delete")?;
     // Deleting a privileged hook is a change to a privileged hook like any other.
@@ -1895,7 +2067,7 @@ pub async fn list_hook_parameters(
     Path(identifier): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_visibility(&state.db, &key, model.id).await?;
+    require_visibility(&state.db, &key, &model).await?;
     Ok(Json(load_parameters(&state.db, model.id).await?))
 }
 
@@ -1908,7 +2080,7 @@ pub async fn create_hook_parameter(
     Json(payload): Json<ParameterInput>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, model.id).await?;
+    require_manage(&state.db, &key, &model).await?;
     // A parameter is argv for the elevated command: a defaulted parameter on a root hook running
     // `/bin/sh` supplies `-c` and a command string without the caller ever editing `script_path`.
     require_master_for_privileged_hook(&key, &model, "declare parameters on")?;
@@ -1971,7 +2143,7 @@ pub async fn update_hook_parameter(
     Json(payload): Json<UpdateParameterPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, model.id).await?;
+    require_manage(&state.db, &key, &model).await?;
     // Changing a `default_value` rewrites what the elevated command receives, so this needs the
     // same gate as declaring one.
     require_master_for_privileged_hook(&key, &model, "modify parameters on")?;
@@ -2019,7 +2191,7 @@ pub async fn delete_hook_parameter(
     Path((identifier, param_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, model.id).await?;
+    require_manage(&state.db, &key, &model).await?;
     // Removing a required parameter shifts every positional argument after it, which changes the
     // elevated command just as surely as editing one.
     require_master_for_privileged_hook(&key, &model, "remove parameters from")?;
@@ -2285,24 +2457,26 @@ pub async fn list_executions(
 ) -> Result<impl IntoResponse, AppError> {
     let mut q = Execution::find().order_by_desc(execution::Column::Timestamp);
 
-    // §4, third scope: executions are creator-private. A hook's manager sees *that it is used* —
-    // the hook, its definition, its parameter contract — but not the arguments other keys passed to
-    // it or the output they got back. The hook-visibility filter below stays as a second bound, so
-    // history for a hook the caller can no longer see disappears even for runs it made itself.
+    // §4's third scope, expressed as a filter. The disjunction is exactly [`may_read_execution`]:
+    // rows this caller produced, plus every row on a hook it owns or has been granted history access
+    // to. Anything else is not merely hidden from the body — it never enters the result set, so the
+    // count and the paging are computed over what the caller may see rather than trimmed afterwards.
+    //
+    // Note the previous implementation also required the *hook* to still be visible, which meant a
+    // caller losing its grant on a hook lost the record of its own past runs. That extra bound is
+    // gone: §4 makes an execution visible to its creator, and a creator does not stop being one.
     if !key.is_master {
-        q = q.filter(execution::Column::ApiKeyId.eq(key.id));
-
-        if let Some(ids) = visible_hook_ids(&state.db, &key).await? {
-            if ids.is_empty() {
-                return Ok(Json(Vec::<ExecutionView>::new()));
-            }
-            q = q.filter(execution::Column::HookId.is_in(ids));
+        let mut visibility = Condition::any().add(execution::Column::ApiKeyId.eq(key.id));
+        let readable = execution_visible_hook_ids(&state.db, &key).await?;
+        if !readable.is_empty() {
+            visibility = visibility.add(execution::Column::HookId.is_in(readable));
         }
+        q = q.filter(visibility);
     }
 
     if let Some(identifier) = query.hook.as_deref().filter(|s| !s.is_empty()) {
         let hook_model = resolve_hook(&state.db, identifier).await?;
-        require_visibility(&state.db, &key, hook_model.id).await?;
+        require_visibility(&state.db, &key, &hook_model).await?;
         q = q.filter(execution::Column::HookId.eq(hook_model.id));
     }
 
@@ -2335,10 +2509,10 @@ pub async fn get_execution(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    // §4, third scope: an execution belongs to the key that requested it. Its `parameters_json`,
-    // stdout and stderr are that caller's data — hook membership is not a licence to read another
-    // tenant's arguments and output. `404` rather than `403`, per oracle discipline.
-    if !key.is_master && model.api_key_id != Some(key.id) {
+    // §4, third scope. `404` rather than `403` per oracle discipline: a record the caller may not
+    // read must be byte-identical to one that was never written, or the endpoint reports how much
+    // history exists to someone entitled to none of it.
+    if !may_read_execution(&state.db, &key, &model).await? {
         return Err(AppError::NotFound);
     }
 
@@ -2359,8 +2533,16 @@ pub async fn delete_execution(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    // The parent hook is loaded rather than passed by id because authority over an execution record
+    // is decided partly by who owns that hook. A row pointing at a hook that no longer exists is
+    // unreachable through any supported path — hard deletion drops the history with the hook — so
+    // treating it as absent is the honest answer rather than a case to invent a policy for.
+    let hook_model =
+        Hook::find_by_id(model.hook_id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     // Deleting history is a management action over the hook, not merely an execute-level one.
-    require_manage(&state.db, &key, model.hook_id).await?;
+    // Note this is deliberately *stricter* than reading it: `can_view_execution` buys visibility of
+    // the record, never the right to destroy it. An auditor is not a redactor.
+    require_manage(&state.db, &key, &hook_model).await?;
 
     Execution::delete_by_id(id).exec(&state.db).await?;
 
@@ -2566,6 +2748,10 @@ async fn build_minimal_api_key_view(
                     hook_name: h.name,
                     can_execute: perm.can_execute,
                     can_manage: perm.can_manage,
+                    // Still §4-minimal: this is the target key's rights *on the shared hook alone*,
+                    // which the shared-resource scope explicitly permits ("that key's rights on that
+                    // resource alone"). No global flag or unrelated membership is added by it.
+                    can_view_execution: perm.can_view_execution,
                 })
             })
             .collect(),
@@ -3180,6 +3366,18 @@ pub struct HookPermInput {
     pub can_execute: bool,
     /// Permission to manage the hook.
     pub can_manage: bool,
+    /// Permission to read the hook's execution records.
+    ///
+    /// `#[serde(default)]` rather than a required field, and the default is `false`. A client
+    /// written before this verb existed sends a body without it and must keep working — and must
+    /// keep working by granting *less*, never more. Defaulting to `true` would have meant every
+    /// pre-existing integration silently started handing out history access on its next grant.
+    ///
+    /// Note this makes an omitted field indistinguishable from an explicit `false`, which is correct
+    /// for a grant endpoint that writes the whole row: `POST` here is "these are the rights", not
+    /// "change these rights".
+    #[serde(default)]
+    pub can_view_execution: bool,
 }
 
 /// Handles `POST /api/keys/{id}/permissions` — grants or updates one key's rights over one hook.
@@ -3234,7 +3432,12 @@ pub async fn update_key_hook_permissions(
     // which endpoint it arrives at". Holding the two routes to different standards achieves
     // nothing: the stricter one is one request away from being routed around.
     let existing = hook_permission(&state.db, id, hook_model.id).await?;
-    let reduction = is_permission_reduction(existing.as_ref(), payload.can_execute, payload.can_manage);
+    let reduction = is_permission_reduction(
+        existing.as_ref(),
+        payload.can_execute,
+        payload.can_manage,
+        payload.can_view_execution,
+    );
 
     if key.is_master {
         // Master bypasses both R1 and R2.
@@ -3263,6 +3466,7 @@ pub async fn update_key_hook_permissions(
             &hook_model,
             payload.can_execute,
             payload.can_manage,
+            payload.can_view_execution,
         )
         .await?;
     }
@@ -3279,6 +3483,7 @@ pub async fn update_key_hook_permissions(
         hook_id: Set(hook_model.id),
         can_execute: Set(payload.can_execute),
         can_manage: Set(payload.can_manage),
+        can_view_execution: Set(payload.can_view_execution),
         created_at: Set(Utc::now().naive_utc()),
     };
     ApiKeyHookPermission::insert(perm)
@@ -3287,9 +3492,14 @@ pub async fn update_key_hook_permissions(
                 api_key_hook_permission::Column::ApiKeyId,
                 api_key_hook_permission::Column::HookId,
             ])
+            // Every verb the payload carries must appear here. A column left out of this list is
+            // silently unwritable on any *update* — the insert path would set it and the conflict
+            // path would leave the old value, so revoking it through this endpoint would appear to
+            // succeed and change nothing.
             .update_columns([
                 api_key_hook_permission::Column::CanExecute,
                 api_key_hook_permission::Column::CanManage,
+                api_key_hook_permission::Column::CanViewExecution,
             ])
             .to_owned(),
         )
@@ -3498,15 +3708,25 @@ pub async fn get_settings(
 mod tests {
     use super::*;
 
-    /// Builds a permission row carrying just the two verbs; the rest is irrelevant to
+    /// Builds a permission row carrying just the verbs; the rest is irrelevant to
     /// [`is_permission_reduction`].
     fn row(can_execute: bool, can_manage: bool) -> api_key_hook_permission::Model {
+        view_row(can_execute, can_manage, false)
+    }
+
+    /// As [`row`], with `can_view_execution` spelled out.
+    fn view_row(
+        can_execute: bool,
+        can_manage: bool,
+        can_view_execution: bool,
+    ) -> api_key_hook_permission::Model {
         api_key_hook_permission::Model {
             id: Uuid::nil(),
             api_key_id: Uuid::nil(),
             hook_id: Uuid::nil(),
             can_execute,
             can_manage,
+            can_view_execution,
             created_at: chrono::NaiveDateTime::default(),
         }
     }
@@ -3521,28 +3741,52 @@ mod tests {
     #[test]
     fn a_write_is_a_reduction_exactly_when_it_turns_no_verb_on() {
         // Turning a verb on that the target did not have is a grant, in every combination.
-        assert!(!is_permission_reduction(None, true, false));
-        assert!(!is_permission_reduction(None, false, true));
-        assert!(!is_permission_reduction(Some(&row(true, false)), true, true));
-        assert!(!is_permission_reduction(Some(&row(false, true)), true, true));
+        assert!(!is_permission_reduction(None, true, false, false));
+        assert!(!is_permission_reduction(None, false, true, false));
+        assert!(!is_permission_reduction(Some(&row(true, false)), true, true, false));
+        assert!(!is_permission_reduction(Some(&row(false, true)), true, true, false));
 
         // Turning verbs off, in any combination, is a reduction.
-        assert!(is_permission_reduction(Some(&row(true, true)), false, false));
-        assert!(is_permission_reduction(Some(&row(true, true)), true, false));
-        assert!(is_permission_reduction(Some(&row(true, true)), false, true));
+        assert!(is_permission_reduction(Some(&row(true, true)), false, false, false));
+        assert!(is_permission_reduction(Some(&row(true, true)), true, false, false));
+        assert!(is_permission_reduction(Some(&row(true, true)), false, true, false));
 
         // Re-asserting exactly what the target already holds changes nothing, so it cannot be an
         // escalation and must not demand a grant's proof of authority.
-        assert!(is_permission_reduction(Some(&row(true, true)), true, true));
-        assert!(is_permission_reduction(Some(&row(false, true)), false, true));
+        assert!(is_permission_reduction(Some(&row(true, true)), true, true, false));
+        assert!(is_permission_reduction(Some(&row(false, true)), false, true, false));
 
         // An all-`false` write where no row exists is the same end state as no row at all.
-        assert!(is_permission_reduction(None, false, false));
+        assert!(is_permission_reduction(None, false, false, false));
 
         // A mixed write — one verb up, one down — is a grant. The reduction of the other verb does
         // not pay for the escalation, and treating "net less authority" as a reduction would let a
         // caller trade `can_execute` for `can_manage` without holding it.
-        assert!(!is_permission_reduction(Some(&row(true, false)), false, true));
+        assert!(!is_permission_reduction(Some(&row(true, false)), false, true, false));
+    }
+
+    /// `can_view_execution` is a verb like the others, and the classifier must treat it as one.
+    ///
+    /// Written separately because the trade is the interesting case: a write that turns
+    /// `can_execute` off while turning history access on has *net* less authority by any naive
+    /// count, and is still a grant. Classifying it as a reduction would route it past R1 entirely,
+    /// letting a caller hand out execution history it does not itself hold by paying for it with a
+    /// verb it does.
+    #[test]
+    fn granting_history_access_is_a_grant_even_when_another_verb_is_surrendered() {
+        // Turning it on where it was not held is a grant.
+        assert!(!is_permission_reduction(None, false, false, true));
+        assert!(!is_permission_reduction(Some(&view_row(true, true, false)), true, true, true));
+
+        // The trade: execute surrendered, history acquired. Still a grant.
+        assert!(!is_permission_reduction(Some(&view_row(true, false, false)), false, false, true));
+
+        // Turning it off is a reduction, and re-asserting it is a no-op.
+        assert!(is_permission_reduction(Some(&view_row(false, false, true)), false, false, false));
+        assert!(is_permission_reduction(Some(&view_row(false, false, true)), false, false, true));
+
+        // A row that holds only history, asked for only history, is unchanged.
+        assert!(is_permission_reduction(Some(&view_row(true, true, true)), true, true, true));
     }
 
     #[test]

@@ -3930,3 +3930,246 @@ that repository rather than taken as established:
 `cargo test` **234 passed / 0 failed** (84 unit + 129 integration + 21 compliance) ·
 `./scripts/test_e2e.sh` **841 / 841** · `./scripts/verify_convergence.sh` exit 0, byte-identity
 check active and passing (17 converged, 1 known divergence, 0 drifted).
+
+---
+
+## Security hardening pass — master pinning, ownership rights, `can_view_execution`, frontend audit
+
+`feat(security): pin master, refine owner rights, add can_view_execution & js test validation`
+
+Six independent changes in one pass. Recorded together because three of them interact: ownership
+became an editing route, which required ownership to also confer *visibility*, which changed what
+the execution endpoints had to answer.
+
+### 1. The Master's identity is pinned at boot (`src/master.rs`, new)
+
+Every authorization decision branches on `api_key::Model::is_master`, read from a column on every
+request. An attacker who reaches the database needs one statement to become Master:
+
+```sql
+UPDATE api_keys SET is_master = true WHERE id = '<attacker key>';
+```
+
+§5's uniqueness constraint refuses that, and this is the layer behind it — a constraint can be
+dropped by the same access that would run the `UPDATE`, and it says nothing about the *running
+process*, which is where the decisions are actually made.
+
+`MasterPin::pin_at_boot` runs in `main.rs` before the listener binds. It asserts the §5 index is
+present, asserts exactly one master row exists, and freezes that id for the process lifetime. All
+three failures are fatal and each names its own remedy; a deployment whose master identity is
+ambiguous cannot make authorization decisions, and guessing one is not this service's call.
+
+**The enforcement point is `auth_middleware`, and that is the whole design.** A key whose column says
+`is_master` but whose id is not the pinned one is *demoted* — `key.is_master` is set to `false` on
+the record handed to handlers — before any handler sees it. The alternative, comparing an id at each
+decision site, would be one forgotten call site away from worthless: there are dozens of
+`key.is_master` reads in `api.rs`, and every one added later would be written by someone who never
+read this module. Downstream code keeps reading `key.is_master` and is automatically correct, because
+the principal it receives is the *effective* one rather than a copy of the row.
+
+A demotion logs at `error` with a `TAMPER:` prefix. It has exactly one cause and no benign
+explanation.
+
+**What this does not claim.** It is not a defence against an attacker who can write the database *and*
+restart the service, nor against one who repoints an existing Master row's `key_hash` at a credential
+they hold. Nothing at this layer could be. It closes the specific, cheap, otherwise-invisible
+escalation of flipping a boolean on a row you already control.
+
+**Test/production parity.** The pin is a `OnceCell`: production primes it explicitly at boot,
+everything else resolves it on first authenticated request. Both paths run the same resolution and
+neither can replace a stored value. That parity matters more than the timing — a lazily-resolved test
+build and a boot-pinned production build would mean the property under test is not the property
+deployed. Resolution stores a value **only when exactly one master exists**, so a database with none
+or several leaves every key non-master. The failure mode is "nobody is Master", never "the wrong key
+is Master".
+
+### 2. Ownership edits; ownership does not delegate
+
+`require_manage` gained a second route: `is_master` **or** `hook.owner_key_id == key.id` **or** the R2
+conjunction. Delegation is untouched — `update_key_hook_permissions` and `revoke_key_hook_permission`
+call `require_hook_manage_conjunction` directly and still require R2 in full.
+
+The previous pass left a model where a `can_manage_hooks` Daughter could create a hook and then never
+touch it again, including the hook whose `owner_key_id` names it. That is not what §3 describes: it
+makes the owner "the key answerable for this hook" and the only non-Master identity that may delete
+or rename it. A caller who may destroy a resource outright but not edit its description is not a
+position anyone would design on purpose.
+
+The split that matters is **content versus credentials**. Owning a hook is authority over the hook;
+handing out verbs on it is administering who else holds access, which is what R2 governs. A Daughter
+owner can now rewrite its own hook's `script_path` and cannot widen anyone's access to it, including
+its own.
+
+**Ordering is load-bearing.** The owner check runs *before* the conjunction, because
+`require_hook_manage_conjunction` answers `404` when the caller holds no permission row, and an owner
+need not hold one — ownership lives in a column on `hooks`. Asking the conjunction first would hide a
+hook from the very key answerable for it.
+
+**Consequential fix.** Adding ownership as an editing route made `require_visibility` and
+`visible_hook_ids` wrong: both filtered on permission rows only, so a hook whose `owner_key_id` had
+been reassigned by Master to a key holding no row would have been *editable but unlistable* — `PUT`
+succeeding while `GET` answered `404`. Both now treat ownership as conferring visibility.
+
+### 3. `can_view_execution` (migration `m20260809_000001`)
+
+`api_key_hook_permissions` gains a third verb: `BOOLEAN NOT NULL DEFAULT false`. No index — the column
+is never searched on, only read from a row already fetched by the `(api_key_id, hook_id)` unique
+index, and a boolean with a heavy skew toward `false` is close to the worst possible index candidate.
+
+An execution record is now readable by exactly four identities: Master, the acting key, the hook's
+owner, or a row carrying `can_view_execution` or `can_manage`. Everything else is `404`, byte-identical
+to a record that never existed.
+
+**Why a third verb rather than reusing one.** `can_execute` would mean every caller entitled to *run*
+a hook is entitled to read what every other caller's runs printed — a CI key firing a deployment
+would inherit the output of an operator's manual run. `can_manage` would put read-only audit access
+behind R2's conjunction, so an auditor could be granted logs only by first being made a Parent with
+editing authority over the hook — granting far more than was asked for, which is the shape R1 exists
+to prevent. The auditor role (history, no execute, no manage) was simply not expressible before.
+
+`can_manage` is one of the four routes because a key already entitled to rewrite `script_path` and
+delete the history outright cannot meaningfully be denied *reading* it; withholding that would be
+theatre. The verb itself stays read-only in every direction — `DELETE /api/executions/{id}` remains
+behind `require_manage`, because an auditor is not a redactor.
+
+**Two behaviour changes worth stating plainly**, both widenings relative to what shipped before:
+
+- A `can_manage` holder can now read a hook's history. Previously only the acting key and Master
+  could. The e2e §38 checks and one integration test asserted the old rule and were updated.
+- A caller keeps its *own* execution records after losing its grant on the hook. The previous
+  implementation ANDed hook-visibility onto the creator filter, so revoking a grant also erased the
+  key's record of its own past runs. §4 makes an execution visible to its creator, and a creator does
+  not stop being one.
+
+The listing expresses the four routes as a single indexed `WHERE` rather than filtering after the
+fact, which would page wrongly: a `LIMIT 50` applied before a visibility filter returns fewer than
+fifty visible rows and hides the rest behind an offset that never advances past them.
+
+**R1/R6 coverage.** The new verb is wired into `is_permission_reduction` and
+`guard_delegated_hook_grant`. Omitting it from either would have been a delegation hole on day one:
+a write that *adds* history access while turning another verb off would have classified as a pure
+reduction, and reductions skip R1 entirely — so a caller could have traded a verb it held for one it
+did not.
+
+### 4. Daughter keys (verified, not changed)
+
+The rule was already enforced by `require_master_to_grant_scopes` on both the create and update
+routes; this pass added the tests that prove it rather than assuming it. A Parent requesting
+`can_manage_keys` or `can_manage_hooks` on a key it mints gets `403`, and nothing is written.
+
+**Refused rather than silently forced to `false`**, deliberately. A `200` carrying a key that lacks
+what was asked for is the worse failure: the caller walks away believing it provisioned a Parent and
+finds out in production. This mirrors the peer service's reasoning about `is_master` on a payload —
+a security-relevant field that quietly means nothing is how a deployment ends up misconfigured with
+nobody noticing.
+
+### 5. Frontend audit — one live bug, and it was total
+
+**`static/index.html` carried a "Master Access" checkbox whose value `createApiKey` sent as
+`is_master`.** That field is on no key payload (§5), and both payload types are
+`deny_unknown_fields` — so it was not ignored, it failed the whole request at the deserializer.
+**Every key creation from the dashboard returned 422, for as long as the control existed.** Nothing
+caught it: the e2e suite creates keys over HTTP with hand-built JSON and never loads the page.
+
+Other changes:
+
+- `can_view_execution` toggle in the hook-rights form; `V` in the per-key badge summary; a `History`
+  badge in the hooks table.
+- Global scope toggles are Master-only. The create form hides them (a Parent has no decision to make
+  — every key it mints is a Daughter); the edit modal disables them but keeps them visible, because a
+  Parent may legitimately need to see what the key it is editing already holds. Both **omit the
+  fields** for a non-Master rather than sending `false`: the backend refuses a *request* for a scope,
+  and re-sending a value a key already holds is still a request, so a Parent renaming a Parent key
+  would otherwise have `403`d on a scope it was not trying to change.
+- Hook row actions now mirror the server's predicates. `canEditHook` = Master ∨ owner ∨
+  (`can_manage_keys` ∧ `can_manage`); `canDeleteHook` = Master ∨ owner. The old gate on `can_manage`
+  alone was wrong in both directions — disabled for a Daughter owner who may edit, enabled for a
+  Daughter holding a bare row who may not.
+- An `Owner` badge, because "why can I edit this?" was otherwise unanswerable from the UI.
+- `enforceRBACUI` re-runs after the hook list loads: the Hooks tab is reachable by a key that owns a
+  hook and holds no global scope, and ownership is only visible in that response.
+
+### 6. Zero raw SQL, and the two exceptions
+
+**Audit result: `src/api.rs`, `src/retention.rs`, `src/middleware.rs` and `src/executor.rs` contain
+no raw SQL at all.** Every statement built from anything a caller sent already went through SeaORM's
+typed entities and expression builders. Two files remain, both unreachable from a request:
+
+| File | Construct | Why the builder cannot replace it |
+| :--- | :--- | :--- |
+| `src/db.rs` | `PRAGMA journal_mode`, `PRAGMA busy_timeout` | A pragma is not a query — it configures how the engine behaves, not what it is asked — and SeaORM has no builder for one. Backend-gated to SQLite, issued once at startup, four of the six occurrences are in `#[cfg(test)]` |
+| `m20230106_000001_master_key_uniqueness` | `ALTER TABLE ... GENERATED ALWAYS AS (...)` | `ColumnDef` has no generated-column support at all, and §5 requires the marker to be engine-derived rather than application-maintained. DDL, run once |
+
+Neither interpolates a runtime value; the sole substitution across both is a compile-time `const`.
+The property is now enforced by `no_raw_sql_outside_the_two_documented_exceptions` rather than
+asserted once, and a companion test fails if an allowlisted file stops containing raw SQL — an
+exemption must not outlive its justification and be silently inherited by whatever lands at that path
+next.
+
+**A trap found while testing this.** A `Uuid` is not bound as text on every backend, so a
+hand-written `WHERE id = '<uuid>'` can match *nothing* and return `Ok`. Two of the new pinning tests
+initially "passed" while tampering with zero rows. Both now mutate through the entity layer, which
+still bypasses the application entirely — what those tests need to bypass is the *handler*, not the
+ORM. The §5 adversarial tests are unaffected: they insert their own rows as text and their refusal
+comes from the `master_marker` index, which does not involve `id`.
+
+### 7. Harness safety
+
+Both scripts assert their working directory before anything else, twice: the basename (catching an
+inherited `cd`) and a list of marker files (catching a directory with the right name that is not this
+checkout). Verified by running each from `/tmp` and from `example/simply_ip_vault` — both exit 1.
+
+The convergence script needed it most. From the wrong directory its likely outcome was not an error
+but a *false green*: missing paths report as skips, and a run of nothing but skips still reaches the
+summary; from inside the peer snapshot the byte-identity check would have compared a file to itself.
+
+### Breaking changes
+
+1. **A `can_manage` holder can now read a hook's execution history**, including runs made by other
+   keys. This is a widening. Operators who relied on history being creator-only should audit who
+   holds `can_manage`:
+
+```sql
+-- Keys that gain read access to a hook's history under the new rule.
+SELECT k.name AS key_name, k.prefix, h.name AS hook_name
+FROM api_key_hook_permissions p
+JOIN api_keys k ON k.id = p.api_key_id
+JOIN hooks h    ON h.id = p.hook_id
+WHERE p.can_manage = true AND k.is_master = false
+ORDER BY h.name, k.name;
+```
+
+2. **A hook's owner can now edit it without `can_manage_keys`.** This reverses part of the previous
+   pass's breaking change, and is a widening for Daughter owners specifically:
+
+```sql
+-- Keys that regain editing authority over hooks they own.
+SELECT k.name AS key_name, k.prefix, COUNT(h.id) AS hooks_owned
+FROM api_keys k
+JOIN hooks h ON h.owner_key_id = k.id
+WHERE k.is_master = false AND k.can_manage_keys = false
+GROUP BY k.id, k.name, k.prefix
+ORDER BY hooks_owned DESC;
+```
+
+3. **A hot-flipped `is_master` stops working**, which is the point. If any deployment was (somehow)
+   relying on a second master row set directly in the database, it will now be treated as an ordinary
+   key and the startup log will say so. Find them before upgrading:
+
+```sql
+SELECT id, name, prefix, is_master FROM api_keys WHERE is_master = true;
+-- Must return exactly one row, or the service refuses to start.
+```
+
+4. **`POST /api/keys/{id}/permissions` writes `can_view_execution`.** The field is
+   `#[serde(default)]` = `false`, so a client written before this verb existed keeps working and
+   grants *less*, never more. Because the endpoint writes the whole row, an omitted field is
+   indistinguishable from an explicit `false` — which is correct for "these are the rights" and worth
+   knowing if a client re-submits a partial grant.
+
+### Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **255 passed / 0 failed** (88 unit + 133 integration + 23 compliance + 8 source hygiene +
+3 doc) · `./scripts/test_e2e.sh` **875 / 875** (was 841) ·
+`./scripts/verify_convergence.sh` exit 0.

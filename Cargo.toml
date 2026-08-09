@@ -46,3 +46,20 @@ tower = { version = "0.5", features = ["util"] }
 # driven exactly rather than by sleeping for real seconds in the test suite. Test-only: it is not
 # compiled into the daemon.
 tokio = { version = "1", features = ["full", "test-util"] }
+# Parses `static/app.js` in `tests/source_hygiene.rs`. `static/` is served straight off disk by
+# `ServeDir` and is never compiled, linted, or executed by anything else here, so a syntax error in
+# it passes `cargo check`, `cargo clippy`, `cargo test` and the whole e2e suite — every one of which
+# exercises the HTTP API and never parses the file it is serving. The first thing to notice would be
+# a human opening the dashboard and finding it dead.
+#
+# Deliberately a *parser* and not an engine: `app.js` references `document`, `localStorage` and
+# `fetch`, so executing it would fail for reasons that have nothing to do with syntax, and telling
+# those failures apart would mean pattern-matching on error text.
+#
+# Pinned with `=`, unlike every other dependency here. `oxc` is pre-1.0, so its `0.x` releases carry
+# breaking changes under a caret requirement — `ParserReturn::errors` became `diagnostics`, `labels`
+# went from `Option<Vec<_>>` to a slice, `offset()` widened to `u32`. A syntax checker that stops the
+# build for reasons unrelated to syntax is worse than no checker, so this one does not float.
+oxc_allocator = "=0.143.0"
+oxc_parser = "=0.143.0"
+oxc_span = "=0.143.0"

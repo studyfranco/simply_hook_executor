@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::*;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
+};
 use serde_json::json;
 use simply_hook_executor::{
     config::RuntimeConfig, create_app,
@@ -4709,24 +4711,48 @@ async fn s4_an_invisible_hook_is_indistinguishable_from_a_nonexistent_one() {
     assert_eq!(by_name.raw, by_absent_name.raw, "name lookup leaks existence by body");
 }
 
-/// **§4, third scope** — executions belong to the key that requested them.
+/// **§4, third scope** — an execution record is creator-private, with three named exceptions.
 ///
-/// Hook membership is not a licence to read another tenant's arguments and output. A manager sees
-/// *that a hook exists and what it does*; it does not see the `parameters_json`, stdout, or stderr
-/// of runs it did not make.
+/// The Terminology table makes the Execution record this service's creator-private entity, so it is
+/// "never exposed by the shared-resource visibility rule": holding a verb on a hook does not, by
+/// itself, let you read the arguments other keys passed to it or the output they got back.
+///
+/// Four identities may read one, and this walks all of them plus the party that may not:
+///
+/// | Caller | May read | Why |
+/// | :--- | :--- | :--- |
+/// | Master | yes | Full visibility |
+/// | The acting key | yes | It is the "creator" §4 names |
+/// | The hook's owner | yes | §3 makes it answerable for what the hook does |
+/// | `can_view_execution` holder | yes | The explicit audit grant |
+/// | `can_manage` holder | yes | Already entitled to rewrite and delete the history |
+/// | `can_execute`-only holder | **no** | Running a hook is not reading everyone else's runs |
+///
+/// The last row is the one that matters. It is the population a naive "anyone on the hook" rule
+/// would expose, and the reason history needed a verb of its own rather than riding on `can_execute`.
 #[tokio::test]
-async fn s4_executions_are_visible_only_to_the_key_that_requested_them() {
+async fn s4_execution_records_are_creator_private_with_three_named_exceptions() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let scripts = ScriptDir::new();
     let script = scripts.write_script("private.sh", "#!/bin/sh\necho secret-output\n");
 
-    let hook = insert_hook(&db, "shared_runner", &script, 30).await;
+    let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
+    let hook = insert_hook_owned_by(&db, "shared_runner", &script, owner_id).await;
+
     let (runner_id, runner) = insert_key(&db, "runner", "", KeyScopes::plain()).await;
-    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::plain()).await;
+    let (peer_id, peer) = insert_key(&db, "peer-executor", "", KeyScopes::plain()).await;
+    let (auditor_id, auditor) = insert_key(&db, "auditor", "", KeyScopes::plain()).await;
+    let (manager_id, manager) = insert_key(&db, "manager", "", KeyScopes::parent()).await;
     let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
     grant(&db, runner_id, hook, true, false).await;
-    grant(&db, manager_id, hook, true, true).await;
+    // The critical negative: another key that may *run* the hook, and nothing more.
+    grant(&db, peer_id, hook, true, false).await;
+    // The auditor holds history access alone — no execute, no manage. That combination was not
+    // expressible before `can_view_execution` existed.
+    grant_full(&db, auditor_id, hook, false, false, true).await;
+    grant(&db, manager_id, hook, false, true).await;
 
     let run = send(
         &app,
@@ -4735,26 +4761,48 @@ async fn s4_executions_are_visible_only_to_the_key_that_requested_them() {
     .await;
     assert_eq!(run.status, StatusCode::OK);
     let execution_id = run.string("id");
+    let uri = format!("/api/executions/{execution_id}");
 
-    // The runner sees its own run.
-    let own = send(&app, json_request("GET", "/api/executions", &runner, None)).await;
-    assert_eq!(own.json.as_array().map(Vec::len), Some(1), "a key sees its own history");
+    for (who, label) in [
+        (&runner, "the acting key sees its own run"),
+        (&owner, "the hook's owner sees runs of the hook it is answerable for"),
+        (&auditor, "a can_view_execution holder sees the history it was granted"),
+        (&manager, "a can_manage holder may read what it may already delete"),
+        (&master, "master sees everything"),
+    ] {
+        let listed = send(&app, json_request("GET", "/api/executions", who, None)).await;
+        assert_eq!(listed.json.as_array().map(Vec::len), Some(1), "{label}: {}", listed.raw);
+        let single = send(&app, json_request("GET", &uri, who, None)).await;
+        assert_eq!(single.status, StatusCode::OK, "{label} (by id): {}", single.raw);
+    }
 
-    // The manager holds *both* verbs on the hook and still sees nothing: it did not run it.
-    let theirs = send(&app, json_request("GET", "/api/executions", &manager, None)).await;
+    // `can_execute` alone reads nothing, and the refusal is `404` — indistinguishable from an
+    // execution id that was never issued, per oracle discipline.
+    let listed = send(&app, json_request("GET", "/api/executions", &peer, None)).await;
     assert_eq!(
-        theirs.json.as_array().map(Vec::len),
+        listed.json.as_array().map(Vec::len),
         Some(0),
-        "managing a hook is not licence to read another key's runs: {}",
-        theirs.raw
+        "running a hook is not licence to read another key's runs: {}",
+        listed.raw
     );
-    let by_id = send(&app, json_request("GET", &format!("/api/executions/{execution_id}"), &manager, None)).await;
-    assert_eq!(by_id.status, StatusCode::NOT_FOUND, "and reading one by id is refused as nonexistent");
+    let by_id = send(&app, json_request("GET", &uri, &peer, None)).await;
+    assert_eq!(by_id.status, StatusCode::NOT_FOUND, "refused as nonexistent, not as forbidden");
     assert!(!by_id.raw.contains("secret-output"), "no output leaks in the refusal: {}", by_id.raw);
+    let invented = send(
+        &app,
+        json_request("GET", &format!("/api/executions/{}", Uuid::new_v4()), &peer, None),
+    )
+    .await;
+    assert_eq!(by_id.status, invented.status, "an unreadable record leaks existence by status");
+    assert_eq!(by_id.raw, invented.raw, "an unreadable record leaks existence by body");
 
-    // Master sees everything.
-    let all = send(&app, json_request("GET", "/api/executions", &master, None)).await;
-    assert_eq!(all.json.as_array().map(Vec::len), Some(1), "master sees all history");
+    // Reading is not deleting. The auditor may see the record and may not destroy it — history
+    // access is deliberately weaker than `can_manage`, or an auditor would be a redactor.
+    assert_eq!(
+        send(&app, json_request("DELETE", &uri, &auditor, None)).await.status,
+        StatusCode::FORBIDDEN,
+        "can_view_execution must not confer deletion"
+    );
 }
 
 /// **§4, the counterpart control** — authenticate before authorize, so an *unauthenticated* caller
@@ -7032,4 +7080,349 @@ async fn hoisting_the_window_check_does_not_reach_unsigned_or_body_only_traffic(
     .body(axum::body::Body::empty())
     .expect("request builds");
     assert_eq!(send(&app, signed_shape).await.status, StatusCode::UNAUTHORIZED);
+}
+
+// ═════════════════════════════════════════════════════════════
+// Master key pinning
+// ═════════════════════════════════════════════════════════════
+
+/// **Master pinning** — flipping `is_master` on a row the process did not pin has zero effect.
+///
+/// The whole authorization model branches on `api_key::Model::is_master`, read from a column on
+/// every request. An attacker who reaches the database needs one `UPDATE` to become Master. §5's
+/// uniqueness constraint refuses that statement, and this is the second line: even if the constraint
+/// were dropped, the *running process* has already decided who the Master is.
+///
+/// The tamper is applied with raw SQL after the pin is established, which is exactly the shape of
+/// the attack — the application is never asked, and never gets a chance to refuse the write.
+#[tokio::test]
+async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
+    let db = setup_test_db().await;
+    let state = test_state(&db);
+    let app = create_app(state.clone());
+
+    let (real_master_id, real_master) = insert_key(&db, "the-master", "", KeyScopes::master()).await;
+    let (impostor_id, impostor) = insert_key(&db, "impostor", "", KeyScopes::plain()).await;
+
+    // One authenticated request establishes the pin from a database holding exactly one master.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &real_master, None)).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(state.master_pin.get(), Some(real_master_id), "the real master was pinned");
+
+    // The tamper. No endpoint can do this — `is_master` is not a field on any payload — so it goes
+    // in behind the application's back. Written through the entity layer rather than as a SQL
+    // string because a `Uuid` is not bound as text on every backend, so a hand-written
+    // `WHERE id = '...'` silently matches nothing and the test would pass without tampering at all.
+    // What matters here is bypassing the *application*, which this does completely.
+    let promote = |db: sea_orm::DatabaseConnection| async move {
+        ApiKey::update_many()
+            .col_expr(api_key::Column::IsMaster, sea_orm::sea_query::Expr::value(true))
+            .filter(api_key::Column::Id.eq(impostor_id))
+            .exec(&db)
+            .await
+    };
+
+    // §5 first: the constraint refuses a second master outright, and pinning is the layer *behind*
+    // it rather than a replacement for it.
+    assert!(
+        promote(db.clone()).await.is_err(),
+        "§5: the database itself must refuse a second master"
+    );
+
+    // So take the constraint out of the picture, which is the situation pinning exists for: an
+    // attacker who can write the schema as well as the rows.
+    db.execute_unprepared("DROP INDEX idx_api_keys_master_marker")
+        .await
+        .expect("dropping the index models an attacker who reached the schema");
+    promote(db.clone()).await.expect("with the constraint gone, the row flips");
+
+    // The database now says two keys are master.
+    assert_eq!(
+        ApiKey::find()
+            .filter(api_key::Column::IsMaster.eq(true))
+            .all(&db)
+            .await
+            .expect("query")
+            .len(),
+        2,
+        "the tamper landed — this test is worthless if it did not"
+    );
+
+    // And it buys nothing. The impostor is refused everywhere master authority is required.
+    let me = send(&app, json_request("GET", "/api/auth/me", &impostor, None)).await;
+    assert_eq!(me.status, StatusCode::OK, "the impostor is still a valid key");
+    assert_eq!(
+        me.field("is_master"),
+        &json!(false),
+        "the impostor must not be *reported* as master either: {}",
+        me.raw
+    );
+
+    for (method, uri, body) in [
+        ("GET", "/api/settings", None),
+        ("GET", "/api/audit-logs", None),
+        ("POST", "/api/keys", Some(json!({ "name": "minted-by-impostor" }))),
+        ("GET", "/api/hooks?include_deleted=true", None),
+    ] {
+        let response = send(&app, json_request(method, uri, &impostor, body)).await;
+        assert_ne!(
+            response.status,
+            StatusCode::OK,
+            "{method} {uri} honoured a hot-flipped is_master: {}",
+            response.raw
+        );
+    }
+
+    // The genuine master is unaffected — pinning must not break the key it pinned.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/settings", &real_master, None)).await.status,
+        StatusCode::OK,
+        "the pinned master still works"
+    );
+}
+
+/// The pin is established once and never re-read, so a *later* database state cannot move it.
+#[tokio::test]
+async fn the_master_pin_is_resolved_once_and_never_moves() {
+    let db = setup_test_db().await;
+    let state = test_state(&db);
+    let app = create_app(state.clone());
+
+    let (first_id, first) = insert_key(&db, "first-master", "", KeyScopes::master()).await;
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &first, None)).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(state.master_pin.get(), Some(first_id));
+
+    // Delete the pinned master and mint a different one. A process that re-read the database would
+    // now follow the new row; a pinned one does not, and requires a restart to notice.
+    //
+    // Through the entity layer for the same reason as above — a `Uuid` in a hand-written `WHERE`
+    // clause is not portably text, and a `DELETE` matching nothing would leave two masters and fail
+    // the *next* insert instead of this assertion.
+    ApiKey::delete_by_id(first_id)
+        .exec(&db)
+        .await
+        .expect("the master row is deletable directly in the database");
+    let (second_id, second) = insert_key(&db, "second-master", "", KeyScopes::master()).await;
+
+    assert_eq!(state.master_pin.get(), Some(first_id), "the pin did not move");
+    assert_ne!(second_id, first_id);
+
+    let me = send(&app, json_request("GET", "/api/auth/me", &second, None)).await;
+    assert_eq!(me.status, StatusCode::OK);
+    assert_eq!(
+        me.field("is_master"),
+        &json!(false),
+        "a master minted after the pin is not this process's master until it restarts: {}",
+        me.raw
+    );
+}
+
+// ═════════════════════════════════════════════════════════════
+// Daughter keys, hook ownership, and delegation
+// ═════════════════════════════════════════════════════════════
+
+/// **R4** — a Parent key cannot mint another Parent, nor a hook creator.
+///
+/// > *Only the Master key may grant `can_manage_keys` or any resource-creation right. A parent key
+/// > can never mint another parent key.*
+///
+/// Refused rather than silently forced to `false`. A `200` carrying a key that lacks what was asked
+/// for is the worse failure: the caller walks away believing it provisioned a Parent, and finds out
+/// when that key fails in production.
+#[tokio::test]
+async fn a_parent_key_can_only_mint_daughter_keys() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    let (_parent_id, parent) = insert_key(&db, "parent", "", KeyScopes::parent()).await;
+
+    for scope in ["can_manage_keys", "can_manage_hooks"] {
+        let refused = send(
+            &app,
+            json_request("POST", "/api/keys", &parent, Some(json!({ "name": scope, scope: true }))),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "R4: a Parent minted a key holding '{scope}': {}",
+            refused.raw
+        );
+        assert!(refused.raw.contains(scope), "the refusal names the scope: {}", refused.raw);
+
+        // And nothing was created — a refusal that still writes the row is not a refusal.
+        let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+        assert!(
+            !listed.raw.contains(&format!("\"name\":\"{scope}\"")),
+            "R4: the refused key was created anyway: {}",
+            listed.raw
+        );
+    }
+
+    // A Daughter is fine, and is what a Parent may mint.
+    let daughter = send(
+        &app,
+        json_request("POST", "/api/keys", &parent, Some(json!({ "name": "ordinary-daughter" }))),
+    )
+    .await;
+    assert_eq!(daughter.status, StatusCode::OK, "a Parent may mint a Daughter: {}", daughter.raw);
+
+    // Escalating an existing key is the same rule on the update route.
+    let target_id = daughter.string("id");
+    for scope in ["can_manage_keys", "can_manage_hooks"] {
+        let refused = send(
+            &app,
+            json_request("PUT", &format!("/api/keys/{target_id}"), &parent, Some(json!({ scope: true }))),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "R4: a Parent granted '{scope}' by update: {}",
+            refused.raw
+        );
+    }
+
+    // Master may do both, or the refusals above could be explained by the route being broken.
+    let promoted = send(
+        &app,
+        json_request("POST", "/api/keys", &master, Some(json!({ "name": "real-parent", "can_manage_keys": true }))),
+    )
+    .await;
+    assert_eq!(promoted.status, StatusCode::OK, "master may mint a Parent: {}", promoted.raw);
+}
+
+/// **§3 + R2** — owning a hook is authority over the hook, not over who else may reach it.
+///
+/// The two halves are deliberately in one test, because the whole point is that they diverge for the
+/// same caller on the same hook. A Daughter that created a hook may rewrite what it executes; it may
+/// not hand that capability to anybody else, including itself.
+#[tokio::test]
+async fn a_hook_owner_may_edit_it_but_may_not_delegate_rights_on_it() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let original = scripts.write_script("owned.sh", "#!/bin/sh\necho original\n");
+    let replacement = scripts.write_script("replacement.sh", "#!/bin/sh\necho replaced\n");
+
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+    // A Daughter with the creation right and nothing else: no `can_manage_keys`, so R2's conjunction
+    // is out of reach for it entirely.
+    let (owner_id, owner) =
+        insert_key(&db, "creator", "", KeyScopes::hook_manager()).await;
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &owner,
+            Some(json!({ "name": "owned_hook", "script_path": original })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "the daughter may create a hook: {}", created.raw);
+    let hook_id = created.string("id");
+    assert_eq!(created.field("is_owner"), &json!(true), "the creator is the owner");
+
+    // ── It may maintain what it owns ────────────────────────────────────────
+    for (label, body) in [
+        ("its description", json!({ "description": "maintained by its owner" })),
+        ("its script_path", json!({ "script_path": replacement })),
+        ("its timeout", json!({ "default_timeout_seconds": 45 })),
+        ("its name", json!({ "name": "renamed_by_owner" })),
+    ] {
+        let edited = send(
+            &app,
+            json_request("PUT", &format!("/api/hooks/{hook_id}"), &owner, Some(body)),
+        )
+        .await;
+        assert_eq!(
+            edited.status,
+            StatusCode::OK,
+            "§3: the owner could not edit {label} of its own hook: {}",
+            edited.raw
+        );
+    }
+
+    let param = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/parameters"),
+            &owner,
+            Some(json!({ "param_key": "target", "default_value": "x" })),
+        ),
+    )
+    .await;
+    assert_eq!(param.status, StatusCode::OK, "the owner declares parameters: {}", param.raw);
+
+    // It can see it, which `visible_hook_ids` has to agree with or the hook would be
+    // editable-but-unlistable.
+    let listed = send(&app, json_request("GET", "/api/hooks", &owner, None)).await;
+    assert!(listed.raw.contains("renamed_by_owner"), "the owner sees its own hook: {}", listed.raw);
+
+    // ── It may not delegate ─────────────────────────────────────────────────
+    let (target_id, _target) = insert_key(&db, "someone-else", "", KeyScopes::plain()).await;
+    set_parent(&db, target_id, owner_id).await;
+
+    let delegation = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{target_id}/permissions"),
+            &owner,
+            Some(json!({ "hook_id": hook_id, "can_execute": true, "can_manage": false })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        delegation.status,
+        StatusCode::FORBIDDEN,
+        "R2: owning a hook let its owner hand out rights on it without can_manage_keys: {}",
+        delegation.raw
+    );
+
+    // Revocation is the same rule from the other direction — R6 lowers the bar to "manage rights on
+    // the resource", and the owner does not have those in R2's sense.
+    grant(&db, target_id, Uuid::parse_str(&hook_id).expect("hook id is a uuid"), true, false).await;
+    let revocation = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{target_id}/permissions/{hook_id}"),
+            &owner,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        revocation.status,
+        StatusCode::FORBIDDEN,
+        "R2: the owner revoked a grant without holding can_manage_keys: {}",
+        revocation.raw
+    );
+
+    // Master can do what the owner could not, so the refusals are about the caller and not the route.
+    assert_eq!(
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/keys/{target_id}/permissions"),
+                &master,
+                Some(json!({ "hook_id": hook_id, "can_execute": true, "can_manage": false })),
+            ),
+        )
+        .await
+        .status,
+        StatusCode::OK,
+        "master may delegate on the same hook"
+    );
 }

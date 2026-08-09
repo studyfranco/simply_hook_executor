@@ -676,10 +676,53 @@ class HookExecutorClient {
         const canExecuteAny = p.is_master || (p.hook_permissions || []).some(h => h.can_execute);
         document.getElementById('run-hook-section').style.display = canExecuteAny ? 'block' : 'none';
 
+        // Hooks Management is also reachable by a key that *owns* a hook: §3 ownership confers the
+        // right to edit and delete it, and that is independent of holding a `can_manage` row. Owned
+        // hooks are only known once the hook list loads, so `renderHooks` re-runs this.
+        if (!canManageAnyHook && (this.state.hooks || []).some(h => h.is_owner)) {
+            document.getElementById('hooks-tab-btn').style.display = 'inline-block';
+        }
+
         // Assigning run_as_user is a privilege-escalation request and is master-only server side.
         // The field is disabled rather than merely hidden, so a non-master sees that the capability
         // exists and why it is unavailable, instead of wondering where it went.
         this.applyRunAsUserGuard();
+        // R4: only Master may grant a global scope, so the toggles that request one are inert for
+        // everyone else.
+        this.applyGlobalScopeGuard();
+    }
+
+    // Reflects RBAC_MODEL.md R4 in the key forms: "Only the Master key may grant `can_manage_keys`
+    // or any resource-creation right."
+    //
+    // The create form *hides* the toggles, because a Parent has no decision to make there — every
+    // key it mints is a Daughter, and offering a checkbox that can only be left unticked is an
+    // invitation to a 403. The edit modal keeps them visible but disabled, because there a Parent
+    // may legitimately need to *see* what the key it is editing already holds; R4 restricts granting
+    // a scope, not looking at one.
+    applyGlobalScopeGuard() {
+        const isMaster = Boolean(this.state.profile?.is_master);
+
+        const createGrid = document.getElementById('apikey-master-only-scopes');
+        const createNote = document.getElementById('apikey-scopes-locked-note');
+        if (createGrid && createNote) {
+            createGrid.classList.toggle('hidden', !isMaster);
+            createNote.classList.toggle('hidden', isMaster);
+            if (!isMaster) {
+                // Cleared as well as hidden: a stale tick from a previous Master session in the same
+                // tab would otherwise still be read by `createApiKey`.
+                document.getElementById('apikey-can-manage-keys').checked = false;
+                document.getElementById('apikey-can-manage-hooks').checked = false;
+            }
+        }
+
+        ['edit-key-can-manage-keys', 'edit-key-can-manage-hooks'].forEach(id => {
+            const input = document.getElementById(id);
+            if (input) {
+                input.disabled = !isMaster;
+                input.title = isMaster ? '' : 'Only the Master key may change this scope (R4)';
+            }
+        });
     }
 
     // Disables the run_as_user inputs for non-master keys, matching the backend's 403.
@@ -722,6 +765,9 @@ class HookExecutorClient {
             this.state.selectedHookIds.clear();
             this.state.hooks = await this.apiFetch('/hooks');
             this.renderHooksTable();
+            // Re-run once the hooks are known: the Hooks tab is also reachable by a key that owns a
+            // hook without holding any global scope, and ownership is only visible in this response.
+            if (this.state.profile) this.enforceRBACUI();
 
             const byId = this.state.hooks.map(h => ({ value: h.id, label: h.name }));
             const byName = this.state.hooks.map(h => ({ value: h.name, label: h.name }));
@@ -1356,6 +1402,28 @@ class HookExecutorClient {
         document.getElementById('hook-result-modal').classList.remove('hidden');
     }
 
+    // Mirrors `require_manage` in src/api.rs. Master, or the hook's owner, or the R2 conjunction:
+    // global `can_manage_keys` AND a `can_manage` row on this specific hook.
+    //
+    // The middle route is why `h.can_manage` alone is not the test. A key that created a hook owns
+    // it and may maintain it without being a Parent; a key handed a bare `can_manage` row without
+    // `can_manage_keys` is a Daughter, which "may manage resources: Never" — the row on its own buys
+    // nothing, and offering it an enabled Edit button would only produce a 403.
+    canEditHook(h) {
+        const p = this.state.profile;
+        if (!p) return false;
+        return Boolean(p.is_master || h.is_owner || (p.can_manage_keys && h.can_manage));
+    }
+
+    // Mirrors `require_lifecycle_authority`: §3 restricts deleting and renaming to Master and the
+    // designated owner. Holding manage rights confers no lifecycle authority — "a parent that merely
+    // uses a resource must not be able to delete it."
+    canDeleteHook(h) {
+        const p = this.state.profile;
+        if (!p) return false;
+        return Boolean(p.is_master || h.is_owner);
+    }
+
     renderHooksTable() {
         const tbody = document.getElementById('hooks-table-body');
 
@@ -1363,14 +1431,25 @@ class HookExecutorClient {
             tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No hooks defined.</td></tr>';
         } else {
             tbody.innerHTML = this.state.hooks.map(h => {
+                const editable = this.canEditHook(h);
+                const deletable = this.canDeleteHook(h);
+                const editHint = editable
+                    ? 'Edit this hook'
+                    : 'Requires being the hook owner, or Manage Keys plus a Manage grant on this hook';
+                const deleteHint = deletable
+                    ? 'Delete this hook'
+                    : 'Only the hook owner or the Master key may delete a hook (§3)';
+
                 const rights = [
+                    h.is_owner ? '<span class="badge badge-scope badge-scope-master" title="You are answerable for this hook: you may edit, rename and delete it">Owner</span>' : '',
                     h.can_execute ? '<span class="badge badge-scope">Execute</span>' : '',
-                    h.can_manage ? '<span class="badge badge-scope">Manage</span>' : ''
+                    h.can_manage ? '<span class="badge badge-scope">Manage</span>' : '',
+                    h.can_view_execution ? '<span class="badge badge-scope" title="May read this hook\'s execution history">History</span>' : ''
                 ].filter(Boolean).join('') || '<span class="text-muted text-sm">None</span>';
 
                 return `
                 <tr>
-                    <td>${h.can_manage ? `<input type="checkbox" class="row-select" data-id="${h.id}">` : ''}</td>
+                    <td>${deletable ? `<input type="checkbox" class="row-select" data-id="${h.id}">` : ''}</td>
                     <td><strong>${escapeHtml(h.name)}</strong></td>
                     <td class="font-mono text-sm truncate">${escapeHtml(h.script_path)}</td>
                     <td>${this.privilegeBadge(h.run_as_user)}</td>
@@ -1384,9 +1463,9 @@ class HookExecutorClient {
                             <button class="btn btn-sm btn-primary" onclick="window.app.launchHookFromTable('${h.id}')" ${h.can_execute ? '' : 'disabled'}
                                 title="${h.can_execute ? 'Execute this hook for real' : 'Requires execute permission'}">Launch</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.showHookLogs('${h.id}')">Logs</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openParamsModal('${h.id}')" ${h.can_manage ? '' : 'disabled'}>Parameters</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditHookModal('${h.id}')" ${h.can_manage ? '' : 'disabled'}>Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteHook('${h.id}')" ${h.can_manage ? '' : 'disabled'}>Delete</button>
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.openParamsModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Parameters</button>
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditHookModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteHook('${h.id}')" ${deletable ? '' : 'disabled'} title="${deleteHint}">Delete</button>
                         </div>
                     </td>
                 </tr>
@@ -1617,7 +1696,13 @@ class HookExecutorClient {
         if (k.can_manage_hooks) scopes.push('<span class="badge badge-scope">Create Hooks</span>');
 
         const hookBadges = (k.hook_permissions || []).map(p => {
-            const rights = [p.can_execute ? 'X' : '', p.can_manage ? 'M' : ''].filter(Boolean).join('') || 'none';
+            // X = execute, M = manage, V = view history. `V` is listed last so an existing grant
+            // reads the same as it did before this verb existed.
+            const rights = [
+                p.can_execute ? 'X' : '',
+                p.can_manage ? 'M' : '',
+                p.can_view_execution ? 'V' : ''
+            ].filter(Boolean).join('') || 'none';
             return `<span class="badge badge-group" title="${escapeHtml(p.hook_name)}: ${rights}">${escapeHtml(p.hook_name)}: ${rights}
                 <button type="button" class="badge-revoke" title="Revoke this hook permission" onclick="window.app.revokeHookPermission('${k.id}', '${p.hook_id}')">&times;</button>
             </span>`;
@@ -1641,15 +1726,25 @@ class HookExecutorClient {
 
     async createApiKey(e) {
         e.preventDefault();
+        // `is_master` is deliberately absent. It is not a field on the create payload at all
+        // (RBAC_MODEL.md §5), and the payload type is `deny_unknown_fields` — so sending it, as this
+        // form used to, made the deserializer reject the whole request with a 422 and no key was
+        // ever created from this dashboard.
         const payload = {
             name: document.getElementById('apikey-name').value,
             bound_ips: document.getElementById('apikey-bound-ips').value,
             max_concurrent_jobs: parseInt(document.getElementById('apikey-max-jobs').value, 10),
-            hmac_mode: document.getElementById('apikey-hmac-mode').value,
-            is_master: document.getElementById('apikey-is-master').checked,
-            can_manage_keys: document.getElementById('apikey-can-manage-keys').checked,
-            can_manage_hooks: document.getElementById('apikey-can-manage-hooks').checked
+            hmac_mode: document.getElementById('apikey-hmac-mode').value
         };
+
+        // R4: only Master may grant a global scope. A non-Master caller omits the fields rather than
+        // sending `false` — the backend refuses any *request* for a scope, and an explicit `false`
+        // is indistinguishable from a request in a payload it has to reason about. Every key a
+        // Parent mints is a Daughter, and saying nothing is the accurate way to ask for that.
+        if (this.state.profile && this.state.profile.is_master) {
+            payload.can_manage_keys = document.getElementById('apikey-can-manage-keys').checked;
+            payload.can_manage_hooks = document.getElementById('apikey-can-manage-hooks').checked;
+        }
 
         try {
             const res = await this.apiFetch('/keys', { method: 'POST', body: JSON.stringify(payload) });
@@ -1691,10 +1786,12 @@ class HookExecutorClient {
             return;
         }
 
+        // This endpoint writes the whole row: an unchecked box is a revocation, not "leave as is".
         const payload = {
             hook_id: hookId,
             can_execute: document.getElementById('manage-rights-execute').checked,
-            can_manage: document.getElementById('manage-rights-manage').checked
+            can_manage: document.getElementById('manage-rights-manage').checked,
+            can_view_execution: document.getElementById('manage-rights-view-execution').checked
         };
 
         try {
@@ -1731,6 +1828,26 @@ class HookExecutorClient {
         document.getElementById('edit-key-hmac-mode').value = k.hmac_mode || 'CANONICAL_V1';
         document.getElementById('edit-key-can-manage-keys').checked = k.can_manage_keys;
         document.getElementById('edit-key-can-manage-hooks').checked = k.can_manage_hooks;
+
+        // A minimally-visible key (§4's shared-resource scope) arrives without its global flags at
+        // all, so say "not visible" rather than rendering `undefined` as an unticked box — which
+        // would read as a positive statement that the key holds neither scope.
+        const note = document.getElementById('edit-key-scopes-locked-note');
+        if (note) {
+            const isMaster = Boolean(this.state.profile?.is_master);
+            note.classList.toggle('hidden', isMaster);
+            if (!isMaster) {
+                const held = [
+                    k.can_manage_keys ? 'Manage Keys' : '',
+                    k.can_manage_hooks ? 'Create Hooks' : ''
+                ].filter(Boolean).join(', ');
+                note.textContent = k.partial
+                    ? 'Global scopes are not visible for a key you only share a hook with.'
+                    : `Global scopes (${held || 'none'}) are shown read-only: only the Master key may change them (R4).`;
+            }
+        }
+
+        this.applyGlobalScopeGuard();
         document.getElementById('edit-key-modal').classList.remove('hidden');
     }
 
@@ -1741,10 +1858,17 @@ class HookExecutorClient {
             name: document.getElementById('edit-key-name').value,
             bound_ips: document.getElementById('edit-key-bound-ips').value,
             max_concurrent_jobs: parseInt(document.getElementById('edit-key-max-jobs').value, 10),
-            hmac_mode: document.getElementById('edit-key-hmac-mode').value,
-            can_manage_keys: document.getElementById('edit-key-can-manage-keys').checked,
-            can_manage_hooks: document.getElementById('edit-key-can-manage-hooks').checked
+            hmac_mode: document.getElementById('edit-key-hmac-mode').value
         };
+
+        // Omitted entirely for a non-Master caller, for the same reason as in `createApiKey`: the
+        // backend refuses a *request* for a global scope, and re-sending the value a key already
+        // holds is still a request. Editing a Parent key's name would otherwise 403 on the scope it
+        // already had, which looks like the rename being forbidden.
+        if (this.state.profile && this.state.profile.is_master) {
+            payload.can_manage_keys = document.getElementById('edit-key-can-manage-keys').checked;
+            payload.can_manage_hooks = document.getElementById('edit-key-can-manage-hooks').checked;
+        }
 
         try {
             await this.apiFetch(`/keys/${id}`, { method: 'PUT', body: JSON.stringify(payload) });

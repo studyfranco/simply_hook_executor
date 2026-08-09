@@ -282,12 +282,15 @@
                             </div>
                         </div>
 
-                        <div class="permissions-grid mt-2 mb-4">
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-is-master">
-                                <span class="checkmark"></span>
-                                Master Access
-                            </label>
+                        <!--
+                          The "Master Access" checkbox that used to sit here is gone. `is_master` is
+                          not a field on any key payload (RBAC_MODEL.md §5: "no key-creation or
+                          key-update payload may carry it"), so the control promised something the
+                          API refuses — and because the payload types are `deny_unknown_fields`, the
+                          form was sending a key the deserializer rejected outright. Every key
+                          creation from this dashboard returned 422.
+                        -->
+                        <div class="permissions-grid mt-2 mb-4" id="apikey-master-only-scopes">
                             <label class="checkbox-container">
                                 <input type="checkbox" id="apikey-can-manage-keys">
                                 <span class="checkmark"></span>
@@ -299,6 +302,12 @@
                                 Create Hooks
                             </label>
                         </div>
+                        <!-- Shown in place of the grid above when the signed-in key is not Master. -->
+                        <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scopes-locked-note">
+                            Only the Master key may grant <strong>Manage Keys</strong> or
+                            <strong>Create Hooks</strong> (RBAC_MODEL.md R4). Keys you create are
+                            Daughter keys: they hold neither scope.
+                        </p>
 
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create API Key</button>
@@ -354,13 +363,17 @@
                                 </div>
                             </div>
                             <div class="permissions-grid mt-2 mb-4">
-                                <label class="checkbox-container">
+                                <label class="checkbox-container" title="Run the hook">
                                     <input type="checkbox" id="manage-rights-execute" checked>
                                     <span class="checkmark"></span> Execute
                                 </label>
-                                <label class="checkbox-container">
+                                <label class="checkbox-container" title="Edit the hook's definition and parameters. Takes effect only for keys that also hold Manage Keys (RBAC_MODEL.md R2).">
                                     <input type="checkbox" id="manage-rights-manage">
                                     <span class="checkmark"></span> Manage
+                                </label>
+                                <label class="checkbox-container" title="Read this hook's execution history, including runs made by other keys. Read-only: it never permits deleting a record.">
+                                    <input type="checkbox" id="manage-rights-view-execution">
+                                    <span class="checkmark"></span> View History
                                 </label>
                             </div>
                             <div class="form-actions">
@@ -553,7 +566,7 @@
                         <option value="BODY_ONLY">BODY_ONLY (no replay protection)</option>
                     </select>
                 </div>
-                <div class="permissions-grid mt-2 mb-4">
+                <div class="permissions-grid mt-2 mb-4" id="edit-key-master-only-scopes">
                     <label class="checkbox-container">
                         <input type="checkbox" id="edit-key-can-manage-keys">
                         <span class="checkmark"></span> Manage Keys
@@ -563,6 +576,13 @@
                         <span class="checkmark"></span> Create Hooks
                     </label>
                 </div>
+                <!--
+                  Replaces the grid above for a non-Master signed-in key. The scopes are still
+                  *shown* as read-only text by the script, because hiding them outright would make a
+                  Parent key unable to see what the key it is editing already holds — and R4 only
+                  restricts granting, not looking.
+                -->
+                <p class="text-muted text-sm mt-2 mb-4 hidden" id="edit-key-scopes-locked-note"></p>
                 <div class="form-actions">
                     <button type="submit" class="btn btn-primary">Save Changes</button>
                     <button type="button" id="edit-key-cancel" class="btn btn-secondary">Cancel</button>

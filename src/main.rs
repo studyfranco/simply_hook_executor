@@ -293,6 +293,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prime_trusted_proxies(&config.trusted_proxies);
 
     let state = AppState::new(db, config.shared(), std::sync::Arc::new(cipher));
+
+    // Establishes who the Master is, once, before anything can serve a request. This both asserts
+    // `RBAC_MODEL.md` §5's invariants against the live database — exactly one master row, and the
+    // uniqueness index actually present — and freezes the answer for the process lifetime, so a
+    // later direct `UPDATE ... SET is_master = true` on some other row has no effect until someone
+    // restarts the service. Fatal on failure: a deployment whose master identity is ambiguous cannot
+    // make authorization decisions, and guessing one is not this service's call.
+    state.master_pin.pin_at_boot(&state.db).await?;
+
     let (retention_tx, retention_handle) = spawn_retention_worker(&state);
 
     let app = create_app(state);

@@ -42,6 +42,29 @@
 
 set -uo pipefail
 
+# ── Working-directory guard ──────────────────────────────────────────────────
+#
+# This script compares this repository against a peer snapshot under `example/`. Run from the wrong
+# directory, the most likely outcome is not an error but a *false green*: paths that do not exist
+# are reported as skips, and a run consisting entirely of skips still reaches the summary. Worse,
+# from inside `example/simply_ip_vault` the peer path resolves to nothing and the byte-identity
+# check compares a file against itself.
+#
+# Two assertions rather than one. The directory name catches an inherited `cd`; the marker files
+# catch a directory that carries the right name without being this checkout.
+if [[ "$(basename "$PWD")" != "simply_hook_executor" ]]; then
+  echo "ERROR: Script must be executed from the simply_hook_executor repository root." >&2
+  echo "       Current directory: $PWD" >&2
+  exit 1
+fi
+for marker in Cargo.toml AGENT.MD RBAC_MODEL.md src/main.rs scripts/verify_convergence.sh; do
+  if [[ ! -e "$marker" ]]; then
+    echo "ERROR: '$PWD' is named simply_hook_executor but is not this repository." >&2
+    echo "       Expected to find '$marker' and did not." >&2
+    exit 1
+  fi
+done
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PEER_ROOT="$REPO_ROOT/example/simply_ip_vault"
 

@@ -1434,3 +1434,122 @@ async fn s7_adversarial_dangling_lineage_written_behind_the_applications_back() 
         dangling.raw
     );
 }
+
+/// > *Creator-private entities: visible exclusively to their creator and Master. They are never
+/// > exposed by the shared-resource rule above.* (§4)
+///
+/// The Terminology table names the **Execution record** as this service's creator-private entity.
+/// This is the rule-indexed statement of it; the behavioural matrix lives next door in
+/// `s4_execution_records_are_creator_private_with_three_named_exceptions`.
+///
+/// The assertion that carries the weight is the negative one: a key holding `can_execute` on the
+/// hook — squarely inside the *shared-resource* scope — reads nothing. That is what "never exposed
+/// by the shared-resource rule" means, and it is the case a visibility filter written against hook
+/// membership would get wrong.
+#[tokio::test]
+async fn s4_a_creator_private_entity_is_not_reached_by_the_shared_resource_rule() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s4_private.sh", "#!/bin/sh\necho private\n");
+
+    let hook = insert_hook(&db, "s4_private_hook", &script, 30).await;
+    let (runner_id, runner) = insert_key(&db, "s4-runner", "", KeyScopes::plain()).await;
+    let (sharer_id, sharer) = insert_key(&db, "s4-sharer", "", KeyScopes::plain()).await;
+    grant(&db, runner_id, hook, true, false).await;
+    grant(&db, sharer_id, hook, true, false).await;
+
+    let run = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &runner, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK, "the run happens: {}", run.raw);
+    let execution = run.string("id");
+
+    // Both keys sit inside the shared-resource scope on this hook, and only one created the record.
+    let shared_hook = send(&app, json_request("GET", &format!("/api/hooks/{hook}"), &sharer, None)).await;
+    assert_eq!(shared_hook.status, StatusCode::OK, "§4: the sharer genuinely sees the hook");
+
+    let listed = send(&app, json_request("GET", "/api/executions", &sharer, None)).await;
+    assert_eq!(
+        listed.json.as_array().map(Vec::len),
+        Some(0),
+        "§4: the shared-resource rule exposed a creator-private entity: {}",
+        listed.raw
+    );
+
+    // Oracle discipline: unreadable and nonexistent must be the same answer, byte for byte.
+    let unreadable =
+        send(&app, json_request("GET", &format!("/api/executions/{execution}"), &sharer, None)).await;
+    let nonexistent = send(
+        &app,
+        json_request("GET", &format!("/api/executions/{}", Uuid::new_v4()), &sharer, None),
+    )
+    .await;
+    assert_eq!(unreadable.status, StatusCode::NOT_FOUND, "§4: not 403 — that confirms existence");
+    assert_eq!(unreadable.status, nonexistent.status, "§4: status leaks existence");
+    assert_eq!(unreadable.raw, nonexistent.raw, "§4: body leaks existence");
+
+    // The creator reads its own, or the refusals above would be indistinguishable from the endpoint
+    // being broken.
+    let own = send(&app, json_request("GET", "/api/executions", &runner, None)).await;
+    assert_eq!(own.json.as_array().map(Vec::len), Some(1), "the creator reads its own: {}", own.raw);
+}
+
+/// **§4 + the explicit grant.** `can_view_execution` is what makes an auditor expressible.
+///
+/// Before this verb, read-only access to another key's history could only be approximated by
+/// granting `can_manage` — which under R2 also means editing the hook's dispatch configuration and
+/// deleting the records. Handing out write authority to satisfy a read request is exactly the
+/// over-granting R1 exists to prevent, so the rule needed a verb rather than a workaround.
+#[tokio::test]
+async fn s4_history_access_is_grantable_without_granting_anything_else() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s4_audit.sh", "#!/bin/sh\necho audited\n");
+
+    let hook = insert_hook(&db, "s4_audit_hook", &script, 30).await;
+    let (runner_id, runner) = insert_key(&db, "s4-audit-runner", "", KeyScopes::plain()).await;
+    let (auditor_id, auditor) = insert_key(&db, "s4-auditor", "", KeyScopes::plain()).await;
+    grant(&db, runner_id, hook, true, false).await;
+    // History access alone: no execute, no manage.
+    grant_full(&db, auditor_id, hook, false, false, true).await;
+
+    let run = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook}/execute"), &runner, Some(json!({}))),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK);
+    let execution = run.string("id");
+
+    // It reads the history it was granted...
+    let listed = send(&app, json_request("GET", "/api/executions", &auditor, None)).await;
+    assert_eq!(listed.json.as_array().map(Vec::len), Some(1), "the auditor reads: {}", listed.raw);
+    assert_eq!(
+        send(&app, json_request("GET", &format!("/api/executions/{execution}"), &auditor, None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // ...and nothing else. The verb is read-only in every direction that matters.
+    for (method, uri, body, what) in [
+        ("POST", format!("/api/hooks/{hook}/execute"), Some(json!({})), "run the hook"),
+        ("POST", format!("/api/hooks/{hook}/test"), Some(json!({})), "dry-run the hook"),
+        ("PUT", format!("/api/hooks/{hook}"), Some(json!({ "description": "x" })), "edit the hook"),
+        ("DELETE", format!("/api/executions/{execution}"), None, "delete the record"),
+        ("DELETE", format!("/api/hooks/{hook}"), None, "delete the hook"),
+    ] {
+        let response = send(&app, json_request(method, &uri, &auditor, body)).await;
+        assert_ne!(
+            response.status,
+            StatusCode::OK,
+            "can_view_execution must not confer the ability to {what}: {}",
+            response.raw
+        );
+        assert_ne!(response.status, StatusCode::NO_CONTENT, "can_view_execution let it {what}");
+    }
+}

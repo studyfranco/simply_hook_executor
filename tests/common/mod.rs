@@ -583,7 +583,11 @@ where
     condition().await
 }
 
-/// Grants a key rights over a hook.
+/// Grants a key the two operational/administrative verbs over a hook.
+///
+/// `can_view_execution` is left `false`, matching the column default. Use [`grant_full`] when the
+/// test needs history access too — keeping it off here means every existing fixture keeps meaning
+/// exactly what it meant before the verb existed, rather than silently acquiring a new right.
 pub async fn grant(
     db: &DatabaseConnection,
     key_id: Uuid,
@@ -591,12 +595,25 @@ pub async fn grant(
     can_execute: bool,
     can_manage: bool,
 ) {
+    grant_full(db, key_id, hook_id, can_execute, can_manage, false).await;
+}
+
+/// Grants a key an arbitrary combination of all three hook verbs.
+pub async fn grant_full(
+    db: &DatabaseConnection,
+    key_id: Uuid,
+    hook_id: Uuid,
+    can_execute: bool,
+    can_manage: bool,
+    can_view_execution: bool,
+) {
     api_key_hook_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(key_id),
         hook_id: Set(hook_id),
         can_execute: Set(can_execute),
         can_manage: Set(can_manage),
+        can_view_execution: Set(can_view_execution),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
     .insert(db)
