@@ -504,8 +504,79 @@ rbac_rule_coverage() {
     OK=$((OK + 1))
 }
 
+# ── Adversarial coverage of infrastructure guarantees ───────────────────────
+#
+# The check above counts tests per rule. This one asks a harder question of the subset of rules that
+# are *structural*: is there a test written from the position of a caller that refuses to cooperate?
+#
+# The distinction matters because a cooperative test of a structural claim is nearly worthless. If
+# §5's uniqueness lives in a helper and the test reaches the table through that same helper, the test
+# passes for a service whose guarantee evaporates the instant a migration, a maintenance script, or a
+# psql session writes to the table. `RBAC_MODEL.md` §5 now says so directly: "A test that
+# cooperatively supplies the marker proves only that a well-behaved writer behaves well, which is not
+# what this rule is about."
+#
+# So the naming convention `<rule>_adversarial_<description>` is made load-bearing here. Application-
+# logic rules (R1-R7) are deliberately *not* listed: they govern decisions the application is the
+# only party to, so there is no "behind its back" to write from. Only guarantees that must survive an
+# uncooperative writer are required to prove they were tested by one.
+adversarial_infrastructure_coverage() {
+    local suite="$REPO_ROOT/tests/rbac_model_compliance.rs"
+
+    if [ ! -f "$suite" ]; then
+        echo "${RED}[DRIFT]${RESET} ${BOLD}Adversarial infrastructure coverage${RESET}"
+        echo "         ${DIM}tests/rbac_model_compliance.rs is missing.${RESET}"
+        DRIFT=$((DRIFT + 1))
+        return
+    fi
+
+    local names
+    names=$(grep -oE '^async fn [a-z0-9_]+' "$suite" | sed 's/^async fn //')
+
+    # Each entry is `prefix:what it must be adversarial about`. `s5` covers both the master
+    # uniqueness constraint and the payload-safety clause in the same section — the payload test is
+    # named `s5_adversarial_raw_bytes_...` because §5 is where "no payload may carry it" is written.
+    local missing=""
+    local entry prefix label
+    for entry in \
+        "s5:master uniqueness + payload safety (RBAC_MODEL.md 5)" \
+        "s7:database constraints and indexes (RBAC_MODEL.md 7)"
+    do
+        prefix="${entry%%:*}"
+        label="${entry#*:}"
+        if ! printf '%s\n' "$names" | grep -qE "^${prefix}_adversarial_"; then
+            missing="$missing\n         - ${prefix}: ${label}"
+        fi
+    done
+
+    # Payload safety is asserted separately from the section prefixes, because a suite could satisfy
+    # `s5_adversarial_` with the SQL test alone and leave the wire format entirely cooperative. This
+    # requires a test that puts *raw bytes* on the wire rather than a typed struct.
+    if ! grep -qE '^\s*(async )?fn s5_adversarial_raw_bytes' "$suite" \
+        && ! grep -q 'raw_request' "$suite"; then
+        missing="$missing\n         - payload safety: no adversarial test sends untyped request bytes"
+    fi
+
+    if [ -n "$missing" ]; then
+        echo "${RED}[DRIFT]${RESET} ${BOLD}Adversarial infrastructure coverage${RESET}"
+        echo "         ${DIM}Missing adversarial test(s):${RESET}"
+        printf "         ${DIM}%b${RESET}\n" "$missing"
+        echo "         ${DIM}Every structural guarantee needs at least one test named"
+        echo "         <rule>_adversarial_<description> that reaches the guarantee without going"
+        echo "         through the code meant to uphold it — raw SQL, or raw request bytes.${RESET}"
+        DRIFT=$((DRIFT + 1))
+        return
+    fi
+
+    local count
+    count=$(printf '%s\n' "$names" | grep -cE '^(r[1-7]|s[3-7])_adversarial_')
+    echo "${GREEN}[OK]${RESET}    ${BOLD}Adversarial infrastructure coverage${RESET} ${DIM}($count test(s))${RESET}"
+    OK=$((OK + 1))
+}
+
 rbac_model_identity
 rbac_rule_coverage
+adversarial_infrastructure_coverage
 
 echo
 echo "${DIM}$OK converged, $KNOWN known divergence(s), $DRIFT drifted, $SKIPPED skipped${RESET}"

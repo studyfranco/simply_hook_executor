@@ -3756,3 +3756,177 @@ sees every execution of it regardless of who ran it. That is a genuine new diver
 amendment, not by this phase, and closing it is a visibility change with its own §3 question (an
 execution has an acting key but no `owner_key_id` column). It is out of scope for a phase whose remit
 is R2 and is recorded here as the next candidate.
+
+---
+
+## Phase 2 — Adversarial coverage of infrastructure-level guarantees
+
+`test(rbac): add adversarial-writer coverage for infrastructure-level guarantees`
+
+No production code changed in this phase. It is entirely about what the compliance suite was
+*capable of detecting*, which the amended `RBAC_MODEL.md` §5 now states as a requirement:
+
+> *Any test asserting this constraint must attempt an adversarial write — a direct insert setting
+> `is_master` with the marker absent or NULL. A test that cooperatively supplies the marker proves
+> only that a well-behaved writer behaves well, which is not what this rule is about.*
+
+### Infrastructure guarantees vs. application-logic rules
+
+The split decides which rules need an adversarial test at all, and it is not arbitrary:
+
+**Application-logic rules — R1, R2, R3, R4, R5, R6, R7, §3, §4, §6.** These govern *decisions* that
+the application is the only party to. "May this caller grant this verb" has no meaning outside a
+request; there is no second writer to defend against, because the rule does not exist below the
+handler. An adversarial test here would be incoherent — bypassing the application means bypassing
+the rule itself, not evading an enforcement of it. Cooperative HTTP tests are the right and complete
+instrument, and these are deliberately **not** required to have `_adversarial_` variants.
+
+**Infrastructure guarantees — §5 (master uniqueness, and the payload-safety clause), §7 (constraints
+and indexes).** These are claims about what is true of the *data*, regardless of who is writing. The
+whole point of "enforced by a database constraint rather than by application logic alone" is that it
+holds when the application is not involved. A test that only ever reaches the table through the
+application therefore tests the wrong thing: it would pass identically for a service where the
+guarantee lives entirely in a helper and evaporates the moment a migration, a maintenance script, or
+a psql session writes a row.
+
+R2 sits interestingly on the line and stays in the first group: it is a decision, but the *dispatch
+configuration* it now protects is a fact about a row. It is covered cooperatively, and the row is
+re-read after each refusal to confirm the write never landed — which is the part that would catch a
+handler that refuses after writing.
+
+### Classification of the compliance suite
+
+| Test | Class | How it reaches the guarantee |
+| :--- | :--- | :--- |
+| `r1_a_caller_may_only_grant_verbs_it_holds_itself` | Cooperative | HTTP; correct — R1 is a decision |
+| `r2_neither_half_of_the_conjunction_suffices_alone` | Cooperative | HTTP |
+| `r2_daughter_cannot_repoint_script_path` | Cooperative **+ DB read-back** | Attack over HTTP; the *verification* reads the row directly, so a handler that refused after writing would still fail |
+| `r2_the_conjunction_governs_content_routes_not_only_delegation` | Cooperative | HTTP, all five routes |
+| `r2_the_conjunction_is_not_a_substitute_for_section_3_ownership` | Cooperative | HTTP |
+| `r3_a_daughter_of_the_master_has_no_elevated_standing` | Cooperative **+ direct lineage write** | `set_parent` writes `parent_key_id` behind the API, because no endpoint sets it — the *setup* is adversarial, the assertions are not |
+| `r4_only_master_grants_can_manage_keys_or_resource_creation` | Cooperative | HTTP |
+| `r5_manage_propagates_sideways_between_parents_but_never_mints_one` | Cooperative | HTTP |
+| `r6_revocation_needs_no_proof_and_both_routes_agree` | Cooperative | HTTP |
+| `r7_satisfying_one_rule_is_never_a_way_past_the_other` | Cooperative | HTTP |
+| `s3_lifecycle_is_the_owners_and_masters_alone` | Cooperative | HTTP |
+| `s4_a_shared_resource_is_not_a_keyhole_into_a_whole_configuration` | Cooperative | HTTP |
+| `s4_out_of_scope_ids_are_byte_identical_to_nonexistent_ones` | Cooperative | HTTP, byte comparison |
+| `s4_the_401_vs_403_ordering_still_holds_for_unauthenticated_callers` | Cooperative | HTTP |
+| `s5_exactly_one_master_immutable_and_undeletable` | **Adversarial by accident** | Inserts via `api_key::ActiveModel`. This bypasses the handler, but only because `master_marker` is absent from the model — SeaORM *cannot* emit the column, so the omission is the ORM's doing rather than the test's. It would read as adversarial for a service whose marker *is* on the model and quietly supplied. Kept, and now backed by tests that do not rely on that accident |
+| `s6_the_cascade_is_recursive_and_gated_on_a_total_resolution_map` | Cooperative | HTTP |
+| `s7_every_required_index_and_constraint_exists` | **Mixed** | Index presence by schema introspection (structural, not adversarial); the `key_hash` uniqueness probe inserts a duplicate through the entity layer, which is adversarial in the same accidental sense as above |
+| `s5_adversarial_direct_sql_insert_cannot_mint_a_second_master` | **Adversarial** | Raw SQL `INSERT`/`UPDATE`, no entity layer |
+| `s5_adversarial_the_marker_column_refuses_to_be_written` | **Adversarial** | Raw SQL naming `master_marker` explicitly |
+| `s5_adversarial_raw_bytes_cannot_smuggle_is_master_onto_a_key` | **Adversarial** | Hand-written `&str` bodies on the wire, no typed struct |
+| `s7_adversarial_dangling_lineage_written_behind_the_applications_back` | **Adversarial** | Raw SQL forces the dangling state the API refuses to create |
+
+Before this phase: **0 tests adversarial by construction**, 2 adversarial by accident of the entity
+layer. After: **4 by construction**, and the accidental ones are no longer load-bearing.
+
+### The four new tests, and what each would catch
+
+- **`s5_adversarial_direct_sql_insert_cannot_mint_a_second_master`** — the test that separates an
+  engine-derived marker from an application-maintained one. It writes raw SQL naming every column
+  *except* `master_marker`, exactly as an operator at a psql prompt would, then repeats the attack as
+  an `UPDATE` (a generated column recomputes; a constraint that only guards `INSERT` would pass the
+  first and fail the second). It also runs the identical statement with `is_master = false` and
+  requires it to **succeed** — without that control, a typo in the SQL would make the test pass for
+  the wrong reason forever.
+- **`s5_adversarial_the_marker_column_refuses_to_be_written`** — the precise bypass §5 describes:
+  claim mastery, supply an explicit `NULL` marker, rely on NULLs not colliding in the unique index.
+  Also asserts the marker cannot be cleared off the existing master.
+- **`s5_adversarial_raw_bytes_cannot_smuggle_is_master_onto_a_key`** — nine hand-written create
+  bodies and four update bodies, including key-ordering variants, duplicate keys (last-wins parsing
+  is a classic smuggling primitive), truthy-not-true values, nesting, and alternate spellings.
+  Expects **422**, not 403: the requirement is that the *deserializer* refuses, so no handler is left
+  to reintroduce the path. Closes with a valid body that must still return 200.
+- **`s7_adversarial_dangling_lineage_written_behind_the_applications_back`** — §7's new sentence
+  ("where a target engine cannot express a constraint in DDL, the application-level equivalent must
+  be covered by a test that runs in CI") applied to this repository's deliberate absence of foreign
+  keys on `parent_key_id` and `owner_key_id`. Raw SQL forces dangling parents, a lineage cycle, and a
+  dangling hook owner; the service must stay upright across authentication, listing, reading, and an
+  unrelated cascade. Then it asserts the write-path half: the API refuses to *create* the dangling
+  state, which is the job the foreign key would have done.
+
+### Mutation verification
+
+Every new test was proven to fail against a broken constraint, and each mutation was restored
+immediately.
+
+| # | Mutation | Expected to fail | Result |
+| :--- | :--- | :--- | :--- |
+| 1 | `master_marker` reverted to an application-maintained `VARCHAR(16) NULL` with an `UPDATE` backfill — i.e. exactly the peer service's design | both `s5_adversarial_` DB tests | **Both FAILED** ✓. `s5_exactly_one_master_immutable_and_undeletable` also failed, confirming its accidental adversarial character |
+| 2 | `#[serde(deny_unknown_fields)]` removed from all three payload types | `s5_adversarial_raw_bytes_...` | **FAILED** ✓ |
+| 3 | The `owner_key_id` existence check removed from `update_hook` | `s7_adversarial_...` | **FAILED** ✓ |
+| 4 | The `seen` cycle guard removed from `descendant_key_ids` | `s7_adversarial_...` | **SURVIVED** — see below |
+| 5 | `s7_adversarial_dangling...` renamed to `s7_dangling...` | `verify_convergence.sh` | **Exit 1**, naming the missing rule ✓ |
+
+**Mutation 4 is an equivalent mutant, not a coverage gap**, and the distinction is worth recording
+because the original code comment claims otherwise. `descendant_key_ids` walks children over
+`parent_key_id`, which is **single-valued**: a node is enqueued only via its one parent, so each node
+enters the frontier at most once, and the only way a cycle re-enters the walk is through the root —
+which the walk already filters with `*id != root`. Termination follows from the shape of the data,
+not from the `seen` set. No test can kill this mutant because it changes no behaviour. The comment on
+`seen` ("a cycle here would spin forever") **overstates**; the guard is genuine defence in depth
+against a future second lineage edge or a dropped root filter, and the test now says exactly that
+rather than implying it is catching something.
+
+Mutation 5 applies the Phase 5 discipline of mutating the *checker* — a coverage assertion that
+cannot fail is worth nothing.
+
+### Convergence checker extension
+
+`adversarial_infrastructure_coverage()` added to `scripts/verify_convergence.sh`, run alongside the
+existing rule-coverage check. It requires at least one `<rule>_adversarial_<description>` test for
+**§5** and **§7**, plus a separate assertion that some adversarial test puts *raw bytes* on the wire
+— because a suite could otherwise satisfy `s5_adversarial_` with the SQL tests alone and leave the
+wire format entirely cooperative. R1–R7 are deliberately excluded, for the reason given above: there
+is no "behind the application's back" for a rule that only exists inside it.
+
+### Cross-service gap summary (read-only inspection of `./example`)
+
+Read by `grep` only; no file under `example/` was modified. The one file with a newer mtime there is
+`RBAC_MODEL.md`, which the operator synced.
+
+Everything below is a **prediction about the peer**, made from its source, and should be verified in
+that repository rather than taken as established:
+
+1. **The peer's §5 test is cooperative, and its constraint is bypassable — the two compound.**
+   `tests/rbac_model_compliance.rs` seeds its second-master insert with
+   `master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned()))` — it hands the
+   constraint the very value that makes it fire. Combined with a `master_marker` that is a plain
+   `VARCHAR(16)` maintained by application code (`master_marker: Set(None)` on the ordinary key
+   path), the peer has a §5 guarantee that a non-cooperating writer walks straight past and a §5
+   test that cannot see it. **`s5_adversarial_direct_sql_insert_cannot_mint_a_second_master` would
+   fail against the peer today.** This is the same finding the previous audit recorded, but the
+   amended §5 now makes it a specification violation rather than a design difference, and this phase
+   supplies the test that demonstrates it.
+
+2. **The peer rejects `is_master` at the handler, not at the deserializer.** `is_master:
+   Option<bool>` remains a field on its key payload types, refused by `guard_no_master_flag` with a
+   `400`. The amended §5 addresses this directly: *"Removing the field from the payload type is
+   required; rejecting it at the handler is not sufficient, since a later handler can reintroduce
+   the path."* The peer's own reasoning for refusing rather than ignoring is good and worth keeping
+   — a caller holding a `200` and a key it wrongly believes is master is a real failure mode — but
+   the refusal belongs one layer down. No `deny_unknown_fields` appears anywhere in its `src/api.rs`,
+   so unknown fields are silently dropped and the guarantee rests entirely on that one guard being
+   called from every present and future key route.
+
+3. **The peer's compliance suite contains no raw SQL at all** (zero occurrences of
+   `execute_unprepared` or `execute_raw`), so gap 1 is structural rather than an oversight in one
+   test: nothing in that suite is positioned to test a claim about the database as a database.
+
+4. **§7 is likely fine there and is the one place the peer is ahead.** Its initial schema declares
+   real `ForeignKey::create()` constraints with `ON DELETE CASCADE`, so the referential integrity
+   this repository must uphold in application code is enforced in DDL for the peer. §7's new sentence
+   is conditional ("where a target engine cannot express a constraint in DDL") and so does not bind
+   it in the same way. Worth confirming the cascade behaviour does not conflict with §6's "data is
+   never destroyed implicitly" — a `CASCADE` on an ownership column is exactly the shape this
+   repository rejected for that reason.
+
+### Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **234 passed / 0 failed** (84 unit + 129 integration + 21 compliance) ·
+`./scripts/test_e2e.sh` **841 / 841** · `./scripts/verify_convergence.sh` exit 0, byte-identity
+check active and passing (17 converged, 1 known divergence, 0 drifted).

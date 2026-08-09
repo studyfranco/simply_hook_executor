@@ -20,7 +20,9 @@ mod common;
 
 use axum::http::StatusCode;
 use common::*;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
+};
 use sea_orm_migration::SchemaManager;
 use serde_json::json;
 use simply_hook_executor::{
@@ -1061,4 +1063,374 @@ async fn s7_every_required_index_and_constraint_exists() {
     .insert(&db)
     .await;
     assert!(clash.is_err(), "§7 violated: api_keys.key_hash is not uniquely indexed");
+}
+
+// ═════════════════════════════════════════════════════════════
+// Adversarial coverage — infrastructure-level guarantees
+// ═════════════════════════════════════════════════════════════
+//
+// Every test below is named `<rule>_adversarial_<description>`, and every one of them reaches the
+// guarantee it tests **without going through the code that is supposed to uphold it**: raw SQL
+// rather than the entity layer, raw request bytes rather than a typed payload struct.
+//
+// The distinction is the whole point, and `RBAC_MODEL.md` §5 now states it outright:
+//
+// > *Any test asserting this constraint must attempt an adversarial write — a direct insert setting
+// > `is_master` with the marker absent or NULL. A test that cooperatively supplies the marker proves
+// > only that a well-behaved writer behaves well, which is not what this rule is about.*
+//
+// A cooperative test of a structural claim is close to worthless: it exercises the same helper the
+// production path uses, so it passes for a service whose guarantee lives entirely in that helper and
+// evaporates the moment anything else writes to the table. These tests are written from the position
+// of a caller that has no interest in cooperating — a migration on another branch, a maintenance
+// script, an `INSERT` typed at a psql prompt, a curl invocation with a hand-written body.
+
+/// **§5, adversarially.** A direct SQL insert setting `is_master = true` without mentioning the
+/// marker column at all.
+///
+/// > *The uniqueness marker must be derived by the database engine from `is_master` ... An
+/// > application-maintained marker does not satisfy this rule. Any writer can set `is_master = true`
+/// > and leave the marker NULL, and NULL values do not collide in a unique index, so a second Master
+/// > is accepted.*
+///
+/// This is the test that separates the two designs, and it is deliberately written in raw SQL rather
+/// than through `api_key::ActiveModel`. Going through the entity layer would prove less than it
+/// appears to: `master_marker` is absent from the model, so SeaORM *cannot* emit it, and the insert
+/// would omit the column whether the column were generated or not. Raw SQL removes that alibi — this
+/// statement is what a maintenance script or a psql session would type, and nothing in this process
+/// gets a say in it.
+///
+/// A service whose marker is an ordinary column maintained by application code passes every
+/// cooperative §5 test and fails this one.
+#[tokio::test]
+async fn s5_adversarial_direct_sql_insert_cannot_mint_a_second_master() {
+    let db = setup_test_db().await;
+    let (_master_id, _master) = insert_key(&db, "s5-adv-master", "", KeyScopes::master()).await;
+
+    let smuggled = Uuid::new_v4();
+    let plaintext = simply_hook_executor::api::generate_random_key();
+    let key_hash = simply_hook_executor::api::hash_key(&plaintext);
+    let key_id = simply_hook_executor::api::generate_key_id();
+    let now = chrono::Utc::now().naive_utc();
+
+    // Every column named explicitly except `master_marker`, exactly as an operator writing this by
+    // hand would — they cannot name a column they do not know exists.
+    let insert = format!(
+        "INSERT INTO api_keys \
+         (id, key_hash, name, prefix, key_id, hmac_mode, bound_ips, max_concurrent_jobs, \
+          is_master, can_manage_keys, can_manage_hooks, created_at, updated_at) \
+         VALUES ('{smuggled}', '{key_hash}', 's5-adv-smuggled', 'smuggled', '{key_id}', \
+                 'CANONICAL_V1', '', 10, true, true, true, '{now}', '{now}')"
+    );
+    let refused = db.execute_unprepared(&insert).await;
+    assert!(
+        refused.is_err(),
+        "§5 violated: raw SQL minted a second master. The marker is not engine-derived — it is an \
+         ordinary column that only the application remembers to populate, which §5 names explicitly \
+         as insufficient."
+    );
+
+    // The refusal has to be the *uniqueness* constraint, not a typo in the statement above. A
+    // malformed INSERT would also return `Err`, and would make this test pass for the wrong reason
+    // forever. The same statement with `is_master = false` must succeed.
+    let ordinary = Uuid::new_v4();
+    let ordinary_hash = simply_hook_executor::api::hash_key(
+        &simply_hook_executor::api::generate_random_key(),
+    );
+    let ordinary_key_id = simply_hook_executor::api::generate_key_id();
+    db.execute_unprepared(&format!(
+        "INSERT INTO api_keys \
+         (id, key_hash, name, prefix, key_id, hmac_mode, bound_ips, max_concurrent_jobs, \
+          is_master, can_manage_keys, can_manage_hooks, created_at, updated_at) \
+         VALUES ('{ordinary}', '{ordinary_hash}', 's5-adv-ordinary', 'ordinry', \
+                 '{ordinary_key_id}', 'CANONICAL_V1', '', 10, false, false, false, '{now}', '{now}')"
+    ))
+    .await
+    .expect(
+        "the identical statement with is_master = false must succeed — otherwise the refusal above \
+         proves only that this test's SQL is malformed",
+    );
+
+    // Promotion by UPDATE is the same attack with an extra step, and a generated column recomputes
+    // on update rather than only on insert.
+    let promoted = db
+        .execute_unprepared(&format!("UPDATE api_keys SET is_master = true WHERE id = '{ordinary}'"))
+        .await;
+    assert!(
+        promoted.is_err(),
+        "§5 violated: an UPDATE promoted a second key to master. A generated marker is recomputed \
+         on update; this passing would mean the constraint only guards INSERT."
+    );
+
+    assert_eq!(
+        ApiKey::find()
+            .filter(api_key::Column::IsMaster.eq(true))
+            .all(&db)
+            .await
+            .expect("query")
+            .len(),
+        1,
+        "§5 violated: the database holds more than one master"
+    );
+}
+
+/// **§5, adversarially.** The marker is not writable, which is what makes it a constraint rather
+/// than a convention.
+///
+/// > *Because the marker is engine-derived it must not be writable: it may not appear as a settable
+/// > field on any entity, bootstrap path, fixture, or test helper.*
+///
+/// An engine-generated column rejects any attempt to supply a value for it, on every supported
+/// backend. That refusal *is* the guarantee: it is why no writer anywhere — including a future
+/// handler, a fixture, or this test — can set `is_master = true` while quietly parking the marker at
+/// `NULL` to dodge the unique index. A plain column would accept both statements below.
+#[tokio::test]
+async fn s5_adversarial_the_marker_column_refuses_to_be_written() {
+    let db = setup_test_db().await;
+    let (master_id, _master) = insert_key(&db, "s5-adv-write", "", KeyScopes::master()).await;
+
+    let now = chrono::Utc::now().naive_utc();
+    let plaintext = simply_hook_executor::api::generate_random_key();
+    let key_hash = simply_hook_executor::api::hash_key(&plaintext);
+    let key_id = simply_hook_executor::api::generate_key_id();
+
+    // The precise dodge §5 describes: claim mastery, hand the marker an explicit NULL, and rely on
+    // NULLs not colliding in a unique index.
+    let with_null_marker = db
+        .execute_unprepared(&format!(
+            "INSERT INTO api_keys \
+             (id, key_hash, name, prefix, key_id, hmac_mode, bound_ips, max_concurrent_jobs, \
+              is_master, master_marker, can_manage_keys, can_manage_hooks, created_at, updated_at) \
+             VALUES ('{}', '{key_hash}', 's5-adv-null', 'nullmrk', '{key_id}', 'CANONICAL_V1', '', \
+                     10, true, NULL, true, true, '{now}', '{now}')",
+            Uuid::new_v4()
+        ))
+        .await;
+    assert!(
+        with_null_marker.is_err(),
+        "§5 violated: a writer supplied its own NULL marker alongside is_master = true and the \
+         database accepted it. This is the exact bypass an application-maintained marker permits."
+    );
+
+    // And it cannot be cleared off the existing master either.
+    let cleared = db
+        .execute_unprepared(&format!(
+            "UPDATE api_keys SET master_marker = NULL WHERE id = '{master_id}'"
+        ))
+        .await;
+    assert!(
+        cleared.is_err(),
+        "§5 violated: the marker was cleared by hand, which would free the unique index to accept a \
+         second master"
+    );
+}
+
+/// **§5 payload safety, adversarially.** `is_master` on the wire, as bytes rather than as a struct.
+///
+/// > *`is_master` must not be settable or clearable through any API endpoint ... Removing the field
+/// > from the payload type is required; rejecting it at the handler is not sufficient, since a later
+/// > handler can reintroduce the path.*
+///
+/// Sending `json!({...})` through a typed helper is not a real test of that sentence: the field
+/// either exists on the payload struct or it does not, and if it does not, the test is asserting
+/// what the compiler already knows. These bodies are hand-written `&str` — the exact bytes a curl
+/// invocation would put on the socket, including malformed shapes a `serde_json::Value` could not
+/// represent.
+///
+/// The requirement is that the **deserializer** refuses, which is why the expected status is `422`
+/// rather than `403`: nothing in the authorization layer is consulted, so there is no handler left
+/// to reintroduce the path. `deny_unknown_fields` plus the absence of the field is what produces it.
+#[tokio::test]
+async fn s5_adversarial_raw_bytes_cannot_smuggle_is_master_onto_a_key() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (master_id, master) = insert_key(&db, "s5-adv-payload", "", KeyScopes::master()).await;
+
+    let create_bodies = [
+        r#"{"name":"smuggle","is_master":true}"#,
+        // Ordering must not matter: a deserializer that stops at the first unknown key would pass
+        // the case above and fail this one.
+        r#"{"is_master":true,"name":"smuggle"}"#,
+        // Duplicate keys — last-wins parsing is a classic smuggling primitive.
+        r#"{"name":"smuggle","is_master":false,"is_master":true}"#,
+        // Truthy-but-not-true, in case anything downstream coerces.
+        r#"{"name":"smuggle","is_master":1}"#,
+        r#"{"name":"smuggle","is_master":"true"}"#,
+        // Nested, in case a flattened struct is ever introduced.
+        r#"{"name":"smuggle","scopes":{"is_master":true}}"#,
+        // Alternate spellings, in case a rename attribute is ever added.
+        r#"{"name":"smuggle","isMaster":true}"#,
+        r#"{"name":"smuggle","IS_MASTER":true}"#,
+        // The marker itself, in case it is ever mistakenly exposed.
+        r#"{"name":"smuggle","master_marker":1}"#,
+    ];
+    for body in create_bodies {
+        let response =
+            send(&app, raw_request("POST", "/api/keys", &master, body.as_bytes().to_vec())).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "§5 violated: POST /api/keys did not refuse {body} at the deserializer: {}",
+            response.raw
+        );
+    }
+
+    // The update route is named by the same sentence and is a separate extractor.
+    let update_bodies = [
+        r#"{"is_master":true}"#,
+        r#"{"name":"renamed","is_master":true}"#,
+        // Clearing is forbidden by the same clause as setting.
+        r#"{"is_master":false}"#,
+        r#"{"master_marker":null}"#,
+    ];
+    for body in update_bodies {
+        let response = send(
+            &app,
+            raw_request("PUT", &format!("/api/keys/{master_id}"), &master, body.as_bytes().to_vec()),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "§5 violated: PUT /api/keys/{{id}} did not refuse {body} at the deserializer: {}",
+            response.raw
+        );
+    }
+
+    // Nothing landed, and the deployment still has exactly one master.
+    assert_eq!(
+        ApiKey::find()
+            .filter(api_key::Column::IsMaster.eq(true))
+            .all(&db)
+            .await
+            .expect("query")
+            .len(),
+        1,
+        "§5 violated: a smuggled payload minted a master"
+    );
+
+    // A well-formed body on the same route must still succeed, or every assertion above could be
+    // explained by the route being broken rather than by the deserializer being strict.
+    let legitimate = send(
+        &app,
+        raw_request("POST", "/api/keys", &master, br#"{"name":"legitimate"}"#.to_vec()),
+    )
+    .await;
+    assert_eq!(
+        legitimate.status,
+        StatusCode::OK,
+        "the strict extractor rejected a valid body: {}",
+        legitimate.raw
+    );
+}
+
+/// **§7, adversarially.** Referential integrity survives without DDL foreign keys.
+///
+/// > *Where a target engine cannot express a constraint in DDL (for example SQLite's lack of
+/// > `ALTER TABLE ADD CONSTRAINT` for foreign keys), the application-level equivalent must be covered
+/// > by a test that runs in CI. A constraint that holds only in production is one CI never checks.*
+///
+/// `parent_key_id` and `owner_key_id` deliberately carry **no** foreign key — see the migration's
+/// note: `CASCADE` would destroy the very resources §6 forbids destroying implicitly, and `SET NULL`
+/// would orphan them exactly when §6's inventory needs to name their owner. The integrity those
+/// constraints would have provided is therefore the application's job, and this is the CI test §7
+/// now requires of it.
+///
+/// Adversarial in the direction that matters: the dangling rows are written **by raw SQL**, so the
+/// application layer never gets the chance to prevent them and must instead survive finding them.
+#[tokio::test]
+async fn s7_adversarial_dangling_lineage_written_behind_the_applications_back() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_master_id, master) = insert_key(&db, "s7-adv-master", "", KeyScopes::master()).await;
+    let (orphan_id, orphan) = insert_key(&db, "s7-adv-orphan", "", KeyScopes::plain()).await;
+
+    // A parent that does not exist. No FK stops this, which is the premise of the test.
+    let ghost = Uuid::new_v4();
+    db.execute_unprepared(&format!(
+        "UPDATE api_keys SET parent_key_id = '{ghost}' WHERE id = '{orphan_id}'"
+    ))
+    .await
+    .expect("no foreign key prevents a dangling parent — that is precisely why §7 wants this test");
+
+    // The service must stay upright and answer, rather than 500 on a broken join or spin forever
+    // walking a lineage that leads nowhere.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &orphan, None)).await.status,
+        StatusCode::OK,
+        "§7: a dangling parent_key_id broke the orphan's own authentication path"
+    );
+    assert_eq!(
+        send(&app, json_request("GET", "/api/keys", &master, None)).await.status,
+        StatusCode::OK,
+        "§7: a dangling parent_key_id broke the key listing"
+    );
+
+    // A lineage *cycle* is the case a foreign key would not have prevented either. Note what this
+    // does and does not prove: mutation testing showed that removing the `seen` set from
+    // `descendant_key_ids` changes nothing, because `parent_key_id` is single-valued, so the only
+    // way a cycle re-enters the frontier is through the root — which the walk already filters out.
+    // Termination comes from the structure, not from the guard. This is kept as a shape regression:
+    // if the walk ever gains a second lineage edge, or drops the root filter, the guard stops being
+    // redundant and this is the test that will be here to notice.
+    let (a_id, _a) = insert_key(&db, "s7-adv-cycle-a", "", KeyScopes::plain()).await;
+    let (b_id, _b) = insert_key(&db, "s7-adv-cycle-b", "", KeyScopes::plain()).await;
+    db.execute_unprepared(&format!(
+        "UPDATE api_keys SET parent_key_id = '{b_id}' WHERE id = '{a_id}'"
+    ))
+    .await
+    .expect("cycle half one");
+    db.execute_unprepared(&format!(
+        "UPDATE api_keys SET parent_key_id = '{a_id}' WHERE id = '{b_id}'"
+    ))
+    .await
+    .expect("cycle half two");
+
+    let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+    assert_eq!(listed.status, StatusCode::OK, "§7: a parent_key_id cycle hung or broke the listing");
+
+    // Ownership is the other unconstrained column. A hook owned by a key that never existed must not
+    // become undeletable or crash the inventory §6 builds before a cascade.
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("s7_adv.sh", "#!/bin/sh\nexit 0\n");
+    let hook = insert_hook(&db, "s7_adv_hook", &script, 30).await;
+    db.execute_unprepared(&format!(
+        "UPDATE hooks SET owner_key_id = '{ghost}' WHERE id = '{hook}'"
+    ))
+    .await
+    .expect("no foreign key prevents a dangling owner either");
+
+    assert_eq!(
+        send(&app, json_request("GET", &format!("/api/hooks/{hook}"), &master, None)).await.status,
+        StatusCode::OK,
+        "§7: a dangling owner_key_id broke reading the hook"
+    );
+    assert_eq!(
+        send(&app, json_request("DELETE", &format!("/api/keys/{orphan_id}"), &master, None))
+            .await
+            .status,
+        StatusCode::NO_CONTENT,
+        "§7: a dangling owner elsewhere in the table broke an unrelated cascade"
+    );
+
+    // The application-level equivalent of the FK, on the write path: the API refuses to *create* the
+    // dangling state the raw SQL above forced. This is the half a foreign key would have done, and
+    // the half that has to be tested because there is no foreign key to do it.
+    let dangling = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook}"),
+            &master,
+            Some(json!({ "owner_key_id": Uuid::new_v4().to_string() })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        dangling.status,
+        StatusCode::BAD_REQUEST,
+        "§7: the API accepted an owner_key_id naming no existing key, so nothing enforces \
+         referential integrity on this column at all: {}",
+        dangling.raw
+    );
 }
