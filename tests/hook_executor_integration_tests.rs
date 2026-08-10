@@ -4140,7 +4140,6 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
         parent_key_id: Set(None),
-        owner_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
         created_at: Set(now),

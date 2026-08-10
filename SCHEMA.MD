@@ -56,10 +56,29 @@ Stores authentication keys, global scopes, and network restrictions.
 | `master_marker` | Integer | **GENERATED**, NULLABLE, UNIQUE (`idx_api_keys_master_marker`) | `1` when `is_master`, `NULL` otherwise — the database-level guarantee that exactly one master exists (`RBAC_MODEL.md` §5). Absent from `api_key::Model` on purpose: SeaORM builds explicit column lists from the entity, so an undeclared column never appears in an `INSERT`, which is required since the engine rejects writes to a generated column. See the note below. |
 | `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage **other** API keys. Explicitly *not* the right to grant global scopes, to administer a key that is itself `is_master`, or to alter the caller's own hook permissions — all three are master-only, or the scope would be self-amplifying and thus equivalent to `is_master`. |
 | `parent_key_id` | UUID / String | NULLABLE, INDEXED (`idx_api_keys_parent_key_id`) | The key that created this one. **Lineage only — never authority** (`RBAC_MODEL.md` R3): it exists for cascading deletion and visibility scoping, and no authorization decision may read it. A daughter of the master is an ordinary daughter. `NULL` for the bootstrap master and for keys predating lineage. |
-| `owner_key_id` | UUID / String | NULLABLE, INDEXED (`idx_api_keys_owner_key_id`) | The key answerable for this one. Set to the creator at creation and thereafter free to diverge from lineage: §6's inventory reports it as `current_owner`, while the subtree walk producing that inventory follows `parent_key_id`. |
 | `can_manage_hooks` | Boolean | NOT NULL, DEFAULT `false` | Global right to create hooks (creation auto-provisions a full permission row on the new hook and records the creator as its `owner_key_id`). Never confers rights over a hook created by someone else, and never over a hook carrying `run_as_user`. **Nor does it confer the right to edit what it created:** every later edit is governed by `RBAC_MODEL.md` R2, whose global half is `can_manage_keys` — a resource-creation right and a resource-management right are separate powers and neither implies the other (§1). A key that must both define and maintain hooks holds both flags, and both are Master-granted only (R4). |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
+
+> **Removed in `m20260810_000001`: `api_keys.owner_key_id`.** It was added alongside
+> `hooks.owner_key_id` on the symmetric assumption that if a hook has an owner, a key might as well.
+> It was **write-only** for its whole life — set to the creator at creation, and read by no guard, no
+> query, no response, and no page of the dashboard.
+>
+> The reason is structural rather than an oversight: `RBAC_MODEL.md` §3 scopes ownership to "every
+> managed resource and every creator-private entity", and §2's glossary makes the managed resource in
+> this service the **Hook**. An API key is neither, so there was never a rule for the column to
+> implement — who may administer a key is decided by §4 visibility and R4, which read `parent_key_id`
+> and `can_manage_keys`. `simply_ip_vault` has never had the column.
+>
+> A populated column no rule consults is worse than an absent one: it reads as an authorization input
+> to anyone auditing the schema, and invites a future handler to start treating it as one — creating a
+> second, unspecified key-to-key relationship beside the `parent_key_id` lineage §6 actually walks.
+> `s7_every_required_index_and_constraint_exists` now asserts its **absence**, so re-adding it has to
+> argue with a red test first.
+>
+> **`hooks.owner_key_id` is untouched and remains load-bearing** — it is §3's resource owner and gates
+> lifecycle actions. The two columns are easy to confuse and only one of them ever did anything.
 
 #### Master uniqueness (`master_marker`)
 

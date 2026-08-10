@@ -479,8 +479,8 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 
 | File | Table | Note |
 | :--- | :--- | :--- |
-| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. Also defines `HmacMode` |
-| `hook.rs` | `hooks` | Carries `owner_key_id` (§3) and the soft-delete columns |
+| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_000001`. Also defines `HmacMode` |
+| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
 | `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus` |
@@ -502,10 +502,19 @@ one that has shipped.
 | `m20230104_000001_add_hmac_mode` | `api_keys.hmac_mode` |
 | `m20230105_000001_add_hook_soft_delete` | The trash columns on `hooks` |
 | `m20230106_000001_master_key_uniqueness` | `api_keys.master_marker` — **§5's engine-derived generated column** |
-| `m20230107_000001_key_lineage_and_resource_ownership` | `parent_key_id`, `owner_key_id`, and §7's indexes |
+| `m20230107_000001_key_lineage_and_resource_ownership` | `parent_key_id`, `owner_key_id` (on both `api_keys` and `hooks`), and §7's indexes |
 | `m20260809_000001_add_can_view_execution` | The third permission verb |
+| `m20260810_000001_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
 
-**`m20230106` is the second of the two files permitted to contain raw SQL.** SeaORM's `ColumnDef` has
+`m20260810` is the only migration so far that **removes** something, and the reasoning is worth
+keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the
+symmetric assumption that if a hook has an owner then a key might as well. Only the hook column ever
+meant anything — `RBAC_MODEL.md` §3 scopes ownership to managed resources and creator-private
+entities, and a key is neither. The key column was write-only for its whole life.
+`s7_every_required_index_and_constraint_exists` now asserts its absence *and* the hook column's
+presence, so neither the removal nor its limit can drift.
+
+**`m20230106` is the second of the three files permitted to contain raw SQL.** SeaORM's `ColumnDef` has
 no generated-column support at all, and §5 requires the marker to be engine-derived rather than
 application-maintained. The storage keyword is dialect-dependent — `STORED` for PostgreSQL (which
 gained `VIRTUAL` only in 18), `VIRTUAL` for SQLite (which permits only that on an added column) and

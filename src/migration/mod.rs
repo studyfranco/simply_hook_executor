@@ -10,6 +10,7 @@ mod m20230105_000001_add_hook_soft_delete;
 mod m20230106_000001_master_key_uniqueness;
 mod m20230107_000001_key_lineage_and_resource_ownership;
 mod m20260809_000001_add_can_view_execution;
+mod m20260810_000001_drop_api_key_owner_key_id;
 
 /// The ordered set of all schema migrations for `simply_hook_executor`.
 pub struct Migrator;
@@ -26,6 +27,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20230106_000001_master_key_uniqueness::Migration),
             Box::new(m20230107_000001_key_lineage_and_resource_ownership::Migration),
             Box::new(m20260809_000001_add_can_view_execution::Migration),
+            Box::new(m20260810_000001_drop_api_key_owner_key_id::Migration),
         ]
     }
 }

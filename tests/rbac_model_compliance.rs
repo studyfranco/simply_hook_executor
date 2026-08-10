@@ -890,7 +890,6 @@ async fn s5_exactly_one_master_immutable_and_undeletable() {
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
         parent_key_id: Set(None),
-        owner_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
         created_at: Set(now),
@@ -1025,8 +1024,18 @@ async fn s7_every_required_index_and_constraint_exists() {
     for (table, index) in [
         // §5's master-uniqueness constraint, as the portable generated-column form.
         ("api_keys", "idx_api_keys_master_marker"),
+        // §7's `parent_key_id` — the column §6's subtree walk recurses on, once per level.
         ("api_keys", "idx_api_keys_parent_key_id"),
-        ("api_keys", "idx_api_keys_owner_key_id"),
+        // §7's `owner_key_id`. **This is the only one**, and the reading is load-bearing: §3 says
+        // "every managed resource and every creator-private entity carries an `owner_key_id`", and
+        // §2's glossary makes the managed resource in this service the **Hook**. An API key is
+        // neither a managed resource nor a creator-private entity, so §7 never required an
+        // `api_keys.owner_key_id` index — there was never a column for it to require.
+        //
+        // `api_keys.owner_key_id` did exist, dormant and never read, and was dropped by
+        // `m20260810_000001`. This list previously asserted its index; that assertion was over-strict
+        // rather than normative, and removing it is a correction to the test, not a relaxation of §7.
+        // The check immediately below is what stops that being a convenient story.
         ("hooks", "idx_hooks_owner_key_id"),
     ] {
         assert!(
@@ -1034,6 +1043,27 @@ async fn s7_every_required_index_and_constraint_exists() {
             "§7 violated: {table}.{index} is missing"
         );
     }
+
+    // The dormant column is gone and must stay gone. Asserted rather than assumed, because "we
+    // dropped it" and "it is absent from a freshly-migrated database" are different claims — a
+    // migration registered out of order, or omitted from `Migrator::migrations()`, would leave the
+    // column present while every other test passed.
+    //
+    // This also pins the alignment with `simply_ip_vault`, which has never had the column: a future
+    // migration re-adding an ownership notion for *keys* would be introducing a second, unspecified
+    // relationship alongside the `parent_key_id` lineage §6 actually walks, and should have to argue
+    // with a red test first.
+    assert!(
+        !manager.has_column("api_keys", "owner_key_id").await.expect("column lookup succeeds"),
+        "api_keys.owner_key_id is back. §3 scopes ownership to managed resources and \
+         creator-private entities; a key is neither, and `parent_key_id` is the only key-to-key \
+         relationship the model defines"
+    );
+    // ...while the resource column it is often confused with is untouched and still load-bearing.
+    assert!(
+        manager.has_column("hooks", "owner_key_id").await.expect("column lookup succeeds"),
+        "§3 violated: hooks.owner_key_id is the managed resource's owner and gates lifecycle actions"
+    );
 
     // The key-hash lookup column and the permission-table join columns predate this work and carry
     // unique indexes from the initial migration. Asserted by *behaviour* rather than by name,
@@ -1054,7 +1084,6 @@ async fn s7_every_required_index_and_constraint_exists() {
         max_concurrent_jobs: Set(10),
         is_master: Set(false),
         parent_key_id: Set(None),
-        owner_key_id: Set(None),
         can_manage_keys: Set(false),
         can_manage_hooks: Set(false),
         created_at: Set(now),

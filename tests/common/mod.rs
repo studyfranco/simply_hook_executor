@@ -262,7 +262,6 @@ pub async fn insert_key_with_mode(
         // parent must never change how a key behaves. Tests that care about the subtree set it
         // explicitly via [`set_parent`].
         parent_key_id: Set(None),
-        owner_key_id: Set(None),
         can_manage_keys: Set(scopes.can_manage_keys),
         can_manage_hooks: Set(scopes.can_manage_hooks),
         created_at: Set(now),

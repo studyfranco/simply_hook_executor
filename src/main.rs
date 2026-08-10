@@ -117,7 +117,6 @@ async fn bootstrap_master_key(
         // that harmless — lineage confers no authority, so a NULL parent is not a missing
         // privilege, and every key the master goes on to create records the master as its parent.
         parent_key_id: Set(None),
-        owner_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
         created_at: Set(now),

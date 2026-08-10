@@ -514,7 +514,6 @@ pub async fn create_api_key(
         // reassign ownership (§3) — but lineage never changes, because §6's cascade has to be able
         // to answer "which keys came from this one" long after custody has moved.
         parent_key_id: Set(Some(key.id)),
-        owner_key_id: Set(Some(key.id)),
         can_manage_keys: Set(payload.can_manage_keys.unwrap_or(false)),
         can_manage_hooks: Set(payload.can_manage_hooks.unwrap_or(false)),
         created_at: Set(now),

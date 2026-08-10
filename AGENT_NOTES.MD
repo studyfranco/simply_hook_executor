@@ -4891,3 +4891,203 @@ No test changed. That is the expected outcome for a pure relocation, and it is a
 the suite can say about this change: the compliance suite tests behaviour, and behaviour is
 identical. The claim this commit actually makes — that only one domain consumes these — is checked by
 the compiler via the private visibility, not by a test.
+
+---
+
+# Session — drop dormant `api_keys.owner_key_id`, R2 position of record, structural audit
+
+Driven by `SECURITY_COMPARISON_REPORT.md`. **That report audits `b5cf624`, which is seven commits
+behind HEAD**, and one of its two findings acted on here has already been fixed in the interim. Both
+premises were checked against the running code before anything was written; one held and one did not.
+
+## 1. `api_keys.owner_key_id` dropped — premise held
+
+### Verification first, because two columns share the name
+
+`owner_key_id` exists on **two** tables and only one of them means anything. Dropping the wrong one
+would remove §3's entire ownership mechanism, so the distinction was established mechanically rather
+than by reading:
+
+| Column | `Column::OwnerKeyId` in queries | Read by | Verdict |
+| :--- | :--- | :--- | :--- |
+| `hooks.owner_key_id` | 3 sites (`guards.rs` ×2, `keys.rs` ×1) | `require_manage` route 2, `require_lifecycle_authority`, `visible_hook_ids`, §6 inventory | **Load-bearing — untouched** |
+| `api_keys.owner_key_id` | **0** | Nothing: no guard, no query, no response DTO, no dashboard reference | **Dormant — dropped** |
+
+The key column was written at creation (`create_api_key`, the caller's id) and at bootstrap (NULL),
+and never read again. Every `owner_key_id` reference in `guards.rs` and `hooks.rs` is the *hook*
+column.
+
+### Why it was dormant, structurally
+
+`RBAC_MODEL.md` §3 scopes ownership to "every managed resource and every creator-private entity", and
+§2's glossary makes the managed resource in this service the **Hook**. An API key is neither. Who may
+administer a key is decided by §4 visibility (`load_administrable_key`) and R4 — both reading
+`parent_key_id` and `can_manage_keys`. There was never a rule for `api_keys.owner_key_id` to
+implement, which is exactly why nothing read it. `simply_ip_vault` has never had the column, and this
+brings the two schemas to parity.
+
+### The §7 compliance test caught the drop, and was itself wrong
+
+`s7_every_required_index_and_constraint_exists` failed, asserting `idx_api_keys_owner_key_id` must
+exist. §7 does say *"Indexes on `parent_key_id`, `owner_key_id`, …"* — so the failure forced the
+question of **which** `owner_key_id` §7 means.
+
+It means the one §3 mandates, on managed resources and creator-private entities. In this service that
+is `hooks.owner_key_id`, whose index is present and asserted. The test's expectation was over-strict:
+it asserted an index on a column the specification never required, because the column happened to
+exist. Removing that one row is a **correction to the test, not a relaxation of §7** — and to stop
+that being a convenient story, the test now additionally asserts:
+
+- `api_keys.owner_key_id` is **absent** (so a migration registered out of order, or omitted from
+  `Migrator::migrations()`, is caught rather than passing silently), and
+- `hooks.owner_key_id` is **present** (so the drop cannot be widened to the column that matters).
+
+### Migration
+
+`m20260810_000001_drop_api_key_owner_key_id` drops the index first, then the column — the order is
+required on PostgreSQL and MySQL, and SQLite tolerates either, so following only SQLite would have
+shipped a migration that fails on the backends nothing tests.
+
+**It is not reversible with data.** `down()` restores the column, its nullability and its index, all
+NULL. That is honest rather than lossless, and it costs nothing real: no endpoint could ever set the
+column to anything other than the creator id that `parent_key_id` already holds, so nothing
+recoverable is lost. Verified by round-trip against a file-backed database:
+
+```
+AFTER UP   api_keys.owner_key_id = false   hooks.owner_key_id = true   idx_hooks_owner = true
+AFTER DOWN api_keys.owner_key_id = true    idx_api_keys_owner = true
+AFTER REUP api_keys.owner_key_id = false
+```
+
+## 2. R2 — the position of record
+
+**The task asked for a specific claim to be documented as an accepted risk: that a Daughter key
+holding a `can_manage` row can edit a hook's `script_path`. Against HEAD that claim is false, and it
+is not documented here, because writing it down would tell every future auditor to stop looking at
+something that is actually defended.**
+
+The report is right about `b5cf624`. Commit `79156ce fix(rbac): enforce R2 conjunction on
+require_manage and dispatch configuration` landed afterwards.
+`require_hook_manage_conjunction` now demands **both** `can_manage_keys` and `row.can_manage`, and
+`r2_daughter_cannot_repoint_script_path` has guarded it since. Measured against HEAD:
+
+| Caller | Holds | `PUT /api/hooks/{id}` `script_path` |
+| :--- | :--- | :--- |
+| **A** — Daughter, not owner | `can_manage` row, no `can_manage_keys` | **403** — *the report's scenario; closed* |
+| **B** — Daughter, **owner** | owns the hook, no row, no `can_manage_keys` | **200, and the path changes** |
+| **C** — Parent | `can_manage_keys` + `can_manage` row | 200 — correct per R2 |
+
+### The real accepted risk is route B, and it is a different thing
+
+`require_manage` short-circuits on `hook.owner_key_id == Some(key.id)` **before** reaching the
+conjunction. So a Daughter that owns a hook may repoint its `script_path` while holding no global
+scope at all.
+
+This is intentional — introduced deliberately in `9a1c499` so a `can_manage_hooks` holder can maintain
+the hooks it created — and it is a **genuine deviation from the model as written**, not merely an
+edge case. §2's Dispatch-configuration clause is explicit that where dispatch config lives on a shared
+managed resource, "editing it is a management action on that resource and is **governed by R2 in
+full**". §3 grants the owner authority over *lifecycle* — deleting or renaming — and says nothing
+about dispatch configuration. Route B therefore exercises an authority §3 does not confer over a field
+§2 assigns to R2.
+
+**Accepted, with the reasoning stated rather than assumed:**
+
+- The alternative is worse in practice. Without route B, a `can_manage_hooks` Daughter can create a
+  hook and then never touch it again — not even to fix a typo in the path it just wrote. Every
+  maintenance action would need a Parent, which pushes deployments toward handing out
+  `can_manage_keys` far more widely than R2 intends, weakening the conjunction everywhere to preserve
+  it here.
+- The blast radius is bounded by ownership, which is not delegable: `hooks.owner_key_id` is set at
+  creation and reassignable **only by master** (§3). A Daughter cannot acquire ownership of a hook it
+  did not create, so route B never widens beyond what that key already introduced.
+- `require_master_for_privileged_hook` still makes any hook carrying `run_as_user` master-only to
+  modify, so route B cannot reach an elevated hook.
+
+**What is *not* claimed:** that `ALLOWED_SCRIPT_ROOTS` mitigates this. It defaults to empty, meaning
+unrestricted, and `src/config.rs` logs a warning saying so. In a default deployment the confinement is
+absent, and the report was right to say so. The bound here is ownership, not path confinement.
+
+**No guard code was modified for this point, per instruction.** The genuinely correct fix is the one
+the report identifies architecturally: split `can_manage` into administrative and content verbs as
+`simply_ip_vault` did, so "edit dispatch config" becomes an operational verb the tier matrix governs
+directly. That is a schema and API change, recorded here as the standing recommendation rather than
+attempted.
+
+## 3. Structural and naming audit vs `simply_ip_vault`
+
+**The peer has moved toward us since the last audit**, which is worth recording because the previous
+entry describes a layout that no longer exists on their side.
+
+### Module-level parity — now essentially complete
+
+| Module | Peer | Ours | Status |
+| :--- | :--- | :--- | :--- |
+| `src/master.rs` | 320 | 291 | **Converged** — peer extracted it from `state.rs`; it used to be ours-only |
+| `src/api/support.rs` | 260 | 399 | **Converged** — peer extracted it from `api/mod.rs`; also used to be ours-only |
+| `src/api/system.rs` | 97 | 101 | **Converged** — peer added it |
+| `src/api/audit.rs` | 54 | 78 | **Converged** — we added it last commit |
+| `src/db.rs`, `crypto.rs`, `error.rs`, `config.rs`, `replay.rs`, `retention.rs`, `middleware.rs`, `state.rs` | ✓ | ✓ | Converged |
+| `src/api/guards.rs` | ✓ | ✓ | Both a single cross-domain module |
+| `src/executor.rs` | — | ours | **Domain difference** — we spawn processes; they dispatch HTTP (`dispatch.rs`, `webhooks.rs`) |
+| `src/extract.rs` | theirs | folded into `api/support.rs` | Placement difference, no behavioural gap |
+| `src/api/health.rs` | **absent — theirs are in `api/system.rs`** | ours, 102 | Divergent placement, see below |
+
+Every structural finding from the earlier audit is now closed **except** `extract.rs` placement, which
+is cosmetic, and the health-probe placement introduced this week on both sides independently.
+
+### The probes: same names, different file, and one thing not copied
+
+Both services added liveness/readiness independently and arrived at **identical handler names** —
+`health_check` and `readiness_check` — which is the strongest naming-convergence signal in the two
+codebases. Three differences:
+
+1. **Placement.** Theirs sit in `api/system.rs`; ours are in `api/health.rs`. **Keeping ours.** Our
+   `system.rs` is authenticated and master-only; putting the only two unauthenticated routes in the
+   service inside it would destroy the property that makes that file easy to audit.
+2. **`"database": "ok"` vs our `"up"`.** Cosmetic, and the two services never poll each other's
+   probes. Not converged; recorded so it is a decision rather than an oversight.
+3. **The peer's readiness body includes `"master_pinned": true`** — and it is a **hardcoded literal**,
+   not a computed value. **Deliberately not copied.** It discloses internal security posture on an
+   endpoint reachable without credentials, and because it is a constant it would be uninformative even
+   to an operator. This is the one place our probe is tighter than theirs.
+
+### Naming audit — aligned in shape, divergent in prefix, and **not** mass-renamed
+
+| Concept | Peer | Ours | Assessment |
+| :--- | :--- | :--- | :--- |
+| Delegation bound | `guard_delegated_group_grant` | `guard_delegated_hook_grant` | **Aligned** — differs only by the domain noun, correctly |
+| Liveness / readiness | `health_check`, `readiness_check` | same | **Aligned** |
+| R2 conjunction | `guard_group_manage` | `require_hook_manage_conjunction` | Prefix + explicitness differ |
+| §3 lifecycle | `guard_resource_lifecycle` | `require_lifecycle_authority` | Prefix differs |
+| R4 scope elevation | `guard_scope_elevation` | `require_master_to_grant_scopes` | Prefix differs |
+| Master immutability | `guard_master_immutable` | `require_master_self_edit_is_bound_ips_only` | Ours is more specific |
+| Master as target | `guard_master_target` | `refuse_master_lifecycle_action` | Prefix differs |
+| Any-manage standing | `holds_any_group_manage` | `manages_any_hook` | Aligned in shape |
+| Permission fetch | `caller_group_permission` | `hook_permission` | Aligned in shape |
+| R6 classification | `widens_permissions` | `is_permission_reduction` | **Inverse polarity** |
+
+The peer uses a `guard_*` prefix; we use `require_*` for enforcing guards and `is_*`/verb forms for
+predicates. **No renames were performed, and the audit's conclusion is that they should not be:**
+
+- The prefix is a convention difference with no behavioural content, and
+  `scripts/verify_convergence.sh` does not compare guard names — it compares the three functions where
+  a *behavioural* difference would change what each service authenticates.
+- Renaming `is_permission_reduction` → `widens_permissions` is **not a rename**: the two predicates
+  are logical inverses, so every call site's branch would have to invert. That is a correctness-risky
+  edit to R6 enforcement bought purely with cosmetics, and it is the single most likely way to
+  introduce a real vulnerability while "aligning naming".
+- Our names encode the resource (`hook`) where the peer's encode theirs (`group`). Those *should*
+  differ; a shared name would be actively misleading.
+
+Task 3 asked to *verify* naming alignment. The verification result is: aligned where alignment is
+meaningful, divergent in prefix convention, and one apparent rename is a semantic change in disguise.
+Acting on that would exceed an audit, so it is recorded as a decision to be taken deliberately if the
+prefix convention is ever judged worth the churn.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **275 passed / 0 failed** · `./scripts/test_e2e.sh` **886 / 886** ·
+`./scripts/verify_convergence.sh` exit 0 — 19 converged, 0 known, 0 drifted, 0 skipped ·
+`git diff RBAC_MODEL.md` empty · `SECURITY_COMPARISON_REPORT.md` unmodified.
