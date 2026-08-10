@@ -1,13 +1,29 @@
-//! Every authorization decision in the API layer.
+//! Every **cross-domain** authorization decision in the API layer.
 //!
-//! One module, deliberately, because the rules in `RBAC_MODEL.md` are cross-cutting: R2's
+//! One module, deliberately, because most rules in `RBAC_MODEL.md` are cross-cutting: R2's
 //! conjunction governs hooks, parameters and execution records alike, and §3's ownership test is
-//! consulted from three different handler domains. Splitting them by *caller* would put the same
+//! consulted from three different handler domains. Splitting *those* by caller would put the same
 //! sentence of the specification in three files and invite the three copies to drift.
 //!
 //! The organising principle is that a guard answers "may this caller do this", returns
 //! `Result<_, AppError>`, and never writes anything. Helpers that merely fetch or format live in
 //! [`super::support`].
+//!
+//! # The one exception, and the test it has to pass
+//!
+//! §4's **key-subtree** visibility — `KeyVisibility`, `descendant_key_ids`, `managed_hook_ids`,
+//! `key_visibility`, `load_administrable_key` — lives in [`super::keys`] instead. It qualified on a
+//! criterion the rest of this file fails: it is consulted by exactly **one** domain, and the five
+//! form a closed cluster calling only each other, so moving them cannot scatter a rule across files.
+//! They are now module-private there, which is the compiler holding that claim rather than a comment
+//! asking future editors to.
+//!
+//! Note what did *not* move with it. §4 also governs **hook** visibility — `require_visibility`,
+//! `visible_hook_ids`, `execution_visible_hook_ids` — and those stay here, because three domains
+//! consult them. A single section of the specification is therefore split across two files, which is
+//! the cost; it is accepted because the split follows the number of consumers rather than the
+//! section numbering, and "one domain uses it" is a property a test can check while "it feels
+//! related" is not. The boundary is stated in `AGENT.MD` §0.
 //!
 //! § and R references throughout are to `RBAC_MODEL.md`, which is normative.
 
@@ -670,131 +686,17 @@ pub(crate) async fn require_hook_manage_conjunction(
     Ok(row)
 }
 
-/// How much of a key another key is entitled to see (`RBAC_MODEL.md` §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyVisibility {
-    /// **Own subtree.** "A parent sees its own key subtree in full, minus raw secrets — its
-    /// daughters, their granted rights, and their bound IPs." Also covers the caller itself.
-    Full,
-    /// **Shared resource, minimal form.** "A parent sees, in minimal form only, any key holding a
-    /// permission row on a resource it manages: id, name, and that key's rights on that resource
-    /// alone. Global flags, bound IPs, and unrelated resource memberships remain hidden."
-    ///
-    /// The sentence that gives this scope its shape is the next one: "A single shared resource must
-    /// never become a keyhole into another parent's whole configuration."
-    Minimal,
-}
-
-/// Every key descended from `root`, transitively, **excluding `root` itself**.
-///
-/// Breadth-first over `parent_key_id`, one indexed query per level rather than one per key. The
-/// `seen` set is not an optimization: `parent_key_id` carries no database-level constraint
-/// preventing a cycle (see the migration's note on why there is no FK), and a cycle here would spin
-/// forever inside a request handler.
-pub(crate) async fn descendant_key_ids(
-    db: &sea_orm::DatabaseConnection,
-    root: Uuid,
-) -> Result<Vec<Uuid>, AppError> {
-    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    let mut frontier = vec![root];
-
-    while !frontier.is_empty() {
-        let children: Vec<Uuid> = ApiKey::find()
-            .filter(api_key::Column::ParentKeyId.is_in(frontier.clone()))
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|k| k.id)
-            .collect();
-
-        frontier = children.into_iter().filter(|id| *id != root && seen.insert(*id)).collect();
-    }
-
-    Ok(seen.into_iter().collect())
-}
-
-/// The hooks this key holds a `can_manage` row on — the resources whose *other* holders it is
-/// entitled to see in minimal form.
-pub(crate) async fn managed_hook_ids(
-    db: &sea_orm::DatabaseConnection,
-    key_id: Uuid,
-) -> Result<Vec<Uuid>, AppError> {
-    Ok(ApiKeyHookPermission::find()
-        .filter(api_key_hook_permission::Column::ApiKeyId.eq(key_id))
-        .filter(api_key_hook_permission::Column::CanManage.eq(true))
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|p| p.hook_id)
-        .collect())
-}
-
-/// How much of `target` the caller may see, or `None` for "not visible at all".
-///
-/// `None` is the answer that has to be handled carefully by every caller: under §4's oracle
-/// discipline it must produce exactly what a nonexistent id produces, never a `403` that confirms
-/// the id is real.
-pub(crate) async fn key_visibility(
-    db: &sea_orm::DatabaseConnection,
-    caller: &api_key::Model,
-    target: &api_key::Model,
-) -> Result<Option<KeyVisibility>, AppError> {
-    // "Master: full visibility over all keys, resources, dispatch targets, and configuration."
-    if caller.is_master || caller.id == target.id {
-        return Ok(Some(KeyVisibility::Full));
-    }
-
-    // Own subtree, transitively. Note this reads `parent_key_id` for *visibility scoping*, which is
-    // the one use R3 explicitly sanctions — "`parent_key_id` exists solely for cascading deletion
-    // and visibility scoping" — and never to decide whether an action is permitted.
-    if descendant_key_ids(db, caller.id).await?.contains(&target.id) {
-        return Ok(Some(KeyVisibility::Full));
-    }
-
-    // Shared resource: does the target hold a row on any hook the caller manages?
-    let managed = managed_hook_ids(db, caller.id).await?;
-    if !managed.is_empty() {
-        let shares = ApiKeyHookPermission::find()
-            .filter(api_key_hook_permission::Column::ApiKeyId.eq(target.id))
-            .filter(api_key_hook_permission::Column::HookId.is_in(managed))
-            .one(db)
-            .await?
-            .is_some();
-        if shares {
-            return Ok(Some(KeyVisibility::Minimal));
-        }
-    }
-
-    Ok(None)
-}
-
-/// Loads a key the caller is entitled to *administer*, or `404`.
-///
-/// Administering the key entity — updating, deleting, rotating it — needs
-/// [`KeyVisibility::Full`]: the caller's own subtree, or master. A key met only through a shared
-/// resource is visible in minimal form and is **not** administrable; §4 gives that scope precisely
-/// "id, name, and that key's rights on that resource alone", which is a window, not a handle.
-///
-/// Every refusal is `404`, matching what a key id that does not exist produces. A `403` here would
-/// turn `PUT /api/keys/{uuid}` into a key-enumeration oracle for any `can_manage_keys` holder.
-pub(crate) async fn load_administrable_key(
-    db: &sea_orm::DatabaseConnection,
-    caller: &api_key::Model,
-    id: Uuid,
-) -> Result<api_key::Model, AppError> {
-    let target = ApiKey::find_by_id(id).one(db).await?.ok_or(AppError::NotFound)?;
-    match key_visibility(db, caller, &target).await? {
-        Some(KeyVisibility::Full) => Ok(target),
-        _ => {
-            tracing::warn!(
-                key = %caller.prefix,
-                target = %id,
-                "§4: key outside the caller's administrable scope; refused as nonexistent"
-            );
-            Err(AppError::NotFound)
-        }
-    }
-}
+// ── §4 key-subtree visibility lives in `super::keys` ─────────────────────────
+//
+// `KeyVisibility`, `descendant_key_ids`, `managed_hook_ids`, `key_visibility` and
+// `load_administrable_key` were here and moved to `src/api/keys.rs`. They answer "how much of
+// *another key* may this caller see", which is a question only the key handlers ask — every one of
+// their call sites outside this file was in `keys.rs`, and they formed a closed cluster calling only
+// each other. See `AGENT.MD` §0 for the boundary this draws, and `AGENT_NOTES.MD` for the audit.
+//
+// What stays here is everything cross-domain, including the §4 *hook* visibility rules
+// (`require_visibility`, `visible_hook_ids`, `execution_visible_hook_ids`), which three domains
+// consult. Splitting those would be the drift this module exists as one file to prevent.
 
 /// **§3 — resource lifecycle authority.** Authorizes deleting or renaming a hook.
 ///

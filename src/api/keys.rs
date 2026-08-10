@@ -7,6 +7,20 @@
 //!
 //! Also holds the §6 cascade: deleting a key walks its subtree, inventories everything those keys
 //! own, and refuses until the caller resolves each entity explicitly.
+//!
+//! # Why the §4 key-visibility helpers live here rather than in [`super::guards`]
+//!
+//! `guards.rs` is one module because `RBAC_MODEL.md`'s rules are cross-cutting and splitting one by
+//! caller would put a single sentence of the specification in three files. §4's *key-subtree*
+//! visibility is the one part that does not fit that argument: it is consulted by exactly one domain
+//! — this one — and `KeyVisibility`, `descendant_key_ids`, `managed_hook_ids`, `key_visibility` and
+//! `load_administrable_key` form a closed cluster calling only each other. Moving them therefore
+//! cannot scatter a rule; it just puts it where its only consumer is.
+//!
+//! All five are **module-private**, which is what makes "only this domain uses it" a fact the
+//! compiler checks rather than a claim in a comment. If a second domain ever needs one, the build
+//! breaks and the choice becomes explicit: widen the visibility and accept that it is cross-domain
+//! after all, or move the cluster back. Both are better than it drifting.
 
 use axum::{
     Extension,
@@ -30,15 +44,155 @@ use crate::state::AppState;
 
 
 use super::guards::{
-    guard_delegated_hook_grant, has_permission_admin_standing, is_permission_reduction,
-    key_visibility, load_administrable_key, descendant_key_ids, refuse_master_lifecycle_action,
-    require_hook_manage_conjunction, require_master_for_privileged_hook, require_master_self_edit_is_bound_ips_only,
-    require_master_to_administer, require_master_to_grant_scopes, hook_permission, managed_hook_ids,
+    guard_delegated_hook_grant, has_permission_admin_standing, hook_permission,
+    is_permission_reduction, refuse_master_lifecycle_action, require_hook_manage_conjunction,
+    require_master_for_privileged_hook, require_master_self_edit_is_bound_ips_only,
+    require_master_to_administer, require_master_to_grant_scopes,
 };
 use super::support::{
     OptionalStrictJson, StrictJson, create_audit_log, describe_hmac_mode, format_reference, generate_random_key, hash_key,
     mint_signing_pair, resolve_hook, validate_bound_ips, validate_concurrency,
 };
+
+// ─────────────────────────────────────────────────────────────
+// §4 key-subtree visibility
+// ─────────────────────────────────────────────────────────────
+//
+// "How much of *another key* may this caller see" — see the module header for why these are here
+// and not in `guards.rs`, and `AGENT.MD` §0 for the boundary it draws.
+//
+// They are authorization logic and are held to `guards.rs`'s discipline regardless of which file
+// they sit in: each returns `Result<_, AppError>`, none writes anything, and the `None`/`404` answer
+// is §4's oracle discipline — it must be indistinguishable from what a nonexistent id produces, so
+// every caller propagates it unchanged rather than turning it into a `403`.
+//
+// §4's *hook* visibility deliberately stayed in `guards.rs`: three domains consult it.
+
+/// How much of a key another key is entitled to see (`RBAC_MODEL.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyVisibility {
+    /// **Own subtree.** "A parent sees its own key subtree in full, minus raw secrets — its
+    /// daughters, their granted rights, and their bound IPs." Also covers the caller itself.
+    Full,
+    /// **Shared resource, minimal form.** "A parent sees, in minimal form only, any key holding a
+    /// permission row on a resource it manages: id, name, and that key's rights on that resource
+    /// alone. Global flags, bound IPs, and unrelated resource memberships remain hidden."
+    ///
+    /// The sentence that gives this scope its shape is the next one: "A single shared resource must
+    /// never become a keyhole into another parent's whole configuration."
+    Minimal,
+}
+
+/// Every key descended from `root`, transitively, **excluding `root` itself**.
+///
+/// Breadth-first over `parent_key_id`, one indexed query per level rather than one per key. The
+/// `seen` set is not an optimization: `parent_key_id` carries no database-level constraint
+/// preventing a cycle (see the migration's note on why there is no FK), and a cycle here would spin
+/// forever inside a request handler.
+async fn descendant_key_ids(
+    db: &sea_orm::DatabaseConnection,
+    root: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut frontier = vec![root];
+
+    while !frontier.is_empty() {
+        let children: Vec<Uuid> = ApiKey::find()
+            .filter(api_key::Column::ParentKeyId.is_in(frontier.clone()))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|k| k.id)
+            .collect();
+
+        frontier = children.into_iter().filter(|id| *id != root && seen.insert(*id)).collect();
+    }
+
+    Ok(seen.into_iter().collect())
+}
+
+/// The hooks this key holds a `can_manage` row on — the resources whose *other* holders it is
+/// entitled to see in minimal form.
+async fn managed_hook_ids(
+    db: &sea_orm::DatabaseConnection,
+    key_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    Ok(ApiKeyHookPermission::find()
+        .filter(api_key_hook_permission::Column::ApiKeyId.eq(key_id))
+        .filter(api_key_hook_permission::Column::CanManage.eq(true))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| p.hook_id)
+        .collect())
+}
+
+/// How much of `target` the caller may see, or `None` for "not visible at all".
+///
+/// `None` is the answer that has to be handled carefully by every caller: under §4's oracle
+/// discipline it must produce exactly what a nonexistent id produces, never a `403` that confirms
+/// the id is real.
+async fn key_visibility(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    target: &api_key::Model,
+) -> Result<Option<KeyVisibility>, AppError> {
+    // "Master: full visibility over all keys, resources, dispatch targets, and configuration."
+    if caller.is_master || caller.id == target.id {
+        return Ok(Some(KeyVisibility::Full));
+    }
+
+    // Own subtree, transitively. Note this reads `parent_key_id` for *visibility scoping*, which is
+    // the one use R3 explicitly sanctions — "`parent_key_id` exists solely for cascading deletion
+    // and visibility scoping" — and never to decide whether an action is permitted.
+    if descendant_key_ids(db, caller.id).await?.contains(&target.id) {
+        return Ok(Some(KeyVisibility::Full));
+    }
+
+    // Shared resource: does the target hold a row on any hook the caller manages?
+    let managed = managed_hook_ids(db, caller.id).await?;
+    if !managed.is_empty() {
+        let shares = ApiKeyHookPermission::find()
+            .filter(api_key_hook_permission::Column::ApiKeyId.eq(target.id))
+            .filter(api_key_hook_permission::Column::HookId.is_in(managed))
+            .one(db)
+            .await?
+            .is_some();
+        if shares {
+            return Ok(Some(KeyVisibility::Minimal));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Loads a key the caller is entitled to *administer*, or `404`.
+///
+/// Administering the key entity — updating, deleting, rotating it — needs
+/// [`KeyVisibility::Full`]: the caller's own subtree, or master. A key met only through a shared
+/// resource is visible in minimal form and is **not** administrable; §4 gives that scope precisely
+/// "id, name, and that key's rights on that resource alone", which is a window, not a handle.
+///
+/// Every refusal is `404`, matching what a key id that does not exist produces. A `403` here would
+/// turn `PUT /api/keys/{uuid}` into a key-enumeration oracle for any `can_manage_keys` holder.
+async fn load_administrable_key(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    id: Uuid,
+) -> Result<api_key::Model, AppError> {
+    let target = ApiKey::find_by_id(id).one(db).await?.ok_or(AppError::NotFound)?;
+    match key_visibility(db, caller, &target).await? {
+        Some(KeyVisibility::Full) => Ok(target),
+        _ => {
+            tracing::warn!(
+                key = %caller.prefix,
+                target = %id,
+                "§4: key outside the caller's administrable scope; refused as nonexistent"
+            );
+            Err(AppError::NotFound)
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // Auth

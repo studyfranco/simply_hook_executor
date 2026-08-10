@@ -302,10 +302,11 @@ The credential primitives are `pub` because `tests/common/mod.rs` mints keys dir
 database, hashing a plaintext exactly as the service would — the only way to seed a key whose secret
 the test already knows.
 
-### `src/api/guards.rs` — 1,030 lines
+### `src/api/guards.rs` — 932 lines
 
-**Role & scope.** Every authorization decision in the API layer. **Must not write anything.** A guard
-answers "may this caller do this", returns `Result<_, AppError>`, and mutates no state.
+**Role & scope.** Every **cross-domain** authorization decision in the API layer. **Must not write
+anything.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no
+state. §4's *key-subtree* visibility is the one exception and lives in `api/keys.rs` — see below.
 
 **Key exports.**
 
@@ -320,7 +321,7 @@ answers "may this caller do this", returns `Result<_, AppError>`, and mutates no
 | §3 lifecycle | `require_lifecycle_authority` |
 | §4 hook visibility | `require_visibility`, `visible_hook_ids`, `verb_denied` |
 | §4 execution visibility | `may_read_execution`, `execution_visible_hook_ids` |
-| §4 key visibility | `key_visibility`, `descendant_key_ids`, `managed_hook_ids`, `load_administrable_key` |
+| §4 key-subtree visibility | **moved to `api/keys.rs`** — single-consumer exception, `AGENT.MD` §0 |
 | §5 master protection | `refuse_master_lifecycle_action`, `require_master_self_edit_is_bound_ips_only` |
 | Privilege elevation | `normalize_run_as_user`, `require_master_for_privileged_hook` |
 | Execute verb | `require_execute` |
@@ -333,6 +334,14 @@ would put a single sentence of the specification in three files and invite the c
 which is precisely the failure the compliance suite exists to catch, and therefore must not be
 designed in.
 
+**The single-consumer exception.** §4's key-subtree visibility (`KeyVisibility`,
+`descendant_key_ids`, `managed_hook_ids`, `key_visibility`, `load_administrable_key`) moved to
+`api/keys.rs` because it satisfies both halves of the rule in `AGENT.MD` §0: exactly one domain calls
+it, and the five form a closed cluster calling only each other, so relocating them cannot split a
+rule across files. They are module-private there, which makes the single-consumer claim something the
+compiler checks. §4's *hook* visibility stayed here — three domains consult it — so one §4 is split
+across two files. That is the accepted cost of counting consumers rather than section numbers.
+
 Two ordering rules inside this file are load-bearing:
 
 - `require_manage` checks **ownership before the conjunction**, because the conjunction answers `404`
@@ -342,13 +351,17 @@ Two ordering rules inside this file are load-bearing:
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,102 lines
+### `src/api/keys.rs` — 1,256 lines
 
-**Role & scope.** API key lifecycle, caller identity, per-hook grants, and the §6 cascade.
+**Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
+**key-subtree** visibility.
 
 **Key exports.** `get_me`, `create_api_key`, `list_api_keys`, `update_api_key`, `delete_api_key`,
 `rotate_api_key`, `update_key_hook_permissions`, `revoke_key_hook_permission`; `HookPermissionView`,
 `MeResponse`, `ApiKeySummary`, `MinimalApiKeyView`, `collect_subtree_inventory`.
+
+**Module-private** (deliberately not exported): `KeyVisibility`, `descendant_key_ids`,
+`managed_hook_ids`, `key_visibility`, `load_administrable_key`.
 
 **Rationale.** `get_me` lives here rather than in an `auth.rs` because it shares both its view type
 (`HookPermissionView`) and its loader (`load_hook_permissions`) with the key listing — a separate
@@ -358,6 +371,14 @@ hold" is the same question in both places. **The peer service made the same choi
 `delete_api_key` returns `axum::response::Response` rather than a typed body because §6 requires two
 different shapes: `204` on success, `409` with a structured inventory when the subtree owns entities
 the caller must resolve first.
+
+**The §4 key-visibility cluster lives here**, not in `guards.rs`, under the single-consumer exception
+in `AGENT.MD` §0: every call site is in this file, and the five call only each other. All five are
+module-private, so a second domain needing one breaks the build and forces an explicit decision
+rather than letting the boundary erode. They keep `guards.rs`'s discipline regardless of file —
+returning `Result<_, AppError>`, writing nothing, and preserving §4 oracle discipline, where a
+`None`/`404` must be indistinguishable from a nonexistent id and is propagated rather than converted
+to a `403`.
 
 ### `src/api/hooks.rs` — 892 lines
 
@@ -505,6 +526,8 @@ A quick index for the questions that send people to the wrong file:
 | Looking for | It is in | Not in |
 | :--- | :--- | :--- |
 | "May this caller do X?" | `api/guards.rs` | the handler modules |
+| "How much of another *key* may I see?" | `api/keys.rs` (module-private) | `api/guards.rs` — moved, see `AGENT.MD` §0 |
+| "How much of a *hook* may I see?" | `api/guards.rs` | `api/hooks.rs` — three domains consult it |
 | "Who is this caller?" | `middleware.rs` | `api/guards.rs` |
 | "Which key is the Master?" | `master.rs` | `api/guards.rs`, `state.rs` |
 | "What may the Master do?" | `api/guards.rs` | `master.rs` |

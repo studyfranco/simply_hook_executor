@@ -42,8 +42,8 @@ To keep this context clean and modular, responsibilities are split across three 
 | :--- | :--- | :--- |
 | `api/mod.rs` | Module wiring, router-facing re-exports, shared policy constants | Every handler is re-exported here, so `api::create_hook` resolves as it always did and `src/lib.rs`'s router is untouched by the layout |
 | `api/support.rs` | Shared plumbing used by three or more domains — audit-log writing, hook resolution, parameter loading, validation, formatting — plus the strict JSON extractors | **Decides nothing.** Nothing here returns a refusal that depends on *who* is calling. A helper that starts deciding moves to `guards` |
-| `api/guards.rs` | Every authorization decision: hook verbs, R2's conjunction, master guards, §3 lifecycle, key visibility, delegation bounds | **Writes nothing.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no state |
-| `api/keys.rs` | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade | Identity lives with keys because it shares its view types with the key listing |
+| `api/guards.rs` | Every **cross-domain** authorization decision: hook verbs, R2's conjunction, master guards, §3 lifecycle, §4 *hook* visibility, delegation bounds | **Writes nothing.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no state |
+| `api/keys.rs` | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade, and §4 **key-subtree** visibility | Identity lives with keys because it shares its view types with the key listing. The visibility helpers live here by the single-consumer rule below, and are module-private |
 | `api/hooks.rs` | Hook definitions, parameter contracts, trash/restore/purge | What a hook *is*, not what happens when one fires |
 | `api/executions.rs` | Triggering hooks, and reading the records that result | Together because they share `ExecutionView` and nothing else does |
 | `api/audit.rs` | Reads over `audit_logs` | Master-only. **Reads only** — writing an entry is `support::create_audit_log`, called from every mutating handler |
@@ -51,6 +51,21 @@ To keep this context clean and modular, responsibilities are split across three 
 | `api/health.rs` | Liveness and readiness probes | **The only unauthenticated routes in the service.** Must disclose nothing an anonymous caller could not already infer |
 
 **`guards` is one module, not one per domain, and must stay that way.** `RBAC_MODEL.md`'s rules are cross-cutting: R2's conjunction governs hooks, parameters and execution records alike, and §3's ownership test is consulted from three domains. Splitting guards by caller would put a single sentence of the specification in three files and invite the copies to drift — which is the exact failure the compliance suite exists to catch, and so must not be designed in.
+
+#### The single-consumer exception
+
+An authorization helper belongs in its domain module rather than in `guards.rs` when **both** of these hold, and it belongs in `guards.rs` otherwise:
+
+1. **Exactly one handler domain calls it**, and
+2. **it is part of a closed cluster** — the group calls only itself and things outside the cluster call only the group's entry points — so relocating it cannot leave one rule split across two files.
+
+Today that describes exactly one group: §4's **key-subtree** visibility — `KeyVisibility`, `descendant_key_ids`, `managed_hook_ids`, `key_visibility`, `load_administrable_key` — which lives in `api/keys.rs`.
+
+Three constraints make the exception safe rather than a hole:
+
+- **The relocated helpers are module-private.** That is what makes "only this domain uses it" a fact the compiler checks rather than a claim in a comment. A second domain needing one breaks the build, forcing an explicit choice — widen the visibility and accept it is cross-domain after all, or move the cluster back — instead of letting it drift.
+- **They keep `guards.rs`'s discipline wherever they live:** return `Result<_, AppError>`, write nothing, and preserve §4 oracle discipline (a `None`/`404` must be indistinguishable from what a nonexistent id produces, so callers propagate it rather than converting it to a `403`).
+- **"Feels related" is not criterion 1.** The rule counts consumers, because that is checkable. §4's *hook* visibility (`require_visibility`, `visible_hook_ids`, `execution_visible_hook_ids`) is the same section of the specification and stays in `guards.rs`, because three domains consult it. **One §4 is therefore split across two files.** That is the accepted cost of following consumer count rather than section numbering; the alternative — grouping by section — is the taste-based split that lets a rule get copied.
 
 Outside `src/api/`, one boundary is a rule for the same reason:
 

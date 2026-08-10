@@ -4804,3 +4804,90 @@ That is a rule change, not a refactor, and it was not in this session's scope.
 7 health + 6 referential integrity) · `./scripts/test_e2e.sh` **886 / 886** ·
 `./scripts/verify_convergence.sh` exit 0 — **19 converged, 0 known divergences, 0 drifted, 0
 skipped** · `git diff RBAC_MODEL.md` empty.
+
+---
+
+# Session — P2: §4 key-subtree visibility moved to `api/keys.rs`
+
+The last item from the audit's prioritized proposal, and the one deferred twice because it needed a
+rule change rather than a refactor. Following `2897b80`.
+
+## What moved
+
+`KeyVisibility`, `descendant_key_ids`, `managed_hook_ids`, `key_visibility` and
+`load_administrable_key` moved from `src/api/guards.rs` to `src/api/keys.rs`. `guards.rs` 1,030 →
+932 lines; `keys.rs` 1,102 → 1,256.
+
+**`KeyVisibility` moved too, though the task named only the four functions.** It is
+`key_visibility`'s return type and has no other use anywhere in the crate. Leaving the enum behind
+while its producer and both its consumers moved would have been worse than either placement — a type
+in one file whose entire reason to exist is in another.
+
+## Verifying the premise before acting on it
+
+The task asserted these are "exclusively consumed by key handlers". Checked rather than assumed:
+
+```
+key_visibility          → guards.rs:786 (self), keys.rs:923
+descendant_key_ids      → guards.rs:750 (self), keys.rs:414, keys.rs:622
+managed_hook_ids        → guards.rs:755 (self), keys.rs:419
+load_administrable_key  → keys.rs:484, keys.rs:692, keys.rs:831
+```
+
+Every reference outside `guards.rs` is in `keys.rs`, and every reference *inside* `guards.rs` is one
+cluster member calling another (`key_visibility` uses the two id-collectors; `load_administrable_key`
+uses `key_visibility`). So the five form a **closed cluster**: nothing outside calls into its
+middle, and it calls nothing outside itself. That is what makes the move safe — a group with an
+external caller in a third domain could not have moved without splitting a rule.
+
+## They are now module-private, and that is the substance of the change
+
+All five dropped from `pub(crate)`/`pub` to private. This is not tidying: it converts "only the key
+domain uses these" from a claim in a comment into **a fact the compiler checks**. If a second domain
+ever needs one, the build breaks and forces an explicit decision — widen the visibility and accept it
+is cross-domain after all, or move the cluster back — instead of the boundary eroding one `use` at a
+time, which is exactly how `guards.rs` would have become a junk drawer.
+
+`KeyVisibility` was `pub` and therefore nominally part of the crate's public API; it is now private.
+Nothing outside the crate could meaningfully have used it (it is an internal RBAC classification with
+no public constructor), and no test referenced it.
+
+## The rule this needed, and its honest cost
+
+`AGENT.MD` §0 said `guards.rs` holds **every** authorization decision. That sentence had to change,
+and the risk in changing it is that "some guards live elsewhere" becomes a licence to scatter them.
+So the amendment is a *test*, not a permission — a helper leaves `guards.rs` only when **both** hold:
+
+1. exactly one handler domain calls it, **and**
+2. it is part of a closed cluster, so relocating cannot leave one rule split across two files.
+
+Criterion 1 counts consumers because that is checkable. "Feels related to keys" is not a criterion,
+deliberately — it is the taste-based split that lets a rule get copied.
+
+**The cost is stated rather than hidden: one section of the specification is now split across two
+files.** §4 governs both key-subtree visibility (moved) and hook visibility —
+`require_visibility`, `visible_hook_ids`, `execution_visible_hook_ids` — which stayed, because three
+domains consult it. A reader looking for "§4" now finds it in two places. That is accepted because
+the split follows consumer count rather than section numbering; grouping by section number would have
+moved the hook helpers too, and put one rule in three callers' reach across two files, which is the
+drift `guards.rs` exists as one module to prevent. Both module headers say this explicitly, and
+`FILE_MAP.MD`'s "Where things are *not*" index now distinguishes the two §4 questions.
+
+## Reversal of an earlier position
+
+The previous session recorded P2 as blocked: *"all-or-nothing … and requires amending `AGENT.MD`'s
+'`guards.rs` holds every authorization decision' rule. That is a rule change, not a refactor."* Both
+halves were right; neither was a reason not to do it once the rule change was in scope. The
+all-or-nothing part is why `KeyVisibility` went along with the four.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **275 passed / 0 failed** · `./scripts/test_e2e.sh` **886 / 886** ·
+`./scripts/verify_convergence.sh` exit 0 — 19 converged, 0 known, 0 drifted, 0 skipped ·
+`git diff RBAC_MODEL.md` empty.
+
+No test changed. That is the expected outcome for a pure relocation, and it is also the limit of what
+the suite can say about this change: the compliance suite tests behaviour, and behaviour is
+identical. The claim this commit actually makes — that only one domain consumes these — is checked by
+the compiler via the private visibility, not by a test.

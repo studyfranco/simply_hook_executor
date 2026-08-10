@@ -424,7 +424,7 @@ src/
 ├── api/
 │   ├── mod.rs              Module wiring, router-facing re-exports, policy constants
 │   ├── support.rs          Shared plumbing — audit writes, hook resolution, validation. Decides nothing
-│   ├── guards.rs           Every authorization decision (RBAC_MODEL.md R1–R7, §3–§5). Writes nothing
+│   ├── guards.rs           Cross-domain authorization decisions (RBAC_MODEL.md R1–R7, §3–§5). Writes nothing
 │   ├── keys.rs             Key CRUD, GET /api/auth/me, per-hook grants, cascade deletion
 │   ├── hooks.rs            Hook definitions, parameter contracts, trash/restore/purge
 │   ├── executions.rs       Triggering hooks, and reading the execution records
@@ -442,7 +442,9 @@ Two boundaries in `src/api/` are rules rather than conventions, and both are sta
 - **`guards.rs` writes nothing**, and is one module rather than one per domain. The rules it enforces
   are cross-cutting — R2's conjunction governs hooks, parameters and execution records alike — so
   splitting it by caller would put one sentence of the specification in three files and invite the
-  copies to drift.
+  copies to drift. The one exception is §4's **key-subtree** visibility, which lives in `keys.rs`
+  because exactly one domain calls it and it forms a closed cluster; it is module-private there, so
+  the compiler enforces that rather than a comment.
 - **`crypto.rs` holds the primitives; `middleware.rs` holds the policy.** Nothing in `crypto.rs`
   touches the database, the request, or `AppError` — it returns a `SignatureRejection` and lets the
   middleware decide which failures become `401` and which become `500`.
