@@ -4,13 +4,11 @@
 use std::net::SocketAddr;
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
-    EntityTrait, QueryFilter,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
-use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
-    api, config, config::RuntimeConfig, create_app, crypto, db, entities, migration,
-    spawn_retention_worker, state::AppState,
+    api, config, config::RuntimeConfig, create_app, crypto, db, entities, spawn_retention_worker,
+    state::AppState,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -101,7 +99,7 @@ async fn bootstrap_master_key(
     // The bootstrap key gets a full signing pair too, so webhook signature auth is usable
     // immediately rather than requiring a rotation first.
     let key_id = api::generate_key_id();
-    let signing_secret = api::generate_signing_secret();
+    let signing_secret = crypto::generate_signing_secret();
 
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -252,9 +250,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "sqlite://simply_hook_executor.db?mode=rwc".to_owned());
 
     tracing::info!("Connecting to database...");
-    let mut opt = ConnectOptions::new(db_url);
-    opt.sqlx_logging_level(log::LevelFilter::Debug);
-    let db: DatabaseConnection = Database::connect(opt).await?;
+    // `db::connect` rather than `Database::connect`: for SQLite it builds the pool from
+    // `SqliteConnectOptions`, which is the only place the per-connection pragmas can be declared
+    // such that a connection SQLx opens or recycles *later* inherits them. `apply_sqlite_pragmas`
+    // below then reports what actually took effect. Other backends take the plain path unchanged.
+    let db: DatabaseConnection = db::connect(&db_url).await?;
 
     // Before migrations: the migration run is itself a long write, and is exactly the moment a
     // concurrently-starting replica would otherwise hit SQLITE_BUSY.
@@ -271,8 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    tracing::info!("Running database migrations...");
-    migration::Migrator::up(&db, None).await?;
+    db::run_migrations(&db).await?;
 
     // Built before the bootstrap key is minted, since that key's signing secret is sealed with it.
     // A malformed SIGNING_SECRET_KEY stops startup here rather than silently degrading to writing

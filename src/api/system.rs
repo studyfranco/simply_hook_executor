@@ -1,71 +1,28 @@
-//! Master-only introspection: the audit trail and the effective runtime configuration.
+//! Operational introspection: the effective runtime configuration and instance counters.
 //!
-//! Named `system` rather than `audit` because it is not only the audit log — `GET /api/settings`
-//! reports the resolved configuration, which is a different subject with the same audience. A file
-//! called `audit.rs` whose second half is settings sends the next reader to the wrong place.
+//! # What is *not* here
+//!
+//! The audit trail was the other half of this module until it moved to [`super::audit`]. The two
+//! shared an audience — both are master-only — and nothing else: this one reports a configuration
+//! struct fixed at startup plus three `COUNT(*)`s, while the audit log is a growing table with
+//! query surface still to come. Grouping by audience would eventually pull most of the
+//! administrative API into one file.
+//!
+//! Health and readiness probes are not here either, despite sounding like the same subject. They
+//! are unauthenticated and mounted outside the `/api` tree, so they live in [`super::health`] where
+//! that difference is visible from the filename rather than buried in a router line.
 
 use axum::{
     Extension,
-    extract::{Json, Query, State},
+    extract::{Json, State},
     response::IntoResponse,
 };
-use sea_orm::{
-    ColumnTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect,
-};
-use serde::{Deserialize, Serialize};
+use sea_orm::{EntityTrait, PaginatorTrait};
+use serde::Serialize;
 
-use crate::entities::{
-    api_key, audit_log, prelude::*,
-};
+use crate::entities::{api_key, prelude::*};
 use crate::error::AppError;
 use crate::state::AppState;
-
-use super::DEFAULT_PAGE_LIMIT;
-
-// ─────────────────────────────────────────────────────────────
-// Audit logs & system settings
-// ─────────────────────────────────────────────────────────────
-
-/// Query parameters for the audit log listing.
-#[derive(Deserialize)]
-pub struct AuditLogQuery {
-    /// Filter by exact action type (e.g. `HOOK_EXECUTE`).
-    pub action: Option<String>,
-    /// Pagination limit.
-    pub limit: Option<u64>,
-    /// Pagination offset.
-    pub offset: Option<u64>,
-}
-
-/// Handles `GET /api/audit-logs`.
-///
-/// Restricted to master keys: audit entries span every key and hook in the system, so a scoped key
-/// reading them would be an RBAC leak regardless of its own grants.
-pub async fn list_audit_logs(
-    State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
-    Query(query): Query<AuditLogQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden(
-            "Only master keys can view audit logs".to_owned(),
-        ));
-    }
-
-    let mut q = AuditLog::find().order_by_desc(audit_log::Column::Timestamp);
-    if let Some(action) = query.action.as_deref().filter(|a| !a.is_empty()) {
-        q = q.filter(audit_log::Column::Action.eq(action));
-    }
-
-    let logs = q
-        .limit(query.limit.unwrap_or(DEFAULT_PAGE_LIMIT))
-        .offset(query.offset.unwrap_or(0))
-        .all(&state.db)
-        .await?;
-
-    Ok(Json(logs))
-}
 
 /// The runtime configuration and instance counters shown on the System Settings tab.
 #[derive(Serialize)]

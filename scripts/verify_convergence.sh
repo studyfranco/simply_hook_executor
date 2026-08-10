@@ -328,23 +328,53 @@ compare "X-Forwarded-For chain walk" \
 
 # No divergence is accepted in the signed material. A difference here means a signature one service
 # issues is not one the other verifies.
+#
+# Both sides now name this `canonical_v1_payload` in `src/crypto.rs`. This service used to call it
+# `signature_base` and keep it in `src/middleware.rs`; it moved when the HMAC primitives were
+# extracted, and the two repositories converged on the peer's name and location rather than the
+# normalizer continuing to paper over the difference. The `signature_base` alias stays in
+# `normalize()` regardless: it costs nothing and it means this check keeps working when run against
+# an older checkout.
 compare "Signature canonicalization" \
-    "src/middleware.rs" "signature_base" \
+    "src/crypto.rs" "canonical_v1_payload" \
     "src/crypto.rs" "canonical_v1_payload" \
     "-" \
     ""
 
-# KNOWN-2, re-baselined. The original rationale ("peer aborts startup on pragma failure") is no
-# longer true: the peer converged on non-fatal and went one better, returning `()` so the function
-# is *structurally* incapable of aborting, where ours returns a `Result` its caller logs and
-# swallows. Same two pragmas, same values, same outcome; what differs now is the return type and
-# the log wording. Recorded rather than reconciled because adopting `()` would be a signature change
-# for no behavioural gain — worth doing on the next pass that touches this file, not on its own.
+# KNOWN-2, re-baselined twice.
+#
+# The original rationale ("peer aborts startup on pragma failure") stopped being true when the peer
+# converged on non-fatal. The *path* then went stale too: the peer has since moved
+# `apply_sqlite_pragmas` out of `src/state.rs` and into `src/db.rs`, which is where ours has always
+# lived — so the two now agree on the file as well as the behaviour, and the lookup below follows it.
+#
+# This is what a skip is for. The check did not silently pass against a function it could no longer
+# find; it refused to report anything and failed the run, which is how the move was noticed at all.
+#
+# **KNOWN-2 is now retired: this entry is converged.**
+#
+# The last baseline recorded a genuine gap — the peer's pragma set had grown to include
+# `foreign_keys=ON` and `synchronous=NORMAL` while ours set only `journal_mode=WAL` and
+# `busy_timeout`. That gap is closed: `apply_sqlite_pragmas` now issues all four, and `db::connect`
+# additionally declares them through `SqliteConnectOptions` so a connection SQLx recycles inherits
+# them.
+#
+# One claim attached to the old baseline was **wrong and is corrected here**: it stated that the six
+# foreign keys declared in `m20230101_000001_initial_schema` were therefore *inert* on SQLite. They
+# were not. SQLx enables foreign keys on every SQLite connection it opens, so they have always been
+# enforced — `PRAGMA foreign_keys` reads back `1` on a bare `Database::connect`, and an orphan insert
+# is refused with `(code: 787) FOREIGN KEY constraint failed`. Setting the pragma explicitly is
+# therefore hardening (a defaulted security-relevant setting is one a dependency can revise in a
+# point release, silently), not a repair. `tests/referential_integrity.rs` now pins the behaviour
+# itself rather than the pragma, and was mutation-verified: five of its six tests go red with
+# `foreign_keys=OFF`.
+#
+# The fingerprint argument is retained but no longer reached, since the two functions compare equal.
 compare "SQLite pragma initialization" \
     "src/db.rs" "apply_sqlite_pragmas" \
-    "src/state.rs" "apply_sqlite_pragmas" \
-    "3743579462" \
-    "Peer returns (); ours returns Result and the caller swallows it. Both non-fatal — cosmetic."
+    "src/db.rs" "apply_sqlite_pragmas" \
+    "3377969800" \
+    "Retired: both services now apply the same four pragmas. Any match here is a regression."
 
 # KNOWN-3 is retired: the peer adopted the 3 MiB ceiling and now derives its signature buffer from
 # the same constant. Both sides declare it explicitly, so this compares equal by value.
@@ -391,12 +421,21 @@ assert_absent "Replay digests are not compared as text" \
 
 # MAC comparison goes through `Mac::verify_slice`, which is constant-time. A `==` on the decoded
 # digest or the hex string leaks the expected signature a byte at a time under timing observation.
-assert_absent "Signature comparison is constant-time" \
+#
+# Both now point at `src/crypto.rs`, which is where this service's HMAC moved to. The absence check
+# is deliberately still run against `src/middleware.rs` as well: the primitive moved, but the
+# middleware is exactly where someone would reintroduce a hand-rolled comparison "just to check the
+# header first", and a rule that stopped looking there would not notice.
+assert_absent "Signature comparison is constant-time (crypto)" \
+    "src/crypto.rs" \
+    'expected_?[Ss]ig[a-z_]* *== |signature *== *expected|\.eq\(&?expected_signature\)' \
+    "Comparing MACs with == leaks the signature byte by byte; use Mac::verify_slice."
+assert_absent "Signature comparison is constant-time (middleware)" \
     "src/middleware.rs" \
     'expected_?[Ss]ig[a-z_]* *== |signature *== *expected|\.eq\(&?expected_signature\)' \
     "Comparing MACs with == leaks the signature byte by byte; use Mac::verify_slice."
 assert_present "Signature verification uses verify_slice" \
-    "src/middleware.rs" \
+    "src/crypto.rs" \
     'verify_slice' \
     "The constant-time comparison is what makes the HMAC check safe to expose to an attacker."
 

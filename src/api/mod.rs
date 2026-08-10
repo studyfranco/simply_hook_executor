@@ -17,7 +17,9 @@
 //! | [`keys`] | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade |
 //! | [`hooks`] | Hook definitions, parameter contracts, trash/restore/purge |
 //! | [`executions`] | Triggering hooks, and reading the records that result |
-//! | [`system`] | Audit log and settings — master-only introspection |
+//! | [`system`] | The effective configuration and instance counters — master-only |
+//! | [`audit`] | Reads over the audit trail — master-only |
+//! | [`health`] | Liveness and readiness probes. **The only unauthenticated routes in the service** |
 //!
 //! **`guards` is one module rather than one per domain on purpose.** The rules in `RBAC_MODEL.md`
 //! are cross-cutting: R2's conjunction governs hooks, parameters and execution records alike, and
@@ -36,8 +38,10 @@
 //! refactor that forces every call site to change is a refactor whose blast radius is impossible to
 //! review.
 
+pub mod audit;
 pub mod executions;
 pub mod guards;
+pub mod health;
 pub mod hooks;
 pub mod keys;
 pub mod support;
@@ -61,12 +65,18 @@ pub use keys::{
     create_api_key, delete_api_key, get_me, list_api_keys, revoke_key_hook_permission,
     rotate_api_key, update_api_key, update_key_hook_permissions,
 };
-pub use system::{get_settings, list_audit_logs};
+pub use audit::list_audit_logs;
+pub use health::{health_check, readiness_check};
+pub use system::get_settings;
 
 // The credential primitives are public because the test suite mints keys directly against the
 // database — `tests/common/mod.rs` hashes a plaintext exactly as the service would, which is the
 // only way to seed a key whose secret the test already knows.
-pub use support::{generate_key_id, generate_random_key, generate_signing_secret, hash_key};
+//
+// `generate_signing_secret` is **not** among them, and its absence is the point: it lives in
+// `crate::crypto` beside the HMAC that consumes it. Re-exporting it here would recreate exactly the
+// "where do I find the crypto?" ambiguity moving it was meant to remove.
+pub use support::{generate_key_id, generate_random_key, hash_key};
 
 // ── Shared constants ─────────────────────────────────────────────────────────
 //

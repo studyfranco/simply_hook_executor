@@ -281,3 +281,68 @@ Stored as a plain string (portable across SQLite/PostgreSQL/MySQL), selected **p
 - **`Hook` -> `HookParameter`**: HasMany (`hook_id`)
 - **`Hook` -> `Execution`**: HasMany (`hook_id`)
 - **`ApiKey` -> `Execution`**: HasMany (`api_key_id`)
+
+---
+
+## 🔐 Foreign Key Enforcement
+
+The schema declares **six** foreign keys. They are not decoration: they are the backstop that holds
+when the application layer is bypassed — by a future handler, an operator at a SQL prompt, or a bug.
+
+| Child | Column | Parent | On delete |
+| :--- | :--- | :--- | :--- |
+| `hook_parameters` | `hook_id` | `hooks.id` | `CASCADE` |
+| `api_key_hook_permissions` | `hook_id` | `hooks.id` | `CASCADE` |
+| `api_key_hook_permissions` | `api_key_id` | `api_keys.id` | `CASCADE` |
+| `executions` | `hook_id` | `hooks.id` | `CASCADE` |
+| `executions` | `api_key_id` | `api_keys.id` | **`SET NULL`** |
+| `audit_logs` | `api_key_id` | `api_keys.id` | **`SET NULL`** |
+
+### The `CASCADE` / `SET NULL` asymmetry is deliberate
+
+A grant is meaningless once its holder is gone, so it goes. An execution record and an audit entry
+are **evidence**: deleting the key that wrote them must not erase what was done, or deleting your own
+key would become a way to erase your own trail. `audit_logs` additionally denormalizes
+`api_key_name` and `api_key_prefix` at write time, and those are *never* nulled — they are a
+point-in-time snapshot rather than a live join, and they are what keeps the trail legible after the
+FK is cleared.
+
+### On SQLite specifically
+
+SQLite is the one supported engine where **declaring** a foreign key and **enforcing** it are
+separate decisions. With `PRAGMA foreign_keys=OFF` the constraints parse, the schema reports them,
+and the engine ignores them in silence — a database in that state accumulates orphans with no error
+anywhere.
+
+This service sets `PRAGMA foreign_keys=ON` explicitly, both through `SqliteConnectOptions` in
+`db::connect` (so a recycled connection inherits it) and as a statement in
+`db::apply_sqlite_pragmas`. See `AGENT.MD` §3b.
+
+> **Correction.** An earlier audit recorded these six constraints as *inert* here, because nothing in
+> `src/db.rs` set the pragma. **That was wrong.** SQLx enables foreign keys on every SQLite
+> connection it opens, so they have always been enforced — `PRAGMA foreign_keys` reads back `1` on a
+> bare `Database::connect`, and an orphan insert is refused with `(code: 787) FOREIGN KEY constraint
+> failed`. Declaring it explicitly is hardening against a dependency default changing silently, not a
+> repair, and **no orphan-cleanup migration was needed or added**: there were no orphans to clean.
+>
+> An operator wanting to confirm this on an existing database can run `PRAGMA foreign_key_check;`,
+> which returns one row per violating row and nothing at all for a clean database.
+
+`tests/referential_integrity.rs` pins the *behaviour* rather than the pragma — `PRAGMA foreign_keys`
+returning `1` says a switch is set, not that the engine acts on it. Those tests were
+mutation-verified: five of the six go red with `foreign_keys=OFF`.
+
+### Two columns deliberately carry no foreign key
+
+`api_keys.parent_key_id` and `hooks.owner_key_id` reference `api_keys.id` and are **intentionally
+unconstrained**, as documented in `m20230107_000001_key_lineage_and_resource_ownership`:
+
+- `ON DELETE CASCADE` would delete a hook when its owner key is deleted — exactly what
+  `RBAC_MODEL.md` §6 forbids.
+- `ON DELETE SET NULL` would silently orphan the resource at the moment of deletion, which is the
+  outcome §6's pre-flight inventory exists to make impossible by **refusing** instead.
+
+So the guarantee for those two is application-level by design. `RBAC_MODEL.md` §6's inventory is what
+must prevent a dangling reference; the schema deliberately declines to. A future migration that
+"fixes the missing constraint" would break §6 —
+`key_lineage_and_ownership_columns_are_unconstrained_by_design` exists to say so before it lands.

@@ -129,11 +129,14 @@ const RAW_SQL_MARKERS: [&str; 8] = [
     "Expr::cust",
 ];
 
-/// The only two files permitted to contain them, each for a reason the query builder cannot address.
+/// The only three files permitted to contain them, each for a reason the query builder cannot
+/// address.
 ///
-/// Both are audited in `AGENT_NOTES.MD`. Neither interpolates any runtime value: the sole
-/// substitution across both is a compile-time `const`.
-const ALLOWED: [(&str, &str); 2] = [
+/// All three are audited in `AGENT_NOTES.MD`. **None interpolates any runtime value**: across the
+/// whole list the only substitution is a compile-time `const`, and the third entry's statement is a
+/// two-character literal. That is the property that makes these exemptions safe rather than merely
+/// tolerated, and it is what a fourth entry would have to demonstrate too.
+const ALLOWED: [(&str, &str); 3] = [
     (
         "src/db.rs",
         "SQLite `PRAGMA` statements. A pragma is not a query — it configures how the engine \
@@ -145,6 +148,13 @@ const ALLOWED: [(&str, &str); 2] = [
         "`ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (...)`. SeaORM's `ColumnDef` has no \
          generated-column support at all, and RBAC_MODEL.md §5 requires the master marker to be \
          engine-derived rather than application-maintained. DDL, run once, with no user input.",
+    ),
+    (
+        "src/api/health.rs",
+        "`SELECT 1` in the readiness probe. It must touch no table — a probe that read rows would \
+         let an anonymous caller provoke unbounded work — so there is no entity for the builder to \
+         hang a query on. The statement is a literal with no interpolation, and is portable across \
+         all three supported backends.",
     ),
 ];
 
@@ -182,11 +192,14 @@ fn source_files() -> Vec<(String, String)> {
 /// expression builders. This test asserts that mechanically rather than by inspection, because the
 /// property is only worth anything if it holds for code written after the audit as well.
 ///
-/// The two allowlisted files are genuine exceptions rather than unfinished work, and both are
-/// unreachable from a request: one issues connection pragmas at startup, the other emits DDL the
-/// schema builder cannot express. Adding a third entry to that list should require an argument.
+/// The allowlisted files are genuine exceptions rather than unfinished work. Two are unreachable
+/// from a request at all — one issues connection pragmas at startup, the other emits DDL the schema
+/// builder cannot express. The third, the readiness probe, *is* request-reachable and anonymous, and
+/// earns its place differently: its statement is the literal `SELECT 1`, with no table, no
+/// parameters and nothing to interpolate. Adding a fourth entry should require an argument of the
+/// same kind.
 #[test]
-fn no_raw_sql_outside_the_two_documented_exceptions() {
+fn no_raw_sql_outside_the_documented_exceptions() {
     let mut violations = Vec::new();
 
     for (relative, contents) in source_files() {

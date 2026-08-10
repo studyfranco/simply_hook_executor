@@ -403,6 +403,42 @@ log "Server is up."
 check_local "$(grep -c "listening on http://$BIND_HOST:$SERVER_PORT" "$SERVER_LOG")" "1" \
     "the server honored BIND_HOST=$BIND_HOST and PORT=$SERVER_PORT"
 
+# ─────────────────────────────────────────────────────────────
+# Monitoring probes
+# ─────────────────────────────────────────────────────────────
+#
+# Checked against the real server rather than only in `tests/health_probes.rs`, because the risk
+# these cover only exists here: the probes are mounted on the root router alongside a `ServeDir`
+# static fallback, and whether `/health` reaches the handler or a file on disk is a question about a
+# real filesystem. They are also the only routes in the service that must answer with no credential,
+# so every call below deliberately passes an empty API key.
+
+api_call GET "/health"
+check "200" "liveness answers with no credential at all"
+check_jq ".status" "ok" "liveness reports ok"
+check_jq ".service" "simply_hook_executor" "liveness names the service"
+check_true 'length == 2' "the public liveness body discloses exactly two fields"
+
+api_call GET "/healthz"
+check "200" "the Kubernetes-idiomatic /healthz spelling is accepted too"
+
+api_call GET "/ready"
+check "200" "readiness answers with no credential"
+check_jq ".status" "ready" "readiness reports ready"
+check_jq ".database" "up" "readiness reports the database as up"
+
+api_call GET "/readyz"
+check "200" "the /readyz spelling is accepted too"
+
+# A bogus credential is ignored rather than validated — positive evidence that no auth layer sits in
+# front of these routes, which "works without a header" alone would not prove.
+api_call GET "/health" "not-a-real-key"
+check "200" "a garbage X-API-Key neither helps nor hinders the liveness probe"
+
+# ...while the authenticated tree is untouched by the merge that mounted them.
+api_call GET "/api/settings"
+check "401" "adding the probes did not open the authenticated tree"
+
 api_call GET "/api/auth/me" "$MASTER_KEY"
 check "200" "the deterministic INITIAL_MASTER_KEY authenticates"
 check_jq ".is_master" "true" "it reports is_master=true"

@@ -322,6 +322,15 @@ included, and an empty value is the only way to say "from anywhere". Any route a
 | `GET` | `/api/settings` | Runtime configuration and instance counters (master only). |
 | `POST` | `/api/system/purge-hooks` | Permanently drop trashed hooks older than 92 days (`?older_than_days=`, master only). |
 
+The two monitoring probes are the exception to the paragraph above — they are **unauthenticated by
+design**, because an orchestrator holds no API key and a liveness check that needs one fails exactly
+when the credential store is what broke. Both disclose nothing beyond a fixed two-field document.
+
+| Method | Path | Purpose |
+| :--- | :--- | :--- |
+| `GET` | `/health`, `/healthz` | **Liveness.** Always `200`. Touches nothing — a failing database must not make an orchestrator restart a healthy process. |
+| `GET` | `/ready`, `/readyz` | **Readiness.** `200` when the pool answers `SELECT 1`, `503` otherwise. This is what a load balancer should poll. |
+
 `POST .../execute` accepts two body shapes: `{"parameters": {...}}` for first-party clients, or a
 bare flat object for webhook senders that can only post their own document. An empty body means
 "no parameters". A non-zero script exit is still `200 OK` — the request succeeded; the script's
@@ -396,22 +405,83 @@ echo "banned $target ($reason)"    # captured as stdout on the execution record
 The script must be executable (`chmod +x`) and referenced by an absolute path. Exit `0` for
 `SUCCESS`; any other code is recorded as `FAILED` along with whatever it wrote to stderr.
 
+## Project structure
+
+```
+src/
+├── lib.rs                  Router assembly, module registry, retention worker spawn
+├── main.rs                 Entrypoint: migrate → bootstrap → pin master → bind → shut down
+├── state.rs                AppState: db pool, config, limiter, cipher, replay guard, master pin
+├── master.rs               Boot-time Master identity pinning, and runtime demotion of tampered rows
+├── middleware.rs           Authentication: bearer key, HMAC, replay, bound-IP
+├── config.rs               Environment parsing, trusted proxies, client-IP resolution
+├── crypto.rs               HMAC request signing, and signing-secret encryption at rest
+├── replay.rs               Single-use enforcement for CANONICAL_V1 signatures
+├── executor.rs             Script execution: argv, env isolation, timeout, process-group kill
+├── retention.rs            Background sweeps: expired history, trashed hooks
+├── db.rs                   Pool construction, SQLite session pragmas, migrations
+├── error.rs                AppError → HTTP status mapping
+├── api/
+│   ├── mod.rs              Module wiring, router-facing re-exports, policy constants
+│   ├── support.rs          Shared plumbing — audit writes, hook resolution, validation. Decides nothing
+│   ├── guards.rs           Every authorization decision (RBAC_MODEL.md R1–R7, §3–§5). Writes nothing
+│   ├── keys.rs             Key CRUD, GET /api/auth/me, per-hook grants, cascade deletion
+│   ├── hooks.rs            Hook definitions, parameter contracts, trash/restore/purge
+│   ├── executions.rs       Triggering hooks, and reading the execution records
+│   ├── audit.rs            Reads over the audit trail — master-only
+│   ├── system.rs           Effective configuration and instance counters — master-only
+│   └── health.rs           Liveness/readiness probes — the only unauthenticated routes
+├── entities/               SeaORM models, one file per table
+└── migration/              Ordered schema migrations, applied at startup
+```
+
+Two boundaries in `src/api/` are rules rather than conventions, and both are stated in `AGENT.MD`:
+
+- **`support.rs` decides nothing.** Nothing in it returns a refusal that depends on *who* is calling.
+  A helper that starts deciding moves to `guards.rs`.
+- **`guards.rs` writes nothing**, and is one module rather than one per domain. The rules it enforces
+  are cross-cutting — R2's conjunction governs hooks, parameters and execution records alike — so
+  splitting it by caller would put one sentence of the specification in three files and invite the
+  copies to drift.
+- **`crypto.rs` holds the primitives; `middleware.rs` holds the policy.** Nothing in `crypto.rs`
+  touches the database, the request, or `AppError` — it returns a `SignatureRejection` and lets the
+  middleware decide which failures become `401` and which become `500`.
+
+`FILE_MAP.MD` documents every file's role, key exports, and the rationale for its boundaries.
+
 ## Development
 
 ```bash
 cargo check --all-targets            # compile everything, including tests
-cargo test                           # unit + integration tests, run against sqlite::memory:
+cargo test                           # unit + integration + compliance + source hygiene
 cargo clippy --all-targets -- -D warnings
 ./scripts/test_e2e.sh                # full black-box HTTP suite against a real server
+./scripts/verify_convergence.sh      # security drift check against the peer service
 ```
 
 Integration tests live in `tests/` and spin up a fresh in-memory SQLite database per test, driving
 the real router and spawning real (throwaway) scripts — no external services required. The E2E
 script builds and boots an actual server against a throwaway database and exercises the whole API
-with `curl` + `jq`.
+with `curl` + `jq`. Both scripts refuse to run from anywhere but the repository root.
+
+Beyond the behavioural suites, two files check things the others structurally cannot:
+
+- **`tests/rbac_model_compliance.rs`** — one test per rule of `RBAC_MODEL.md`, named after the rule
+  it enforces, so coverage against the specification is auditable by listing test names. Includes
+  *adversarial* tests that reach a guarantee without going through the code meant to uphold it (raw
+  SQL, raw request bytes), because a cooperative test of a structural claim proves only that a
+  well-behaved writer behaves well.
+- **`tests/source_hygiene.rs`** — parses `static/app.js` (never compiled by anything else, so a
+  syntax error would otherwise ship silently), checks that every `getElementById` resolves, and
+  enforces the raw-SQL allowlist across `src/`.
+- **`tests/referential_integrity.rs`** — asserts what the schema's six foreign keys actually *do* on
+  delete, since SQLite is the one supported engine where declaring a constraint and enforcing it are
+  separate decisions. It distinguishes the `CASCADE` edges from the `SET NULL` ones, because deleting
+  a key must remove its grants while leaving its audit trail standing.
 
 See `AGENT.MD` for the full architectural/security ruleset this project is built and audited
-against, `SCHEMA.MD` for the database schema, and `AGENT_NOTES.MD` for the running worklog.
+against, `FILE_MAP.MD` for the file-by-file map, `SCHEMA.MD` for the database schema, and
+`AGENT_NOTES.MD` for the running worklog.
 
 ## License
 

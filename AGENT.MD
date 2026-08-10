@@ -46,15 +46,26 @@ To keep this context clean and modular, responsibilities are split across three 
 | `api/keys.rs` | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade | Identity lives with keys because it shares its view types with the key listing |
 | `api/hooks.rs` | Hook definitions, parameter contracts, trash/restore/purge | What a hook *is*, not what happens when one fires |
 | `api/executions.rs` | Triggering hooks, and reading the records that result | Together because they share `ExecutionView` and nothing else does |
-| `api/system.rs` | Audit log, settings | Master-only introspection |
+| `api/audit.rs` | Reads over `audit_logs` | Master-only. **Reads only** — writing an entry is `support::create_audit_log`, called from every mutating handler |
+| `api/system.rs` | The effective runtime configuration and instance counters | Master-only. Split from `audit.rs` because a shared audience is the weakest reason to share a file |
+| `api/health.rs` | Liveness and readiness probes | **The only unauthenticated routes in the service.** Must disclose nothing an anonymous caller could not already infer |
 
 **`guards` is one module, not one per domain, and must stay that way.** `RBAC_MODEL.md`'s rules are cross-cutting: R2's conjunction governs hooks, parameters and execution records alike, and §3's ownership test is consulted from three domains. Splitting guards by caller would put a single sentence of the specification in three files and invite the copies to drift — which is the exact failure the compliance suite exists to catch, and so must not be designed in.
+
+Outside `src/api/`, one boundary is a rule for the same reason:
+
+| Module | Holds | Rule |
+| :--- | :--- | :--- |
+| `crypto.rs` | Every cryptographic primitive: `generate_signing_secret`, `canonical_v1_payload`, `compute_signature`, `verify_signature`, and `SecretCipher` | **Pure.** No database, no request, no `AppError`. A refusal is returned as `SignatureRejection`, never as an HTTP status |
+| `middleware.rs` | *When* a signature is required, which header carries it, and what a caller is told when one fails | Holds the policy, not the primitive. It must not reimplement an HMAC "just to check something first" |
+
+`generate_signing_secret` lives in `crypto.rs` and **must not** be moved to or re-exported from `api/support.rs`. `support.rs` mints the *public* `key_id`; the signing secret is the entropy every signature in the system rests on and belongs beside the HMAC that consumes it. `api/support.rs::mint_signing_pair` is where the two meet.
 
 Handlers keep their exact Axum signatures, extractors, error responses and guard calls regardless of which file they live in. A move that changes a signature is not a move.
 
 ### 1. Security & Network (Zero-Trust)
 
-- **Middleware Protection:** All `/api/*` and `/webhook/*` routes pass through custom authentication middleware (`src/middleware.rs`). There are no unauthenticated API routes; only the static SPA is public.
+- **Middleware Protection:** All `/api/*` and `/webhook/*` routes pass through custom authentication middleware (`src/middleware.rs`). The public surface is exactly three things: the static SPA, and the `/health` and `/ready` monitoring probes (§3d). Nothing else answers without a credential.
 - **Authentication:** there is exactly **one** way a caller identifies itself — the `X-API-Key` header, matched against `api_keys.key_hash` (SHA-256). This is the single key lookup path in the system; no other header resolves a key record.
   - A signature (`X-Signature-256`) may accompany it and is then always verified, adding request integrity on top of bearer authentication. `REQUIRE_SIGNED_REQUESTS=true` makes it mandatory.
   - `api_keys.key_id` is a public display/correlation identifier only. It is **not** a credential and **not** an authentication header.
@@ -192,24 +203,39 @@ Listing endpoints narrow by these rules rather than rejecting: `GET /api/hooks` 
 - **Per-Key Concurrency Throttling:** Enforce `max_concurrent_jobs` per `ApiKey` using `tokio::sync::Semaphore`. If a key exceeds its concurrency limit, reject the request with `429 Too Many Requests`.
 - **Execution Timeouts:** Enforce per-hook timeout (defaults to 30 seconds if unspecified in the hook configuration). If execution exceeds the timeout, kill the process tree (`SIGKILL`) and record status `TIMEOUT`.
 
-### 3b. SQLite Concurrency
+### 3b. SQLite Connection Setup
 
-When the backend is SQLite (the zero-config default), the daemon applies two pragmas at startup —
-`journal_mode=WAL` and `busy_timeout=5000` — before migrations run. This is the one place a
-backend-specific statement is permitted, and it is a *connection pragma*, not a query: the SQL-agnostic
-rule in the Tech Stack section still holds for everything the ORM issues.
+When the backend is SQLite (the zero-config default), `db::connect` builds the pool from
+`SqliteConnectOptions` and declares four settings on **every** connection; `db::apply_sqlite_pragmas`
+then re-issues them and reads `journal_mode` back so the startup log reports what is actually in
+force. This is the one place a backend-specific statement is permitted, and these are *connection
+pragmas*, not queries: the SQL-agnostic rule in the Tech Stack section still holds for everything the
+ORM issues.
 
-- **WAL** lets readers proceed against the last committed snapshot while a writer appends. Without it
-  the default rollback journal takes a database-wide exclusive lock for every write, so one hook
-  recording its `executions` row blocks every concurrent reader — the opposite of what a daemon whose
-  job is parallel execution needs. It is **persistent** (stored in the file header), so setting it
-  once covers the whole pool and every later run.
-- **`busy_timeout`** covers what WAL does not: WAL still allows only one writer, so simultaneous
-  executions can still collide, and without a timeout the loser fails instantly with `SQLITE_BUSY` as
-  a spurious `500`. It is **per-connection**; the pool-wide guarantee comes from SQLx's own five-second
-  default, which this statement matches and makes explicit.
-- Failure to apply either is logged, never fatal. An in-memory database (`sqlite::memory:`, used
+| Setting | Scope | Why |
+| :--- | :--- | :--- |
+| `journal_mode=WAL` | **persistent** (file header) | Readers proceed against the last committed snapshot while a writer appends. Without it the default rollback journal takes a database-wide exclusive lock for every write, so one hook recording its `executions` row blocks every concurrent reader — the opposite of what a daemon whose job is parallel execution needs |
+| `foreign_keys=ON` | per-connection | SQLite is the one supported engine where declaring a constraint and enforcing it are separate decisions. **SQLx already defaults this on**, so declaring it is hardening against a dependency default changing silently, not a repair — see the correction below |
+| `synchronous=NORMAL` | per-connection | The standard companion to WAL: full durability against process crashes, giving up only the last transactions in a power loss, in exchange for not fsyncing on every commit. **The one setting here that genuinely changes behaviour** — the driver default is `FULL` |
+| `busy_timeout=5000` | per-connection | WAL still allows only one writer, so simultaneous executions can collide; without a timeout the loser fails instantly with `SQLITE_BUSY` as a spurious `500`. Matches SQLx's own default and makes it explicit |
+
+- **Why `connect` declares them rather than relying on the `PRAGMA` statements alone.** SQLx reopens
+  a connection that has been closed or invalidated, and a reopened connection replays its *options*
+  but not our statements. Declaring them at open time is what makes them survive a recycle.
+- **`SQLITE_MAX_CONNECTIONS = 1` is not a tuning knob.** SQLite permits one writer, and a DDL sequence
+  spread across connections does not survive `m20230106`'s drop-and-re-add of the generated
+  `master_marker` column. SeaORM's own `Database::connect` pins this for SQLite; hand-building a pool
+  opts out of that default silently, so it is restored explicitly and asserted.
+- Failure to apply any of them is logged, never fatal. An in-memory database (`sqlite::memory:`, used
   throughout the test suite) legitimately cannot use WAL.
+
+> **Correction to an earlier record.** A previous audit stated that the six foreign keys declared in
+> `m20230101_000001_initial_schema` were *inert* on SQLite because nothing here set
+> `PRAGMA foreign_keys=ON`. **That was wrong.** SQLx enables foreign keys on every SQLite connection
+> it opens, so those constraints have always been enforced: `PRAGMA foreign_keys` reads back `1` on a
+> bare `Database::connect`, and an orphan insert is refused with `FOREIGN KEY constraint failed`. No
+> orphan-cleanup migration is needed, and none was added — writing one would have been a destructive
+> no-op. `tests/referential_integrity.rs` now pins the *behaviour* rather than the pragma.
 
 ### 3c. Request Body Ceiling
 
@@ -225,6 +251,32 @@ Every request body — authenticated or not, on every nested route — is capped
   enough would reintroduce exactly the differential the shared constant removes.
 - The value is the figure converged with `simply_ip_vault`, so the two services refuse the same
   payloads. A body over the limit is rejected with `413` before it is read to completion.
+
+### 3d. Monitoring Probes
+
+Two unauthenticated routes, mounted on the root router outside both `nest()` calls so no auth layer
+is in their path:
+
+| Route | Question | Consumer | Behaviour |
+| :--- | :--- | :--- | :--- |
+| `GET /health`, `/healthz` | "Is this process alive?" | Orchestrator, deciding whether to **restart** | Always `200`. `{"status":"ok","service":"simply_hook_executor"}` |
+| `GET /ready`, `/readyz` | "Can this process serve traffic?" | Load balancer, deciding whether to **route** | `200` `{"status":"ready","database":"up"}`, or `503` `{"status":"unavailable","database":"down"}` |
+
+- **They must not require a credential.** An orchestrator holds no API key, and a liveness check that
+  needs one fails exactly when the credential store is what broke.
+- **Liveness must not touch the database.** `health_check` takes no `State` — enforced by the
+  compiler, not by a comment. If liveness also checked the database, a thirty-second database blip
+  would fail liveness on every replica and the orchestrator would restart all of them, which does not
+  fix a database and does destroy in-flight executions.
+- **Because they are public, they disclose nothing.** No version, no hostname, no row count, no
+  driver error. `readiness_check`'s `DbErr` is logged at `warn` and never returned: it renders
+  connection strings and driver internals. A test asserts the body is exactly two fixed fields, so a
+  field added later has to be justified rather than arriving unnoticed on a public endpoint.
+- **`SELECT 1` and nothing more.** A probe that read rows would let an anonymous caller provoke
+  unbounded work — a denial-of-service primitive aimed at the endpoint that reports health. It is the
+  third entry in the raw-SQL allowlist for exactly this reason.
+- `503` rather than `500`: nothing about the request failed. The answer *is* "not ready", and it was
+  produced successfully.
 
 ### 4. History, Output Capture & Log Retention
 
@@ -298,7 +350,7 @@ Four things can ship broken while every other gate passes green, because no othe
 - **`static/app.js` must parse.** `static/` is served straight off disk by `ServeDir` and is never compiled, linted, or executed by anything else here — `cargo check`, `clippy`, the integration suite and the e2e suite all drive the HTTP API and never parse the file they serve. Checked with `oxc_parser` (a parser, not an engine: the file references `document` and `localStorage`, so *running* it would fail for reasons unrelated to syntax). The `oxc` crates are pinned with `=` because they are pre-1.0 and their `0.x` releases carry breaking changes under a caret requirement — a syntax checker that stops the build for reasons unrelated to syntax is worse than none.
 - **Every `getElementById` must resolve**, against ids declared in `index.html` *or* injected by the script's own templates.
 - **The dashboard must not send `is_master`** in a key payload.
-- **No raw SQL on any query path.** `src/` is scanned for `execute_unprepared`, `Statement::from_*`, `query_*_raw`, `execute_raw`, `from_raw_sql` and `Expr::cust`. Exactly two files are allowlisted, each with its reason recorded in the test and in `AGENT_NOTES.MD`: `src/db.rs` (SQLite `PRAGMA`s — not queries, and SeaORM's builders cannot express one) and `m20230106_000001_master_key_uniqueness` (`GENERATED ALWAYS AS` DDL, which `ColumnDef` cannot express). Neither interpolates a runtime value; the sole substitution across both is a compile-time `const`. A companion test fails if an allowlisted file stops containing raw SQL, so an exemption cannot outlive its justification and be silently inherited by whatever lands at that path next.
+- **No raw SQL on any query path.** `src/` is scanned for `execute_unprepared`, `Statement::from_*`, `query_*_raw`, `execute_raw`, `from_raw_sql` and `Expr::cust`. Exactly **three** files are allowlisted, each with its reason recorded in the test and in `AGENT_NOTES.MD`: `src/db.rs` (SQLite `PRAGMA`s — not queries, and SeaORM's builders cannot express one), `m20230106_000001_master_key_uniqueness` (`GENERATED ALWAYS AS` DDL, which `ColumnDef` cannot express), and `src/api/health.rs` (`SELECT 1` — the readiness probe must touch no table, so there is no entity for the builder to hang a query on). **None interpolates a runtime value**: across the whole list the only substitution is a compile-time `const`, and the third entry's statement is a two-character literal. That is the property that makes these exemptions safe rather than merely tolerated, and a fourth entry must demonstrate the same. A companion test fails if an allowlisted file stops containing raw SQL, so an exemption cannot outlive its justification and be silently inherited by whatever lands at that path next.
 
 ### Harness safety
 

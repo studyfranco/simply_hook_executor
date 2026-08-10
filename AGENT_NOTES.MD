@@ -4101,7 +4101,7 @@ typed entities and expression builders. Two files remain, both unreachable from 
 | `m20230106_000001_master_key_uniqueness` | `ALTER TABLE ... GENERATED ALWAYS AS (...)` | `ColumnDef` has no generated-column support at all, and §5 requires the marker to be engine-derived rather than application-maintained. DDL, run once |
 
 Neither interpolates a runtime value; the sole substitution across both is a compile-time `const`.
-The property is now enforced by `no_raw_sql_outside_the_two_documented_exceptions` rather than
+The property is now enforced by `no_raw_sql_outside_the_documented_exceptions` rather than
 asserted once, and a companion test fails if an allowlisted file stops containing raw SQL — an
 exemption must not outlive its justification and be silently inherited by whatever lands at that path
 next.
@@ -4311,3 +4311,496 @@ deliberate — it drives the safe and destructive choices to opposite edges, and
 `cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
 `cargo test` **252 passed / 0 failed** · `./scripts/test_e2e.sh` **875 / 875** ·
 `./scripts/verify_convergence.sh` exit 0.
+
+---
+
+## Structural & functional distribution audit vs `simply_ip_vault`
+
+Read-only comparison of where capabilities live in each codebase, plus the two new mapping documents
+(`FILE_MAP.MD`, and a structure section in `README.md`). No file under `src/` was modified.
+
+**Reference state.** `./example/simply_ip_vault` remains a flat snapshot with no git metadata; no
+`git` command was run inside it. Comparison is by file listing and symbol grep.
+
+### Size baseline
+
+| | `simply_hook_executor` | `simply_ip_vault` |
+| :--- | ---: | ---: |
+| `src/` total | 11,247 | ~9,100 |
+| Largest file | `executor.rs` 1,389 | `api/keys.rs` 1,372 |
+| `api/` total | 4,088 across 7 | 2,523 across 6 |
+| `api/guards.rs` | **1,030** | **463** |
+| `api/mod.rs` | **85** | **267** |
+| `state.rs` | **80** | **330** |
+
+The three bolded pairs are the whole story of the structural divergence, and they are not
+independent: our `guards.rs` is large because it absorbed helpers the peer keeps in `keys.rs`, our
+`api/mod.rs` is small because we extracted `support.rs`, and our `state.rs` is small because we
+extracted `master.rs`.
+
+### Comparative function & responsibility matrix
+
+**Identical alignment** — same concept, same file role:
+
+| Capability | `simply_hook_executor` | `simply_ip_vault` |
+| :--- | :--- | :--- |
+| Router assembly | `lib.rs::create_app` | `lib.rs::create_app` |
+| Entrypoint, migrate → bootstrap → pin → bind | `main.rs` | `main.rs` |
+| Graceful shutdown | `main.rs::shutdown_signal` | `main.rs::shutdown_signal` |
+| Authentication pipeline | `middleware.rs::auth_middleware` | `middleware.rs::auth_middleware` |
+| Master demotion of tampered rows | `middleware.rs` (via `MasterPin::authenticate`) | `middleware.rs` (via `is_effective_master`) |
+| Environment config, proxy trust, client IP | `config.rs` | `config.rs` |
+| Replay single-use | `replay.rs::ReplayGuard` | `replay.rs::ReplayGuard` |
+| Retention worker | `retention.rs` | `retention.rs` |
+| Connection pragmas | `db.rs` | `db.rs` |
+| Error type → HTTP | `error.rs::AppError` | `error.rs::AppError` |
+| Entities, one per table | `entities/` | `entities/` |
+| Ordered migrations | `migration/` | `migration/` |
+| Key CRUD + identity (`get_me`) | `api/keys.rs` | `api/keys.rs` |
+| RBAC guards | `api/guards.rs` | `api/guards.rs` |
+
+`get_me` living with key CRUD rather than in an `auth` module was decided independently in both
+codebases, for the same reason: it shares its view types with the key listing.
+
+**Guard correspondence** — same rules, different names. Both files implement `RBAC_MODEL.md`:
+
+| Rule | `simply_hook_executor` | `simply_ip_vault` |
+| :--- | :--- | :--- |
+| R2 conjunction | `require_hook_manage_conjunction` | `guard_group_manage` |
+| R2 pre-payload standing | `has_permission_admin_standing` | `guard_may_administer_any_group` |
+| "holds manage somewhere" | `manages_any_hook` | `holds_any_group_manage` |
+| R1 delegation bound | `guard_delegated_hook_grant` | `guard_delegated_group_grant` |
+| R6 revocation classification | `is_permission_reduction` | `widens_permissions` *(inverse polarity)* |
+| R4 scope elevation | `require_master_to_grant_scopes` | `guard_scope_elevation` |
+| §3 lifecycle | `require_lifecycle_authority` | `guard_resource_lifecycle` |
+| §3 owner lookup / reassignment | inline in `require_manage` / `update_hook` | `resource_owner` / `resolve_owner_assignment` |
+| §5 master as target | `refuse_master_lifecycle_action` | `guard_master_target` |
+| §5 master immutability | `require_master_self_edit_is_bound_ips_only` | `guard_master_immutable` |
+| Per-resource permission fetch | `hook_permission` | `caller_group_permission` |
+
+`is_permission_reduction` and `widens_permissions` are the same predicate with opposite polarity —
+worth knowing when reading the two side by side, because the call sites negate in opposite places.
+
+**Functional misplacement** — same capability, different host file:
+
+| Capability | `simply_hook_executor` | `simply_ip_vault` | Assessment |
+| :--- | :--- | :--- | :--- |
+| Shared non-guard helpers (`create_audit_log`, resource resolution, `hash_key`) | `api/support.rs` (named module) | `api/mod.rs` (267 lines, mixed with wiring) | **Ours is clearer.** The peer's `mod.rs` is both the router surface *and* the helper drawer; ours separates them and states a testable boundary ("decides nothing") |
+| Master pinning | `master.rs` (dedicated, 291 lines) | `state.rs` (`pin_master_key`, `MasterPinError`, `resolve_master_key_id`) | **Ours is clearer.** Theirs mixes a security control with a handle bag; `state.rs` is 330 lines as a result |
+| HMAC request signing | `middleware.rs` (inline) | `crypto.rs` (`canonical_v1_payload`, `compute_signature`, `verify_signature`) | **Theirs is clearer.** They have reusable, separately-testable signature functions; ours are inline in the auth pipeline. This is the one place the peer's layout is better, and it is the top item in the proposal below |
+| §4 key-visibility helpers | `api/guards.rs` (`key_visibility`, `descendant_key_ids`, `managed_hook_ids`, `load_administrable_key`) | `api/keys.rs` (`collect_key_subtree`, `groups_the_caller_manages`, `caller_can_administer_key`, `find_administrable_key`) | **Theirs is arguably better placed.** All four of ours are used by `keys.rs` *and nothing else* — see proposal |
+| Reference formatting | `api/support.rs::format_reference` | `api/guards.rs::format_key_reference` | **Ours is correct.** Formatting is not a guard; the peer has the misplacement here |
+| Strict JSON extractor | `api/support.rs` | `extract.rs` (top-level module) | Cosmetic. Ours also carries `OptionalStrictJson`, which the peer lacks |
+| Audit log + settings endpoints | `api/system.rs` (both) | `api/audit.rs` (54 lines, audit only) | **Deliberate divergence.** Our module is audit *and* `/api/settings`; a file called `audit.rs` whose second half reports configuration misleads. The peer's is genuinely audit-only, so its name is right for it |
+
+**Missing module / concept** — present in one codebase only:
+
+| Concept | Where | Why |
+| :--- | :--- | :--- |
+| `executor.rs` (1,389) | Ours only | We execute local scripts; the peer dispatches HTTP. No equivalent is possible or wanted |
+| `webhooks.rs` (519) + `api/webhooks.rs` (580) | Peer only | Outbound dispatch worker and its CRUD. Our dispatch config lives *on* the Hook row, per `RBAC_MODEL.md`'s Terminology section |
+| `api/support.rs` | Ours only | Peer's equivalents are in `api/mod.rs` |
+| `master.rs` | Ours only | Peer's equivalent is in `state.rs` |
+| `extract.rs` | Peer only | Ours is in `api/support.rs` |
+| `api/audit.rs` | Peer only | Ours is `api/system.rs`, which is broader |
+| `api/records.rs`, `api/groups.rs` | Peer only | Their resource-data model; our `hook_parameters` are governed inside `api/hooks.rs` |
+| `api/executions.rs` | Ours only | Executions are our creator-private entity |
+
+### Infrastructure & health handlers
+
+**Neither codebase exposes a healthcheck, readiness probe, or version endpoint.** Verified by
+grepping both for `/health`, `/healthz`, `/readyz`, `/ready`, `/version`: zero route registrations in
+either. Graceful shutdown is present and *identically placed* in both (`main.rs::shutdown_signal`,
+wired via `axum::serve(...).with_graceful_shutdown(...)`), and both retention workers take a shutdown
+channel so they stop cleanly rather than being killed mid-sweep.
+
+This is a **symmetric gap, not a divergence.** It is worth recording as a finding in its own right:
+neither service can be probed by an orchestrator without an authenticated request, and every route in
+both is behind `auth_middleware` by design. Adding one is a deliberate decision with a real
+trade-off — an unauthenticated `/healthz` is an unauthenticated route in a service whose stated
+posture is that it has none — so it is proposed below rather than assumed.
+
+### Shared utilities & DTOs
+
+| Utility | `simply_hook_executor` | `simply_ip_vault` |
+| :--- | :--- | :--- |
+| Bearer key hashing (`hash_key`) | `api/support.rs` | `api/mod.rs` |
+| Key/secret generation | `api/support.rs` | `api/mod.rs` + `crypto.rs::generate_signing_secret` |
+| Secret encryption at rest | `crypto.rs::SecretCipher` | `crypto.rs::SecretCipher` |
+| HMAC compute/verify | `middleware.rs` (inline) | `crypto.rs` |
+| Error wrapper | `error.rs::AppError` (10 variants) | `error.rs::AppError` (10 variants) |
+| DTOs / view types | Co-located with their handlers | Co-located with their handlers |
+
+`AppError` variants are nine-tenths identical. Ours has `TooManyRequests` (concurrency throttling, no
+peer equivalent); theirs has `ConflictWithDetails`. Both carry `BodyRejected`, which preserves the
+extractor's own status rather than flattening to `400` — independently arrived at in both codebases.
+
+**DTO placement is aligned:** neither service has a shared `dto.rs`. Request payloads and view structs
+sit next to the handlers that use them, which is why `HookDetail` is in `hooks.rs` and
+`ApiKeySummary` in `keys.rs`.
+
+### Correction to an earlier audit finding
+
+The comparative security audit recorded in this file previously stated that the peer's §5 master
+uniqueness was **weaker than ours** because its `master_marker` was an application-maintained
+`VARCHAR(16)`, so `is_master = true` with a `NULL` marker was an accepted second master.
+
+**That finding is now stale.** The peer has since added
+`m20260808_000009_derive_master_marker`, which replaces the hand-maintained column with an
+engine-derived generated column. Its module documentation describes the exact bypass — including a
+worked `INSERT` demonstrating two master rows — and fixes it the same way ours does. **The two
+services are now aligned on §5**, and the adversarial tests added here would pass against the peer.
+
+This is recorded rather than quietly dropped because the earlier note is still in this file above,
+and a reader arriving at it should not act on it.
+
+### Prioritized, non-destructive refactoring proposal
+
+None of this was executed — this session was read-only by instruction. Ordered by value.
+
+**P0 — `PRAGMA foreign_keys=ON` is never set, and six declared foreign keys are inert on SQLite.**
+Found by the convergence checker during this audit, not by looking for it. The peer's
+`apply_sqlite_pragmas` has grown `foreign_keys=ON` and `synchronous=NORMAL`; ours still sets only
+`journal_mode=WAL` and `busy_timeout`. **SQLite ignores foreign keys unless that pragma is set on
+each connection**, and `m20230101_000001_initial_schema` declares six:
+
+| Table | Column | Action |
+| :--- | :--- | :--- |
+| `api_key_hook_permissions` | `api_key_id` | `CASCADE` |
+| `api_key_hook_permissions` | `hook_id` | `CASCADE` |
+| `hook_parameters` | `hook_id` | `CASCADE` |
+| `executions` | `hook_id` | `CASCADE` |
+| `executions` | `api_key_id` | `SET NULL` |
+| `audit_logs` | `api_key_id` | `SET NULL` |
+
+So on the default backend a hard-deleted hook currently leaves its permission rows, parameter
+declarations and execution history behind as orphans rather than cascading, and the same applies to a
+deleted key's permission rows. Note this is **distinct from — and does not contradict —** the
+deliberate absence of foreign keys on `parent_key_id`/`owner_key_id` in `m20230107`: those were
+omitted on purpose because both available behaviours are wrong for §6. These six were *declared* and
+are simply not being enforced.
+
+Not fixed here because this session was read-only by instruction, and because it is not a one-line
+change: enabling enforcement against an existing database can surface violations that were silently
+tolerated while the pragma was off, so it needs a migration-time audit query and probably a cleanup
+pass for rows already orphaned. Worth doing early — the cost grows with the amount of orphaned data.
+
+Operator query to size the problem before enabling it:
+
+```sql
+-- Orphaned permission rows, parameters, and executions (run per table).
+SELECT COUNT(*) FROM api_key_hook_permissions p
+  LEFT JOIN hooks h ON h.id = p.hook_id WHERE h.id IS NULL;
+SELECT COUNT(*) FROM api_key_hook_permissions p
+  LEFT JOIN api_keys k ON k.id = p.api_key_id WHERE k.id IS NULL;
+SELECT COUNT(*) FROM hook_parameters hp
+  LEFT JOIN hooks h ON h.id = hp.hook_id WHERE h.id IS NULL;
+SELECT COUNT(*) FROM executions e
+  LEFT JOIN hooks h ON h.id = e.hook_id WHERE h.id IS NULL;
+```
+
+`synchronous=NORMAL` is the lesser half of the same divergence and is a durability/throughput
+trade-off rather than a correctness one; adopt or decline it deliberately when the above is fixed.
+
+**P1 — Extract HMAC signature computation from `middleware.rs` into `crypto.rs`.**
+The only place the peer's layout is clearly better. Move the canonical-string construction and
+constant-time verification into named, separately-testable functions
+(`canonical_v1_payload`, `compute_signature`, `verify_signature`), leaving `middleware.rs` to
+sequence the pipeline. Benefits beyond tidiness: `scripts/verify_convergence.sh` already compares
+"Signature canonicalization" between the two services, and comparing two named functions is more
+robust than comparing a region of a 704-line middleware. **Risk: low** — pure extraction, no
+behaviour change, fully covered by the existing HMAC integration tests. Est. ~150 lines moved.
+
+**P2 — Move the four §4 key-visibility helpers from `api/guards.rs` to `api/keys.rs`.**
+`key_visibility`, `descendant_key_ids`, `managed_hook_ids` and `load_administrable_key` are each used
+by `keys.rs` **and nothing else** — confirmed by the coupling measurement recorded above, and the peer
+places its equivalents in `keys.rs`. This would take `guards.rs` from 1,030 to roughly 870 lines and
+leave it holding only genuinely cross-domain rules. **Counter-argument, and the reason this is P2
+rather than P1:** they *are* authorization decisions, and `AGENT.MD` states that `guards.rs` holds
+every authorization decision. Moving them weakens a rule that is currently absolute and easy to check
+in exchange for locality. Recommend either moving all four *and* amending `AGENT.MD` to say
+"cross-domain authorization decisions", or leaving them and accepting the size. **Do not do half.**
+
+**P3 — Decide the healthcheck question explicitly.**
+Neither service has one. Either add `GET /healthz` (unauthenticated, no body beyond liveness — and
+note this makes it the *only* unauthenticated route besides the static SPA, which contradicts the
+current stated posture) or record in `AGENT.MD` that its absence is deliberate and that orchestrators
+should use a TCP connect probe. Right now it is neither decided nor documented, which is the worst of
+the three states. **Risk: low either way; the cost is the decision, not the code.**
+
+**P4 — Consider aligning `format_reference` placement in the peer.**
+Peer-side only: their `format_key_reference` sits in `guards.rs` and formats a string. Nothing to do
+here; noted so a future cross-repo pass has it on the list.
+
+**Explicitly not proposed:** merging `api/system.rs` back into an `audit.rs` to match the peer. The
+divergence is deliberate and the name is more accurate than the peer's would be for our contents.
+Also not proposed: splitting `executor.rs`. It is 1,389 lines about one subject, and the line count
+tracks depth of defence rather than a responsibility problem.
+
+### Gates
+
+`src/` and `tests/` untouched. One change to `scripts/verify_convergence.sh`: the peer's
+`apply_sqlite_pragmas` moved file, so the checker's hardcoded lookup path was corrected and the
+fingerprint re-baselined against the drift that correction exposed (see above). No application or
+business logic was altered. `git diff RBAC_MODEL.md` empty. `cargo check --all-targets` clean ·
+`cargo clippy --all-targets -- -D warnings` clean · `cargo test` **252 passed / 0 failed** ·
+`./scripts/test_e2e.sh` **875 / 875** · `./scripts/verify_convergence.sh` exit 0.
+
+### Convergence Parity Check — accepted divergence (re-baselined this session)
+
+`scripts/verify_convergence.sh` went **red during this audit** and that is the headline result of it.
+Two separate things had happened since the last run, and the checker caught both:
+
+1. **A stale path became a skip.** The script looked for the peer's `apply_sqlite_pragmas` in
+   `src/state.rs`; the peer has since moved it to `src/db.rs` — the file ours has always been in, so
+   the two now agree on placement as well as behaviour. The check did not silently pass against a
+   function it could no longer find: it refused to report and failed the run, which is the only
+   reason the move was noticed. *A skip is not a pass*, and this is what that rule is for.
+
+2. **Fixing the path revealed real drift** — the `foreign_keys=ON` gap recorded as **P0** above.
+
+The fingerprint has been re-baselined to `3377969800` so that *further* drift in this function is
+still caught. The recorded rationale says `OPEN (P0)` rather than "cosmetic", deliberately: this is a
+tracked defect being watched, not a difference that has been blessed.
+
+---
+
+# Session — P0/P1/P3 remediation: FK enforcement, HMAC extraction, `api/audit.rs`, health probes
+
+Acting on the prioritized proposal recorded in the previous (read-only) session. Four scoped changes
+plus the harness realignment they forced.
+
+## P0 — SQLite foreign keys: **the previous finding was wrong, and this corrects it**
+
+The last session recorded, as its headline result, that this service's six declared foreign keys were
+**inert** on SQLite because `src/db.rs` set only `journal_mode` and `busy_timeout` and never
+`PRAGMA foreign_keys=ON`. The reasoning was sound and the conclusion was false. I checked before
+acting on it, and the check is the first thing worth recording:
+
+```
+PROBE foreign_keys=1          # file-backed, bare Database::connect
+PROBE mem foreign_keys=1      # sqlite::memory:
+PROBE orphan insert refused = true
+PROBE err = Query Error: error returned from database: (code: 787) FOREIGN KEY constraint failed
+```
+
+**SQLx enables foreign keys on every SQLite connection it opens.** The constraints have been enforced
+the entire time; cascades have always fired. The audit's error was reasoning from *our* source alone
+about a setting a dependency was already applying — the class of mistake where the code you can read
+is not the code that decides.
+
+Consequences for the task as scoped:
+
+- **No orphan-cleanup migration was written, and that is the finding, not an omission.** The task
+  allowed for one "if necessary". It is not: there was never a window in which enforcement was off,
+  so there are no orphans to clean. Writing a migration that deletes rows matching a condition that
+  cannot hold would have been a destructive no-op — real risk, zero benefit. An operator who wants to
+  confirm this against a specific database can run `PRAGMA foreign_key_check;`, which returns one row
+  per violation and nothing for a clean database; that is recorded in `SCHEMA.MD` rather than
+  automated, because it is a one-time reassurance and not an invariant needing a sweep.
+- **The pragma is now set explicitly anyway.** Not as a repair — as hardening. A defaulted
+  security-relevant setting is one a dependency can revise in a point release, and the failure mode of
+  that revision is silent: orphans accumulate and nothing errors. Declaring it pins the behaviour to
+  this crate's intent.
+
+### What actually changed in `src/db.rs`
+
+`connect()` and `run_migrations()` are new; `apply_sqlite_pragmas` gained `foreign_keys=ON` and
+`synchronous=NORMAL`. `main.rs` calls `db::connect` instead of `Database::connect`.
+
+`connect()` exists for a reason the pragma statements cannot cover: **SQLx replays a reopened
+connection's options but not our `PRAGMA` statements**, so a connection recycled after an invalidation
+would come back without them. Declaring them through `SqliteConnectOptions` is what makes them
+survive that. `apply_sqlite_pragmas` is still called and still earns its place — it reads
+`journal_mode` back, so the startup log reports what is *in force* rather than what was requested, and
+it covers pools this crate did not build (every pool in the test suite).
+
+`SQLITE_MAX_CONNECTIONS = 1` is pinned explicitly. SeaORM's `Database::connect` does this for SQLite;
+hand-building a pool from `SqliteConnectOptions` opts out of that default **silently**, and at any
+pool size ≥ 2 `m20230106`'s drop-and-re-add of the generated `master_marker` column lands on a
+connection whose schema still has the old one. The peer hit exactly this and documented it; taking
+their fix without re-deriving the bug was the point of having a peer to read.
+
+Of the four settings, only **`synchronous=NORMAL` is a behaviour change** — the driver default is
+`FULL`. The other three were already in force and are now asserted.
+`synchronous_normal_is_a_real_change_from_the_driver_default` pins that distinction against a bare
+`Database::connect`, so if SQLx ever changed its default the test goes red and says so, rather than
+continuing to pass while the code setting it had quietly become redundant.
+
+### `tests/referential_integrity.rs` (6 tests) — the gap that was real either way
+
+The pragma was never the missing piece. **Nothing in the repository asserted that any of the six
+foreign keys fired**, and that gap was genuine regardless of who was right about the pragma. The new
+suite pins behaviour, not configuration:
+
+| Test | Pins |
+| :--- | :--- |
+| `deleting_a_hook_cascades_to_permissions_parameters_and_executions` | Three `CASCADE` edges, with a sibling hook present so a cascade that reached too far is caught |
+| `deleting_a_key_cascades_grants_but_only_nulls_execution_and_audit_attribution` | The `CASCADE`/`SET NULL` **asymmetry**, including that the denormalized `api_key_name`/`prefix` survive |
+| `a_row_referencing_a_nonexistent_parent_is_refused_at_insert` | The constraint in the *other* direction — a row cannot be created dangling |
+| `a_parameter_cannot_be_attached_to_a_hook_that_does_not_exist` | The edge a hook purge relies on |
+| `purging_a_trashed_hook_leaves_no_orphaned_children` | The **shipped path**: `purge_expired_deleted_hooks` deletes from `hooks` alone and never touches child tables |
+| `key_lineage_and_ownership_columns_are_unconstrained_by_design` | An **absence** — see below |
+
+**Mutation-verified.** With `PRAGMA foreign_keys=OFF` injected into `setup_test_db`, five of the six
+go red. The sixth stays green, correctly: it asserts that `parent_key_id` and `owner_key_id` carry no
+constraint, which is unaffected by the pragma. That split is the evidence the suite tests what it
+claims rather than the fixture.
+
+That sixth test asserts an absence, which deserves justification. `m20230107` omits those FKs
+deliberately: `CASCADE` would delete a hook when its owner key is deleted — exactly what
+`RBAC_MODEL.md` §6 forbids — and `SET NULL` would silently orphan the resource at the moment of
+deletion, which is the outcome §6's pre-flight inventory exists to prevent by **refusing** instead.
+The test exists so that a future migration "fixing the missing constraint" is met with a red test
+explaining why not, rather than shipping and breaking §6.
+
+## P1 — HMAC extraction into `src/crypto.rs`
+
+`signature_base` and `verify_signature` moved out of `middleware.rs` and became
+`canonical_v1_payload`, `compute_signature`, `verify_signature`, `SIGNATURE_PREFIX` and
+`SignatureRejection`. `generate_signing_secret` moved from `api/support.rs`, and is deliberately
+**not** re-exported from `api/mod.rs` — a re-export would recreate the "where do I find the crypto?"
+ambiguity the move exists to remove. `mint_signing_pair` calls through to `crypto`.
+
+### Deviation from the task's proposed signatures, and why
+
+The task sketched `canonical_v1_payload(...) -> String`, `compute_signature(secret: &[u8], payload:
+&str) -> String`, `verify_signature(...) -> bool`. All three shipped differently:
+
+- **`-> Vec<u8>` rather than `String`** for the payload. A signed body is arbitrary bytes and need not
+  be UTF-8 — `BODY_ONLY` exists precisely to accept senders whose format we do not control. A
+  `String` return would make signing depend on the payload being decodable.
+  `a_body_that_is_not_valid_utf8_still_signs_and_verifies` pins this.
+- **`-> Result<Vec<u8>, SignatureRejection>` rather than `-> bool`** for verification. The digest
+  bytes are what `ReplayGuard` keys on; returning `bool` would force the middleware to re-decode the
+  header, and the *decoded bytes* are what makes `sha256=AB…` and `sha256=ab…` the same single use
+  rather than two. `the_same_signature_in_either_hex_case_verifies_to_the_same_digest` pins that.
+- **Four rejection variants rather than a boolean.** The existing pipeline returns three distinct
+  `401` messages and one `500`, and the task required "without changing the authentication pipeline
+  behavior". A `bool` cannot carry that. `SignatureRejection` does, and
+  `middleware::reject_signature` — the only new function in `middleware.rs` — maps it back. Note what
+  is deliberately *not* distinguished: `Mismatch` covers a tampered payload, a wrong secret and a
+  wrong-width tag alike, because telling those apart is exactly the oracle an attacker wants.
+
+`crypto.rs` takes no `AppError`, no database and no request. That purity is the module boundary and
+it is testable: `every_single_byte_mutation_of_a_valid_signature_is_rejected` (96 mutations) is
+practical here and would need a router, a pool and a seeded key against the middleware.
+
+Ten unit tests moved with the primitive and five were added: the non-UTF-8 body, hex-case
+equivalence, the correct-but-untagged digest, the empty secret (which is *valid* HMAC key material —
+`KeyUnusable` exists for a case HMAC-SHA256 makes unreachable, and it would be easy to assume "empty
+secret" is that case), and secret generation width/uniqueness.
+
+## `src/api/audit.rs` — reversing a previous decision
+
+The last session defended keeping `system.rs` as-is and explicitly listed splitting it as *not
+proposed*: "the divergence is deliberate and the name is more accurate than the peer's". **That
+defence was of the name, not of the grouping, and it does not survive the question actually being
+asked.** `system.rs` grouped the audit log with the settings endpoint because both are master-only —
+organizing by *audience*, which is the weakest available axis, since nearly every administrative
+endpoint in the service shares it.
+
+The two halves differ in every way that matters for change: `audit.rs` reads a growing table and will
+keep acquiring query surface (filter by acting key, by target, by time range), while `system.rs`
+reports a struct fixed at startup plus three `COUNT(*)`s. No shared state, no shared types, no reason
+to be edited together. Splitting them also removes the last naming divergence from the peer, which
+reached `api/audit.rs` independently — corroboration rather than fashion.
+
+Both files gained a header stating what is *not* in them, because the likely error is specific:
+**writing** an audit row is `support::create_audit_log`, called from a dozen mutating handlers.
+`audit.rs` is the reader of a table many call sites write to, and putting the writer there would drag
+an import into every handler module for no gain.
+
+## P3 — health and readiness probes
+
+The previous audit recorded the absence of monitoring endpoints as a **symmetric gap** — neither
+service had them — and filed it as P3 because it was "neither decided nor documented". Now decided.
+
+`GET /health` + `/healthz` and `GET /ready` + `/readyz`, mounted on the root router outside both
+`nest()` calls so no auth layer is in their path. Three properties are load-bearing:
+
+1. **Unauthenticated by design.** An orchestrator holds no API key, and a liveness check that needs
+   one fails exactly when the credential store is what broke.
+2. **Liveness must not touch the database.** `health_check` takes no `State` — enforced by the
+   compiler, not by a comment. Conflating the two is the classic way to turn a brief dependency
+   outage into an outage of your own: if liveness checked the database, a thirty-second blip would
+   fail liveness on *every* replica and the orchestrator would restart all of them, which does not fix
+   a database and does destroy in-flight executions.
+3. **Public means disclosing nothing.** No version, no hostname, no counts, no driver error. `DbErr`
+   renders connection strings and driver internals; it is logged at `warn` and never returned. The
+   body is asserted to be exactly two fixed fields, so a field added later trips a test and must be
+   justified rather than arriving unnoticed on a public endpoint.
+
+`503` rather than `500` for a dead database: nothing about the request failed — the answer *is* "not
+ready", and it was produced successfully. `503` is what tells a well-behaved proxy to stop routing
+and retry.
+
+**The raw-SQL allowlist gained its third entry, and the guard caught it.** `SELECT 1` tripped
+`no_raw_sql_outside_the_two_documented_exceptions` on the first full test run, which is the gate
+working. It earns its exemption differently from the other two: those are unreachable from a request
+(startup pragmas, DDL), while this one *is* request-reachable and anonymous. Its justification is that
+the statement is a literal with no table and nothing to interpolate — a probe that read rows would let
+an anonymous caller provoke unbounded work, which is a denial-of-service primitive aimed at the
+endpoint that reports health. The test was renamed to `no_raw_sql_outside_the_documented_exceptions`,
+since "two" was in the name.
+
+`tests/health_probes.rs` (7 tests) covers the probes at router level, including a **closed pool** so
+readiness is not merely indistinguishable from liveness in every test — without it, a version that
+ignored its query result and always answered `200` would pass everything else. Two tests guard the
+mounting rather than the handlers: a bogus `X-API-Key` is *ignored* (positive evidence no auth layer
+is in front, which "works without a header" alone does not prove), and `/api/*` still answers `401`
+(the `.merge` that mounted the probes could have taken the auth layer off the API tree). 11 further
+checks in `scripts/test_e2e.sh` exercise them against a real server, where the risk is different:
+`ServeDir` is live, and whether `/health` reaches the handler or a file on disk is a question about a
+real filesystem.
+
+## Harness — convergence went from 17/1-known/1-skipped to **19/0/0**
+
+Three script changes, all consequences of code moving rather than baseline adjustments:
+
+- **`Signature canonicalization`** compared `src/middleware.rs::signature_base` against
+  `src/crypto.rs::canonical_v1_payload`. Both sides are now `src/crypto.rs::canonical_v1_payload`, so
+  the rule compares like with like instead of relying on `normalize()` to rename one into the other.
+  The alias stays in `normalize()` regardless — it costs nothing and keeps the check working against
+  an older checkout.
+- **`verify_slice` presence** repointed to `src/crypto.rs`. The *absence* rule (no `==` on MACs) now
+  runs against **both** files: the primitive moved, but `middleware.rs` is exactly where someone would
+  reintroduce a hand-rolled comparison "just to check the header first", and a rule that stopped
+  looking there would not notice.
+- **`SQLite pragma initialization` — KNOWN-2 retired.** The two functions now compare **equal**, so
+  the entry converged rather than being re-baselined again. One cosmetic difference remained after
+  the pragmas were added (a braced vs. unbraced `tracing::info!` arm) and was resolved by matching the
+  peer, not by accepting a new fingerprint. The stale rationale — which asserted the six FKs were
+  inert — is replaced in the script with the correction, so the wrong claim does not survive in the
+  one file that gets read during an incident.
+
+**This closes the largest structural divergence between the two codebases.** The previous audit
+recorded request-signature computation living in `middleware.rs` here and `crypto.rs` in the peer as
+the single biggest layout difference; both are now `crypto.rs`.
+
+## Corrections to the record made this session
+
+Recorded explicitly rather than by quietly editing, because both were stated as findings above and a
+reader scrolling up will meet the wrong version first:
+
+1. **"Six foreign keys are inert on SQLite" — false.** SQLx sets `foreign_keys=ON`; they were always
+   enforced. Corrected in `AGENT.MD` §3b, `SCHEMA.MD`, `src/db.rs`, `tests/referential_integrity.rs`
+   and `scripts/verify_convergence.sh`.
+2. **"Splitting `system.rs` is not proposed" — reversed.** The argument defended the *name*
+   `system.rs`, which remains right for what that file now holds; it did not defend keeping two
+   unrelated subjects in one file.
+
+## Remaining from the previous proposal
+
+**P2 — moving the four §4 key-visibility helpers from `guards.rs` to `keys.rs`** is not done. It is
+all-or-nothing (splitting them would put one rule in two files, the failure `guards.rs` is one module
+to avoid) and requires amending `AGENT.MD`'s "`guards.rs` holds every authorization decision" rule.
+That is a rule change, not a refactor, and it was not in this session's scope.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **275 passed / 0 failed** (98 unit + 133 integration + 23 compliance + 8 hygiene +
+7 health + 6 referential integrity) · `./scripts/test_e2e.sh` **886 / 886** ·
+`./scripts/verify_convergence.sh` exit 0 — **19 converged, 0 known divergences, 0 drifted, 0
+skipped** · `git diff RBAC_MODEL.md` empty.

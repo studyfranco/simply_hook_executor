@@ -240,7 +240,7 @@ pub async fn insert_key_with_mode(
     let id = Uuid::new_v4();
     let plaintext = simply_hook_executor::api::generate_random_key();
     let key_id = simply_hook_executor::api::generate_key_id();
-    let signing_secret = simply_hook_executor::api::generate_signing_secret();
+    let signing_secret = simply_hook_executor::crypto::generate_signing_secret();
     let now = chrono::Utc::now().naive_utc();
 
     api_key::ActiveModel {

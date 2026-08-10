@@ -58,7 +58,9 @@ use state::AppState;
 /// Builds the complete Axum router.
 ///
 /// Both the `/api/*` tree and the `/webhook/*` entry point sit behind
-/// [`middleware::auth_middleware`]; only the static SPA served from `static/` is public.
+/// [`middleware::auth_middleware`]. The public surface is exactly three things: the static SPA
+/// served from `static/`, and the `/health` and `/ready` probes — see [`api::health`] for why those
+/// two must not require a credential.
 pub fn create_app(state: AppState) -> Router {
     let api_routes = Router::new()
         .route("/auth/me", get(api::get_me))
@@ -115,8 +117,25 @@ pub fn create_app(state: AppState) -> Router {
             middleware::auth_middleware,
         ));
 
+    // Monitoring probes, mounted on the root router *outside* both nests so no `from_fn_with_state`
+    // auth layer is in their path. That placement is the mechanism, not a convenience: an
+    // orchestrator has no API key, and a liveness check that needs one fails precisely when the
+    // credential store is what broke. See [`api::health`] for why liveness and readiness are
+    // separate routes rather than one endpoint with a flag.
+    //
+    // Both are also mounted before the `ServeDir` fallback, so a file that happened to be named
+    // `static/health` could never shadow the probe.
+    let probe_routes = Router::new()
+        .route("/health", get(api::health_check))
+        .route("/ready", get(api::readiness_check))
+        // `/healthz` and `/readyz` are the Kubernetes-idiomatic spellings and cost nothing to
+        // accept; a chart that defaults to one of them works without being edited.
+        .route("/healthz", get(api::health_check))
+        .route("/readyz", get(api::readiness_check));
+
     Router::new()
         .fallback_service(ServeDir::new("static"))
+        .merge(probe_routes)
         .nest("/api", api_routes)
         .nest("/webhook", webhook_routes)
         // Applied outside the nests so it covers `/api/*`, `/webhook/*`, and the static fallback

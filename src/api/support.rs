@@ -128,19 +128,19 @@ pub fn generate_key_id() -> String {
     format!("shk_{}", hex::encode(bytes))
 }
 
-/// Generates a 32-byte HMAC signing secret.
-pub fn generate_signing_secret() -> String {
-    let bytes: [u8; 32] = rand::rng().random();
-    hex::encode(bytes)
-}
-
 /// Mints and seals a fresh `(key_id, signing_secret)` pair, returning the plaintext secret.
 ///
 /// The plaintext is handed back exactly once so the caller can put it in the HTTP response; only
 /// the sealed form is ever persisted.
+///
+/// The secret itself comes from [`crate::crypto::generate_signing_secret`], not from this module.
+/// That is a deliberate boundary: `generate_key_id` above mints a *public* identifier and belongs
+/// here with the rest of the request plumbing, while the signing secret is the entropy every
+/// signature in the system rests on and belongs beside the HMAC that consumes it. This function is
+/// where the two meet, which is exactly what it is for.
 pub(crate) fn mint_signing_pair(cipher: &SecretCipher) -> Result<(String, String, String), AppError> {
     let key_id = generate_key_id();
-    let signing_secret = generate_signing_secret();
+    let signing_secret = crate::crypto::generate_signing_secret();
     let sealed = cipher.seal(&signing_secret).map_err(|e| {
         tracing::error!("Failed to seal a signing secret: {e}");
         AppError::Internal
