@@ -5091,3 +5091,92 @@ prefix convention is ever judged worth the churn.
 `cargo test` **275 passed / 0 failed** · `./scripts/test_e2e.sh` **886 / 886** ·
 `./scripts/verify_convergence.sh` exit 0 — 19 converged, 0 known, 0 drifted, 0 skipped ·
 `git diff RBAC_MODEL.md` empty · `SECURITY_COMPARISON_REPORT.md` unmodified.
+
+---
+
+# Session — final read-only parity pass: security + structural convergence reports
+
+Read-only throughout. No file under `src/`, `tests/`, `scripts/` or `static/` was modified, and no
+commit was created by the analysis itself. Deliverables: `SECURITY_COMPARISON_REPORT.md` (rewritten),
+`STRUCTURAL_CONVERGENCE_REPORT.md` (new), `FILE_MAP.MD` (coverage section + corrected line counts).
+
+## Scope
+
+The workspace holds several Rust projects. Per instruction mid-session — *"Compare only with
+simply_ip_vault"* — both reports are strictly two-way: `simply_hook_executor` ↔ `simply_ip_vault`.
+Other workspace projects were surveyed only far enough to confirm they were out of scope, and appear
+in neither report.
+
+## The finding that changed the methodology
+
+Every prior audit in this repository compared against `example/simply_ip_vault`, a **vendored flat
+snapshot**. This pass compared against the **live sibling checkout** at
+`../simply_ip_vault` as well, and they are not the same tree:
+
+```
+diff -rq example/simply_ip_vault/src ../simply_ip_vault/src
+  Only in example/simply_ip_vault/src/api: system.rs
+  Only in example/simply_ip_vault/src:     webhooks.rs
+```
+
+Both files were **deleted upstream** and linger in our snapshot — it was refreshed with a
+non-deleting copy. Every other source file is byte-identical, and `RBAC_MODEL.md` is identical across
+all three copies (`cb0b76ab…`), so the convergence gate's results were **not** falsified.
+
+**But two findings in the previous session's structural audit were, and both are retracted:**
+
+| Prior claim | Reality | Cause |
+| :--- | :--- | :--- |
+| "The peer's probes live in `api/system.rs`; ours in `api/health.rs`. Keeping ours." | The peer has `api/health.rs`; `api/system.rs` **no longer exists**. Placement is **identical** | Read the orphaned snapshot file |
+| "The peer exposes a hardcoded `master_pinned: true`; deliberately not copied." | The live peer performs a **real** `master_pin.get().is_none()` check driving the status code, and exposes no such field. **The peer is stricter than us here** | Same |
+
+The orphaned `system.rs` is not referenced by the peer's `api/mod.rs`, so it is dead code even inside
+the snapshot — which is exactly why it went unnoticed: it compiles, it greps, and nothing links it.
+
+Recorded as **S1** in the structural report: re-sync with `rsync -a --delete`, and make
+`verify_convergence.sh` fail on a peer `.rs` file unreachable from the peer's module tree. This is the
+highest-value action from the pass, because it silently degrades every future comparison.
+
+## Checks performed
+
+| # | Check | Method | Result |
+| :--- | :--- | :--- | :--- |
+| 1 | Snapshot freshness | `diff -rq` snapshot vs live peer `src/` | 2 orphaned files; all others byte-identical |
+| 2 | Normative identity | `md5sum RBAC_MODEL.md` × 3 (ours, snapshot, live) | Identical — `cb0b76ab…` |
+| 3 | Gate provenance | Read `PEER_ROOT` in `verify_convergence.sh` | Reads the snapshot, not the live tree |
+| 4 | F1 — §5 marker | Read peer `m20260808_000009_derive_master_marker` | Generated column + `STORED`/`VIRTUAL` split — **resolved** |
+| 5 | F2 — R2 conjunction | Read `require_hook_manage_conjunction`; live probe of three caller shapes | Daughter+row ⇒ **403**; owner ⇒ 200; Parent+row ⇒ 200 |
+| 6 | F3 — dormant key column | `grep` for `api_key::Column::OwnerKeyId` across `src/` | Zero query sites; column dropped in `m20260810_000001` |
+| 7 | F4 — master CIDR bypass | Read both `middleware.rs` bound-IP blocks | No `is_master` exemption on either side |
+| 8 | F5 — FK enforcement | Prior mutation-verified suite + peer `db.rs` pragma table | Enforced both sides; earlier "inert" claim already retracted |
+| 9 | Payload strictness | Enumerated every `…Payload` struct and its attributes, both repos | Both strict on key create/update; peer lacks it on `DeleteKeyPayload` |
+| 10 | Error contract | Read both `error.rs` variant lists, status maps, body shapes | Body identical; 3 fixed messages string-identical; 2 non-shared variants |
+| 11 | Audit schema | Compared `entities/audit_log.rs` column-by-column | 6/9 match; nullability and target-column shape differ |
+| 12 | Master pinning API | Compared `master.rs` public surfaces | **Character-identical** six-method API |
+| 13 | Raw-SQL policy | `grep Statement::from_string` across both `src/` | Peer: `db.rs` + migrations only. Ours additionally `api/health.rs` |
+| 14 | Module/naming inventory | Enumerated `src/*.rs`, `src/api/*.rs`, guard fn names, middleware fn names, `mod` vs `pub mod` | Recorded in the structural report |
+| 15 | FILE_MAP exhaustiveness | Three shape-specific coverage commands (see that file) | 39/39 files documented; 5 stale line counts corrected |
+
+## Verdicts
+
+**Security.** All 7 flaws raised in any prior report across both repositories are resolved. Four open
+divergences remain, none a regression: two where the peer is stricter (**D1** our `SELECT 1`
+raw-SQL allowlist entry vs their typed query; **D2** their readiness checks the Master pin, ours does
+not), and two where this service is (**D3** their audit attribution columns are nullable; **D4** their
+`DeleteKeyPayload` lacks `deny_unknown_fields`).
+
+**Structural.** 14/14 crate-root concerns and 7/8 API modules share identical filenames; 11/11
+cross-cutting type and function name categories are exact; the HTTP error contract matches on every
+shared variant including three message strings. The weakest axis is **observability** — the audit log
+schemas differ in three columns' nullability and in target-column naming and arity, so an
+ecosystem-wide log consumer cannot assume one schema.
+
+Convergence is **bidirectional and still moving**: in the last cycle the peer extracted `master.rs`,
+`db.rs` and `api/support.rs` toward our layout while we moved HMAC into `crypto.rs` and split out
+`api/audit.rs` toward theirs, and both added `api/health.rs` in the same week with identical handler
+names.
+
+## Actions recorded for later, not taken here
+
+`D1`/`D2` are both cheap changes to *this* service and both make it stricter. They are the natural
+next commit; this session was read-only by instruction, so neither was applied.

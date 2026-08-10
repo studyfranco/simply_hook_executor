@@ -11,7 +11,47 @@ Each entry states three things:
   by measurement rather than taste, the measurement is named.
 
 Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `AGENT_NOTES.MD`
-(worklog and audits), `RBAC_MODEL.md` (normative authorization spec, read-only).
+(worklog and audits), `RBAC_MODEL.md` (normative authorization spec, read-only),
+`SECURITY_COMPARISON_REPORT.md` and `STRUCTURAL_CONVERGENCE_REPORT.md` (peer parity vs
+`simply_ip_vault`).
+
+## Coverage
+
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-10.
+
+| Group | Files | Where documented here |
+| :--- | :--- | :--- |
+| Crate root (`src/*.rs`) | 12 | One `###` section each, under **Top level** |
+| API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
+| Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
+| Migrations (`src/migration/*.rs`) | 10 | Table under **`src/migration/`** (9 migrations + `mod.rs`) |
+| **Total** | **39** | — |
+
+To re-verify after adding a file — all three commands print nothing when coverage is complete
+(verified passing 2026-08-10):
+
+```bash
+# 1. Crate-root and API modules, documented as `### `src/…`` headings
+diff <(grep -oE '^### `src/[a-z_0-9/]+\.rs`' FILE_MAP.MD | tr -d '#` ' | sort) \
+     <(find src -maxdepth 2 -name '*.rs' \
+            -not -path 'src/entities/*' -not -path 'src/migration/*' | sort)
+
+# 2. Entities, documented by basename in a table
+comm -13 <(grep -oE '`[a-z_0-9]+\.rs`' FILE_MAP.MD | tr -d '`' | sort -u) \
+         <(ls src/entities | sort)
+
+# 3. Migrations, documented by name *without* the .rs suffix
+comm -13 <(grep -oE '`m[0-9]{8}_[0-9]{6}_[a-z_0-9]+`' FILE_MAP.MD | tr -d '`' | sort -u) \
+         <(ls src/migration | grep '^m20' | sed 's/\.rs$//' | sort)
+```
+
+The three groups are checked separately because they are documented in three different shapes —
+full path for modules, basename for entities, suffix-less for migrations. A single naive `grep` over
+paths reports false gaps for the latter two, and false *hits* for `src/api.rs` and `src/webhooks.rs`,
+which appear in prose as historical and peer references rather than as index entries.
+
+Line counts in the section headings are indicative and drift between audits; the **Role & scope**
+and **Rationale** text is the contract.
 
 ---
 
@@ -49,7 +89,7 @@ src/
 
 ## Top level
 
-### `src/lib.rs` — 144 lines
+### `src/lib.rs` — 163 lines
 
 **Role & scope.** Declares the module tree, assembles the Axum router, and spawns the retention
 worker. Holds no business logic and no authorization: it is the wiring diagram.
@@ -65,7 +105,7 @@ enforceable rather than aspirational.
 > `api/mod.rs` re-exports every handler, and it is why the `src/api.rs` → `src/api/` split left this
 > file byte-identical.
 
-### `src/main.rs` — 329 lines
+### `src/main.rs` — 327 lines
 
 **Role & scope.** The binary. Runs migrations, bootstraps the Master key on an empty table, pins the
 Master identity, primes proxy resolution, binds the listener, and shuts down gracefully. Must **not**
@@ -113,7 +153,7 @@ would be one forgotten call site away from worthless — including every call si
 someone who never read this file. Handlers keep reading `key.is_master` and are automatically
 correct, because the principal they receive is the *effective* one.
 
-### `src/middleware.rs` — 704 lines
+### `src/middleware.rs` — 543 lines
 
 **Role & scope.** Authentication only — establishing *who* is calling. Bearer key lookup, HMAC
 signature verification, timestamp freshness, replay rejection, and bound-IP enforcement. Must **not**
@@ -266,7 +306,7 @@ what keeps a `413` oversized-body rejection from being reported as a malformed p
 Split from a single 3,847-line file. The layout was chosen by measuring which private helpers cross
 domain boundaries (17 do); the full audit and rationale are in `AGENT_NOTES.MD`.
 
-### `src/api/mod.rs` — 85 lines
+### `src/api/mod.rs` — 95 lines
 
 **Role & scope.** Module declarations, router-facing re-exports, and shared policy constants. Must
 **not** hold handlers or helpers.
@@ -351,7 +391,7 @@ Two ordering rules inside this file are load-bearing:
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,256 lines
+### `src/api/keys.rs` — 1,255 lines
 
 **Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
 **key-subtree** visibility.
