@@ -1,248 +1,352 @@
-# Structural & Formal Convergence Report — `simply_hook_executor` ↔ `simply_ip_vault`
+# Structural and Formal Convergence Report — `simply_hook_executor` ↔ `simply_ip_vault`
 
-**Date:** 2026-08-10
-**Mode:** strictly read-only. No source file in either repository was modified.
-**Subject A:** `simply_hook_executor` @ `20f2695`
-**Subject B:** `simply_ip_vault` — live checkout at `/home/fallrik/Documents/workspaces/simply_ip_vault`
-**Companion document:** `SECURITY_COMPARISON_REPORT.md` (behavioural/security parity)
+**Date:** 2026-08-11
+**Mode:** strictly read-only. No file under `src/`, `tests/`, `migration/`, `scripts/` or `static/`
+was modified in either repository. `RBAC_MODEL.md` is untouched.
+**Subject A (this repository):** `simply_hook_executor` @ `4865a82`
+**Subject B (peer):** `simply_ip_vault` @ `6f1c4c7`, at `example/simply_ip_vault` — a live git clone,
+pulled at the start of this pass (`Already up to date.`)
 
-This report assesses **shared architectural DNA**: whether the two services are organised the same
-way, name the same things the same way, and answer failures in the same shape. It deliberately does
-not re-litigate security controls — those are in the companion document.
+This edition replaces the 2026-08-10 report of `20f2695`, preserved at `7a7ffc7`. Its single unforced
+divergence — mixed `require_*` / `guard_*` guard prefixes on this side — has since closed.
 
----
-
-## 1. Module & file structure
-
-### 1.1 Crate root — `src/*.rs`
-
-| Module | `simply_hook_executor` | `simply_ip_vault` | Status |
-| :--- | :--- | :--- | :--- |
-| `lib.rs` | ✅ Router assembly, module registry, worker spawn | ✅ Same role | **Identical role** |
-| `main.rs` | ✅ Migrate → bootstrap → pin → bind → shut down | ✅ Same sequence | **Identical role** |
-| `state.rs` | ✅ `AppState` | ✅ `AppState` | **Identical** |
-| `master.rs` | ✅ Boot-time Master pinning | ✅ Same | **Converged** — peer extracted this from `state.rs` after the prior audit |
-| `middleware.rs` | ✅ Auth pipeline | ✅ Same | **Identical role** |
-| `config.rs` | ✅ Env parsing, proxy trust, client-IP resolution | ✅ Same | **Identical role** |
-| `crypto.rs` | ✅ HMAC signing + secrets-at-rest | ✅ Same | **Converged** — this service moved HMAC here to match |
-| `db.rs` | ✅ Pool, pragmas, migrations | ✅ Same | **Converged** — peer extracted this from `state.rs` |
-| `replay.rs` | ✅ Single-use signature enforcement | ✅ Same | **Identical role** |
-| `retention.rs` | ✅ Background sweeps | ✅ Same | **Identical role** |
-| `error.rs` | ✅ `AppError` → HTTP | ✅ Same | **Identical role** |
-| `entities/` | ✅ SeaORM models, one file per table | ✅ Same | **Identical convention** |
-| `migration/` | ✅ Ordered, append-only | ✅ Same | **Identical convention** |
-| `extract.rs` | ❌ — folded into `api/support.rs` | ✅ Strict-JSON extractors | **Placement divergence** (§1.3) |
-| `executor.rs` | ✅ Process spawn, argv, env isolation, killpg | ❌ | **Domain difference** |
-| `dispatch.rs` / `webhooks.rs` | ❌ | ✅ Outbound HTTP dispatch | **Domain difference** |
-
-**14 of 14 shared concerns occupy an identically-named file.** The only differences are the two
-domain modules (this service runs local processes; the peer dispatches HTTP) and `extract.rs`.
-
-### 1.2 API layer — `src/api/*.rs`
-
-| Module | `simply_hook_executor` | `simply_ip_vault` | Status |
-| :--- | :--- | :--- | :--- |
-| `mod.rs` | ✅ Wiring + re-exports + policy constants | ✅ Same | **Identical role** |
-| `guards.rs` | ✅ Cross-domain authorization, single module | ✅ Same, single module | **Identical** |
-| `support.rs` | ✅ Shared plumbing, decides nothing | ✅ Same | **Converged** — peer extracted from `api/mod.rs` |
-| `keys.rs` | ✅ Key CRUD, `/auth/me`, grants, §6 cascade | ✅ Same | **Identical role** |
-| `audit.rs` | ✅ Audit-trail reads, master-only | ✅ Same | **Converged** — this service split it out to match |
-| `health.rs` | ✅ Liveness/readiness, unauthenticated | ✅ Same | **Converged independently, same week** |
-| `system.rs` | ✅ Effective config + counters | ❌ **Removed upstream** | **Divergence** (justified, §1.4) |
-| Managed-resource module | `hooks.rs` | `groups.rs` | **Structural analogue** |
-| Resource-data module | `executions.rs` | `records.rs` | **Structural analogue** |
-| Creator-private module | — (executions carry it) | `webhooks.rs` | **Domain difference** |
-
-**7 of 8 API modules exist on both sides under the same filename.**
-
-### 1.3 The two placement divergences
-
-| Concern | This service | Peer | Assessment |
-| :--- | :--- | :--- | :--- |
-| Strict-JSON extractors | `api/support.rs` (`StrictJson`, `OptionalStrictJson`) | `src/extract.rs` | **Cosmetic.** Same types, same behaviour, same rejection mapping. Neither placement is wrong: ours groups them with the other request plumbing, theirs promotes them to a crate-root concern |
-| Module visibility in `api/mod.rs` | `pub mod` × 8 | `mod` × 8 (**private**, re-exported selectively) | **Peer is tighter.** Ours exposes every API submodule as crate-public API; theirs exposes only the handler re-exports. Ours is a consequence of the historical `src/api.rs` split, where preserving `crate::api::*` paths mattered |
-
-### 1.4 `api/system.rs` — the one true structural divergence
-
-The peer **deleted** `api/system.rs` and with it any settings endpoint. This service retains
-`GET /api/settings` (master-only: effective configuration plus three counters).
-
-| Aspect | Detail |
-| :--- | :--- |
-| Is this drift? | **No.** It is a deliberate product difference: this service's settings response reports `allowed_env_vars` and `allowed_script_roots`, which describe what a spawned hook process inherits. The peer spawns nothing, so its equivalent had little to report |
-| Security posture | Both defensible. Ours is master-gated and discloses nothing to an unauthenticated caller; the peer's removal is pure surface reduction |
-| Verdict | **Justified divergence.** No action |
+**Scope note.** This is a *formal* analysis: it asks whether the two services are built the same way,
+not whether they do the same things. They deliberately do not do the same things — one executes
+local processes, the other manages IP blocklists and dispatches webhooks — so a divergence is a
+finding only when it has no domain justification.
 
 ---
 
-## 2. Naming conventions
+## 1. Repository hierarchy
 
-### 2.1 Where naming is already exact
-
-| Concern | Both services use |
-| :--- | :--- |
-| Auth entry point | `auth_middleware` |
-| Master pinning type | `MasterPin` |
-| Master pinning API | `new`, `pinned_to`, `get`, `pin_at_boot`, `resolve`, `authenticate` — **all six, same order, same signatures** |
-| Canonical signed string | `canonical_v1_payload` |
-| Signature helpers | `compute_signature`, `verify_signature`, `generate_signing_secret`, `SIGNATURE_PREFIX` |
-| Secrets at rest | `SecretCipher`, `CryptoError`, `seal`, `open`, `is_encrypting` |
-| Pool setup | `connect`, `run_migrations`, `apply_sqlite_pragmas`, `SQLITE_BUSY_TIMEOUT_MS`, `SQLITE_MAX_CONNECTIONS` |
-| Probes | `health_check`, `readiness_check` |
-| Error type | `AppError` |
-| Payload suffix | `…Payload` (`CreateApiKeyPayload`, `UpdateApiKeyPayload`) |
-| Entity file convention | snake_case singular, one file per table, plus `mod.rs` + `prelude.rs` |
-| Migration convention | `m<YYYYMMDD>_<NNNNNN>_<snake_case_description>.rs`, append-only |
-
-`MasterPin`'s six-method surface being character-identical across two independently-written services
-is the strongest single indicator of shared DNA in the ecosystem.
-
-### 2.2 Where naming diverges
-
-| Concept | `simply_hook_executor` | `simply_ip_vault` | Assessment |
+| Path | `simply_hook_executor` | `simply_ip_vault` | Convergence |
 | :--- | :--- | :--- | :--- |
-| R2 conjunction | `require_hook_manage_conjunction` | `guard_group_manage` | Prefix + explicitness |
-| §3 lifecycle | `require_lifecycle_authority` | `guard_resource_lifecycle` | Prefix |
-| R4 scope elevation | `require_master_to_grant_scopes` | `guard_scope_elevation` | Prefix |
-| Master immutability | `require_master_self_edit_is_bound_ips_only` | `guard_master_immutable` | Ours far more specific |
-| Master as target | `refuse_master_lifecycle_action` | `guard_master_target` | Prefix |
-| Delegation bound | `guard_delegated_hook_grant` | `guard_delegated_group_grant` | ✅ **Aligned** — differs only by domain noun |
-| Any-manage standing | `manages_any_hook` | `holds_any_group_manage` | Shape aligned |
-| Permission fetch | `hook_permission` | `caller_group_permission` | Shape aligned |
-| Timestamp window | `verify_timestamp` | `validate_timestamp` | **Near-miss** — same job, one word apart |
-| R6 classification | `is_permission_reduction` | `widens_permissions` | ⚠️ **Inverse polarity**, not a rename |
+| `src/` | ✅ | ✅ | ✅ |
+| `src/api/` | ✅ 8 modules | ✅ 8 modules | ✅ Same count, same role split |
+| `src/entities/` | ✅ 6 entities + `mod` + `prelude` | ✅ 6 entities + `mod` + `prelude` | ✅ Identical shape |
+| `src/migration/` | ✅ 9 migrations + `mod` | ✅ 10 migrations + `mod` | ✅ Same pattern |
+| `tests/` | ✅ 5 binaries + `common/` | ✅ 6 binaries, no shared module | ⚠️ Fixture strategy differs (**S3**) |
+| `scripts/` | `test_e2e.sh`, `verify_convergence.sh` | `test_e2e.sh`, `verify_convergence.sh` | ✅ Identical names and roles |
+| `static/` | `app.js`, `index.html`, `style.css` | `app.js`, `index.html`, `style.css` | ✅ Identical |
+| `.github/workflows/` | `docker-publish.yml` | `docker-publish.yml` | ✅ |
+| `.forgejo/workflows/` | `update-readme-each-month.yml` | `update-readme-each-month.yml` | ✅ |
+| `example/<peer>` | ✅ present, a git clone | ❌ **absent** | ⚠️ Asymmetric (**S1**) |
+| `Dockerfile`, `docker-compose.yml` | ✅ | ✅ | ✅ |
+| Normative + guidance docs | `RBAC_MODEL.md`, `AGENT.MD`, `SCHEMA.MD`, `FILE_MAP.MD`, `AGENT_NOTES.MD`, `README.md` | Same six | ✅ Identical document set |
+| Both comparative reports | ✅ | ✅ | ✅ Both repositories carry both reports |
 
-**Convention summary**
+**Verdict:** the top-level hierarchy is identical bar one asymmetry — only this repository vendors the
+peer, so only this repository can run drift detection (**S1**).
 
-| Dimension | This service | Peer |
+---
+
+## 2. Module inventory and separation of concerns
+
+### 2.1 Top-level modules (`src/*.rs`)
+
+| Module | A | B | Role | Convergence |
+| :--- | :---: | :---: | :--- | :--- |
+| `api` | ✅ | ✅ | HTTP surface | ✅ |
+| `config` | ✅ | ✅ | Runtime configuration + validation | ✅ |
+| `crypto` | ✅ | ✅ | HMAC canonicalization, signing, AEAD at rest | ✅ |
+| `db` | ✅ | ✅ | Connection, pragmas, migrations | ✅ |
+| `entities` | ✅ | ✅ | SeaORM models | ✅ |
+| `error` | ✅ | ✅ | `AppError` + `IntoResponse` | ✅ |
+| `master` | ✅ | ✅ | `MasterPin`, §5 identity | ✅ |
+| `middleware` | ✅ | ✅ | Auth, signature, replay, CIDR | ✅ |
+| `migration` | ✅ | ✅ | Schema evolution | ✅ |
+| `replay` | ✅ | ✅ | Single-use signature ledger | ✅ |
+| `retention` | ✅ | ✅ | Soft-delete purge worker | ✅ |
+| `state` | ✅ | ✅ | `AppState` | ✅ |
+| `executor` | ✅ | — | Spawns hook processes | Domain-only |
+| `dispatch` | — | ✅ | Delivers webhook events | Domain-only |
+| `extract` | — | ✅ | `StrictJson` / `OptionalStrictJson` | ⚠️ Placement divergence (**S2**) |
+
+**12 of 12 shared modules carry the same name and the same role.** `executor` and `dispatch` are the
+domain-specific side-effect engine on each side — role-analogous, correctly named for what they
+actually do, and not a convergence defect.
+
+### 2.2 `src/api/` modules
+
+| Module | A | B | Classification |
+| :--- | :---: | :---: | :--- |
+| `audit.rs` | ✅ | ✅ | **Structural** — audit-log read endpoint |
+| `guards.rs` | ✅ | ✅ | **Structural** — all RBAC decisions, one file |
+| `health.rs` | ✅ | ✅ | **Structural** — unauthenticated probes |
+| `keys.rs` | ✅ | ✅ | **Structural** — credential lifecycle |
+| `support.rs` | ✅ | ✅ | **Structural** — shared helpers, audit writer |
+| `hooks.rs` / `executions.rs` / `system.rs` | ✅ | — | Domain |
+| `groups.rs` / `records.rs` / `webhooks.rs` | — | ✅ | Domain |
+
+**5 of 5 structural modules are identical in name and responsibility, and each side carries exactly
+3 domain modules.** Both isolate every RBAC decision in a single `guards.rs` rather than distributing
+authorization across handlers — the most important structural property in either codebase, and it
+holds on both sides.
+
+### 2.3 Facade style — the one real module-level divergence
+
+| Aspect | `simply_hook_executor` | `simply_ip_vault` |
 | :--- | :--- | :--- |
-| Enforcing guard prefix | `require_*` | `guard_*` |
-| Predicate prefix | `is_*` / verb (`manages_any_hook`) | verb (`holds_any_group_manage`) / `widens_*` |
-| Domain noun in guard names | `hook` | `group` — **correct; these should differ** |
+| Submodule visibility | `pub mod audit; pub mod guards; …` | `mod audit; mod guards; …` (**private**) |
+| Re-export style | Selective — each handler named individually | Glob — `pub use audit::*;` per module |
+| `guards` reachable from outside the crate | **Yes** | **No** |
+| Consequence | Integration tests can call guards directly; the facade is advisory | Everything must go through the facade; the glob re-exports whatever is `pub` |
 
-**Assessment.** The prefix split (`require_*` vs `guard_*`) is the ecosystem's one systematic naming
-divergence. It is cosmetic — `scripts/verify_convergence.sh` compares behaviour, not identifiers —
-and unifying it is **not recommended as a mechanical pass**, because one entry in the table is a trap:
-`is_permission_reduction` and `widens_permissions` are logical inverses, so "renaming" one to the
-other requires inverting every call site's branch. That is a correctness-risky edit to R6 enforcement
-purchased with cosmetics. If the convention is ever unified, that pair must be handled as a semantic
-change with its own tests, separately from the other nine.
+Neither is strictly better. This service is explicit about *what* leaves the module but permissive
+about *who* can bypass the facade; the peer is the reverse. Tracked as **S4**.
 
----
+### 2.4 Module sizes
 
-## 3. Error handling & observability
-
-### 3.1 HTTP error contract
-
-| Property | `simply_hook_executor` | `simply_ip_vault` | Unified? |
-| :--- | :--- | :--- | :--- |
-| Error enum | `AppError` | `AppError` | ✅ |
-| Response body | `{"error": "<message>"}` | `{"error": "<message>"}` | ✅ **Identical** |
-| `InvalidInput` | `400` | `400` | ✅ |
-| `Unauthorized` | `401` | `401` | ✅ |
-| `Forbidden` | `403` | `403` | ✅ |
-| `NotFound` | `404` + `"Resource not found"` | `404` + `"Resource not found"` | ✅ **Identical string** |
-| `Conflict` | `409` | `409` | ✅ |
-| `DbError` | `500` + `"Internal database error"` | `500` + `"Internal database error"` | ✅ **Identical string** |
-| `Internal` | `500` + `"An internal server error occurred"` | `500` + same string | ✅ **Identical string** |
-| `BodyRejected` | carries `(StatusCode, String)` — 400/413/422 preserved | Same shape | ✅ |
-| `TooManyRequests` | `429` | ❌ absent | **Domain difference** — raised by `executor.rs` at `max_concurrent_jobs`; the peer spawns nothing |
-| `ConflictWithDetails` | ❌ absent | `409` + extra fields merged into the body | **Divergence** — same §6 feature, different mechanism |
-
-**§6 conflict payload — same semantics, different plumbing**
-
-| | This service | Peer |
-| :--- | :--- | :--- |
-| Mechanism | `delete_api_key` returns `axum::response::Response` directly | `AppError::ConflictWithDetails { message, details }` |
-| Wire result | `409` + structured inventory | `409` + structured inventory |
-| Assessment | The peer's is the better factoring — it keeps the handler returning `Result<_, AppError>` and puts the shape in one place. **Recommended for adoption**, low risk, no wire change |
-
-### 3.2 Audit logging structure — **not unified**
-
-| Column | `simply_hook_executor` | `simply_ip_vault` | Match |
-| :--- | :--- | :--- | :--- |
-| `id` | `Uuid` | `Uuid` | ✅ |
-| `api_key_id` | `Option<Uuid>` (FK `SET NULL`) | `Option<Uuid>` | ✅ |
-| `api_key_name` | **`String` (NOT NULL)** | `Option<String>` | ❌ |
-| `api_key_prefix` | **`String` (NOT NULL)** | `Option<String>` | ❌ |
-| `client_ip` | **`String` (NOT NULL)** | `Option<String>` | ❌ |
-| `action` | `String` | `String` | ✅ |
-| Target column(s) | `target_resource: Option<String>` | `target_address: Option<String>` **+** `group_names: Option<String>` | ❌ name and arity |
-| `details` | `Option<String>` | `Option<String>` | ✅ |
-| `timestamp` | `DateTime` | `DateTime` | ✅ |
-
-**Two substantive differences.**
-
-1. **Nullability.** This service's denormalized attribution columns are `NOT NULL`; the peer's are
-   nullable. The denormalized name/prefix exist precisely so the trail survives its key's deletion —
-   a nullable column permits a row that has lost both the FK and the snapshot, which is an audit
-   entry attributable to nobody. **This service is stronger; recommended for the peer.**
-2. **Target shape.** `target_resource` (generic) versus `target_address` + `group_names`
-   (domain-specific, two columns). Unifying would mean a migration on one side and a genuine loss of
-   queryability on the peer's (`group_names` is separately filterable). **Justified divergence** —
-   but it means an ecosystem-wide log pipeline cannot assume one schema.
-
-### 3.3 Writer/reader split
-
-| Aspect | This service | Peer | Unified? |
-| :--- | :--- | :--- | :--- |
-| Audit **writer** | `api/support.rs::create_audit_log` | `api/support.rs` equivalent | ✅ Same file role |
-| Audit **reader** | `api/audit.rs::list_audit_logs` | `api/audit.rs::list_audit_logs` | ✅ Same file, same name |
-| Reader access | Master-only, flat check | Master-only | ✅ |
-
-### 3.4 Structured logging & gates
-
-| Aspect | This service | Peer | Unified? |
-| :--- | :--- | :--- | :--- |
-| Log framework | `tracing` + `EnvFilter`, ANSI only on a TTY | Same | ✅ |
-| Convergence harness | `scripts/verify_convergence.sh` | `scripts/verify_convergence.sh` | ✅ Both sides run one |
-| E2E harness | `scripts/test_e2e.sh` | `scripts/test_e2e.sh` | ✅ |
-| Frontend syntax gate | `tests/source_hygiene.rs` | `tests/frontend_syntax_test.rs` | Same purpose, different filename |
-| RBAC compliance suite | `tests/rbac_model_compliance.rs` | `tests/rbac_model_compliance.rs` | ✅ **Identical filename** |
-| Schema/integrity suite | `tests/referential_integrity.rs` | `tests/schema_integrity_tests.rs` | Same purpose, different filename |
+| Module | A (lines) | B (lines) | Note |
+| :--- | ---: | ---: | :--- |
+| `api/keys.rs` | 1274 | 1365 | ✅ Comparable — the largest module on both sides |
+| `api/guards.rs` | 932 | 457 | Ratio tracks verb count: 4 hook verbs + executions vs. a 4-verb group model |
+| `api/support.rs` | 426 | 280 | This side also hosts `StrictJson` (**S2**) |
+| `api/health.rs` | 131 | 121 | ✅ Near-identical |
+| `api/audit.rs` | 78 | 54 | ✅ |
+| `api/mod.rs` | 95 | 69 | ✅ Both are thin facades |
+| `crypto.rs` | 781 | 839 | ✅ |
+| `master.rs` | 291 | 320 | ✅ |
+| `error.rs` | 140 | 107 | Difference is one extra variant and denser comments |
+| `state.rs` | 80 | 169 | Peer's `AppState` carries the webhook channel and trusted-proxy set |
+| `middleware.rs` | 543 | 319 | This side pre-validates the timestamp header separately |
+| **`src/` total** | **10 734** | **9 314** | ✅ Same order of magnitude |
 
 ---
 
-## 4. Convergence scorecard
+## 3. Naming conventions
 
-| Dimension | Score | Basis |
-| :--- | :--- | :--- |
-| Crate-root module structure | **14 / 14** shared concerns identically named | §1.1 |
-| API-layer module structure | **7 / 8** modules identically named | §1.2 |
-| Cross-cutting type/function names | **11 / 11** categories exact | §2.1 |
-| Guard naming convention | **1 / 10** aligned (prefix split) | §2.2 |
-| HTTP error contract | **10 / 10** shared variants identical, incl. message strings | §3.1 |
-| Audit log schema | **6 / 9** columns match | §3.2 |
-| Normative specification | **byte-identical** | companion report |
+### 3.1 Security functions
+
+| Concern | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| Guard prefix | `guard_*` — **10 of 10** | `guard_*` — **6 of 6** | ✅ **Converged.** The mixed `require_*` / `guard_*` split flagged in the previous report was unified in `4865a82` |
+| R2 conjunction | `guard_hook_manage_conjunction` | `guard_group_manage` | ✅ Prefix matches; noun is the domain |
+| §3 lifecycle | `guard_lifecycle_authority` | `guard_resource_lifecycle` | ⚠️ Same concept, transposed words (**S5**) |
+| §4 pre-gate | `manages_any_hook` | `holds_any_group_manage` | ⚠️ Same concept, different verb (**S5**) |
+| Escalation check | `is_permission_reduction` | `widens_permissions` | ⚠️ Logical inverses — deliberately **not** renamed, since a mechanical rename would invert branch conditions |
+| Master-target guard | `guard_master_to_administer`, `guard_master_to_grant_scopes` | `guard_master_target`, `guard_scope_elevation` | ⚠️ Same pair of concepts, different naming axis |
+| Delegated grant | `guard_delegated_hook_grant` | `guard_delegated_group_grant` | ✅ Identical modulo the domain noun |
+| Timestamp validation | `middleware::validate_timestamp` | `middleware::validate_timestamp` | ✅ **Converged** in `4865a82` |
+| Client IP resolution | `resolve_client_ip` | `resolve_client_ip` | ✅ Byte-identical body (gate-enforced) |
+| Canonical payload | `canonical_v1_payload` | `canonical_v1_payload` | ✅ Byte-identical body (gate-enforced) |
+| Pragma application | `apply_sqlite_pragmas` | `apply_sqlite_pragmas` | ✅ Byte-identical body (gate-enforced) |
+| Audit writer | `create_audit_log` | `create_audit_log` | ✅ Same name, same argument order |
+| Key hashing | `hash_key`, `generate_random_key` | `hash_key`, `generate_random_key` | ✅ |
+
+**The guard-prefix divergence is closed. Every remaining naming difference is a synonym choice, not a
+pattern difference** — both sides mark the same set of concepts with the same `guard_` marker, so a
+reader who knows one codebase can find the authorization decisions in the other by grep.
+
+### 3.2 `MasterPin` — identical public API
+
+| Symbol | A | B |
+| :--- | :---: | :---: |
+| `struct MasterPin` | ✅ | ✅ |
+| `enum MasterPinError` | ✅ | ✅ |
+| `new` / `pinned_to` / `get` | ✅ | ✅ |
+| `pin_at_boot` / `resolve` / `authenticate` | ✅ | ✅ |
+
+**8 of 8 symbols match by name and signature** — the strongest single piece of evidence for shared
+DNA in either codebase, since none of it is forced by a framework.
+
+### 3.3 Configuration constants
+
+| Constant | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| `MAX_REQUEST_BODY_BYTES` | `3 * 1024 * 1024` | `3 * 1024 * 1024` | ✅ Gate-enforced |
+| `SQLITE_BUSY_TIMEOUT_MS` | `5_000` | `5_000` | ✅ |
+| `SQLITE_MAX_CONNECTIONS` | `1` | `1` | ✅ |
+| `RETENTION_DAYS` | `92` | `92` | ✅ Gate-enforced |
+| Master key width | `INITIAL_MASTER_KEY_HEX_LEN = 64` | `MASTER_KEY_HEX_LEN = 64` | ⚠️ Same value, different name (**S6**) |
+| Env var name constant | *(literal at the call site)* | `INITIAL_MASTER_KEY_ENV` | ⚠️ Peer's form is better |
+| Validation error type | `InitialMasterKeyError` (3 variants) | `InvalidInitialMasterKey { got, detail }` | ⚠️ Divergent shape (**S6**) |
+
+### 3.4 Database models
+
+| Aspect | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| One file per table | ✅ | ✅ | ✅ |
+| `prelude.rs` re-export module | ✅ | ✅ | ✅ |
+| Table naming | `snake_case` plural — `api_keys`, `hooks`, `executions`, `audit_logs` | `api_keys`, `ip_groups`, `ip_records`, `audit_logs` | ✅ Same convention |
+| Join table | `api_key_hook_permission` | `api_key_group_permission` | ✅ `api_key_<resource>_permission` on both |
+| Shared `api_key` columns | `id`, `name`, `key_hash`, `prefix`, `signing_secret`, `bound_ips`, `is_master`, `can_manage_keys`, `parent_key_id`, `created_at`, `updated_at` | Identical set | ✅ **11 of 11** |
+| Domain verb columns | `can_manage_hooks`, `max_concurrent_jobs`, `hmac_mode`, `key_id` | `can_manage_webhooks`, `can_create_groups` | Domain |
+| §3 ownership column | `hooks.owner_key_id` | `ip_groups.owner_key_id`, `webhook_configs.owner_key_id` | ✅ Same name, same role |
+| Audit FK behaviour | `on_delete = "SetNull"` | `on_delete = "SetNull"` | ✅ |
+| Migration file convention | `mYYYYMMDD_NNNNNN_<slug>.rs` | `mYYYYMMDD_NNNNNN_<slug>.rs` | ✅ Same shape |
+| Migration sequence semantics | Per-date reset (`m20230101_000001`, `m20230102_000001`, …) | Globally monotonic (`…_000001` … `…_000010`) | ⚠️ **S7** — the peer's ordering is self-evident from the filename; this side's requires reading the date |
+
+### 3.5 Payload definitions
+
+| Aspect | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| Suffix convention | `…Payload` — 6 of 6 | `…Payload` — 9 of 9 | ✅ |
+| Create/Update prefixes | `Create…` / `Update…` | `Create…` / `Update…` | ✅ |
+| Key payload names | `CreateApiKeyPayload`, `UpdateApiKeyPayload`, `DeleteApiKeyPayload` | `CreateApiKeyPayload`, `UpdateApiKeyPayload`, `DeleteKeyPayload` | ⚠️ `Delete**Api**KeyPayload` vs `DeleteKeyPayload` — the only asymmetric name in the trio |
+| Strict extractor names | `StrictJson`, `OptionalStrictJson` | `StrictJson`, `OptionalStrictJson` | ✅ Identical |
+| Strict extractor location | `src/api/support.rs` | `src/extract.rs` | ⚠️ **S2** |
+| `deny_unknown_fields` on key create/update | ✅✅ | ✅✅ | ✅ |
+| `deny_unknown_fields` on key delete | ✅ | ❌ | ⚠️ Security finding — see `SECURITY_COMPARISON_REPORT.md` **D2** |
 
 ---
 
-## 5. Outstanding items
+## 4. Error handling
 
-| # | Item | Owner | Severity | Recommendation |
+### 4.1 `AppError` variants and status mapping
+
+| Variant | A | B | HTTP status | Convergence |
+| :--- | :---: | :---: | :--- | :--- |
+| `DbError(#[from] DbErr)` | ✅ | ✅ | `500` — logged in full, reported as `"Internal database error"` | ✅ |
+| `InvalidInput(String)` | ✅ | ✅ | `400` | ✅ |
+| `Unauthorized(String)` | ✅ | ✅ | `401` | ✅ |
+| `Forbidden(String)` | ✅ | ✅ | `403` | ✅ |
+| `NotFound` | ✅ | ✅ | `404` — `"Resource not found"` | ✅ |
+| `Conflict(String)` | ✅ | ✅ | `409` | ✅ |
+| `ConflictWithDetails { message, details }` | ✅ | ✅ | `409` + merged top-level fields | ✅ **Converged** in `4865a82` |
+| `BodyRejected(StatusCode, String)` | ✅ | ✅ | Passed through | ✅ |
+| `Internal` | ✅ | ✅ | `500` — `"An internal server error occurred"` | ✅ |
+| `TooManyRequests(String)` | ✅ | — | `429` | Domain — this service spawns processes |
+
+**9 of 9 shared variants map to identical status codes with byte-identical default messages.**
+
+### 4.2 Response envelope
+
+| Property | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| Base shape | `{"error": "<message>"}` | Identical | ✅ |
+| `ConflictWithDetails` merge | Details merged at **top level**, not nested | Identical | ✅ |
+| Handled before the flat match | Yes, with the same stated reason | Yes | ✅ |
+| Match kept exhaustive despite early return | Yes — no `_` arm | Yes | ✅ Same discipline |
+| Collision on the `error` key | **Skipped** — the envelope's message wins | **Overwritten** — `details.error` replaces the message | ⚠️ **S8**, this side stricter |
+| Non-object `details` | Logged at `error!`, envelope stays well-formed | Silently dropped by the `if let` | ⚠️ **S8**, this side louder |
+
+`S8` is a robustness divergence rather than a security one: no current call site passes an `error`
+key or a non-object `details`. It matters because it is exactly the kind of difference that produces
+two different wire shapes from what reads as the same code.
+
+### 4.3 Health and readiness contract
+
+| Property | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| Routes | `/health`, `/healthz`, `/ready`, `/readyz` | Same four | ✅ |
+| Unauthenticated | ✅ | ✅ | ✅ |
+| `health_check` takes no `State` | ✅ — compiler-enforced independence from the DB | ✅ | ✅ |
+| Liveness body | `{"status":"ok","service":"<crate>"}` — exactly two fields | Same shape | ✅ |
+| Readiness DB probe | Typed SeaORM, bounded to one row | Typed SeaORM, bounded | ✅ **Converged** in `4865a82` |
+| Readiness checks the master pin | ✅ | ✅ | ✅ **Converged** in `4865a82` |
+| Failure status | `503`, not `500` | `503` | ✅ |
+| Driver error in the body | Never — logged only | Never | ✅ |
+
+---
+
+## 5. Observability — audit trail structure
+
+| Column | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| `id: Uuid` | ✅ | ✅ | ✅ |
+| `api_key_id: Option<Uuid>` | ✅ | ✅ | ✅ Nullable on both, by design — the FK is `SET NULL` |
+| `api_key_name: String` | ✅ **NOT NULL** | ✅ **NOT NULL** | ✅ **Converged** in the peer's `6f1c4c7` |
+| `api_key_prefix: String` | ✅ **NOT NULL** | ✅ **NOT NULL** | ✅ Converged |
+| `client_ip: String` | ✅ **NOT NULL** | ✅ **NOT NULL** | ✅ Converged |
+| `action: String` | ✅ | ✅ | ✅ |
+| `details: Option<String>` | ✅ | ✅ | ✅ |
+| `timestamp: DateTime` | ✅ | ✅ | ✅ |
+| Target reference | `target_resource: Option<String>` | `target_address: Option<String>` + `group_names: Option<String>` | Domain |
+
+**8 of 8 non-domain columns now match in name, type and nullability.** The writer signatures match as
+well — `create_audit_log(db, &api_key::Model, IpAddr, action, …, details)`, with the key and address
+taken **by value on both sides**, so an unattributed write is not merely constrained at the database
+but inexpressible in the type.
+
+| Action-name convention | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| Format | `SCREAMING_SNAKE`, `<NOUN>_<VERB>` | Same | ✅ |
+| Examples | `HOOK_CREATE`, `KEY_ROTATE`, `KEY_PERM_UPDATE`, `EXECUTION_DELETE` | `IP_ADD`, `KEY_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `KEY_PERM_UPDATE` | ✅ |
+| Shared credential actions | `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE` | Identical spellings | ✅ |
+
+---
+
+## 6. Verification gates
+
+| Gate | A | B | Convergence |
+| :--- | :--- | :--- | :--- |
+| Unit + integration suite | `cargo test` — **285 tests, 8 binaries** | `cargo test` — 172 test attributes across 6 binaries | ✅ Both substantial |
+| RBAC compliance suite | `rbac_model_compliance.rs` — 23 tests | `rbac_model_compliance.rs` — 18 tests | ✅ Same filename, same `rN_` / `sN_` prefix convention |
+| Schema / referential integrity | `referential_integrity.rs` — 6 tests | `schema_integrity_tests.rs` — 16 tests | ✅ Same role, different filename |
+| Health probes | `health_probes.rs` — 8 tests | Folded into the peer's broader suites | ⚠️ This side isolates them |
+| Source hygiene | `source_hygiene.rs` — 8 tests (incl. frontend checks) | `source_hygiene.rs` — 5 tests **+** `frontend_syntax_test.rs` — 3 | ⚠️ Same coverage, different partition |
+| `no_handler_is_ever_exempted` | ❌ | ✅ | ⚠️ Peer stricter (**S9**) |
+| `no_dml_keyword_is_hand_written…` | ❌ | ✅ | ⚠️ Peer stricter (**S9**) |
+| Raw-SQL allowlist size | 2 entries | 2 entries | ✅ |
+| E2E script | `test_e2e.sh` — 3710 lines, 893 checks | `test_e2e.sh` — 3027 lines | ✅ Same tool, same role |
+| Convergence gate | `verify_convergence.sh` — **19 converged, 0 drifted**, exit `0` | `verify_convergence.sh` — **`SKIP`**, exit `0`, nothing compared | ⚠️ **S1** — inert on the peer side |
+| Frontend parser pin | `oxc` pinned with `=` | `oxc` pinned with `=` | ✅ Same reasoning recorded on both |
+| CI runs any of the above | ❌ | ❌ | ⚠️ Symmetric gap |
+
+---
+
+## 7. Open structural items
+
+| # | Item | Side | Impact | Recommendation |
 | :--- | :--- | :--- | :--- | :--- |
-| **S1** | Vendored peer snapshot at `example/simply_ip_vault` is stale — carries `src/api/system.rs` and `src/webhooks.rs`, both deleted upstream. It is what `verify_convergence.sh` reads | This service | **High (process)** | Re-sync with `rsync -a --delete`; make the gate fail on a `.rs` file unreachable from the peer's module tree. This staleness already produced two incorrect findings in a prior audit |
-| **S2** | Audit attribution columns nullable | Peer | Medium | Tighten `api_key_name` / `api_key_prefix` / `client_ip` to `NOT NULL` |
-| **S3** | `ConflictWithDetails` factoring | This service | Low | Adopt the peer's error variant for the §6 inventory |
-| **S4** | `api/mod.rs` submodules crate-public | This service | Low | Consider `mod` + selective re-export, matching the peer |
-| **S5** | Guard prefix convention (`require_*` / `guard_*`) | Both | Low | Unify only as a deliberate decision; **exclude** the `is_permission_reduction` / `widens_permissions` pair, which is a polarity inversion |
-| **S6** | `verify_timestamp` / `validate_timestamp` | Both | Trivial | One-word rename if S5 is ever actioned |
+| **S1** | Peer's convergence gate points at a non-existent `example/simply_hook_executor` and exits `0` after printing `SKIP` | Peer | **High (process).** Convergence is policed from one direction only; a divergence introduced on the peer's side passes its own gate | Clone this service into the peer's `example/`, and make a missing peer a non-zero exit rather than a skip |
+| **S2** | `StrictJson` lives in `src/api/support.rs` here and `src/extract.rs` there | Both | Low. Same names, same semantics, different address | Prefer the peer's `src/extract.rs`: an Axum extractor is a framework concern, not an API-support helper, and the split keeps `support.rs` to domain helpers |
+| **S3** | This repo shares fixtures via `tests/common/mod.rs`; the peer duplicates setup per binary | Both | Low | This side's arrangement is the better one; recommend it to the peer |
+| **S4** | `pub mod` + selective re-export here vs. private `mod` + glob re-export there | Both | Low. Neither is unsafe | Ideal is the **intersection**: private `mod` (so the facade cannot be bypassed) **plus** selective `pub use` (so what leaves is explicit). Neither side has both |
+| **S5** | Guard nouns diverge — `guard_lifecycle_authority` / `guard_resource_lifecycle`, `manages_any_hook` / `holds_any_group_manage` | Both | Very low | Leave. The `guard_` marker is what carries the convention, and it is uniform |
+| **S6** | `INITIAL_MASTER_KEY_HEX_LEN` / `MASTER_KEY_HEX_LEN`; `InitialMasterKeyError` / `InvalidInitialMasterKey`; differing validator signatures | Both | Low | Cosmetic, but this is a control both sides added independently in the same week — worth one coordinated naming pass. The peer's `INITIAL_MASTER_KEY_ENV` constant is the better half and is missing here |
+| **S7** | Migration sequence numbers reset per date here, run monotonically there | This repo | Low | Adopt the peer's monotonic numbering for new migrations; renaming existing ones would rewrite applied migration names and is not worth it |
+| **S8** | `ConflictWithDetails` merge: this side refuses to let `details` overwrite `error` and logs a non-object `details`; the peer does neither | Peer | Low | Recommend the peer adopt this side's merge, which is 6 lines longer and cannot produce a surprising wire shape |
+| **S9** | Peer's `source_hygiene.rs` carries `no_handler_is_ever_exempted` and `no_dml_keyword_is_hand_written_outside_the_exceptions`; this repo has neither | This repo | Medium | **Adopt `no_handler_is_ever_exempted`.** This repo removed its only `src/api/` raw-SQL exemption in `4865a82`; nothing currently prevents the next one |
+| **S10** | Neither CI pipeline runs `cargo test`, `test_e2e.sh` or `verify_convergence.sh` | Both | Medium (process) | Add a shared CI job. The gates already exist and already exit non-zero correctly; they are simply never invoked automatically |
 
 ---
 
-## 6. Executive verdict
+## 8. Convergence scorecard
 
-| Question | Verdict |
+| Dimension | Measured | Score |
+| :--- | :--- | :--- |
+| Top-level module names and roles | 12 of 12 shared modules match | **100%** |
+| `api/` structural module names and roles | 5 of 5 match | **100%** |
+| Domain module count | 3 each | **Symmetric** |
+| `MasterPin` public API | 8 of 8 symbols | **100%** |
+| Shared `api_key` columns | 11 of 11 | **100%** |
+| Gate-enforced byte-identical functions | 3 of 3 (`resolve_client_ip`, `canonical_v1_payload`, `apply_sqlite_pragmas`) | **100%** |
+| Shared configuration constants | 4 of 4 by name and value; 1 of 2 master-key names | **89%** |
+| Guard prefix uniformity | 10 of 10 here, 6 of 6 there | **100%** |
+| `AppError` variants → status codes | 9 of 9 shared variants, identical bodies | **100%** |
+| Error-envelope shape | Identical; one merge-precedence difference | **~95%** |
+| Audit-log non-domain columns | 8 of 8 by name, type and nullability | **100%** |
+| Audit writer signature | Identical, both by-value | **100%** |
+| Health/readiness contract | 8 of 8 properties | **100%** |
+| Verification gates present on both sides | 7 of 8 (**S1**: the peer's is inert) | **88%** |
+| Repository hierarchy | Identical bar `example/` | **~95%** |
+
+---
+
+## 9. Executive verdict — structural convergence
+
+| Dimension | Verdict |
 | :--- | :--- |
-| Do the two services share the same foundational DNA? | **Yes, demonstrably.** Fourteen crate-root concerns and seven of eight API modules occupy identically-named files. `MasterPin` exposes a character-identical six-method API on both sides. The canonical signed string is byte-identical under gate enforcement |
-| Is the separation of concerns the same? | **Yes.** Both isolate authorization into a single `api/guards.rs`; both keep a non-deciding `api/support.rs`; both keep entities one-file-per-table with `mod.rs` + `prelude.rs`; both keep migrations append-only under an identical filename grammar |
-| Is convergence still moving? | **Yes, and bidirectionally.** In the last cycle the peer extracted `master.rs`, `db.rs` and `api/support.rs` toward this service's layout, while this service moved HMAC into `crypto.rs` and split out `api/audit.rs` toward theirs. Both added `api/health.rs` in the same week, independently, with identical handler names |
-| Are error responses unified? | **Yes.** Every shared variant maps to the same status code, and the three fixed messages are string-identical. The two non-shared variants are a domain difference and a factoring difference, not drift |
-| Is observability unified? | **No — this is the weakest axis.** The audit log schemas differ in three columns' nullability and in target-column naming and arity. Any ecosystem-wide log consumer must special-case per service |
-| Overall maturity | **High.** Structure, naming of cross-cutting machinery, and the error contract are converged to a degree that is unusual for independently-developed services. The residue is one process defect (**S1**), one schema divergence worth closing (**S2**), and a cosmetic naming split (**S5**) that is safe to leave |
+| Shared foundational DNA | **Confirmed.** 12 of 12 shared top-level modules and 5 of 5 structural `api/` modules match by name and role; every difference in the module list is one side's domain engine |
+| Separation of concerns | **Identical.** Both isolate all RBAC decisions in a single `api/guards.rs`, all schema evolution in `migration/`, all models in `entities/`, and both keep the two unauthenticated probes in their own `api/health.rs` |
+| Naming standardization | **Converged.** The one unforced divergence in the previous report — mixed `require_*` / `guard_*` prefixes here — was closed in `4865a82`. What remains is synonym choice, uniform under a shared marker |
+| Error handling | **Unified.** 9 of 9 shared variants, identical status codes, identical envelope, identical `ConflictWithDetails` merge strategy — with one precedence difference (**S8**) |
+| Observability | **Unified.** 8 of 8 non-domain audit columns match by name, type and nullability; the writer signature is identical and equally strict on both sides |
+| Divergences with no domain justification | **10**, all Low or Medium, none a defect in behaviour. Half are naming or placement; the material ones are **S1**, **S9** and **S10** |
+| Regressions since the previous report | **None** |
 
-**Definitive verdict: the two codebases are architecturally convergent and share a common,
-deliberately maintained DNA.** No structural divergence found in this pass is unjustified. The single
-highest-value action is **S1** — not a code change, but a harness correction: the convergence gate is
-currently reading a snapshot that has drifted from the peer it claims to track, which silently
-degrades every comparison built on it.
+**Convergence level: HIGH — the two services are formally the same codebase wearing two domains.**
+A reader who knows one can navigate the other by structure alone: the guards are in the same file,
+the errors have the same names and produce the same bodies, the audit trail has the same columns, the
+master identity has the same eight-symbol API, and three security-critical functions are enforced
+byte-identical by a script.
+
+Three items are worth acting on, and all three are about *keeping* this state rather than reaching
+it. **S1**: the peer's convergence gate is inert, so drift is currently detected in one direction
+only — this is the highest-value fix in the report, because everything above is a snapshot that only
+a working gate keeps true. **S9**: this repository lacks the peer's `no_handler_is_ever_exempted`
+test, which encodes the rule its raw-SQL allowlist is a proxy for. **S10**: neither CI pipeline runs
+any of the gates, so every guarantee in this document currently depends on a human remembering to
+run two scripts.

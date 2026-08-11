@@ -28,7 +28,7 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 | **Total** | **39** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
-(verified passing 2026-08-10):
+(verified passing 2026-08-11, all three silent against `4865a82`):
 
 ```bash
 # 1. Crate-root and API modules, documented as `### `src/…`` headings

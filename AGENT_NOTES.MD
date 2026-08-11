@@ -5297,3 +5297,116 @@ truncated. The convention is documented at the writer.
 `git diff RBAC_MODEL.md` empty.
 
 Test count moved 275 → 285: nine `initial_master_key_tests` and one readiness test.
+
+---
+
+# 2026-08-11 — Final ecosystem audit: peer refresh, security and structural convergence
+
+**Mode:** strictly read-only over `src/`, `tests/`, `scripts/`, `static/` and `migration/` in **both**
+repositories. `RBAC_MODEL.md` untouched (`git diff RBAC_MODEL.md` empty). Only the four documents
+below were written.
+
+**Subjects:** this repository @ `4865a82` · `example/simply_ip_vault` @ `6f1c4c7`.
+
+## 0. Task 0 — peer repository update
+
+`example/` holds exactly one project, so the comparison is this repository's root tree against
+`example/simply_ip_vault`.
+
+| Step | Command | Outcome |
+| :--- | :--- | :--- |
+| Enumerate | `ls example/` | `simply_ip_vault` — the only entry |
+| Confirm it is a clone | `git rev-parse --is-inside-work-tree`, `git remote -v` | `true`; `origin` = `https://oshino.tomidejetsu.ovh/fallrik/simply_ip_vault.git` |
+| Update | `cd example/simply_ip_vault && git pull` | **`Already up to date.`** — `HEAD` `6f1c4c7` before and after |
+| Tree state | `git status --short` | Clean |
+
+`example/` is listed in this repository's `.gitignore` (`git ls-files example/` returns nothing), so
+the peer clone is not carried in this repository's history — only the reports about it are.
+
+## 1. The previous audit's headline finding is closed
+
+The 2026-08-10 pass found `example/simply_ip_vault` was a **flat vendored snapshot** that had drifted,
+still carrying `src/api/system.rs` and `src/webhooks.rs` after both were deleted upstream, and that
+this had already produced two false findings. It is now a **git clone with a remote**: refreshable
+with `git pull`, and carrying zero files unreachable from the peer's module tree. The recommendation
+was implemented.
+
+## 2. What each side fixed for the other
+
+The interesting property of this cycle is that the two open items at the last audit were one on each
+side, and each was closed by the repository it was raised *against*:
+
+| Item | Raised by | Against | Closed in |
+| :--- | :--- | :--- | :--- |
+| `INITIAL_MASTER_KEY` accepted any non-empty string | peer's report | **this repo** | `4865a82` (`config::validate_initial_master_key`) |
+| Audit attribution columns nullable | this repo's report (D3) | **the peer** | `6f1c4c7` (`m20260811_000010`) |
+
+The peer went past the brief on its side: `create_audit_log` now takes `&api_key::Model` and `IpAddr`
+**by value** rather than as `Option`, so an unattributed write is inexpressible in the type rather
+than merely refused by the column. Our writer already had that signature; they are now byte-compatible.
+
+The two readiness items this repository raised against itself (raw-SQL allowlist entry in an
+anonymous handler; no master-pin check) also closed in `4865a82`. **11 of 11** historical findings
+across both repositories are now resolved.
+
+## 3. Three findings this pass produced
+
+**Drift detection is one-directional (S1/D6).** Both repositories ship `verify_convergence.sh` and
+both point it at a peer inside their own `example/`. Only this one has a peer there. Running the
+peer's gate:
+
+```
+SKIP peer service not found at …/simply_ip_vault/example/simply_hook_executor
+exit=0
+```
+
+It is **green by absence** — reporting success while comparing nothing. Everything in either report
+is a snapshot that only a working gate keeps true, and right now the gate works in one direction.
+This is the highest-value item in this pass.
+
+**A documented control that does not exist (D3).** The peer's `ReassignOwnerPayload` carries a doc
+comment reasoning that sharing the struct avoids "two things to keep `deny_unknown_fields` in step
+across" — and the struct derives only `Deserialize`. No escalation follows (it has one field), but the
+comment asserts a guarantee a reader will not find in the code. Reported rather than assumed
+harmless, because a comment that names an attribute is exactly what a later reviewer greps for.
+
+**Neither CI pipeline runs any gate (D7/S10).** Both repositories ship precisely two workflows —
+`docker-publish.yml` and `update-readme-each-month.yml` — and neither invokes `cargo test`,
+`test_e2e.sh` or `verify_convergence.sh`. Every guarantee in both reports currently depends on a human
+remembering to run two scripts.
+
+## 4. Two items where the peer is stricter than we are
+
+Recorded so they are not lost between sessions:
+
+- **`no_handler_is_ever_exempted`** — the peer's `source_hygiene.rs` asserts that no raw-SQL
+  allowlist entry may begin with `src/api/`, encoding the invariant the allowlist is a proxy for.
+  We removed our only such exemption in `4865a82`; nothing currently prevents the next one. Worth
+  porting.
+- **`no_dml_keyword_is_hand_written_outside_the_exceptions`** — a second, broader scanner alongside
+  the raw-SQL one.
+
+## 5. Method
+
+Comparison was mechanical wherever a mechanical check existed, rather than by reading for impression:
+
+| Question | How it was settled |
+| :--- | :--- |
+| Is the normative document still shared? | `md5sum RBAC_MODEL.md` on both — `cb0b76ab…`, identical |
+| Are the three shared functions still identical? | `./scripts/verify_convergence.sh` — 19 converged, 0 drifted |
+| Does the peer's gate work? | Ran it. It skips and exits `0` |
+| Which payloads are strict? | `grep -rn deny_unknown_fields src/` on both, then read each struct's derive block — the attribute's *line* proves nothing about which struct it sits on |
+| Is audit attribution really NOT NULL now? | Read `entities/audit_log.rs` on both plus the peer's new migration — `String`, not `Option<String>`, on both |
+| Are the guard prefixes uniform? | Enumerated every `fn` in both `guards.rs`: 10 of 10 `guard_*` here, 6 of 6 there |
+| Does this repo's suite still pass? | `cargo test` — **285 passed / 0 failed** across 8 binaries |
+| Is `FILE_MAP.MD` still exhaustive? | The three shape-specific commands recorded in the file itself — all three silent |
+
+The peer's suite was **not** executed: it has no build artifacts in this checkout, and compiling it
+would be the only mutation this pass made to a tree declared read-only. Peer claims are therefore
+sourced from its committed source and its own commit messages, both cited in the reports.
+
+## 6. Written
+
+`SECURITY_COMPARISON_REPORT.md` (replaces the 2026-08-10 edition, retrievable at `7a7ffc7`) ·
+`STRUCTURAL_CONVERGENCE_REPORT.md` (replaces the same edition) · this note · `FILE_MAP.MD`
+verification date.
