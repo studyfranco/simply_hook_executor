@@ -10,7 +10,58 @@ To keep this context clean and modular, responsibilities are split across three 
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, process execution rules, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: You can find the code of other similar/linked project inside.
+4. **`example/`**: Peer repositories — the code of the other linked projects in this ecosystem. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
+
+---
+
+## 🔄 Peer Repository Synchronization
+
+`example/` holds **live git clones** of the peer services (today: `example/simply_ip_vault`), not flat snapshots. They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
+
+### The directive
+
+**Before reading any file under `example/`, and before generating a convergence, parity, or security report, you MUST run:**
+
+```bash
+git -C example/<peer_repo> pull
+```
+
+for every peer present, and **record the outcome** — `Already up to date.` or the revision range — in `AGENT_NOTES.MD` alongside the report it supports.
+
+### Why this is mandatory rather than advisory
+
+An audit is a claim about a specific tree. A stale peer makes that claim **wrong in the most expensive direction**: it reads as a completed verification while describing code that no longer exists. This has already happened here. A previous `example/simply_ip_vault` was a hand-copied snapshot that kept two files after they were deleted upstream, and an audit written against it produced **two findings about dead code** — both later retracted. Nothing failed; the report was simply false, and stayed false until someone diffed the trees by hand.
+
+The failure mode is worth naming precisely, because it is not "the analysis was sloppy":
+
+| Property | Fresh peer | Stale peer |
+| :--- | :--- | :--- |
+| Convergence gate | Compares current code | Compares deleted code, reports green |
+| "The peer does X" | True | Was true |
+| A fixed peer bug | Absent | **Still reported as open** |
+| Detection | — | Only by diffing by hand, which is the work the gate exists to replace |
+
+### Rules
+
+- **Pull first, read second.** Not "pull if it looks stale" — staleness is invisible from inside the tree.
+- **State the revision.** A report that does not name the peer commit it audited cannot be reproduced or re-checked. Both reports in this repository carry the peer's short SHA in their header.
+- **A failed pull is reportable, not ignorable.** If the remote is unreachable, say so in the report and name the local `HEAD` being analysed instead. Silent analysis of an unknown revision is the thing this section exists to prevent.
+- **Never commit the peer.** `example/` is `.gitignore`d. Reports about the peer belong in this repository; the peer's own code does not.
+- **Read-only.** Never modify, stage, or commit inside a peer checkout. `git pull --ff-only` is the only write this repository's tooling performs there.
+
+### Automation
+
+`scripts/verify_convergence.sh` performs this sync itself for every `example/*/.git` it finds, so the gate is never run against a stale peer by accident. Three properties are deliberate:
+
+| Property | Why |
+| :--- | :--- |
+| `--ff-only` | A merge or rebase inside a peer checkout is a local modification to a tree this repository only ever reads. If it cannot fast-forward, someone committed there and it needs a human |
+| **Non-fatal** | An offline or air-gapped run warns and proceeds against the local checkout. A convergence check that cannot run without a network is one that stops being run — and the local comparison is still worth performing, it simply describes an unverified revision, which is what the warning says |
+| `GIT_TERMINAL_PROMPT=0` + 30s timeout | The remotes are HTTPS. Without cached credentials git would block on an interactive username prompt forever, and a gate that *hangs* is worse than one that fails |
+
+`SKIP_PEER_SYNC=1` bypasses it entirely — for a deliberate audit of a pinned peer revision, where the whole point is that the tree must not move.
+
+That automation does **not** discharge the directive above. The script syncs only when it is invoked; an agent that reads `example/simply_ip_vault/src/api/guards.rs` directly has not run it.
 
 ---
 
@@ -41,7 +92,7 @@ To keep this context clean and modular, responsibilities are split across three 
 | Module | Holds | Rule |
 | :--- | :--- | :--- |
 | `api/mod.rs` | Module wiring, router-facing re-exports, shared policy constants | Every handler is re-exported here, so `api::create_hook` resolves as it always did and `src/lib.rs`'s router is untouched by the layout |
-| `api/support.rs` | Shared plumbing used by three or more domains — audit-log writing, hook resolution, parameter loading, validation, formatting — plus the strict JSON extractors | **Decides nothing.** Nothing here returns a refusal that depends on *who* is calling. A helper that starts deciding moves to `guards` |
+| `api/support.rs` | Shared plumbing used by three or more domains — audit-log writing, hook resolution, parameter loading, validation, formatting | **Decides nothing.** Nothing here returns a refusal that depends on *who* is calling. A helper that starts deciding moves to `guards` |
 | `api/guards.rs` | Every **cross-domain** authorization decision: hook verbs, R2's conjunction, master guards, §3 lifecycle, §4 *hook* visibility, delegation bounds | **Writes nothing.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no state |
 | `api/keys.rs` | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade, and §4 **key-subtree** visibility | Identity lives with keys because it shares its view types with the key listing. The visibility helpers live here by the single-consumer rule below, and are module-private |
 | `api/hooks.rs` | Hook definitions, parameter contracts, trash/restore/purge | What a hook *is*, not what happens when one fires |
@@ -49,6 +100,24 @@ To keep this context clean and modular, responsibilities are split across three 
 | `api/audit.rs` | Reads over `audit_logs` | Master-only. **Reads only** — writing an entry is `support::create_audit_log`, called from every mutating handler |
 | `api/system.rs` | The effective runtime configuration and instance counters | Master-only. Split from `audit.rs` because a shared audience is the weakest reason to share a file |
 | `api/health.rs` | Liveness and readiness probes | **The only unauthenticated routes in the service.** Must disclose nothing an anonymous caller could not already infer |
+
+**The strict JSON extractors are deliberately *outside* `src/api/`.** `StrictJson` and
+`OptionalStrictJson` live in **`src/extract.rs`**, a crate-root module, and must stay there. Three
+reasons, in order of weight:
+
+1. **They enforce a `RBAC_MODEL.md` §5 control, so they are not plumbing.** §5 requires that
+   `is_master` be *removed from the payload type* rather than rejected in a handler. Absence plus
+   `#[serde(deny_unknown_fields)]` is what makes that removal mean something, and `StrictJson` is
+   what carries the resulting serde refusal to the caller in the standard envelope.
+2. **`support.rs` decides nothing — and an extractor decides.** It rules on whether a request is
+   well-formed enough to reach a handler at all, before any handler runs. That is the exact charter
+   `support.rs` disclaims.
+3. **An Axum `FromRequest` impl is a framework concern, not a domain one.** Keeping it under `api/`
+   filed HTTP plumbing inside the tree that models this service's domain.
+
+`simply_ip_vault` has always placed the identical pair in its own `src/extract.rs`. This placement
+closes structural divergence **S2** and gives both services one address for "how does a body become a
+typed payload here". Moving them back into `api/` would reopen it.
 
 **`guards` is one module, not one per domain, and must stay that way.** `RBAC_MODEL.md`'s rules are cross-cutting: R2's conjunction governs hooks, parameters and execution records alike, and §3's ownership test is consulted from three domains. Splitting guards by caller would put a single sentence of the specification in three files and invite the copies to drift — which is the exact failure the compliance suite exists to catch, and so must not be designed in.
 

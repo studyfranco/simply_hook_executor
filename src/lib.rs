@@ -46,6 +46,7 @@ pub mod db;
 pub mod entities;
 pub mod error;
 pub mod executor;
+pub mod extract;
 pub mod master;
 pub mod middleware;
 pub mod migration;

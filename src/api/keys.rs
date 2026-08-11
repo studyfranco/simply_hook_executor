@@ -39,6 +39,7 @@ use crate::entities::{
     api_key, api_key::HmacMode, api_key_hook_permission, hook, prelude::*,
 };
 use crate::error::AppError;
+use crate::extract::{OptionalStrictJson, StrictJson};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -50,7 +51,7 @@ use super::guards::{
     guard_master_to_administer, guard_master_to_grant_scopes,
 };
 use super::support::{
-    OptionalStrictJson, StrictJson, create_audit_log, describe_hmac_mode, format_reference, generate_random_key, hash_key,
+    create_audit_log, describe_hmac_mode, format_reference, generate_random_key, hash_key,
     mint_signing_pair, resolve_hook, validate_bound_ips, validate_concurrency,
 };
 

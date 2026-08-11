@@ -17,15 +17,15 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 
 ## Coverage
 
-**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-10.
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-11.
 
 | Group | Files | Where documented here |
 | :--- | :--- | :--- |
-| Crate root (`src/*.rs`) | 12 | One `###` section each, under **Top level** |
+| Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
 | Migrations (`src/migration/*.rs`) | 10 | Table under **`src/migration/`** (9 migrations + `mod.rs`) |
-| **Total** | **39** | — |
+| **Total** | **40** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
 (verified passing 2026-08-11, all three silent against `4865a82`):
@@ -71,6 +71,7 @@ src/
 ├── retention.rs            Background sweeps for expired history and trashed hooks
 ├── db.rs                   Pool construction, SQLite session pragmas, migrations
 ├── error.rs                AppError → HTTP status mapping
+├── extract.rs              StrictJson / OptionalStrictJson — §5's type-level body control
 ├── api/
 │   ├── mod.rs              Module wiring, router-facing re-exports, policy constants
 │   ├── support.rs          Shared plumbing. Decides nothing
@@ -299,6 +300,33 @@ setting would trade a real outage for a theoretical slowdown.
 handler. `BodyRejected` carries the extractor's own status rather than flattening to `400`, which is
 what keeps a `413` oversized-body rejection from being reported as a malformed payload.
 
+### `src/extract.rs` — 108 lines
+
+**Role & scope.** The two request-body extractors, and nothing else. `StrictJson` renders a
+deserialization refusal in this service's `{"error": …}` envelope instead of Axum's plain-text
+rejection; `OptionalStrictJson` additionally treats an **empty body** as `T::default()`, which is
+what lets `DELETE /api/keys/{id}` be called with no body at all on the first request and with a §6
+resolution map on the resubmission.
+
+**Key exports.** `StrictJson`, `OptionalStrictJson`.
+
+**Rationale — why this is a crate-root module and not part of `api/support.rs`.** These are not
+helpers. `StrictJson` is the mechanism that turns `#[serde(deny_unknown_fields)]` from an annotation
+into an enforced control, and `RBAC_MODEL.md` §5 requires exactly that control: *"Removing the field
+from the payload type is required; rejecting it at the handler is not sufficient."* Absence plus
+`deny_unknown_fields` is what makes the removal mean something, and this extractor is what carries
+the resulting refusal to the caller. `api/support.rs` is by its own charter the module that **decides
+nothing** — and deciding whether a request is well-formed enough to reach a handler is a decision,
+made before any handler runs. An Axum `FromRequest` implementation is also a framework concern rather
+than a domain one, so keeping it under `api/` filed HTTP plumbing inside the tree that models the
+service's domain. `simply_ip_vault` places the identical pair in its own `src/extract.rs`; this
+placement closes structural divergence **S2** and gives both services one address for "how does a
+body become a typed payload here".
+
+**Invariant worth preserving.** Both extractors pass the rejection's **own status** through rather
+than flattening it to `400`. The router-wide `DefaultBodyLimit` surfaces here as a rejection too, so
+flattening would silently demote `413 Payload Too Large` into an indistinguishable bad request.
+
 ---
 
 ## `src/api/` — the HTTP layer
@@ -328,13 +356,14 @@ blast radius nobody can review. The constants sit here rather than in `support.r
 policy numbers rather than plumbing, read by both the validators that enforce them and the handlers
 that document them.
 
-### `src/api/support.rs` — 426 lines
+### `src/api/support.rs` — 352 lines
 
-**Role & scope.** Shared plumbing used by three or more handler domains, plus the strict JSON
-extractors. **Must not decide anything.** Nothing here returns a refusal that depends on *who* is
-calling — a helper that starts doing so belongs in `guards.rs`.
+**Role & scope.** Shared plumbing used by three or more handler domains. **Must not decide
+anything.** Nothing here returns a refusal that depends on *who* is calling — a helper that starts
+doing so belongs in `guards.rs`. The strict JSON extractors used to live here and now sit in
+`src/extract.rs`; they were the one thing in this file that decided something.
 
-**Key exports.** `StrictJson`, `OptionalStrictJson`; `create_audit_log`; `resolve_hook`,
+**Key exports.** `create_audit_log`; `resolve_hook`,
 `resolve_hook_including_deleted`; `load_parameters`; `format_reference`; `generate_random_key`,
 `hash_key`, `generate_key_id`, `generate_signing_secret`, `mint_signing_pair`; `validate_timeout`,
 `validate_bound_ips`, `validate_concurrency`; `extract_parameter_map`; `describe_hmac_mode`,

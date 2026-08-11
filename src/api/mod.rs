@@ -12,7 +12,7 @@
 //!
 //! | Module | Holds |
 //! | :--- | :--- |
-//! | [`support`] | Shared plumbing used by three or more handler domains, plus the strict JSON extractors. Decides nothing |
+//! | [`support`] | Shared plumbing used by three or more handler domains. Decides nothing |
 //! | [`guards`] | Every authorization decision. Writes nothing |
 //! | [`keys`] | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade |
 //! | [`hooks`] | Hook definitions, parameter contracts, trash/restore/purge |
@@ -30,6 +30,12 @@
 //! **`support` is not a junk drawer**, and the boundary is testable: nothing in it makes an
 //! authorization decision or returns a refusal that depends on *who* is calling. A helper that
 //! starts deciding belongs in [`guards`].
+//!
+//! That boundary is why the strict JSON extractors are **not** in this tree at all. `StrictJson`
+//! and `OptionalStrictJson` live in [`crate::extract`]: they decide whether a request is
+//! well-formed enough to reach a handler, they enforce the `deny_unknown_fields` control
+//! `RBAC_MODEL.md` §5 requires, and an Axum `FromRequest` implementation is a framework concern
+//! rather than a domain one. `simply_ip_vault` places the identical pair at the same address.
 //!
 //! # Re-exports
 //!

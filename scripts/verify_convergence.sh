@@ -78,6 +78,74 @@ fi
 VERBOSE=0
 [ "${1:-}" = "--verbose" ] && VERBOSE=1
 
+# ── Peer synchronization ─────────────────────────────────────────────────────
+#
+# Every peer under `example/` that is a git checkout is fast-forwarded before anything is compared.
+# Without this the gate answers a question nobody asked: "did this repository drift from the peer as
+# it stood whenever someone last pulled". A peer that is three commits behind reports *converged*
+# while the real trees differ, and a bug the peer already fixed keeps showing up as an open finding.
+# That has happened here; see AGENT.MD § Peer Repository Synchronization.
+#
+# Three deliberate choices:
+#
+#   --ff-only   A merge commit or a rebase inside a peer checkout is a local modification to a tree
+#               this repository only ever reads. If the peer cannot fast-forward, someone has
+#               committed there and that needs a human, not a resolution strategy.
+#
+#   non-fatal   An offline run, an air-gapped CI box, or an unreachable forge must not fail the
+#               convergence check. A gate that requires a network is a gate that stops being run,
+#               and the local comparison is still worth performing — it is simply against an
+#               unverified revision, which is what the warning says.
+#
+#   no prompts  GIT_TERMINAL_PROMPT=0 and a hard timeout. The remotes are HTTPS, so a checkout
+#               without cached credentials would otherwise block on an interactive username prompt
+#               forever. A gate that *hangs* is worse than one that fails: `cargo test` at least
+#               tells you it is unhappy. This is the failure mode the timeout exists for.
+#
+#               Measured, so the expectation is calibrated: the ordinary offline cases — DNS failure,
+#               connection refused — return in milliseconds and the timeout never engages. A
+#               *blackholed* route (packets dropped, no RST) is the one that stalls, and it stalls
+#               for the full 30s before the warning prints. That is the price of not hanging
+#               indefinitely; SKIP_PEER_SYNC=1 avoids it outright on a network known to be hostile.
+#
+# Set SKIP_PEER_SYNC=1 to bypass entirely — for a deliberate audit of a pinned peer revision, where
+# the whole point is that the tree must not move.
+sync_peers() {
+    if [ "${SKIP_PEER_SYNC:-0}" = "1" ]; then
+        echo "${DIM}Peer sync skipped (SKIP_PEER_SYNC=1).${RESET}" >&2
+        return
+    fi
+
+    local peer_git peer_dir peer_name before after
+    local -a runner=()
+    command -v timeout >/dev/null 2>&1 && runner=(timeout 30)
+
+    for peer_git in "$REPO_ROOT"/example/*/.git; do
+        # No match leaves the glob unexpanded, so the path simply does not exist.
+        [ -e "$peer_git" ] || continue
+        peer_dir="$(dirname "$peer_git")"
+        peer_name="$(basename "$peer_dir")"
+
+        before="$(git -C "$peer_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+        if GIT_TERMINAL_PROMPT=0 "${runner[@]}" git -C "$peer_dir" pull --quiet --ff-only >/dev/null 2>&1; then
+            after="$(git -C "$peer_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+            if [ "$before" = "$after" ]; then
+                echo "${DIM}Peer ${peer_name} already up to date at ${after}.${RESET}" >&2
+            else
+                echo "${CYAN}Peer ${peer_name} updated ${before} -> ${after}.${RESET}" >&2
+            fi
+        else
+            # Deliberately not a failure. Naming the revision actually being compared is the point:
+            # a warning that does not say what it fell back to leaves the run unreproducible.
+            echo "${YELLOW}⚠️  Warning: Could not pull peer repository, continuing with local version...${RESET}" >&2
+            echo "${YELLOW}    ${peer_name} stays at ${before}; this run compares an unverified revision.${RESET}" >&2
+        fi
+    done
+}
+
+sync_peers
+
 DRIFT=0; KNOWN=0; OK=0; SKIPPED=0
 
 WORK_DIR="$(mktemp -d)"

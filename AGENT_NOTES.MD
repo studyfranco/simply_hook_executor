@@ -5528,3 +5528,110 @@ too, including R4 across all three of its global scopes.
 `SECURITY_COMPARISON_REPORT.md` (overwritten, as instructed) · `STRUCTURAL_CONVERGENCE_REPORT.md`
 (rewritten) · this note. `FILE_MAP.MD` re-verified exhaustive against `src/` with the three
 shape-specific commands it documents; no entry needed adding.
+
+---
+
+# 2026-08-11 (third pass) — Peer sync automation and S2 (`src/extract.rs`)
+
+Three changes: a mandatory agent directive, an automated peer sync in the convergence gate, and the
+structural move that closes divergence **S2**.
+
+## 1. `src/extract.rs` — S2 closed
+
+`StrictJson` and `OptionalStrictJson` moved out of `src/api/support.rs` into a crate-root
+`src/extract.rs`, matching where `simply_ip_vault` has always kept the identical pair.
+
+The move is not tidying. `support.rs` states in its own header that it **decides nothing** — and an
+extractor decides whether a request is well-formed enough to reach a handler at all, before any
+handler runs. `StrictJson` is also the mechanism that turns `#[serde(deny_unknown_fields)]` from an
+annotation into an enforced control, and `RBAC_MODEL.md` §5 names that control specifically:
+*"Removing the field from the payload type is required; rejecting it at the handler is not
+sufficient."* Absence plus `deny_unknown_fields` is what makes the removal mean something, and this
+extractor is what carries the resulting refusal out. Filing that under "shared plumbing" understated
+it. Third and smallest: an Axum `FromRequest` impl is a framework concern, and `api/` models the
+service's *domain*.
+
+| Aspect | Before | After |
+| :--- | :--- | :--- |
+| Location | `src/api/support.rs` | `src/extract.rs` |
+| Import at the call site | `super::support::{OptionalStrictJson, StrictJson, …}` | `crate::extract::{OptionalStrictJson, StrictJson}` |
+| Call sites touched | — | 1 file (`src/api/keys.rs`), 3 handlers |
+| `api/mod.rs` re-export | Never re-exported them | Unchanged — nothing outside `api` imported them through the facade |
+| Behaviour | — | **None.** Bodies moved verbatim; only doc links and the `Json`/`Request` imports were rewritten |
+
+The one substantive edit inside the moved code is the intra-doc link: `[`CreateApiKeyPayload`]`
+resolved against `api/` and now reads `[`crate::api::keys::CreateApiKeyPayload`]`. The invariant most
+worth not losing in a future edit is recorded at the top of the new module and in `FILE_MAP.MD`:
+**both extractors pass the rejection's own status through rather than flattening it to `400`**,
+because `DefaultBodyLimit` surfaces here too and flattening would demote `413` into an
+indistinguishable bad request.
+
+## 2. Automated peer sync in `scripts/verify_convergence.sh`
+
+`sync_peers()` runs before any comparison, over every `example/*/.git` present — a glob rather than a
+hardcoded `simply_ip_vault`, so a second peer needs no edit.
+
+Without it the gate answers a question nobody asked: *"did this repository drift from the peer as it
+stood whenever someone last pulled."* A peer three commits behind reports **converged** while the
+real trees differ.
+
+That is not hypothetical, and this pass proved it inside a single session. The peer was at `c182a7a`
+when the clean-room audit was written and committed. The first run of the new sync step printed:
+
+```
+Peer simply_ip_vault updated 2d12bf8 -> f6e8444.
+```
+
+— two commits past what the audit had described, one of them touching **14 source files** including
+`src/db.rs` and `src/master.rs`. The gate had been green the whole time and would have stayed green.
+
+Design choices, each with a reason:
+
+| Choice | Reason |
+| :--- | :--- |
+| `--ff-only` | A merge or rebase inside a peer checkout is a local modification to a tree we only read. If it cannot fast-forward, someone committed there and that needs a human, not a strategy |
+| Non-fatal on failure | A gate that requires a network is a gate that stops being run. Offline warns and proceeds; the warning names the local `HEAD`, so the run stays reproducible |
+| `GIT_TERMINAL_PROMPT=0` | The remotes are HTTPS. Without cached credentials git blocks on an interactive username prompt **forever** — a hanging gate is worse than a failing one |
+| `timeout 30` | Bounds the blackholed-route case |
+| `SKIP_PEER_SYNC=1` | For a deliberate audit of a pinned revision, where the tree must not move |
+
+**Measured, not assumed.** The offline path was tested against an unroutable remote in a throwaway
+repository rather than by editing the peer's remote: DNS failure and connection-refused return in
+milliseconds, while a **blackholed** route stalls for the full 30s before the warning prints. That is
+the price of not hanging indefinitely, and it is now stated in the script's comment so nobody
+mistakes the stall for a wedge.
+
+## 3. `AGENT.MD` — Peer Repository Synchronization
+
+New top-level section, linked from the `example/` entry in the document hierarchy. The directive:
+run `git -C example/<peer_repo> pull` **before** reading anything under `example/` or generating any
+convergence, parity, or security report, and record the outcome.
+
+The rationale is a failure this repository has actually had: an earlier `example/simply_ip_vault` was
+a hand-copied snapshot that kept two files after they were deleted upstream, and an audit written
+against it produced **two findings about dead code**, both later retracted. Nothing failed — the
+report was simply false, and stayed false until someone diffed the trees by hand.
+
+The section is explicit that the script's automation does **not** discharge the directive: the script
+syncs only when invoked, and an agent that opens `example/simply_ip_vault/src/api/guards.rs` directly
+has not invoked it.
+
+## 4. Consequence for the reports committed earlier today
+
+`SECURITY_COMPARISON_REPORT.md` and `STRUCTURAL_CONVERGENCE_REPORT.md` name the peer as `c182a7a` in
+their headers, which is accurate and reproducible — but the peer is now at `f6e8444`. Both findings
+against the peer were re-checked at the new HEAD and **still hold**: `DeleteKeyPayload` still lacks
+`deny_unknown_fields` (`keys.rs:651`), `ReassignOwnerPayload` still documents a control it does not
+carry (`support.rs:276`), and `update_webhook` still re-checks `can_manage_webhooks` before ownership
+(`webhooks.rs:385`), which is the comparison **SHE-1** rests on. The convergence gate is 19/0/0/0
+against the new peer source. The reports are behind by a SHA, not by a conclusion — and this is
+precisely the drift the directive above exists to make visible rather than to prevent.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` exit 0 ·
+`cargo test` **285 passed / 0 failed** across 8 binaries — unchanged from before the refactor, which
+is the point for a move that was meant to be behaviour-free · `./scripts/verify_convergence.sh`
+**19 converged, 0 known, 0 drifted, 0 skipped**, exit 0 · `SKIP_PEER_SYNC=1` path exercised ·
+`FILE_MAP.MD` re-verified exhaustive (13 crate-root files now, 40 total) · `git diff RBAC_MODEL.md`
+empty.

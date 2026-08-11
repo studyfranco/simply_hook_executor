@@ -9,8 +9,12 @@
 //!
 //! Nothing here makes an authorization decision. If a function in this file starts deciding who may
 //! do something, it belongs in [`super::guards`] instead.
+//!
+//! The strict JSON extractors used to live here and now sit in [`crate::extract`]. They were the
+//! one thing in this file that decided something — whether a request is well-formed enough to reach
+//! a handler at all — and `deny_unknown_fields`, which they enforce, is a `RBAC_MODEL.md` §5
+//! control rather than plumbing. See that module's header for the full reasoning.
 
-use axum::extract::Json;
 use chrono::Utc;
 use rand::RngExt;
 use ipnetwork::IpNetwork;
@@ -23,84 +27,6 @@ use crate::entities::{api_key, api_key::HmacMode, audit_log, hook, hook_paramete
 use crate::error::AppError;
 
 use super::{MAX_CONCURRENT_JOBS, MAX_TIMEOUT_SECONDS};
-
-/// A [`StrictJson`] whose body may be absent entirely, yielding `T::default()`.
-///
-/// `DELETE /api/keys/{id}` needs this: the *first* request carries no body at all — it is a
-/// question, and the answer is the pre-flight inventory — while the resubmission carries the
-/// resolution map. Axum's own `Option<Json<T>>` does not cover the case, and demanding an empty
-/// `{}` on the first request would make the common "delete a key that owns nothing" call require a
-/// body for no reason.
-///
-/// Emptiness is decided from the *bytes*, not from `Content-Type`, so a client that sends the
-/// header without a payload behaves the same as one that sends neither. Reading through
-/// [`axum::body::Bytes`] keeps the request under `DefaultBodyLimit`, so the `413` control still
-/// applies here as it does everywhere else.
-pub struct OptionalStrictJson<T>(pub T);
-
-impl<T, S> axum::extract::FromRequest<S> for OptionalStrictJson<T>
-where
-    T: serde::de::DeserializeOwned + Default,
-    S: Send + Sync,
-{
-    type Rejection = AppError;
-
-    async fn from_request(
-        req: axum::extract::Request,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let bytes = axum::body::Bytes::from_request(req, state)
-            .await
-            .map_err(|rejection| AppError::BodyRejected(rejection.status(), rejection.body_text()))?;
-
-        if bytes.is_empty() {
-            return Ok(Self(T::default()));
-        }
-
-        serde_json::from_slice(&bytes).map(Self).map_err(|e| {
-            AppError::InvalidInput(format!(
-                "Failed to deserialize the JSON body into the target type: {e}"
-            ))
-        })
-    }
-}
-
-/// A [`Json`] extractor whose deserialization failures come back as [`AppError::InvalidInput`].
-///
-/// Axum's own `Json` rejection renders as a bare `text/plain` body, which would break the
-/// `{"error": "..."}` contract every other failure on these routes honours — a client parsing the
-/// refusal would see no `error` field at all. Since the key-administration payloads are
-/// `deny_unknown_fields` (see [`CreateApiKeyPayload`]), a rejected field is now a *routine,
-/// security-relevant* outcome rather than an exotic one, so it has to read like every other refusal.
-///
-/// The serde message is passed through verbatim, so a caller that sent `is_master` is told exactly
-/// which field was refused rather than being left to guess at a generic "bad request".
-///
-/// The rejection's own **status** is passed through too, which matters more than it looks: the
-/// 1 MiB body limit also arrives here as a `Json` rejection, and mapping every rejection to `400`
-/// would quietly demote `413 Payload Too Large` to an indistinguishable bad request. Only the
-/// response shape is normalized; the status is the extractor's to decide.
-pub struct StrictJson<T>(pub T);
-
-impl<T, S> axum::extract::FromRequest<S> for StrictJson<T>
-where
-    T: serde::de::DeserializeOwned,
-    S: Send + Sync,
-{
-    type Rejection = AppError;
-
-    async fn from_request(
-        req: axum::extract::Request,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => {
-                Err(AppError::BodyRejected(rejection.status(), rejection.body_text()))
-            }
-        }
-    }
-}
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
