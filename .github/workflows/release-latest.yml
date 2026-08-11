@@ -37,9 +37,11 @@ jobs:
 
       - name: Package binary
         run: |
-          tar -czf ${{ matrix.artifact_name }}.tar.gz \
-            -C target/${{ matrix.target }}/release simply_hook_executor \
-            README.md LICENSE deploy/simply_hook_executor.service
+          mkdir staging
+          cp target/${{ matrix.target }}/release/simply_hook_executor staging/
+          cp README.md LICENSE staging/
+          cp -r deploy staging/
+          tar -czf ${{ matrix.artifact_name }}.tar.gz -C staging .
 
       - name: Update Latest Release
         uses: softprops/action-gh-release@v2
