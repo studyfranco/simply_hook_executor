@@ -5410,3 +5410,121 @@ sourced from its committed source and its own commit messages, both cited in the
 `SECURITY_COMPARISON_REPORT.md` (replaces the 2026-08-10 edition, retrievable at `7a7ffc7`) ·
 `STRUCTURAL_CONVERGENCE_REPORT.md` (replaces the same edition) · this note · `FILE_MAP.MD`
 verification date.
+
+---
+
+# 2026-08-11 (second pass) — Independent clean-room audit
+
+**Mode:** strictly read-only over `src/`, `tests/`, `scripts/`, `static/` and `migration/` in **both**
+repositories. `RBAC_MODEL.md` untouched. Only the three documents named at the end were written.
+
+**Constraint that shaped this pass:** the brief required a **clean-room** audit — findings derived
+from `RBAC_MODEL.md` and current `.rs` source only, with no prior audit report read or relied upon.
+Both repositories carry earlier reports and the peer's `git pull` brought in three more; none was
+opened. Where the peer's history had to be consulted at all, only `git diff --stat` and
+`--name-only` were used, to establish that no `.rs` file had moved.
+
+## 0. Task 0 — peer repository update
+
+| Step | Command | Outcome |
+| :--- | :--- | :--- |
+| Locate | `ls example/` | `simply_ip_vault` — the only project |
+| Update | `cd example/simply_ip_vault && git pull` | **Fast-forward `6f1c4c7` → `c182a7a`** |
+| Scope of the update | `git diff --stat 6f1c4c7..c182a7a` | 3 files, all Markdown (the peer's own reports and notes) |
+| Source moved? | `git diff --name-only … \| grep -E '^(src\|tests\|scripts\|static)/'` | **None** |
+| Tree | `git status --porcelain` | Clean |
+
+Because no `.rs` file changed, the peer source analysed here is the tree as committed at `6f1c4c7`
+and unchanged at `c182a7a`.
+
+## 1. Method
+
+Each rule of the specification was traced to enforcing code on both sides, and then attacked. The
+negative results are recorded in the report (§1.2 and §1.4) as well as the positive ones — a
+clean-room audit that lists only what it found is indistinguishable from one that did not look.
+
+| Question | How it was settled |
+| :--- | :--- |
+| Is the normative document still shared? | `md5sum RBAC_MODEL.md` on both — `cb0b76ab…`, identical |
+| Where is R2 enforced? | Enumerated every `fn` in both `guards.rs`; traced each content route back to its gate |
+| Can R2 be reached around? | Followed `update_hook` → `guard_manage` and read all three routes. **It can — see SHE-1** |
+| What does an empty `ALLOWED_SCRIPT_ROOTS` mean? | Read `is_within_roots`: `roots.is_empty() \|\| …` — empty allows every path |
+| Does the peer have the same gap? | Read `update_webhook`: it re-checks `can_manage_webhooks` **and then** ownership. It does not |
+| Is §6 total-map enforcement real on both? | Read both delete paths end to end, including the reassign-into-doomed-subtree refusal |
+| Are the subtree walks cycle-safe? | Both carry a visited set and terminate. Only B additionally refuses a caller inside the doomed subtree |
+| Which payloads are strict? | `grep -rn deny_unknown_fields` on both, then read each struct's derive block — the attribute's line number proves nothing about which struct it decorates |
+| Is R4 complete on the peer? | `MASTER_ONLY_SCOPES` covers all three of its global scopes; both call sites pass all three |
+| Do the CI pipelines run any gate? | `grep -rl 'cargo test\|verify_convergence\|test_e2e' .github .forgejo` on both — no matches |
+
+## 2. The finding this pass produced — SHE-1
+
+The specification's *Dispatch configuration* clause says that where dispatch configuration lives on a
+shared managed resource — for this service, `script_path` on the Hook row — editing it "is a
+management action on that resource and is governed by **R2 in full**".
+
+`guard_manage` admits three routes, and the second is ownership alone:
+
+```rust
+if key.is_master { return Ok(()); }
+if hook.owner_key_id == Some(key.id) { return Ok(()); }   // ← R2 never consulted
+guard_hook_manage_conjunction(db, key, hook.id).await?;
+```
+
+`create_hook` sets `owner_key_id` to the creator and auto-provisions `can_execute`, `can_manage` and
+`can_view_execution`. So a Daughter granted `can_manage_hooks` creates a hook, and **revoking
+`can_manage_hooks` afterwards takes none of that back**: ownership and the permission row survive, so
+the key can still repoint that hook at any absolute path and run it. `ALLOWED_SCRIPT_ROOTS` is empty
+by default, which permits every path.
+
+What keeps this at Medium rather than higher, stated so the severity is not overread: a hook carrying
+`run_as_user` is master-only to modify at all, hooks are never spawned through a shell, and a key
+*currently* holding `can_manage_hooks` could set the same path at creation time anyway. The delta is
+**persistence after revocation** — plus the second route in, which is Master reassigning
+`owner_key_id` to a key holding no `can_manage_keys` at all.
+
+The peer is not exposed: `update_webhook` re-checks the standing scope *and then* ownership, so
+revoking `can_manage_webhooks` contains the key immediately. That asymmetry is the substance of the
+finding — the same containment question, answered two different ways in two codebases that otherwise
+match line for line.
+
+The in-code rationale at `guards.rs:117-128` argues that ownership should confer content authority,
+and it is a coherent product position. It is nonetheless a position the specification does not grant,
+and `RBAC_MODEL.md:10-11` says the specification wins. Recorded as a finding rather than resolved
+here, because this pass is read-only and the resolution is a product decision: either gate the
+ownership route on `can_manage_hooks`, or amend the normative document to admit the exception.
+
+## 3. Other findings
+
+- **SHE-2 (Low, this repo)** — no refusal when the caller's own key lies inside the subtree being
+  deleted. Reachable only through a `parent_key_id` cycle, which the API cannot create. The peer
+  refuses it explicitly; the traversal itself is cycle-safe on both sides.
+- **SIV-1 (Low, peer)** — `DeleteKeyPayload` lacks `deny_unknown_fields`. It **fails safe**: a
+  dropped map yields the `409` inventory rather than a deletion. Worth noting for whoever fixes it —
+  the attribute belongs on `DeleteKeyPayload`, and *cannot* go on the nested `ResolutionEntry`, which
+  uses `#[serde(flatten)]`; serde rejects that combination.
+- **SIV-2 (Informational, peer)** — `ReassignOwnerPayload`'s doc comment reasons about keeping
+  `deny_unknown_fields` in step while the struct derives only `Deserialize`.
+- **ECO-1 (Medium, process)** — the peer's `verify_convergence.sh` points at an
+  `example/simply_hook_executor` that does not exist in that clone. Ran it: prints `SKIP`, exits `0`.
+  Green while comparing nothing, so drift is policed in one direction only.
+- **ECO-2 (Medium, process)** — neither CI pipeline runs any gate. This is the one finding the
+  specification names outright: §7 requires DDL-inexpressible constraints to be covered by a test
+  **that runs in CI**. Both services have written those tests; neither runs them automatically.
+
+## 4. What was attacked and held
+
+Recorded because the negative results are the audit. On this service: minting a second Master through
+a payload, through `deny_unknown_fields`, and through direct SQL against the generated marker;
+self-granting `can_manage_keys`; granting an unheld verb; trading a held verb for an unheld one in
+one write; routing a grant through the update endpoint to dodge R1; probing hook existence and key
+UUIDs through `403`/`404`; rotating or deleting the Master; editing a Master field other than
+`bound_ips`; orphaning hooks through a key deletion; forging `client_ip` through `X-Forwarded-For`;
+bypassing `bound_ips` as Master; assigning `run_as_user` without Master; restoring a trashed
+privileged hook. All refused, each at a named line. The peer's equivalents were attacked and held
+too, including R4 across all three of its global scopes.
+
+## 5. Written
+
+`SECURITY_COMPARISON_REPORT.md` (overwritten, as instructed) · `STRUCTURAL_CONVERGENCE_REPORT.md`
+(rewritten) · this note. `FILE_MAP.MD` re-verified exhaustive against `src/` with the three
+shape-specific commands it documents; no entry needed adding.
