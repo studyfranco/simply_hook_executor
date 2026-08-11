@@ -28,9 +28,9 @@ use crate::executor;
 
 use super::executions::PurgeQuery;
 use super::guards::{
-    require_lifecycle_authority, require_manage, require_master_for_deleted_view,
-    hook_permission, normalize_run_as_user, require_master_for_privileged_hook,
-    require_visibility, visible_hook_ids,
+    guard_lifecycle_authority, guard_manage, guard_master_for_deleted_view,
+    hook_permission, normalize_run_as_user, guard_master_for_privileged_hook,
+    guard_visibility, visible_hook_ids,
 };
 use super::support::{
     create_audit_log, describe_privilege, format_reference, load_parameters,
@@ -357,7 +357,7 @@ pub async fn list_hooks(
     Query(params): Query<ListHooksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let include_deleted = params.include_deleted.unwrap_or(false);
-    require_master_for_deleted_view(&key, include_deleted)?;
+    guard_master_for_deleted_view(&key, include_deleted)?;
 
     let mut query = Hook::find().order_by_asc(hook::Column::Name);
     if !include_deleted {
@@ -390,14 +390,14 @@ pub async fn get_hook(
     Query(params): Query<ListHooksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let include_deleted = params.include_deleted.unwrap_or(false);
-    require_master_for_deleted_view(&key, include_deleted)?;
+    guard_master_for_deleted_view(&key, include_deleted)?;
 
     let model = if include_deleted {
         resolve_hook_including_deleted(&state.db, &identifier).await?
     } else {
         resolve_hook(&state.db, &identifier).await?
     };
-    require_visibility(&state.db, &key, &model).await?;
+    guard_visibility(&state.db, &key, &model).await?;
     Ok(Json(build_hook_detail(&state.db, &key, model).await?))
 }
 
@@ -410,11 +410,11 @@ pub async fn update_hook(
     Json(payload): Json<UpdateHookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, &model).await?;
+    guard_manage(&state.db, &key, &model).await?;
     // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
     // elevate. `script_path`, the timeout, and the name all decide what executes with the borrowed
     // privileges, so guarding one field while leaving the rest writable protected nothing.
-    require_master_for_privileged_hook(&key, &model, "modify")?;
+    guard_master_for_privileged_hook(&key, &model, "modify")?;
 
     // Checked immediately after authorization and before any field validation, for the same reason
     // as in `create_hook`: an escalation attempt must surface as `403`, never be masked by a `400`
@@ -428,7 +428,7 @@ pub async fn update_hook(
     // `/webhook/{identifier}` and in grant payloads, so a rename silently breaks every caller
     // pointed at the old one — which is a change to the resource's identity, not its content.
     if payload.name.is_some() {
-        require_lifecycle_authority(&key, &model, "rename")?;
+        guard_lifecycle_authority(&key, &model, "rename")?;
     }
 
     // §3: only master reassigns ownership.
@@ -556,11 +556,11 @@ pub async fn delete_hook(
     } else {
         resolve_hook(&state.db, &identifier).await?
     };
-    require_manage(&state.db, &key, &model).await?;
+    guard_manage(&state.db, &key, &model).await?;
     // §3: managing a hook is not authority to make it cease to exist.
-    require_lifecycle_authority(&key, &model, "delete")?;
+    guard_lifecycle_authority(&key, &model, "delete")?;
     // Deleting a privileged hook is a change to a privileged hook like any other.
-    require_master_for_privileged_hook(&key, &model, "delete")?;
+    guard_master_for_privileged_hook(&key, &model, "delete")?;
 
     let reference = format_reference(&model.name, model.id);
     let name = model.name.clone();
@@ -737,7 +737,7 @@ pub async fn list_hook_parameters(
     Path(identifier): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_visibility(&state.db, &key, &model).await?;
+    guard_visibility(&state.db, &key, &model).await?;
     Ok(Json(load_parameters(&state.db, model.id).await?))
 }
 
@@ -750,10 +750,10 @@ pub async fn create_hook_parameter(
     Json(payload): Json<ParameterInput>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, &model).await?;
+    guard_manage(&state.db, &key, &model).await?;
     // A parameter is argv for the elevated command: a defaulted parameter on a root hook running
     // `/bin/sh` supplies `-c` and a command string without the caller ever editing `script_path`.
-    require_master_for_privileged_hook(&key, &model, "declare parameters on")?;
+    guard_master_for_privileged_hook(&key, &model, "declare parameters on")?;
 
     if !executor::is_valid_param_key(&payload.param_key) {
         return Err(AppError::InvalidInput(format!(
@@ -813,10 +813,10 @@ pub async fn update_hook_parameter(
     Json(payload): Json<UpdateParameterPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, &model).await?;
+    guard_manage(&state.db, &key, &model).await?;
     // Changing a `default_value` rewrites what the elevated command receives, so this needs the
     // same gate as declaring one.
-    require_master_for_privileged_hook(&key, &model, "modify parameters on")?;
+    guard_master_for_privileged_hook(&key, &model, "modify parameters on")?;
 
     let param = HookParameter::find_by_id(param_id)
         .one(&state.db)
@@ -861,10 +861,10 @@ pub async fn delete_hook_parameter(
     Path((identifier, param_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    require_manage(&state.db, &key, &model).await?;
+    guard_manage(&state.db, &key, &model).await?;
     // Removing a required parameter shifts every positional argument after it, which changes the
     // elevated command just as surely as editing one.
-    require_master_for_privileged_hook(&key, &model, "remove parameters from")?;
+    guard_master_for_privileged_hook(&key, &model, "remove parameters from")?;
 
     let param = HookParameter::find_by_id(param_id)
         .one(&state.db)

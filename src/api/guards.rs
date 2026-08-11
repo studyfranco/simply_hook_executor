@@ -18,7 +18,7 @@
 //! They are now module-private there, which is the compiler holding that claim rather than a comment
 //! asking future editors to.
 //!
-//! Note what did *not* move with it. §4 also governs **hook** visibility — `require_visibility`,
+//! Note what did *not* move with it. §4 also governs **hook** visibility — `guard_visibility`,
 //! `visible_hook_ids`, `execution_visible_hook_ids` — and those stay here, because three domains
 //! consult them. A single section of the specification is therefore split across two files, which is
 //! the cost; it is accepted because the split follows the number of consumers rather than the
@@ -41,7 +41,7 @@ use super::keys::UpdateApiKeyPayload;
 ///
 /// Master-only, because a soft-deleted hook still carries its `script_path` and `run_as_user` — the
 /// full definition of something that was privileged enough to want deleting.
-pub(crate) fn require_master_for_deleted_view(
+pub(crate) fn guard_master_for_deleted_view(
     key: &api_key::Model,
     include_deleted: bool,
 ) -> Result<(), AppError> {
@@ -89,7 +89,7 @@ pub(crate) fn verb_denied(held: Option<&api_key_hook_permission::Model>, verb: &
 
 /// Authorizes execution of a hook: master keys bypass, everyone else needs an explicit
 /// `can_execute` grant (`AGENT.MD` least-privilege rule).
-pub(crate) async fn require_execute(
+pub(crate) async fn guard_execute(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
     hook_id: Uuid,
@@ -112,7 +112,7 @@ pub(crate) async fn require_execute(
 /// 1. **Master.** Bypasses everything.
 /// 2. **The hook's owner** (`hooks.owner_key_id`), with no further requirement.
 /// 3. **R2 in full** — global `can_manage_keys` *and* a `can_manage = true` row on this hook —
-///    for everyone else, via [`require_hook_manage_conjunction`].
+///    for everyone else, via [`guard_hook_manage_conjunction`].
 ///
 /// # Why ownership is sufficient on its own
 ///
@@ -130,14 +130,14 @@ pub(crate) async fn require_execute(
 /// # What ownership is *not* sufficient for
 ///
 /// **Delegation.** Granting or revoking another key's rights on this hook is not reachable through
-/// this function at all — those routes call [`require_hook_manage_conjunction`] directly and so
+/// this function at all — those routes call [`guard_hook_manage_conjunction`] directly and so
 /// still require R2 in full. Owning a hook makes you answerable for it; it does not make you an
 /// administrator of credentials, which is what handing out verbs on it amounts to. A Daughter owner
 /// can therefore edit its own hook and cannot widen anyone's access to it, including its own.
 ///
 /// # Why the owner check runs before the conjunction
 ///
-/// Ordering is load-bearing for §4. [`require_hook_manage_conjunction`] answers `404` when the
+/// Ordering is load-bearing for §4. [`guard_hook_manage_conjunction`] answers `404` when the
 /// caller holds no permission row at all, and an owner need not hold one — ownership lives in a
 /// column on `hooks`, not in `api_key_hook_permissions`. Asking the conjunction first would hide a
 /// hook from the very key answerable for it.
@@ -150,7 +150,7 @@ pub(crate) async fn require_execute(
 /// was not abstract: [`update_hook`] is gated by this function, and `script_path` is one of the
 /// fields it writes. A Daughter holding a single `can_manage` row could repoint a hook at any
 /// binary on the host and then trigger it with the `can_execute` half of the same row.
-/// `require_master_for_privileged_hook` bounded that only for hooks already carrying a
+/// `guard_master_for_privileged_hook` bounded that only for hooks already carrying a
 /// `run_as_user`, and `ALLOWED_SCRIPT_ROOTS` is empty by default.
 ///
 /// # The asymmetry with `can_manage_hooks`
@@ -160,7 +160,7 @@ pub(crate) async fn require_execute(
 /// exist can have no row. Creation rights and management rights remain separate powers — but a
 /// creator is recorded as `owner_key_id`, so route 2 above is what lets it keep maintaining its own
 /// work without also being made a Parent.
-pub(crate) async fn require_manage(
+pub(crate) async fn guard_manage(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
     hook: &hook::Model,
@@ -171,7 +171,7 @@ pub(crate) async fn require_manage(
     if hook.owner_key_id == Some(key.id) {
         return Ok(());
     }
-    require_hook_manage_conjunction(db, key, hook.id).await?;
+    guard_hook_manage_conjunction(db, key, hook.id).await?;
     Ok(())
 }
 
@@ -180,7 +180,7 @@ pub(crate) async fn require_manage(
 /// Every failure here is a `404` under §4: "visible" is precisely the question this asks, so a
 /// caller that fails it is outside the scope by definition and must not be able to tell the hook
 /// apart from one that never existed.
-pub(crate) async fn require_visibility(
+pub(crate) async fn guard_visibility(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
     hook: &hook::Model,
@@ -189,7 +189,7 @@ pub(crate) async fn require_visibility(
         return Ok(());
     }
     // Ownership confers visibility on its own. §3 makes the owner answerable for the hook and
-    // [`require_manage`] lets it edit one, so a hook invisible to the key that owns it would be
+    // [`guard_manage`] lets it edit one, so a hook invisible to the key that owns it would be
     // editable-but-unreadable — `PUT` succeeding while `GET` answers `404`. Ownership lives in a
     // column on `hooks`, not in `api_key_hook_permissions`, so it has to be asked for separately;
     // master may reassign `owner_key_id` to a key holding no row at all.
@@ -315,7 +315,7 @@ pub(crate) async fn visible_hook_ids(
         .collect();
 
     // Owned hooks, whether or not a permission row exists — the listing form of the same rule
-    // [`require_visibility`] applies to a single hook. Without this a key could edit a hook that
+    // [`guard_visibility`] applies to a single hook. Without this a key could edit a hook that
     // never appeared in its own hook list.
     ids.extend(
         Hook::find()
@@ -375,7 +375,7 @@ pub(crate) fn normalize_run_as_user(
 /// Only *granting* is restricted. Clearing a scope is left to any key manager: removing authority
 /// is not an escalation, and requiring master to revoke would make an over-provisioned key harder
 /// to contain than it was to create.
-pub(crate) fn require_master_to_grant_scopes(
+pub(crate) fn guard_master_to_grant_scopes(
     key: &api_key::Model,
     can_manage_keys: Option<bool>,
     can_manage_hooks: Option<bool>,
@@ -411,7 +411,7 @@ pub(crate) fn require_master_to_grant_scopes(
 /// one-request credential theft that also locked out the legitimate holder. Deletion and update are
 /// gated for the same reason: the master key is the system's root of trust, and administering it is
 /// reserved to a peer.
-pub(crate) fn require_master_to_administer(
+pub(crate) fn guard_master_to_administer(
     key: &api_key::Model,
     target: &api_key::Model,
     action: &str,
@@ -434,7 +434,7 @@ pub(crate) fn require_master_to_administer(
 /// Refuses an action against the master key that no caller — **including the master itself** —
 /// may perform through the API.
 ///
-/// [`require_master_to_administer`] answers a different question: it stops *other* keys from
+/// [`guard_master_to_administer`] answers a different question: it stops *other* keys from
 /// touching the master. Once the constraint in
 /// `m20230106_000001_master_key_uniqueness` guarantees there is exactly one master, "another key
 /// administering the master" and "the master administering itself" are the same request, and the
@@ -481,7 +481,7 @@ pub(crate) fn refuse_master_lifecycle_action(target: &api_key::Model, action: &s
 /// The `key.id != target.id` arm is unreachable while exactly one master row exists, and is
 /// written anyway: it is the assertion that keeps §5's "which it alone may edit" true by
 /// construction rather than as a side effect of the uniqueness index holding.
-pub(crate) fn require_master_self_edit_is_bound_ips_only(
+pub(crate) fn guard_master_self_edit_is_bound_ips_only(
     key: &api_key::Model,
     target: &api_key::Model,
     payload: &UpdateApiKeyPayload,
@@ -537,7 +537,7 @@ pub(crate) fn require_master_self_edit_is_bound_ips_only(
 /// Clearing the elevation is covered too. It is a modification of a privileged hook like any other,
 /// and exempting it would just add a step to the same attack: drop the elevation, repoint the
 /// script, and leave an operator's vetted configuration silently downgraded.
-pub(crate) fn require_master_for_privileged_hook(
+pub(crate) fn guard_master_for_privileged_hook(
     key: &api_key::Model,
     hook: &hook::Model,
     action: &str,
@@ -569,7 +569,7 @@ pub(crate) fn require_master_for_privileged_hook(
 /// UUID exists, by reading `404` instead of `403`.
 ///
 /// It deliberately does not say *which* hook — that question needs the resolved hook and is
-/// answered by [`require_hook_manage_conjunction`]. This only establishes that the caller holds a
+/// answered by [`guard_hook_manage_conjunction`]. This only establishes that the caller holds a
 /// manage row somewhere, which is the half of R2 that can be checked without knowing the target.
 pub(crate) async fn manages_any_hook(
     db: &sea_orm::DatabaseConnection,
@@ -587,7 +587,7 @@ pub(crate) async fn manages_any_hook(
 /// before any target key or hook is resolved.
 ///
 /// Both halves of R2 are required, so a caller failing this can never pass
-/// [`require_hook_manage_conjunction`] for any hook — which is what makes refusing here safe rather
+/// [`guard_hook_manage_conjunction`] for any hook — which is what makes refusing here safe rather
 /// than merely early. The refusal must come before the `ApiKey::find_by_id` in either handler, or
 /// the endpoint becomes a key-UUID oracle: `404` for an id that does not exist, `403` for one that
 /// does.
@@ -609,7 +609,7 @@ pub(crate) async fn has_permission_admin_standing(
 ///
 /// Every manage-level route reaches this function: the grant-administration routes call it
 /// directly for the row it returns, and every content route ([`update_hook`], the parameter CRUD,
-/// [`delete_hook`], [`delete_execution`]) arrives through [`require_manage`]. There is deliberately
+/// [`delete_hook`], [`delete_execution`]) arrives through [`guard_manage`]. There is deliberately
 /// no second implementation of R2 to drift from this one.
 ///
 /// > *Managing a specific resource requires holding both global `can_manage_keys` AND a
@@ -631,7 +631,7 @@ pub(crate) async fn has_permission_admin_standing(
 /// The two failures return **one message**, deliberately. Distinguishing "you lack the global flag"
 /// from "you lack the row on this hook" would tell a caller which half to go acquire, and the row
 /// half doubles as a statement about which hooks exist and who manages them.
-pub(crate) async fn require_hook_manage_conjunction(
+pub(crate) async fn guard_hook_manage_conjunction(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
     hook_id: Uuid,
@@ -695,7 +695,7 @@ pub(crate) async fn require_hook_manage_conjunction(
 // each other. See `AGENT.MD` §0 for the boundary this draws, and `AGENT_NOTES.MD` for the audit.
 //
 // What stays here is everything cross-domain, including the §4 *hook* visibility rules
-// (`require_visibility`, `visible_hook_ids`, `execution_visible_hook_ids`), which three domains
+// (`guard_visibility`, `visible_hook_ids`, `execution_visible_hook_ids`), which three domains
 // consult. Splitting those would be the drift this module exists as one file to prevent.
 
 /// **§3 — resource lifecycle authority.** Authorizes deleting or renaming a hook.
@@ -705,7 +705,7 @@ pub(crate) async fn require_hook_manage_conjunction(
 /// > operational verb confers no lifecycle authority: a parent that merely uses a resource must not
 /// > be able to delete it.*
 ///
-/// This is a **narrower** gate than [`require_manage`], and it sits in front of it rather than
+/// This is a **narrower** gate than [`guard_manage`], and it sits in front of it rather than
 /// replacing it. `can_manage` remains what it always was — the right to *operate* a hook: edit its
 /// description, its script path, its timeout, its parameter contract. What it no longer carries is
 /// the right to make the hook cease to exist, or to rename it out from under everything that refers
@@ -719,7 +719,7 @@ pub(crate) async fn require_hook_manage_conjunction(
 /// That is the conservative direction: the alternative, treating "no owner" as "anyone who manages
 /// it", would make the un-migrated state *more* permissive than the migrated one, so every
 /// deployment would silently keep the old behaviour until someone remembered to assign ownership.
-pub(crate) fn require_lifecycle_authority(
+pub(crate) fn guard_lifecycle_authority(
     key: &api_key::Model,
     hook: &hook::Model,
     action: &str,
@@ -780,7 +780,7 @@ pub(crate) fn is_permission_reduction(
 /// > Master.*
 /// > *R7 — Granting is bounded by R1 and R2 together, simultaneously and without exception.*
 ///
-/// R2 is the entry gate ([`require_hook_manage_conjunction`]) and R1 is the per-verb bound applied
+/// R2 is the entry gate ([`guard_hook_manage_conjunction`]) and R1 is the per-verb bound applied
 /// on top of it. "Together, simultaneously and without exception" is the operative phrase: there is
 /// no caller below Master for whom one of the two is skipped. The `2d62d1b` early return skipped
 /// *both* for any `can_manage_keys` holder, so the per-verb comparison below was unreachable except
@@ -815,7 +815,7 @@ pub(crate) async fn guard_delegated_hook_grant(
         return Ok(());
     }
 
-    let held = require_hook_manage_conjunction(db, key, hook.id).await?;
+    let held = guard_hook_manage_conjunction(db, key, hook.id).await?;
 
     // Every verb the permission row carries is compared independently. A verb missing from this
     // array is a verb R1 does not bound, which is how a new column becomes a delegation hole the

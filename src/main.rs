@@ -63,6 +63,7 @@ async fn shutdown_signal() {
 async fn bootstrap_master_key(
     db: &DatabaseConnection,
     cipher: &crypto::SecretCipher,
+    initial_master_key: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
@@ -74,16 +75,19 @@ async fn bootstrap_master_key(
         return Ok(());
     }
 
-    let plaintext_key = match std::env::var("INITIAL_MASTER_KEY") {
-        Ok(fixed_key) if !fixed_key.is_empty() => {
+    // Already validated in `main` as exactly 64 hex characters — see
+    // [`config::validate_initial_master_key`]. This function receives the checked value rather than
+    // reading the environment itself, so the refusal happens before migrations run rather than after.
+    let plaintext_key = match initial_master_key {
+        Some(fixed_key) => {
             tracing::warn!(
                 "INITIAL_MASTER_KEY is set: using the provided value as the master key instead \
                  of generating a random one. This is intended for deterministic test/CI bootstrap \
                  only — do not set this in a real deployment."
             );
-            fixed_key
+            fixed_key.to_owned()
         }
-        _ => api::generate_random_key(),
+        None => api::generate_random_key(),
     };
     let key_hash = api::hash_key(&plaintext_key);
     // Both families, matching the `api_keys.bound_ips` column default in `SCHEMA.MD`. Listing only
@@ -237,6 +241,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // Validated here, beside `RuntimeConfig::from_env` and for the same reason: this is a step that
+    // can refuse to start, and refusing *after* migrations have run and a bootstrap master key has
+    // been minted and printed would leave side effects behind from a boot that never completed.
+    //
+    // Fatal when the variable is set and malformed; absence is the documented zero-config path and
+    // is not an error. See [`config::validate_initial_master_key`] for why those two differ.
+    let initial_master_key = match config::validate_initial_master_key(
+        std::env::var("INITIAL_MASTER_KEY").ok().as_deref(),
+    ) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     tracing::info!(
         allowed_env_vars = ?config.allowed_env_vars,
         log_retention_days = config.log_retention_days,
@@ -286,7 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    bootstrap_master_key(&db, &cipher).await?;
+    bootstrap_master_key(&db, &cipher, initial_master_key.as_deref()).await?;
 
     prime_trusted_proxies(&config.trusted_proxies);
 

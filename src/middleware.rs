@@ -54,7 +54,7 @@ pub struct ClientIp(pub std::net::IpAddr);
 /// The check is symmetric: a timestamp too far in the *future* is refused as well as one too far
 /// in the past. A forward-dated request would otherwise remain replayable for as long as its skew
 /// allows, which is exactly what the window exists to prevent.
-fn verify_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
+fn validate_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
     let presented: i64 = raw.trim().parse().map_err(|_| {
         AppError::Unauthorized(format!("{TIMESTAMP_HEADER} must be a Unix timestamp in seconds"))
     })?;
@@ -116,7 +116,7 @@ fn prevalidate_timestamp_header(
     };
 
     if headers.contains_key(SIGNATURE_HEADER) {
-        verify_timestamp(raw, max_age_seconds)?;
+        validate_timestamp(raw, max_age_seconds)?;
     }
 
     Ok(Some(raw.to_owned()))
@@ -295,7 +295,7 @@ pub async fn auth_middleware(
                             "A signed request must include an {TIMESTAMP_HEADER} header"
                         ))
                     })?;
-                    verify_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
+                    validate_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
                     Some(timestamp)
                 }
                 HmacMode::BodyOnly => None,
@@ -428,28 +428,28 @@ mod tests {
     #[test]
     fn timestamps_inside_the_window_are_accepted() {
         let now = chrono::Utc::now().timestamp();
-        assert!(verify_timestamp(&now.to_string(), 300).is_ok());
-        assert!(verify_timestamp(&(now - 299).to_string(), 300).is_ok());
+        assert!(validate_timestamp(&now.to_string(), 300).is_ok());
+        assert!(validate_timestamp(&(now - 299).to_string(), 300).is_ok());
         // Symmetric: modest forward skew is tolerated for clients whose clocks run fast.
-        assert!(verify_timestamp(&(now + 299).to_string(), 300).is_ok());
-        assert!(verify_timestamp(&format!("  {now}  "), 300).is_ok());
+        assert!(validate_timestamp(&(now + 299).to_string(), 300).is_ok());
+        assert!(validate_timestamp(&format!("  {now}  "), 300).is_ok());
     }
 
     #[test]
     fn timestamps_outside_the_window_are_rejected() {
         let now = chrono::Utc::now().timestamp();
 
-        let stale = verify_timestamp(&(now - 301).to_string(), 300)
+        let stale = validate_timestamp(&(now - 301).to_string(), 300)
             .expect_err("a stale timestamp must be rejected");
         assert!(matches!(stale, AppError::Unauthorized(_)));
 
         // A forward-dated request would otherwise stay replayable for the length of the skew.
-        assert!(verify_timestamp(&(now + 301).to_string(), 300).is_err());
-        assert!(verify_timestamp(&(now - 86_400).to_string(), 300).is_err());
+        assert!(validate_timestamp(&(now + 301).to_string(), 300).is_err());
+        assert!(validate_timestamp(&(now - 86_400).to_string(), 300).is_err());
 
         // Malformed values are rejected rather than defaulting to "now".
         for malformed in ["", "not-a-number", "17e9", "1700000000.5", "-"] {
-            assert!(verify_timestamp(malformed, 300).is_err(), "{malformed:?} should be rejected");
+            assert!(validate_timestamp(malformed, 300).is_err(), "{malformed:?} should be rejected");
         }
     }
 

@@ -3862,7 +3862,7 @@ async fn a_body_just_under_the_ceiling_is_accepted() {
 //
 // Each test is the exploit that previously *succeeded*, inverted into an assertion that it is now
 // refused. They are written against the HTTP surface rather than the guard functions on purpose:
-// a unit test of `require_master_to_grant_scopes` would keep passing if a handler stopped calling
+// a unit test of `guard_master_to_grant_scopes` would keep passing if a handler stopped calling
 // it, which is precisely the regression worth catching.
 // ─────────────────────────────────────────────────────────────
 
@@ -4055,7 +4055,7 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
 /// §5: the master cannot mint a second master — and this is the *master's* refusal, not a
 /// non-master's.
 ///
-/// The pre-existing guard was `require_master_to_grant_scopes`, which returns early for master
+/// The pre-existing guard was `guard_master_to_grant_scopes`, which returns early for master
 /// callers. It stopped a `can_manage_keys` holder from escalating, but a master holding a stolen
 /// credential could mint a peer master and thereby survive the revocation of the original. §5
 /// makes "exactly one" mean exactly one, for everyone.
@@ -6143,7 +6143,7 @@ async fn the_hook_retention_window_is_configurable_and_independent_of_log_retent
 
 /// A **local manager's** delegated grant may not exceed the verbs it holds on that hook.
 ///
-/// `require_manage` answers *whether* a caller may administer grants on a hook; it never answered
+/// `guard_manage` answers *whether* a caller may administer grants on a hook; it never answered
 /// *how much* of it may be handed out. `can_execute` and `can_manage` are separate columns in
 /// `SCHEMA.MD`, so an operator can deliberately grant management without execution — and before
 /// this guard, that key could route the missing verb to itself through a second key it controls:

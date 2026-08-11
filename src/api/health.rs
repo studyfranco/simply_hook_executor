@@ -29,8 +29,10 @@
 //! something *else* is broken is strictly harmful, so liveness stays local by construction.
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{EntityTrait, QuerySelect};
 use serde_json::json;
+
+use crate::entities::{api_key, prelude::ApiKey};
 
 use crate::state::AppState;
 
@@ -53,50 +55,77 @@ pub async fn health_check() -> impl IntoResponse {
     )
 }
 
-/// Handles `GET /ready` — readiness.
+/// Handles `GET /ready` — readiness. `200` when this process can serve traffic, `503` when it cannot.
 ///
-/// Issues `SELECT 1` against the pool and answers `200` with `{"status":"ready","database":"up"}`
-/// or `503` with `{"status":"unavailable","database":"down"}`.
+/// Two things are checked, and both are properties of *this process* rather than of the request.
 ///
-/// # Why `SELECT 1` rather than a real query
+/// # 1. The database answers
 ///
-/// It proves the whole path a request depends on — a connection is obtainable from the pool, the
-/// engine responds, and a result decodes — while touching no table, taking no lock, and costing
-/// nothing that an anonymous caller could amplify into load. A probe that counted rows would be a
-/// free way to make an unauthenticated request do unbounded work, which is a denial-of-service
-/// primitive aimed at the endpoint that exists to report health.
+/// A bounded read of at most one id — **not** `COUNT(*)`, which on a large `api_keys` table would
+/// make every probe a table scan and turn the health check itself into load. A probe an anonymous
+/// caller can amplify into unbounded work is a denial-of-service primitive aimed at the endpoint
+/// that exists to report health.
 ///
-/// It is also the one query in this codebase written as a literal statement rather than through
-/// SeaORM's builder, which is why `tests/source_hygiene.rs` carries an explicit allowlist entry for
-/// it. `SELECT 1` is portable across all three supported backends and interpolates nothing, so it
-/// raises none of the concerns the raw-SQL ban exists to prevent.
+/// The query is built with SeaORM's typed builder rather than a literal `SELECT 1`. An earlier
+/// revision used the literal and carried an allowlist entry in `tests/source_hygiene.rs` to permit
+/// it. That trade was wrong: it bought one saved round-trip and paid with a standing exception to
+/// the raw-SQL ban, in a handler that is both request-reachable and **unauthenticated** — the worst
+/// place in the service to hold an exemption. `select_only().column(Id).limit(1)` is portable across
+/// all three supported backends and needs no exception at all.
 ///
-/// # The error is logged, never returned
+/// # 2. The Master identity is pinned
 ///
-/// `DbErr` renders connection strings, host names, and driver internals. Those go to the operator's
-/// log at `warn`; the caller gets the word `down`. A load balancer needs one bit, and an anonymous
-/// caller has no business learning which database this service failed to reach.
+/// `main.rs` pins before binding the listener, so in production this is a `OnceCell` read that
+/// cannot be `None`. It is asserted anyway because that ordering is a *convention* held by one line:
+/// a future edit that bound the listener first would otherwise produce a process reporting itself
+/// ready while every master-only route quietly refused, and every `key.is_master` read fell back to
+/// per-request resolution. A service in that state is worse than one that is plainly down, because
+/// a load balancer would keep routing to it.
+///
+/// # The response body says as little as possible
+///
+/// `{"status":"ready","database":"up"}`, or `{"status":"unavailable","database":"up"|"down"}`. A
+/// failing probe does **not** name which of the two checks failed beyond the `database` field, and
+/// never carries the error: `DbErr` renders connection strings, host names and driver internals, and
+/// those go to the operator's log where an operator can read them and an anonymous caller cannot. A
+/// load balancer needs one bit.
+///
+/// Note the unpinned case reports `"database":"up"` — because it is. The database answered; what
+/// failed is this process's own startup ordering, and saying `down` would send an operator to
+/// investigate a database that is working perfectly.
 ///
 /// `503` rather than `500` is deliberate: it is the status that tells a well-behaved proxy to stop
 /// routing here and retry, whereas `500` describes a request that failed. Nothing about this request
 /// failed — the answer *is* "not ready", and it was produced successfully.
 pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .query_one_raw(Statement::from_string(backend, "SELECT 1"))
+    if let Err(e) = ApiKey::find()
+        .select_only()
+        .column(api_key::Column::Id)
+        .limit(1)
+        .into_tuple::<uuid::Uuid>()
+        .all(&state.db)
         .await
     {
-        Ok(_) => (
-            StatusCode::OK,
-            axum::Json(json!({ "status": "ready", "database": "up" })),
-        ),
-        Err(e) => {
-            tracing::warn!("Readiness probe failed: the database is unreachable: {e}");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({ "status": "unavailable", "database": "down" })),
-            )
-        }
+        tracing::error!("Readiness probe failed: the database is unreachable: {e}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({ "status": "unavailable", "database": "down" })),
+        );
     }
+
+    if state.master_pin.get().is_none() {
+        tracing::error!(
+            "Readiness probe failed: no Master identity is pinned. This process should not have \
+             bound its listener — see main.rs and RBAC_MODEL.md §5."
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({ "status": "unavailable", "database": "up" })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "status": "ready", "database": "up" })),
+    )
 }

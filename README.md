@@ -263,6 +263,7 @@ automatically if present):
 | `BIND_HOST` (or `HOST`) | `0.0.0.0` | Interface to listen on. Must be a literal IP (`0.0.0.0`, `127.0.0.1`, `::`, `::1`) — hostnames are not resolved, since picking one of several resolved addresses is a security decision, not a convenience. `BIND_HOST` wins if both are set. |
 | `PORT` | `3000` | Listen port. `0` lets the OS assign a free ephemeral port (useful for tests); the actual port is logged at startup. |
 | `BOOTSTRAP_SUBNET` | `0.0.0.0/0,::/0` | `bound_ips` assigned to the auto-generated master key. Both families by default: `bound_ips` binds master keys too, so an IPv4-only value would lock you out of a dual-stack deployment on the first request. |
+| `INITIAL_MASTER_KEY` | *(unset — a random key is generated)* | **Test/CI bootstrap only.** Fixes the bootstrap master key so a harness knows it up front instead of scraping stdout. When set it must be exactly **64 hex characters** — the shape this service issues — and anything else (wrong width, non-hex, or set-but-empty) **aborts startup** before the database is touched. Leaving it unset is the normal path and is not an error. Do not set this in a real deployment: a human-chosen secret defeats the point of a random 256-bit key, and its use is logged as a warning. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_hook_executor=debug`. |
 
 A malformed `BIND_HOST` or `PORT` logs a warning and falls back to the default rather than
@@ -329,7 +330,7 @@ when the credential store is what broke. Both disclose nothing beyond a fixed tw
 | Method | Path | Purpose |
 | :--- | :--- | :--- |
 | `GET` | `/health`, `/healthz` | **Liveness.** Always `200`. Touches nothing — a failing database must not make an orchestrator restart a healthy process. |
-| `GET` | `/ready`, `/readyz` | **Readiness.** `200` when the pool answers `SELECT 1`, `503` otherwise. This is what a load balancer should poll. |
+| `GET` | `/ready`, `/readyz` | **Readiness.** `200` when the database answers a bounded one-row query **and** a Master identity is pinned; `503` otherwise. This is what a load balancer should poll. |
 
 `POST .../execute` accepts two body shapes: `{"parameters": {...}}` for first-party clients, or a
 bare flat object for webhook senders that can only post their own document. An empty body means

@@ -29,8 +29,8 @@ use crate::executor;
 
 use super::DEFAULT_PAGE_LIMIT;
 use super::guards::{
-    execution_visible_hook_ids, may_read_execution, require_execute, require_manage,
-    require_visibility,
+    execution_visible_hook_ids, may_read_execution, guard_execute, guard_manage,
+    guard_visibility,
 };
 use super::support::{
     create_audit_log, extract_parameter_map, format_reference, load_parameters, resolve_hook,
@@ -101,7 +101,7 @@ pub(crate) async fn run_hook_request(
     body: &[u8],
 ) -> Result<axum::response::Response, AppError> {
     let hook_model = resolve_hook(&state.db, identifier).await?;
-    require_execute(&state.db, &key, hook_model.id).await?;
+    guard_execute(&state.db, &key, hook_model.id).await?;
 
     let supplied = extract_parameter_map(body)?;
     let declared = load_parameters(&state.db, hook_model.id).await?;
@@ -197,7 +197,7 @@ pub async fn test_hook(
     let hook_model = resolve_hook(&state.db, &identifier).await?;
     // `can_execute`, not merely visibility: a dry run reveals the fully-resolved command line and
     // the child's environment, which is execution-shaped knowledge even though nothing is spawned.
-    require_execute(&state.db, &key, hook_model.id).await?;
+    guard_execute(&state.db, &key, hook_model.id).await?;
 
     let supplied = extract_parameter_map(&body)?;
     let declared = load_parameters(&state.db, hook_model.id).await?;
@@ -291,7 +291,7 @@ pub async fn list_executions(
 
     if let Some(identifier) = query.hook.as_deref().filter(|s| !s.is_empty()) {
         let hook_model = resolve_hook(&state.db, identifier).await?;
-        require_visibility(&state.db, &key, &hook_model).await?;
+        guard_visibility(&state.db, &key, &hook_model).await?;
         q = q.filter(execution::Column::HookId.eq(hook_model.id));
     }
 
@@ -357,17 +357,27 @@ pub async fn delete_execution(
     // Deleting history is a management action over the hook, not merely an execute-level one.
     // Note this is deliberately *stricter* than reading it: `can_view_execution` buys visibility of
     // the record, never the right to destroy it. An auditor is not a redactor.
-    require_manage(&state.db, &key, &hook_model).await?;
+    guard_manage(&state.db, &key, &hook_model).await?;
 
     Execution::delete_by_id(id).exec(&state.db).await?;
 
+    // `target_resource` carries the affected entity's human-readable **name**, matching every other
+    // audit row in the service — see [`create_audit_log`]. An execution record has no name of its
+    // own, so the hook it belongs to is the anchor an operator recognises and can filter on; the
+    // record's own id moves into `details`, where the full UUID is preserved rather than truncated.
+    //
+    // This previously wrote the bare execution UUID here, which was the one call site in the
+    // codebase whose `target_resource` was an identifier rather than a name.
     create_audit_log(
         &state.db,
         &key,
         client_ip.0,
         "EXECUTION_DELETE",
-        Some(id.to_string()),
-        None,
+        Some(hook_model.name.clone()),
+        Some(format!(
+            "Deleted execution record {id} of hook {}",
+            format_reference(&hook_model.name, hook_model.id)
+        )),
     )
     .await?;
 

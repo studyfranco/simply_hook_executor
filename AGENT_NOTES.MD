@@ -33,7 +33,7 @@ Each of these resolves a point where `AGENT.MD`/`SCHEMA.MD` left room for more t
    conflict for an existing hook owned by someone else, and the least-privilege rule wins: the
    global scope authorizes `POST /api/hooks`, and managing an existing hook additionally requires
    a `can_manage` mapping. Auto-provisioning (below) means a key never loses control of what it
-   created. See `require_manage` in `src/api.rs`.
+   created. See `guard_manage` in `src/api.rs`.
 
 2. **Auto-provisioning is unconditional**, including for master keys. `AGENT.MD` says the backend
    MUST create the mapping when "an API Key" creates a hook, with no master exception. The row is
@@ -504,7 +504,7 @@ It is not in `SCHEMA.MD`, so it was not invented here.
    (`can_execute` / `can_read` / `can_manage`), but `SCHEMA.MD`'s `api_key_hook_permissions` table
    defines only `can_execute` and `can_manage`. Rather than invent a column the schema document
    does not sanction, read access is derived: **any** mapping (execute or manage) grants visibility
-   of the hook, its parameters, and its execution history — see `require_visibility`. That yields
+   of the hook, its parameters, and its execution history — see `guard_visibility`. That yields
    the intended behaviour (an execute-only key can read what it runs; a key with no mapping sees
    nothing) with the columns that actually exist. Adding a real `can_read` flag would need a
    `SCHEMA.MD` change first, and would only matter for a "may read but may neither run nor edit"
@@ -722,8 +722,8 @@ Verified by inspection and by test, not assumed:
 - **`/test` is side-effect free** — it contains no call to `execute_hook`, `run_process`, or any
   `insert`; it requires `can_execute`; and a test asserts a canary file is never created and
   `execution_count == 0` afterwards, while `/execute` produces both.
-- **Per-handler RBAC** — every handler carries an explicit guard: `require_execute` (execute/test/
-  webhook), `require_visibility` (reads), `require_manage` (mutations), `is_master` (settings, audit
+- **Per-handler RBAC** — every handler carries an explicit guard: `guard_execute` (execute/test/
+  webhook), `guard_visibility` (reads), `guard_manage` (mutations), `is_master` (settings, audit
   logs, purge), and the global scope checks on key/hook creation. Listing endpoints narrow via
   `visible_hook_ids` rather than rejecting.
 
@@ -754,7 +754,7 @@ and, symmetrically, `+299` drifted *inside* it. Either direction produces an int
 
 Offsets were widened to ±240 (inside) and ±360 (outside), well clear of the boundary, with the same
 fix applied to the E2E script, which had the identical hazard. Exact boundary behaviour (±299/±301)
-is asserted in `middleware::tests::timestamps_*`, where `verify_timestamp` is called directly with
+is asserted in `middleware::tests::timestamps_*`, where `validate_timestamp` is called directly with
 no I/O in between and drift is measured in microseconds. That is the right split: integration tests
 prove the window is *wired up*, unit tests prove it is *exact*.
 
@@ -1176,7 +1176,7 @@ independent routes. A scope meant to say "you may administer credentials" was re
 `is_master || can_manage_keys`. A key manager could mint a master key, authenticate as it, and
 assign `run_as_user: root` — three requests from scoped key to arbitrary root execution.
 
-`require_master_to_grant_scopes` now gates `is_master`, `can_manage_keys` and `can_manage_hooks` on
+`guard_master_to_grant_scopes` now gates `is_master`, `can_manage_keys` and `can_manage_hooks` on
 both create and update. It runs **before any field validation**, matching the existing `run_as_user`
 convention: an escalation attempt must surface as `403` and never be masked by a `400` about some
 unrelated field in the same payload.
@@ -1190,7 +1190,7 @@ promotion via update remains impossible by construction as well as by check.
 
 `rotate_api_key` accepted any key id and returned the new plaintext secret in its response body, so
 "rotate the master key" was a single-request credential theft that also locked out the legitimate
-holder. `require_master_to_administer` now gates rotate, update and delete whenever the **target** is
+holder. `guard_master_to_administer` now gates rotate, update and delete whenever the **target** is
 `is_master`. Update is included because `bound_ips` alone would let a key manager strand or widen the
 network binding of the system's root credential.
 
@@ -1216,7 +1216,7 @@ every other field writable, so a `can_manage` holder could repoint a root hook's
 different binary while the elevation survived the swap. With `ALLOWED_SCRIPT_ROOTS` unset (the
 default) that is arbitrary root execution.
 
-`require_master_for_privileged_hook` now gates **any** mutation of a hook whose `run_as_user` is
+`guard_master_for_privileged_hook` now gates **any** mutation of a hook whose `run_as_user` is
 non-empty. The scope is wider than "script_path" on purpose — every part of a privileged hook's
 definition decides what runs with the borrowed privileges:
 
@@ -1273,7 +1273,7 @@ the schema.
 Nine integration tests (`regression_*`, plus `bound_ips_restricts_master_keys_as_well` and
 `a_trusted_proxy_can_still_present_the_real_client_address`) and E2E §30. Each is the exploit that
 previously *succeeded*, inverted into an assertion that it is refused. They drive the HTTP surface
-rather than the guard functions directly: a unit test of `require_master_to_grant_scopes` would keep
+rather than the guard functions directly: a unit test of `guard_master_to_grant_scopes` would keep
 passing if a handler stopped calling it, which is precisely the regression worth catching.
 
 Every one also asserts the **negative space** — that the legitimate capability still works. A gate
@@ -1529,11 +1529,11 @@ session were that report and this note. No tests were run.
 - **H-3, proportionality (`src/api.rs:2233`).** `update_key_hook_permissions` checks only that the
   caller manages the hook. The reference additionally enforces verb-by-verb: you cannot grant a verb
   you do not hold. A key with `can_manage_keys` + `can_manage` (but not `can_execute`) on a hook can
-  mint a key, grant it `can_execute`, and use it. Bounded — `require_master_for_privileged_hook`
+  mint a key, grant it `can_execute`, and use it. Bounded — `guard_master_for_privileged_hook`
   blocks this entirely for `run_as_user` hooks, and `can_manage` already permits rewriting
   `script_path` — but `can_execute`/`can_manage` are separate columns and an operator will expect
   granting one without the other to mean something.
-- **H-4, idempotency (`src/api.rs:343`).** `require_master_to_grant_scopes` is not baseline-aware:
+- **H-4, idempotency (`src/api.rs:343`).** `guard_master_to_grant_scopes` is not baseline-aware:
   it treats any `true` as a grant, so a non-master key manager cannot re-save a key that *already*
   holds `can_manage_hooks` (the dashboard posts every field). The reference passes the target's
   current values as a baseline. Not a vulnerability — the failure is a spurious `403` — but a real
@@ -1899,8 +1899,8 @@ not scored); 10 genuine discrepancies, of which 4 are cosmetic. Six worth a futu
 | # | Finding | Owner |
 | :--- | :--- | :--- |
 | 1 | Peer's `ReplayGuard` **clears the whole map** at 100k entries (fails open). The map is global across keys, so one key with a valid signing secret can flood it and reopen the replay window for every other key, master included. Ours prunes early and keeps enforcing. | peer |
-| 2 | Our `update_key_hook_permissions` checks `require_manage` on the hook but **not per-verb proportionality** — a `can_manage`-only holder can grant `can_execute` to a second key it controls. Peer's `guard_delegated_group_grant` checks each verb against the caller's own row. | **us** |
-| 3 | Peer's `revoke_key_group_permission` has no per-group and no master-target check — any `can_manage_keys` holder can strip any key's access to any group. Our revoke mirrors the grant path via `require_manage`. | peer |
+| 2 | Our `update_key_hook_permissions` checks `guard_manage` on the hook but **not per-verb proportionality** — a `can_manage`-only holder can grant `can_execute` to a second key it controls. Peer's `guard_delegated_group_grant` checks each verb against the caller's own row. | **us** |
+| 3 | Peer's `revoke_key_group_permission` has no per-group and no master-target check — any `can_manage_keys` holder can strip any key's access to any group. Our revoke mirrors the grant path via `guard_manage`. | peer |
 | 4 | Peer's `SecretCipher::open()` ends in `Ok(stored.to_owned())`, so an unprefixed/corrupted row is used verbatim as the HMAC secret. Ours errors `MalformedCiphertext`. Deliberate AES-migration affordance, but fail-open. | peer |
 | 5 | Peer prunes its replay map on *every* `observe` (O(n) per authenticated request); ours sweeps once per `window / 4`. | peer |
 | 6 | We validate `X-Timestamp` **after** the API-key DB lookup; the peer validates it before, so a stale timestamp costs it no query. | **us** |
@@ -1929,7 +1929,7 @@ the only remaining items in that report belong to the peer.
 ### 1. Per-verb grant proportionality (`src/api.rs`)
 
 `update_key_hook_permissions` asked whether the caller could administer grants on a hook
-(`require_manage`) but never how much of one it could hand out. `can_execute` and `can_manage` are
+(`guard_manage`) but never how much of one it could hand out. `can_execute` and `can_manage` are
 separate columns in `SCHEMA.MD` precisely so an operator can grant management *without* execution —
 and that key could route the missing verb to itself in two requests: mint a second key (it holds
 `can_manage_keys`), grant *it* `can_execute` on the hook, authenticate as it, run the hook.
@@ -1942,12 +1942,12 @@ Shape is `wanted && !held`, from which two properties fall out and are tested:
 - **Re-asserting a verb you hold is a no-op**, so an idempotent re-submission still succeeds.
 
 The `can_manage` entry gate moved *inside* the new guard rather than staying a separate
-`require_manage` call, so both questions are answered from **one** permission row. Reading it twice
+`guard_manage` call, so both questions are answered from **one** permission row. Reading it twice
 would let the two answers disagree if a grant were revoked in between. The entry gate's refusal text
 is unchanged, deliberately: the two paths must stay indistinguishable to a caller probing them, and
 a separate test pins that message so folding the checks together cannot quietly drop one.
 
-Master keys bypass, and `require_master_for_privileged_hook` still runs afterwards — rights over a
+Master keys bypass, and `guard_master_for_privileged_hook` still runs afterwards — rights over a
 `run_as_user` hook remain master-only even for a caller that legitimately holds both verbs.
 
 ### 2. Freshness before the key lookup (`src/middleware.rs`)
@@ -2348,7 +2348,7 @@ would vanish from the API at the moment it became ungoverned, recoverable only b
 database by hand.
 
 Verified that it does not: `visible_hook_ids` returns `None` for a master (no `IN` filter is applied
-at all), and `require_visibility` / `require_manage` / `require_execute` each return early before any
+at all), and `guard_visibility` / `guard_manage` / `guard_execute` each return early before any
 row is read. A master's view is authority over the deployment, not a grant within it. **No fix was
 needed**, but the property was previously untested, which is how it would have been lost.
 
@@ -2400,7 +2400,7 @@ should be treated as intentional rather than as drift to reconcile.
 **What the override costs, stated plainly.** `can_manage_keys` can mint a key, grant it any verb on
 any non-privileged hook, and authenticate as it — so the scope is *transitively* able to execute any
 non-privileged hook, and per-hook RBAC does not constrain it. It should be read as "deputy master
-over non-privileged hooks". Two bounds remain and are tested: `require_master_for_privileged_hook`
+over non-privileged hooks". Two bounds remain and are tested: `guard_master_for_privileged_hook`
 keeps every hook carrying `run_as_user` master-only, and self-granting is still refused, so the
 escalation always costs a second credential and leaves two audit entries.
 
@@ -2590,11 +2590,11 @@ open and is Phase 2's subject. Original verdicts retained for the record.
 | Rule | Verdict | Evidence |
 | :--- | :--- | :--- |
 | **R1 — Non-amplification** | ~~**VIOLATES**~~ → **RESOLVED** | `guard_delegated_hook_grant` (`src/api.rs:461`) opens `if key.is_master \|\| key.can_manage_keys { return Ok(()) }`. The per-verb `wanted && !held` comparison below it is therefore reached only by callers *without* `can_manage_keys`. A `can_manage_keys` holder grants any verb on any non-privileged hook regardless of what it holds. |
-| **R2 — Manage is a conjunction** | ~~**VIOLATES**~~ → **RESOLVED** | Same line, plus `revoke_key_hook_permission` (`src/api.rs:2366`): `if !key.is_master && !key.can_manage_keys { require_manage(..) }`. `can_manage_keys` alone is currently sufficient on **both** paths — the exact global bypass R2 forbids. This is commit `2d62d1b`, and R2 replaces it. |
+| **R2 — Manage is a conjunction** | ~~**VIOLATES**~~ → **RESOLVED** | Same line, plus `revoke_key_hook_permission` (`src/api.rs:2366`): `if !key.is_master && !key.can_manage_keys { guard_manage(..) }`. `can_manage_keys` alone is currently sufficient on **both** paths — the exact global bypass R2 forbids. This is commit `2d62d1b`, and R2 replaces it. |
 | **R3 — Parentage confers no authority** | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** (Phase 2) | No `parent_key_id` column exists on `api_keys` (`src/entities/api_key.rs`, fields at lines 43–83). Vacuously unviolated: no authority *can* be derived from parentage because parentage is not recorded. Nothing to remove; the column and its cascade/visibility semantics have to be added. |
-| **R4 — Only master creates parents** | **COMPLIES** | `require_master_to_grant_scopes` (`src/api.rs:343`) returns early for master and otherwise refuses any request setting `is_master`, `can_manage_keys` or `can_manage_hooks` to `true`. Enforced on both create and update. Note the naming difference: this service's resource-creation right is `can_manage_hooks`, which the model calls `can_create_hooks`. |
+| **R4 — Only master creates parents** | **COMPLIES** | `guard_master_to_grant_scopes` (`src/api.rs:343`) returns early for master and otherwise refuses any request setting `is_master`, `can_manage_keys` or `can_manage_hooks` to `true`. Enforced on both create and update. Note the naming difference: this service's resource-creation right is `can_manage_hooks`, which the model calls `can_create_hooks`. |
 | **R5 — Manage may propagate sideways** | ~~**VIOLATES**~~ → **RESOLVED** | Sideways propagation itself works, but not *bounded by R1 and R2* as R5 requires — the `can_manage_keys` bypass in `guard_delegated_hook_grant` means a parent can grant manage on a resource it holds nothing on. Also unenforceable in the intended form while "parent" is not a modelled tier (see R3). |
-| **R6 — Revocation is never escalation** | **COMPLIES** (re-scoped by R2 in Phase 1) | `revoke_key_hook_permission` requires only manage on the hook (`require_manage`, `src/api.rs:2388`), does not compare verbs, and has no self-revocation block. The "regardless of which endpoint it arrives at" clause holds too: `update_key_hook_permissions` reduces a row through the `wanted && !held` shape, which never fires on a `false`. |
+| **R6 — Revocation is never escalation** | **COMPLIES** (re-scoped by R2 in Phase 1) | `revoke_key_hook_permission` requires only manage on the hook (`guard_manage`, `src/api.rs:2388`), does not compare verbs, and has no self-revocation block. The "regardless of which endpoint it arrives at" clause holds too: `update_key_hook_permissions` reduces a row through the `wanted && !held` shape, which never fires on a `false`. |
 | **R7 — Granting bounded by R1 and R2 together** | ~~**VIOLATES**~~ → **RESOLVED** | Follows directly from R1 and R2 both being violated by the same early return. |
 
 ### Ownership and Resource Lifecycle
@@ -2604,7 +2604,7 @@ open and is Phase 2's subject. Original verdicts retained for the record.
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
 | `owner_key_id` on every resource | **DOES NOT IMPLEMENT** | Absent from `src/entities/hook.rs` (fields at lines 12–47) and from every migration in `src/migration/`. Ownership is not a concept this service has. |
-| Lifecycle restricted to master + owner | **VIOLATES** | `delete_hook` (`src/api.rs:1157`) and `update_hook` authorize on `require_manage`, so any manage-row holder can delete or rename a hook it does not own. This is precisely the "a parent that merely uses a hook must not be able to delete it" case. |
+| Lifecycle restricted to master + owner | **VIOLATES** | `delete_hook` (`src/api.rs:1157`) and `update_hook` authorize on `guard_manage`, so any manage-row holder can delete or rename a hook it does not own. This is precisely the "a parent that merely uses a hook must not be able to delete it" case. |
 | Master may reassign `owner_key_id` | **DOES NOT IMPLEMENT** | No owner column, so no reassignment endpoint. |
 
 ### Visibility
@@ -2613,11 +2613,11 @@ open and is Phase 2's subject. Original verdicts retained for the record.
 
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
-| Master sees everything | **COMPLIES** | `visible_hook_ids` (`src/api.rs:262`) returns `None` for master, applying no filter; `require_visibility` short-circuits. Asserted by `an_ungoverned_hook_stays_visible_and_manageable_by_a_master`. |
+| Master sees everything | **COMPLIES** | `visible_hook_ids` (`src/api.rs:262`) returns `None` for master, applying no filter; `guard_visibility` short-circuits. Asserted by `an_ungoverned_hook_stays_visible_and_manageable_by_a_master`. |
 | Parent sees its own subtree | **DOES NOT IMPLEMENT** | No subtree exists to scope to (R3). `list_api_keys` (`src/api.rs:2063`) returns **every key in the deployment** to any `can_manage_keys` holder, unscoped. |
 | Shared-resource keys visible in minimal form only | **VIOLATES** | `ApiKeySummary` (`src/api.rs:1914`) carries `bound_ips`, `is_master`, `can_manage_keys`, `can_manage_hooks`, `max_concurrent_jobs`, `hmac_mode` and the full `hook_permissions` list, and `list_api_keys` hands that to every key manager for every key. This is exactly the keyhole the model forbids: one shared hook exposes another parent's entire configuration. |
 | Executors visible to creator + master only | **DOES NOT IMPLEMENT** | This service has no separate Executor/Webhook resource; hooks are the executable resource and are governed by permission rows. Worth an explicit decision in the next pass rather than silent omission. |
-| 404 vs 403 oracle discipline | **VIOLATES** | `get_hook` (`src/api.rs:1068`) calls `resolve_hook` first — `404` when the row is absent — then `require_visibility`, which returns `403`. The two are distinguishable, so a caller can confirm a hook exists without being able to see it. Same shape in `delete_api_key`/`update_api_key`, which `404` on an unknown id before any visibility judgement. **Note the tension with an existing, deliberate control:** `AGENT.MD`'s authenticate-then-authorize rule exists to stop a `403`/`401` oracle on `bound_ips`. That is about *unauthenticated* callers and is unaffected; this is about *authenticated* callers distinguishing absent from invisible. Both can hold, but the next pass should not "fix" one by regressing the other. |
+| 404 vs 403 oracle discipline | **VIOLATES** | `get_hook` (`src/api.rs:1068`) calls `resolve_hook` first — `404` when the row is absent — then `guard_visibility`, which returns `403`. The two are distinguishable, so a caller can confirm a hook exists without being able to see it. Same shape in `delete_api_key`/`update_api_key`, which `404` on an unknown id before any visibility judgement. **Note the tension with an existing, deliberate control:** `AGENT.MD`'s authenticate-then-authorize rule exists to stop a `403`/`401` oracle on `bound_ips`. That is about *unauthenticated* callers and is unaffected; this is about *authenticated* callers distinguishing absent from invisible. Both can hold, but the next pass should not "fix" one by regressing the other. |
 
 ### Master Key Handling
 
@@ -2627,9 +2627,9 @@ verdicts retained for the record.
 | Item | Verdict | Evidence |
 | :--- | :--- | :--- |
 | Exactly one master, DB-enforced | ~~**DOES NOT IMPLEMENT**~~ → **RESOLVED** | No partial unique index anywhere in `src/migration/` — `grep -n "is_master" src/migration/*.rs` returns nothing, so the column carries no constraint at all. Uniqueness is application convention only: `bootstrap_master_key` (`src/main.rs:65`) mints one *if none exists*, and `CreateApiKeyPayload` (`src/api.rs:662`) accepts `is_master: bool`, so **a master can currently create a second master through the API**. |
-| Master immutable except own `bound_ips` | ~~**VIOLATES**~~ → **RESOLVED** | `update_api_key` (`src/api.rs:2096`) gates master targets behind `require_master_to_administer`, but a master editing itself passes, and `UpdateApiKeyPayload` reaches `name`, `bound_ips`, `max_concurrent_jobs` and `hmac_mode`. `rotate_api_key` (`src/api.rs:2187`) is likewise reachable for a master on itself, which the model forbids outright. |
-| Master not deletable through the API | ~~**COMPLIES**, incidentally~~ → **RESOLVED** (now unconditional) | `delete_api_key` (`src/api.rs:2170`) refuses `id == key.id` ("Cannot delete yourself"), and `require_master_to_administer` blocks non-masters from deleting a master. With exactly one master those two combine to make it undeletable — but the guarantee rests on the uniqueness that is *not* enforced (row above). A second master could delete the first. Compliant today, fragile by construction. |
-| `is_master` unsettable via any endpoint | ~~**VIOLATES**~~ → **RESOLVED** | `CreateApiKeyPayload` carried `is_master: Option<bool>` and `create_api_key` wrote `Set(payload.is_master.unwrap_or(false))`; `require_master_to_grant_scopes` returns early for masters, so a master could set it. |
+| Master immutable except own `bound_ips` | ~~**VIOLATES**~~ → **RESOLVED** | `update_api_key` (`src/api.rs:2096`) gates master targets behind `guard_master_to_administer`, but a master editing itself passes, and `UpdateApiKeyPayload` reaches `name`, `bound_ips`, `max_concurrent_jobs` and `hmac_mode`. `rotate_api_key` (`src/api.rs:2187`) is likewise reachable for a master on itself, which the model forbids outright. |
+| Master not deletable through the API | ~~**COMPLIES**, incidentally~~ → **RESOLVED** (now unconditional) | `delete_api_key` (`src/api.rs:2170`) refuses `id == key.id` ("Cannot delete yourself"), and `guard_master_to_administer` blocks non-masters from deleting a master. With exactly one master those two combine to make it undeletable — but the guarantee rests on the uniqueness that is *not* enforced (row above). A second master could delete the first. Compliant today, fragile by construction. |
+| `is_master` unsettable via any endpoint | ~~**VIOLATES**~~ → **RESOLVED** | `CreateApiKeyPayload` carried `is_master: Option<bool>` and `create_api_key` wrote `Set(payload.is_master.unwrap_or(false))`; `guard_master_to_grant_scopes` returns early for masters, so a master could set it. |
 
 ### Key Deletion and Ownership Inventory
 
@@ -2758,7 +2758,7 @@ engine rejects writes to a generated column.
 **2. `is_master` removed from every payload — `src/api.rs`.**
 
 `CreateApiKeyPayload` no longer has the field (`UpdateApiKeyPayload` never did), `create_api_key`
-hard-wires `is_master: Set(false)`, and `require_master_to_grant_scopes` drops the parameter.
+hard-wires `is_master: Set(false)`, and `guard_master_to_grant_scopes` drops the parameter.
 
 Both key payloads are now `#[serde(deny_unknown_fields)]`. **This is the part that matters.** Serde's
 default is to ignore unknown fields, so removing the field alone would have returned `200` and a
@@ -2787,13 +2787,13 @@ extractor's own status through and normalizes only the response *shape*.
 **4. Master lifecycle and mutation guards — `src/api.rs`.**
 
 - `refuse_master_lifecycle_action` — delete and rotate on a master target are refused for **every**
-  caller, the master included. The pre-existing `require_master_to_administer` only stopped *other*
+  caller, the master included. The pre-existing `guard_master_to_administer` only stopped *other*
   keys; once exactly one master row can exist, "only a master may administer a master" had collapsed
   into "the master may administer itself", and rotation returns the new plaintext secret in its
   response. One request against a stolen (but IP-bound) master credential both harvested a fresh
   secret and locked the operator out. Deletion is barred *regardless of row count*, deliberately, so
   the rule is two independent controls rather than one leaning on the uniqueness index.
-- `require_master_self_edit_is_bound_ips_only` — the master reaches `bound_ips` and nothing else.
+- `guard_master_self_edit_is_bound_ips_only` — the master reaches `bound_ips` and nothing else.
   That exception is narrow on purpose: `bound_ips` is the one field an operator has a recurring need
   to change from inside the running system, and the one that can only ever *reduce* a stolen
   credential's usefulness. `hmac_mode` is the sharpest of the refused fields — it could downgrade
@@ -2897,7 +2897,7 @@ alone:
   deployment-wide credential administrator is not scoped to any one hook. What that did not price in
   is that the same scope can *mint the key it grants to*: hold `can_manage_keys`, create a key, grant
   it `can_execute` on any hook, authenticate as it. That is `is_master` in two requests, and the
-  earlier notes recorded it as a "deliberate widening" with `require_master_for_privileged_hook` as
+  earlier notes recorded it as a "deliberate widening" with `guard_master_for_privileged_hook` as
   the bound — which only ever covered hooks carrying `run_as_user`. R2 names this case in as many
   words: "`can_manage_keys` is never a global bypass of per-resource RBAC."
 - **A `can_manage` row alone** — the "local manager" route. The Tiers matrix is explicit that a
@@ -2913,19 +2913,19 @@ statement about which hooks exist and who manages them.
 
 | Function | Change |
 | :--- | :--- |
-| `require_hook_manage_conjunction` (new) | R2 in one place, returning the caller's own row so R1 can use it without a second lookup |
+| `guard_hook_manage_conjunction` (new) | R2 in one place, returning the caller's own row so R1 can use it without a second lookup |
 | `has_permission_admin_standing` (new) | Both halves of R2 as far as they are knowable before the payload is parsed. Must run before `ApiKey::find_by_id`, or the endpoint is a key-UUID oracle |
 | `is_permission_reduction` (new) | R6 endpoint-parity classifier — grant vs revocation, decided by effect |
 | `guard_delegated_hook_grant` | Master-only early return; R1's per-verb check now sits on top of R2 rather than beside it |
 | `update_key_hook_permissions` | Classifies the write, then applies R6 (reduction) or R1+R2 (grant) |
-| `revoke_key_hook_permission` | `require_manage` → `require_hook_manage_conjunction` |
+| `revoke_key_hook_permission` | `guard_manage` → `guard_hook_manage_conjunction` |
 
 **R7 is the reason the two are composed rather than alternated.** "Granting is bounded by R1 and R2
 together, simultaneously and without exception" — the `2d62d1b` early return skipped *both*, which
 is why the per-verb comparison had become unreachable for exactly the population most able to abuse
 it.
 
-**R4 was already satisfied** and is unchanged: `require_master_to_grant_scopes` refuses any
+**R4 was already satisfied** and is unchanged: `guard_master_to_grant_scopes` refuses any
 non-master request setting `can_manage_keys` or `can_manage_hooks` to `true`, on create and update
 alike. Worth recording that this service's resource-creation right is spelled `can_manage_hooks`;
 `RBAC_MODEL.md`'s Terminology table calls it `can_create_executor`, which exists nowhere in `src/`.
@@ -2985,11 +2985,11 @@ JOIN api_key_hook_permissions p ON p.hook_id = h.id
 WHERE p.api_key_id = '<key-id>' AND p.can_manage = TRUE;
 ```
 
-### Scope boundary recorded deliberately: `require_manage` is unchanged
+### Scope boundary recorded deliberately: `guard_manage` is unchanged
 
 R2 as written governs "managing a specific resource", and the Tiers matrix says a Daughter key never
 manages resources. Read at its widest, that would also make **editing a hook's own definition**
-(`PUT /api/hooks/{id}`, parameter CRUD — all gated by `require_manage`) require `can_manage_keys`.
+(`PUT /api/hooks/{id}`, parameter CRUD — all gated by `guard_manage`) require `can_manage_keys`.
 
 Phase 1 did **not** do that, because the phase brief scopes R2 to the grant and revoke paths
 explicitly, and the wider reading has a much larger blast radius: it would revoke hook-editing from
@@ -3098,7 +3098,7 @@ constraint would have been decorative on the default backend regardless.
 
 ### §3 lifecycle authority
 
-`require_lifecycle_authority` sits **in front of** `require_manage`, narrowing rather than replacing
+`guard_lifecycle_authority` sits **in front of** `guard_manage`, narrowing rather than replacing
 it. `can_manage` remains the right to *operate* a hook — description, `script_path`, timeout,
 parameter contract. What it no longer carries is the right to make the hook cease to exist.
 
@@ -3144,7 +3144,7 @@ would have made the upgrade quiet and wrong.
 The phase brief asked for `owner_key_id` on `api_keys` as well as `hooks`. It is added, indexed, and
 populated at creation, and Phase 4 reports it as `current_owner` for key entities in the §6
 inventory. It is **not** yet an authorization input: deleting or updating a key still runs on
-`can_manage_keys` plus `require_master_to_administer`, unchanged.
+`can_manage_keys` plus `guard_master_to_administer`, unchanged.
 
 Applying §3's lifecycle rule to keys themselves — "only master and the owner may delete this key" —
 is a coherent extension and a larger behavioural change than this phase's brief covers. Recorded
@@ -3229,7 +3229,7 @@ Collapsing these, as the code did, made every hook endpoint an existence oracle:
 that exists, `404` for one that does not, from a caller entitled to neither. `verb_denied` is the
 helper that makes the split explicit at each call site.
 
-The same split runs through `require_hook_manage_conjunction`, and it took two attempts to get
+The same split runs through `guard_hook_manage_conjunction`, and it took two attempts to get
 right. The first version checked `can_manage` before deciding visibility, so a caller holding
 `can_execute` alone got a `404` for a hook it could demonstrably see — a lie it could disprove with
 `GET /api/auth/me`. Visibility is decided by whether *any* row exists; only then does the verb
@@ -3420,14 +3420,14 @@ rule; one that **SURVIVED** means the test would pass against unfixed code and p
 | R1 | per-verb `wanted && !held` comparison always `None` | **FIRED** |
 | R2 (per-resource half) | `can_manage_keys` short-circuits to a synthetic full row | **FIRED** |
 | R2 (global half) | `!can_manage_keys` check removed from `has_permission_admin_standing` | *survived* |
-| R2 (global half) | same check removed from `require_hook_manage_conjunction` | *survived* |
+| R2 (global half) | same check removed from `guard_hook_manage_conjunction` | *survived* |
 | R2 (global half) | **both sites at once** | **FIRED** |
-| R3 | `require_execute` grants when the caller's parent is master | **FIRED** |
-| R4 | `require_master_to_grant_scopes` returns `Ok` unconditionally | **FIRED** |
+| R3 | `guard_execute` grants when the caller's parent is master | **FIRED** |
+| R4 | `guard_master_to_grant_scopes` returns `Ok` unconditionally | **FIRED** |
 | R5 | granting `can_manage` also sets `can_manage_keys` on the target | **FIRED** |
 | R6 | revoke path additionally requires the caller to hold `can_execute` | **FIRED** |
 | R7 | R2 gate replaced by a bare row lookup that passes on absence | **FIRED** |
-| §3 | `require_lifecycle_authority` returns `Ok` unconditionally | **FIRED** |
+| §3 | `guard_lifecycle_authority` returns `Ok` unconditionally | **FIRED** |
 | §4 (minimal view) | shared-resource peers rendered with the full summary | **FIRED** |
 | §4 (oracle) | `verb_denied` always returns `403` | **FIRED** |
 | §4 (401-vs-403) | unknown API key returns `403` instead of `401` | **FIRED** |
@@ -3445,7 +3445,7 @@ outside.
 Two mutations changed behaviour in ways worth noting:
 
 - The **§4 oracle** mutation initially *survived*, and that was a real gap. The compliance test
-  probed only `GET /api/hooks/{id}`, which fails at `require_visibility` and never reaches
+  probed only `GET /api/hooks/{id}`, which fails at `guard_visibility` and never reaches
   `verb_denied` — so the guard that handles execute/modify was unpinned. The test now walks six
   routes, and the mutation fires. Left as written, the oracle would simply have migrated to whichever
   endpoint the test had not visited.
@@ -3462,12 +3462,12 @@ arose and neither is closed:
 
 1. **R2's wider reading** (Phase 1). R2 governs "managing a specific resource"; the Tiers matrix says
    a Daughter key never manages resources. Enforced on the grant and revoke paths. **Not** enforced on
-   `require_manage`, so a daughter holding a `can_manage` row can still edit a hook's `script_path`,
+   `guard_manage`, so a daughter holding a `can_manage` row can still edit a hook's `script_path`,
    timeout and parameter contract. The phase brief scoped R2 to grant/revoke explicitly; widening it
    would revoke hook-editing from every manage-only key in every deployment.
 2. **§3 applied to keys** (Phase 2). `api_keys.owner_key_id` is populated, indexed, and reported by
    §6's inventory, but is not an authorization input: key deletion and update still run on
-   `can_manage_keys` plus `require_master_to_administer`.
+   `can_manage_keys` plus `guard_master_to_administer`.
 
 ### Validation
 
@@ -3494,7 +3494,7 @@ reports `[OK] Canonical RBAC model (byte-identical)` — 16 converged, 1 known, 
 
 **2. Phase 1's recorded open question is a genuine weakness relative to the peer, not just an
 unfinished reading.** The note in "Phase 1 — Scope boundary recorded deliberately" said R2's wider
-reading over `require_manage` was an open question. The comparison settles it: `simply_ip_vault`
+reading over `guard_manage` was an open question. The comparison settles it: `simply_ip_vault`
 carries four permission verbs (`can_read`/`can_write`/`can_delete`/`can_manage`) and uses
 `can_manage` for **permission-row administration only**, so R2's conjunction governs everything that
 verb can do. This service's two-verb model overloads `can_manage` to mean administration *and*
@@ -3502,10 +3502,10 @@ content editing, so the conjunction covers half of it.
 
 The concrete consequence, which the Phase 1 note understated: a Daughter key (no `can_manage_keys`)
 holding a `can_manage` row can `PUT /api/hooks/{id}` and change `script_path` — repointing what
-binary the daemon executes. `require_master_for_privileged_hook` bounds this only for hooks carrying
+binary the daemon executes. `guard_master_for_privileged_hook` bounds this only for hooks carrying
 `run_as_user`, and `validate_script_path` bounds it only when `ALLOWED_SCRIPT_ROOTS` is set, which
 `src/config.rs` defaults to empty (unrestricted, with a startup warning). Closing it means either
-requiring the conjunction in `require_manage`, or splitting `can_manage` into an administrative and
+requiring the conjunction in `guard_manage`, or splitting `can_manage` into an administrative and
 an operational verb as the peer did. The second is the better fix and the larger one.
 
 **3. This repository is stronger than the peer on §5, for a reason worth keeping.** The peer's
@@ -3536,7 +3536,7 @@ a unilateral edit forks the spec and breaks the identity check that just started
 
 ## Phase 1 — Closing the R2 conjunction gap on resource content
 
-`fix(rbac): enforce R2 conjunction on require_manage and dispatch configuration`
+`fix(rbac): enforce R2 conjunction on guard_manage and dispatch configuration`
 
 The audit's finding #2 above, closed. `RBAC_MODEL.md` was amended by the operator before this phase
 ran, and the amendment settles two things the audit had recorded as open: the Terminology table now
@@ -3555,8 +3555,8 @@ it is the specification's own words, and the fix is mandatory rather than advisa
 
 ### What changed
 
-`require_manage` was `is_master || row.can_manage`. It is now a master short-circuit in front of
-`require_hook_manage_conjunction` — **one** evaluation point for R2 in the whole service, rather than
+`guard_manage` was `is_master || row.can_manage`. It is now a master short-circuit in front of
+`guard_hook_manage_conjunction` — **one** evaluation point for R2 in the whole service, rather than
 two implementations to drift apart. All six call sites inherit the fix without individual edits:
 
 | Call site | Route | Was | Now |
@@ -3590,35 +3590,35 @@ an edit to one function. The RCE does not wait for the better refactor.
 
 The cost is honest and should be recorded rather than argued away: `can_manage` in this service still
 means two things at once, and the conjunction is what compensates. **A verb split remains the correct
-follow-up**, and if it happens, `require_manage` collapses into the operational verb and
-`require_hook_manage_conjunction` keeps the administrative one.
+follow-up**, and if it happens, `guard_manage` collapses into the operational verb and
+`guard_hook_manage_conjunction` keeps the administrative one.
 
 ### Sibling guards audited
 
-The instruction was to check for the same omission elsewhere before assuming `require_manage` was the
+The instruction was to check for the same omission elsewhere before assuming `guard_manage` was the
 only site. Every authorization helper in `src/api.rs` was read. Findings:
 
 | Guard | Verdict | Reasoning |
 | :--- | :--- | :--- |
-| `require_manage` | **Was defective — fixed** | The subject of this phase |
-| `require_hook_manage_conjunction` | Correct | Already both halves; now the single R2 site |
+| `guard_manage` | **Was defective — fixed** | The subject of this phase |
+| `guard_hook_manage_conjunction` | Correct | Already both halves; now the single R2 site |
 | `has_permission_admin_standing` | Correct | Both halves as far as knowable pre-payload |
 | `manages_any_hook` | Correct by role | Deliberately the row half only; its caller supplies the global half. Not a guard on its own and never called as one |
-| `guard_delegated_hook_grant` | Correct | Enters through `require_hook_manage_conjunction` |
-| `require_execute` | Correct — **must not** change | R2 governs *managing*. `can_execute` is operational, and a Daughter is entitled to it. Adding the conjunction here would break the Tiers matrix in the opposite direction |
-| `require_visibility` | Correct — **must not** change | Read access is derived from *either* verb; §4 governs it, not R2 |
-| `visible_hook_ids` | Correct | The listing form of `require_visibility`; same reasoning |
-| `require_lifecycle_authority` | Correct | §3 master-or-owner, independent of R2 and now stacked behind it |
-| `require_master_for_privileged_hook` | Correct | Master-only for `run_as_user` hooks; narrower than R2, never a substitute — it does not fire on ordinary hooks, which is exactly why the gap was exploitable |
-| `require_master_to_grant_scopes` | Correct | R4 |
-| `require_master_to_administer` | Correct | R1 non-amplification over key administration |
+| `guard_delegated_hook_grant` | Correct | Enters through `guard_hook_manage_conjunction` |
+| `guard_execute` | Correct — **must not** change | R2 governs *managing*. `can_execute` is operational, and a Daughter is entitled to it. Adding the conjunction here would break the Tiers matrix in the opposite direction |
+| `guard_visibility` | Correct — **must not** change | Read access is derived from *either* verb; §4 governs it, not R2 |
+| `visible_hook_ids` | Correct | The listing form of `guard_visibility`; same reasoning |
+| `guard_lifecycle_authority` | Correct | §3 master-or-owner, independent of R2 and now stacked behind it |
+| `guard_master_for_privileged_hook` | Correct | Master-only for `run_as_user` hooks; narrower than R2, never a substitute — it does not fire on ordinary hooks, which is exactly why the gap was exploitable |
+| `guard_master_to_grant_scopes` | Correct | R4 |
+| `guard_master_to_administer` | Correct | R1 non-amplification over key administration |
 | `refuse_master_lifecycle_action` | Correct | §5 |
-| `require_master_self_edit_is_bound_ips_only` | Correct | §5 |
+| `guard_master_self_edit_is_bound_ips_only` | Correct | §5 |
 | `is_permission_reduction` | Correct | R6, classification by effect |
 | `create_hook`'s `can_manage_hooks` check | Correct — **not** an omission | R2 is written about "a `can_manage = true` row for that specific resource"; a resource that does not exist yet can have no row. Creation is governed by the global scope alone, by construction |
-| The key-administration routes (`create_api_key`, `list_api_keys`, `update_api_key`, `delete_api_key`, `rotate_api_key`) | Correct | `is_master \|\| can_manage_keys`. These administer *keys*, not a per-resource entity; there is no row for R2 to require. §3 and §4 govern them via `require_lifecycle_authority` and `key_visibility` |
+| The key-administration routes (`create_api_key`, `list_api_keys`, `update_api_key`, `delete_api_key`, `rotate_api_key`) | Correct | `is_master \|\| can_manage_keys`. These administer *keys*, not a per-resource entity; there is no row for R2 to require. §3 and §4 govern them via `guard_lifecycle_authority` and `key_visibility` |
 
-**No second omission was found.** `require_manage` was the only guard missing a conjunct.
+**No second omission was found.** `guard_manage` was the only guard missing a conjunct.
 
 ### Breaking change
 
@@ -3694,7 +3694,7 @@ Three new compliance tests under `r2_`, plus fixture corrections across the exis
   that a Parent holding the same row may perform the edit (so the refusal is attributable to the
   missing conjunct, not to a broken route).
 - **`r2_the_conjunction_governs_content_routes_not_only_delegation`** — walks all five content routes
-  behind `require_manage`, then the positive path for each. Written this way because "governs every
+  behind `guard_manage`, then the positive path for each. Written this way because "governs every
   action" is a claim about a *set* of endpoints, and the §4 mutation survivor in Phase 5 was caused
   precisely by probing one member of a set and generalising.
 - **`r2_the_conjunction_is_not_a_substitute_for_section_3_ownership`** — the required deletion case:
@@ -3729,14 +3729,14 @@ still works; and the Parent positive path.
 
 ### Mutation verification
 
-`require_manage` was reverted to its pre-fix body (`is_master || row.can_manage`) and the suite re-run:
+`guard_manage` was reverted to its pre-fix body (`is_master || row.can_manage`) and the suite re-run:
 
 | Test | Under mutation | Verdict |
 | :--- | :--- | :--- |
 | `r2_daughter_cannot_repoint_script_path` | **FAILED** | Catches the regression |
 | `r2_the_conjunction_governs_content_routes_not_only_delegation` | **FAILED** | Catches the regression |
-| `r2_the_conjunction_is_not_a_substitute_for_section_3_ownership` | passed | **Expected** — §3 is enforced independently by `require_lifecycle_authority`, so removing R2 does not affect it. Recorded rather than hidden: this test pins §3, and its passing under an R2 mutation is the correct result, not a blind spot |
-| `r2_neither_half_of_the_conjunction_suffices_alone` | passed | Expected — it exercises the delegation routes, which never went through `require_manage` |
+| `r2_the_conjunction_is_not_a_substitute_for_section_3_ownership` | passed | **Expected** — §3 is enforced independently by `guard_lifecycle_authority`, so removing R2 does not affect it. Recorded rather than hidden: this test pins §3, and its passing under an R2 mutation is the correct result, not a blind spot |
+| `r2_neither_half_of_the_conjunction_suffices_alone` | passed | Expected — it exercises the delegation routes, which never went through `guard_manage` |
 
 The mutation was restored immediately and the full suite re-run green.
 
@@ -3751,7 +3751,7 @@ The mutation was restored immediately and the full suite re-run green.
 **Execution records are now creator-private under the amended spec** (Terminology: *creator-private
 entity* = Execution record), and §4 says such an entity is "visible exclusively to their creator and
 Master" and is "never exposed by the shared-resource visibility rule". Today `list_executions` and
-`get_execution` gate on `require_visibility` over the parent hook, so **any** row-holder on a hook
+`get_execution` gate on `guard_visibility` over the parent hook, so **any** row-holder on a hook
 sees every execution of it regardless of who ran it. That is a genuine new divergence created by the
 amendment, not by this phase, and closing it is a visibility change with its own §3 question (an
 execution has an acting key but no `owner_key_id` column). It is out of scope for a phase whose remit
@@ -3985,9 +3985,9 @@ is Master".
 
 ### 2. Ownership edits; ownership does not delegate
 
-`require_manage` gained a second route: `is_master` **or** `hook.owner_key_id == key.id` **or** the R2
+`guard_manage` gained a second route: `is_master` **or** `hook.owner_key_id == key.id` **or** the R2
 conjunction. Delegation is untouched — `update_key_hook_permissions` and `revoke_key_hook_permission`
-call `require_hook_manage_conjunction` directly and still require R2 in full.
+call `guard_hook_manage_conjunction` directly and still require R2 in full.
 
 The previous pass left a model where a `can_manage_hooks` Daughter could create a hook and then never
 touch it again, including the hook whose `owner_key_id` names it. That is not what §3 describes: it
@@ -4001,11 +4001,11 @@ owner can now rewrite its own hook's `script_path` and cannot widen anyone's acc
 its own.
 
 **Ordering is load-bearing.** The owner check runs *before* the conjunction, because
-`require_hook_manage_conjunction` answers `404` when the caller holds no permission row, and an owner
+`guard_hook_manage_conjunction` answers `404` when the caller holds no permission row, and an owner
 need not hold one — ownership lives in a column on `hooks`. Asking the conjunction first would hide a
 hook from the very key answerable for it.
 
-**Consequential fix.** Adding ownership as an editing route made `require_visibility` and
+**Consequential fix.** Adding ownership as an editing route made `guard_visibility` and
 `visible_hook_ids` wrong: both filtered on permission rows only, so a hook whose `owner_key_id` had
 been reassigned by Master to a key holding no row would have been *editable but unlistable* — `PUT`
 succeeding while `GET` answered `404`. Both now treat ownership as conferring visibility.
@@ -4030,7 +4030,7 @@ to prevent. The auditor role (history, no execute, no manage) was simply not exp
 `can_manage` is one of the four routes because a key already entitled to rewrite `script_path` and
 delete the history outright cannot meaningfully be denied *reading* it; withholding that would be
 theatre. The verb itself stays read-only in every direction — `DELETE /api/executions/{id}` remains
-behind `require_manage`, because an auditor is not a redactor.
+behind `guard_manage`, because an auditor is not a redactor.
 
 **Two behaviour changes worth stating plainly**, both widenings relative to what shipped before:
 
@@ -4053,7 +4053,7 @@ did not.
 
 ### 4. Daughter keys (verified, not changed)
 
-The rule was already enforced by `require_master_to_grant_scopes` on both the create and update
+The rule was already enforced by `guard_master_to_grant_scopes` on both the create and update
 routes; this pass added the tests that prove it rather than assuming it. A Parent requesting
 `can_manage_keys` or `can_manage_hooks` on a key it mints gets `403`, and nothing is written.
 
@@ -4223,8 +4223,8 @@ domain boundaries**, with these standing out:
 | `resolve_hook` | hooks, params, keys, exec-trigger, exec-history |
 | `format_reference` | hooks, params, keys, exec-trigger |
 | `load_parameters` | hooks, params, exec-trigger |
-| `require_manage`, `require_visibility` | hooks, params, exec-history |
-| `require_master_for_privileged_hook` | hooks, params, keys |
+| `guard_manage`, `guard_visibility` | hooks, params, exec-history |
+| `guard_master_for_privileged_hook` | hooks, params, keys |
 | `HookPermissionView`, `load_hook_permissions` | auth, keys |
 | `ExecutionView` | exec-trigger, exec-history |
 
@@ -4366,16 +4366,16 @@ codebases, for the same reason: it shares its view types with the key listing.
 
 | Rule | `simply_hook_executor` | `simply_ip_vault` |
 | :--- | :--- | :--- |
-| R2 conjunction | `require_hook_manage_conjunction` | `guard_group_manage` |
+| R2 conjunction | `guard_hook_manage_conjunction` | `guard_group_manage` |
 | R2 pre-payload standing | `has_permission_admin_standing` | `guard_may_administer_any_group` |
 | "holds manage somewhere" | `manages_any_hook` | `holds_any_group_manage` |
 | R1 delegation bound | `guard_delegated_hook_grant` | `guard_delegated_group_grant` |
 | R6 revocation classification | `is_permission_reduction` | `widens_permissions` *(inverse polarity)* |
-| R4 scope elevation | `require_master_to_grant_scopes` | `guard_scope_elevation` |
-| §3 lifecycle | `require_lifecycle_authority` | `guard_resource_lifecycle` |
-| §3 owner lookup / reassignment | inline in `require_manage` / `update_hook` | `resource_owner` / `resolve_owner_assignment` |
+| R4 scope elevation | `guard_master_to_grant_scopes` | `guard_scope_elevation` |
+| §3 lifecycle | `guard_lifecycle_authority` | `guard_resource_lifecycle` |
+| §3 owner lookup / reassignment | inline in `guard_manage` / `update_hook` | `resource_owner` / `resolve_owner_assignment` |
 | §5 master as target | `refuse_master_lifecycle_action` | `guard_master_target` |
-| §5 master immutability | `require_master_self_edit_is_bound_ips_only` | `guard_master_immutable` |
+| §5 master immutability | `guard_master_self_edit_is_bound_ips_only` | `guard_master_immutable` |
 | Per-resource permission fetch | `hook_permission` | `caller_group_permission` |
 
 `is_permission_reduction` and `widens_permissions` are the same predicate with opposite polarity —
@@ -4866,7 +4866,7 @@ deliberately — it is the taste-based split that lets a rule get copied.
 
 **The cost is stated rather than hidden: one section of the specification is now split across two
 files.** §4 governs both key-subtree visibility (moved) and hook visibility —
-`require_visibility`, `visible_hook_ids`, `execution_visible_hook_ids` — which stayed, because three
+`guard_visibility`, `visible_hook_ids`, `execution_visible_hook_ids` — which stayed, because three
 domains consult it. A reader looking for "§4" now finds it in two places. That is accepted because
 the split follows consumer count rather than section numbering; grouping by section number would have
 moved the hook helpers too, and put one rule in three callers' reach across two files, which is the
@@ -4910,7 +4910,7 @@ than by reading:
 
 | Column | `Column::OwnerKeyId` in queries | Read by | Verdict |
 | :--- | :--- | :--- | :--- |
-| `hooks.owner_key_id` | 3 sites (`guards.rs` ×2, `keys.rs` ×1) | `require_manage` route 2, `require_lifecycle_authority`, `visible_hook_ids`, §6 inventory | **Load-bearing — untouched** |
+| `hooks.owner_key_id` | 3 sites (`guards.rs` ×2, `keys.rs` ×1) | `guard_manage` route 2, `guard_lifecycle_authority`, `visible_hook_ids`, §6 inventory | **Load-bearing — untouched** |
 | `api_keys.owner_key_id` | **0** | Nothing: no guard, no query, no response DTO, no dashboard reference | **Dormant — dropped** |
 
 The key column was written at creation (`create_api_key`, the caller's id) and at bootstrap (NULL),
@@ -4967,8 +4967,8 @@ is not documented here, because writing it down would tell every future auditor 
 something that is actually defended.**
 
 The report is right about `b5cf624`. Commit `79156ce fix(rbac): enforce R2 conjunction on
-require_manage and dispatch configuration` landed afterwards.
-`require_hook_manage_conjunction` now demands **both** `can_manage_keys` and `row.can_manage`, and
+guard_manage and dispatch configuration` landed afterwards.
+`guard_hook_manage_conjunction` now demands **both** `can_manage_keys` and `row.can_manage`, and
 `r2_daughter_cannot_repoint_script_path` has guarded it since. Measured against HEAD:
 
 | Caller | Holds | `PUT /api/hooks/{id}` `script_path` |
@@ -4979,7 +4979,7 @@ require_manage and dispatch configuration` landed afterwards.
 
 ### The real accepted risk is route B, and it is a different thing
 
-`require_manage` short-circuits on `hook.owner_key_id == Some(key.id)` **before** reaching the
+`guard_manage` short-circuits on `hook.owner_key_id == Some(key.id)` **before** reaching the
 conjunction. So a Daughter that owns a hook may repoint its `script_path` while holding no global
 scope at all.
 
@@ -5001,7 +5001,7 @@ about dispatch configuration. Route B therefore exercises an authority §3 does 
 - The blast radius is bounded by ownership, which is not delegable: `hooks.owner_key_id` is set at
   creation and reassignable **only by master** (§3). A Daughter cannot acquire ownership of a hook it
   did not create, so route B never widens beyond what that key already introduced.
-- `require_master_for_privileged_hook` still makes any hook carrying `run_as_user` master-only to
+- `guard_master_for_privileged_hook` still makes any hook carrying `run_as_user` master-only to
   modify, so route B cannot reach an elevated hook.
 
 **What is *not* claimed:** that `ALLOWED_SCRIPT_ROOTS` mitigates this. It defaults to empty, meaning
@@ -5058,10 +5058,10 @@ codebases. Three differences:
 | :--- | :--- | :--- | :--- |
 | Delegation bound | `guard_delegated_group_grant` | `guard_delegated_hook_grant` | **Aligned** — differs only by the domain noun, correctly |
 | Liveness / readiness | `health_check`, `readiness_check` | same | **Aligned** |
-| R2 conjunction | `guard_group_manage` | `require_hook_manage_conjunction` | Prefix + explicitness differ |
-| §3 lifecycle | `guard_resource_lifecycle` | `require_lifecycle_authority` | Prefix differs |
-| R4 scope elevation | `guard_scope_elevation` | `require_master_to_grant_scopes` | Prefix differs |
-| Master immutability | `guard_master_immutable` | `require_master_self_edit_is_bound_ips_only` | Ours is more specific |
+| R2 conjunction | `guard_group_manage` | `guard_hook_manage_conjunction` | Prefix + explicitness differ |
+| §3 lifecycle | `guard_resource_lifecycle` | `guard_lifecycle_authority` | Prefix differs |
+| R4 scope elevation | `guard_scope_elevation` | `guard_master_to_grant_scopes` | Prefix differs |
+| Master immutability | `guard_master_immutable` | `guard_master_self_edit_is_bound_ips_only` | Ours is more specific |
 | Master as target | `guard_master_target` | `refuse_master_lifecycle_action` | Prefix differs |
 | Any-manage standing | `holds_any_group_manage` | `manages_any_hook` | Aligned in shape |
 | Permission fetch | `caller_group_permission` | `hook_permission` | Aligned in shape |
@@ -5145,7 +5145,7 @@ highest-value action from the pass, because it silently degrades every future co
 | 2 | Normative identity | `md5sum RBAC_MODEL.md` × 3 (ours, snapshot, live) | Identical — `cb0b76ab…` |
 | 3 | Gate provenance | Read `PEER_ROOT` in `verify_convergence.sh` | Reads the snapshot, not the live tree |
 | 4 | F1 — §5 marker | Read peer `m20260808_000009_derive_master_marker` | Generated column + `STORED`/`VIRTUAL` split — **resolved** |
-| 5 | F2 — R2 conjunction | Read `require_hook_manage_conjunction`; live probe of three caller shapes | Daughter+row ⇒ **403**; owner ⇒ 200; Parent+row ⇒ 200 |
+| 5 | F2 — R2 conjunction | Read `guard_hook_manage_conjunction`; live probe of three caller shapes | Daughter+row ⇒ **403**; owner ⇒ 200; Parent+row ⇒ 200 |
 | 6 | F3 — dormant key column | `grep` for `api_key::Column::OwnerKeyId` across `src/` | Zero query sites; column dropped in `m20260810_000001` |
 | 7 | F4 — master CIDR bypass | Read both `middleware.rs` bound-IP blocks | No `is_master` exemption on either side |
 | 8 | F5 — FK enforcement | Prior mutation-verified suite + peer `db.rs` pragma table | Enforced both sides; earlier "inert" claim already retracted |
@@ -5180,3 +5180,120 @@ names.
 
 `D1`/`D2` are both cheap changes to *this* service and both make it stricter. They are the natural
 next commit; this session was read-only by instruction, so neither was applied.
+
+---
+
+# Session — 64-hex master key, `ConflictWithDetails`, `guard_*` prefix, readiness hardening
+
+Closes **D1** and **D2** from `SECURITY_COMPARISON_REPORT.md` (the two divergences where the peer was
+stricter), adopts **S3** and **S5** from `STRUCTURAL_CONVERGENCE_REPORT.md`, and adds fatal
+validation of the bootstrap override.
+
+## 1. `INITIAL_MASTER_KEY` — strict 64-hex, fatal when malformed
+
+`config::validate_initial_master_key` returns `Result<Option<String>, InitialMasterKeyError>`:
+
+| Input | Result | Reasoning |
+| :--- | :--- | :--- |
+| Unset | `Ok(None)` → generate a random key | The documented zero-config path |
+| 64 hex chars | `Ok(Some(key))` | Accepted, trimmed |
+| Set but empty/whitespace | `Err(Empty)` → **exit 1** | A broken deployment script, not absence |
+| Wrong width | `Err(BadLength(n))` → **exit 1** | |
+| Non-hex | `Err(NonHex(c, i))` → **exit 1** | |
+
+**Interpretation stated explicitly, because the brief said "fatal if the key is missing".** Absence is
+*not* treated as fatal. Making it so would mean the daemon cannot start without an operator-supplied
+master key, which contradicts `main.rs`'s own documentation of this variable as test/CI-only and
+`README.md`'s zero-config startup. What is treated as fatal is the variable being **set to nothing** —
+`INITIAL_MASTER_KEY=$UNSET_VAR` — which is the failure mode "missing" most plausibly means, and where
+silently generating a key would hand the operator a daemon whose master credential is not the one
+their tooling believes it configured. Both cases are pinned by tests so the reading is visible rather
+than inferred.
+
+64 is not arbitrary: `api::generate_random_key` mints 32 bytes hex-encoded, so 64 hex *is* the shape
+this service issues. `a_freshly_generated_key_satisfies_the_validator` pins that against the generator
+rather than against the literal, so a change to one fails rather than silently diverging.
+
+Validation runs in `main` beside `RuntimeConfig::from_env` — **before the database is opened** —
+following that file's existing principle that a boot which can refuse should refuse before leaving
+side effects. `bootstrap_master_key` now takes the checked value instead of reading the environment.
+
+**Three e2e harness keys had to change.** `MASTER_KEY`, `STRICT_MASTER` and an inline value in §34
+were 42–43-character English phrases. The first run after the change failed 2 checks, which is how the
+third one was found. Distinct 64-hex values were chosen so a mix-up between suites stays visible in a
+log. New e2e section 33b asserts the abort itself against the real binary — three bad shapes, each
+exiting `1` and leaving **no database behind**, plus that the message names `openssl rand -hex 32`.
+
+## 2. `ConflictWithDetails` (S3)
+
+`delete_api_key` previously returned `axum::response::Response` by hand to emit its §6 inventory. It
+now returns `Result<impl IntoResponse, AppError>` and raises
+`AppError::ConflictWithDetails { message, details }`.
+
+The wire shape is unchanged — `{"error":…, "subtree":[…], "inventory":[…]}` — because `details` is
+**merged into** the envelope rather than nested; `s6_the_cascade_is_recursive_and_gated_on_a_total_resolution_map`
+asserts a top-level `inventory` array and passed unmodified. `InventoryRefusal` lost its `error`
+field and became `InventoryRefusalDetails`, so there is exactly one place the message can come from.
+
+Two edge rules are in `error.rs` rather than left to call sites: a non-object `details` is dropped
+with an error log rather than replacing the envelope, and a `details` carrying its own `error` key
+does not overwrite the message.
+
+One bug caught in the process: `unresolved` borrows `inventory`, and moving `inventory` into the
+details before the last read of `unresolved.len()` failed to compile. The count is now hoisted.
+
+## 3. Naming (S5)
+
+Ten `require_*` guards became `guard_*`, plus `verify_timestamp` → `validate_timestamp` — 210
+replacements across `src/`, `tests/` and the docs, applied with word boundaries. `require_signed_requests`
+is a config field and was correctly untouched.
+
+`verify_timestamp` lives in `src/middleware.rs` only, not `src/crypto.rs` as the brief suggested.
+
+**`is_permission_reduction` keeps its name, as instructed and for a reason now recorded in `AGENT.MD`:**
+the peer's `widens_permissions` is its logical *inverse*, so adopting that name means inverting every
+call site's branch — a semantic change to R6 enforcement bought with cosmetics.
+
+## 4. Readiness probe (D1 + D2)
+
+| Change | Before | After |
+| :--- | :--- | :--- |
+| Database check | literal `SELECT 1` | `ApiKey::find().select_only().column(Id).limit(1)` |
+| Raw-SQL allowlist | **3 entries** | **2** — `src/api/health.rs` removed |
+| Master pin | not checked | `503` when `master_pin.get().is_none()` |
+
+The allowlist entry was the weaker half of D1: it sat in a handler that is both request-reachable and
+*unauthenticated*, which is the worst place in the service to hold an exemption, and bought only a
+saved round-trip. `AGENT.MD` now states the standard a third entry must meet — unreachable from a
+request — so a handler cannot acquire one again by precedent.
+
+**The pin check exposed a fixture that was modelling an impossible process.** `test_state` leaves the
+pin unset, so adding the check turned four health tests red at once. That is the test suite being
+right: `main.rs` pins *before* binding the listener, so a process serving traffic has always pinned,
+and a fixture that never pins describes a process that would never have accepted the connection. The
+health suite now builds a `pinned_state`, and `readiness_reports_unavailable_when_no_master_is_pinned`
+covers the unpinned case directly — with the database left **live**, so the `503` is attributable only
+to the pin. That case reports `"database":"up"`, because it is.
+
+## 5. Audit trail (verification + one alignment)
+
+Non-nullability **verified, not changed**: `api_key_name`, `api_key_prefix` and `client_ip` are already
+`String` (NOT NULL) in `entities/audit_log.rs`. The reasoning is now written down in
+`create_audit_log`'s rustdoc, `SCHEMA.MD` and `AGENT.MD` §7 so it survives a future "make it
+consistent with the FK" tidy-up — the FK is `SET NULL` on purpose and the snapshot must not be.
+
+One genuine inconsistency found and fixed: of the ~20 `create_audit_log` call sites, every one wrote
+the affected entity's **name** except `EXECUTION_DELETE`, which wrote a bare execution UUID. An
+execution has no name, so it now takes its parent hook's name — the anchor an operator recognises and
+can filter on — and its own id moves into `details`, where the *full* UUID is preserved rather than
+truncated. The convention is documented at the writer.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test` **285 passed / 0 failed** (107 unit + 133 integration + 23 compliance + 8 hygiene +
+8 health + 6 referential integrity) · `./scripts/test_e2e.sh` **893 / 893** ·
+`./scripts/verify_convergence.sh` exit 0 — 19 converged, 0 known, 0 drifted, 0 skipped ·
+`git diff RBAC_MODEL.md` empty.
+
+Test count moved 275 → 285: nine `initial_master_key_tests` and one readiness test.

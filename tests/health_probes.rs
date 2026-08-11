@@ -20,6 +20,21 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::*;
 
+/// Builds application state whose Master identity is pinned, as production's is.
+///
+/// `test_state` deliberately leaves the pin unset — state is routinely built before the master row
+/// exists. That is fine for the authenticated suites, which pin lazily on first request, but it is
+/// the *wrong* model for readiness: `main.rs` calls `pin_at_boot` **before** binding the listener, so
+/// a process serving traffic has always pinned. A fixture that never pins describes a process that
+/// would never have accepted the connection.
+///
+/// The unpinned case is not untested — see
+/// [`readiness_reports_unavailable_when_no_master_is_pinned`], which is the whole point of the check.
+async fn pinned_state(db: &sea_orm::DatabaseConnection) -> simply_hook_executor::state::AppState {
+    let (master_id, _) = insert_key(db, "Master", "", KeyScopes::master()).await;
+    test_state(db).with_pinned_master(master_id)
+}
+
 /// Builds a request carrying **no** `X-API-Key` and no signature — the shape a probe really sends.
 fn anonymous(uri: &str) -> Request<Body> {
     with_connect_info(Request::builder().method("GET").uri(uri))
@@ -34,7 +49,7 @@ fn anonymous(uri: &str) -> Request<Body> {
 #[tokio::test]
 async fn both_probes_answer_without_any_credential() {
     let db = setup_test_db().await;
-    let app = simply_hook_executor::create_app(test_state(&db));
+    let app = simply_hook_executor::create_app(pinned_state(&db).await);
 
     for uri in ["/health", "/healthz", "/ready", "/readyz"] {
         let response = send(&app, anonymous(uri)).await;
@@ -73,7 +88,7 @@ async fn liveness_reports_a_constant_document() {
 #[tokio::test]
 async fn readiness_reports_the_database_as_up_when_it_is() {
     let db = setup_test_db().await;
-    let app = simply_hook_executor::create_app(test_state(&db));
+    let app = simply_hook_executor::create_app(pinned_state(&db).await);
 
     let response = send(&app, anonymous("/ready")).await;
     assert_eq!(response.status, StatusCode::OK);
@@ -91,7 +106,7 @@ async fn readiness_reports_the_database_as_up_when_it_is() {
 #[tokio::test]
 async fn readiness_reports_unavailable_when_the_pool_is_gone() {
     let db = setup_test_db().await;
-    let app = simply_hook_executor::create_app(test_state(&db));
+    let app = simply_hook_executor::create_app(pinned_state(&db).await);
 
     // Confirm it is genuinely up first, so the failure below is caused by the close and not by the
     // fixture never having worked.
@@ -133,7 +148,7 @@ async fn readiness_reports_unavailable_when_the_pool_is_gone() {
 #[tokio::test]
 async fn liveness_still_answers_when_the_database_is_gone() {
     let db = setup_test_db().await;
-    let app = simply_hook_executor::create_app(test_state(&db));
+    let app = simply_hook_executor::create_app(pinned_state(&db).await);
 
     db.close().await.expect("closing the pool succeeds");
 
@@ -159,7 +174,7 @@ async fn liveness_still_answers_when_the_database_is_gone() {
 #[tokio::test]
 async fn a_bogus_api_key_neither_helps_nor_hinders_a_probe() {
     let db = setup_test_db().await;
-    let app = simply_hook_executor::create_app(test_state(&db));
+    let app = simply_hook_executor::create_app(pinned_state(&db).await);
 
     for uri in ["/health", "/ready"] {
         let request = with_connect_info(
@@ -193,4 +208,41 @@ async fn adding_the_probes_did_not_open_the_authenticated_tree() {
             "{uri} must still demand a credential"
         );
     }
+}
+
+/// An unpinned Master identity makes this process **not ready**, even with a healthy database.
+///
+/// This is the check's entire reason for existing. `main.rs` pins before binding the listener, so in
+/// production the `OnceCell` cannot be empty — but that ordering is a convention held by one line. A
+/// future edit that bound first would produce a process reporting itself ready while every
+/// master-only route quietly refused and every `key.is_master` read fell back to per-request
+/// resolution. A load balancer would keep routing to it, which is worse than being plainly down.
+///
+/// The database is deliberately left **live** here, so the `503` can only be attributable to the pin.
+#[tokio::test]
+async fn readiness_reports_unavailable_when_no_master_is_pinned() {
+    let db = setup_test_db().await;
+    // `test_state`, not `pinned_state`: the unpinned fixture is the subject of this test.
+    let app = simply_hook_executor::create_app(test_state(&db));
+
+    let response = send(&app, anonymous("/ready")).await;
+    assert_eq!(
+        response.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a process that never pinned a Master must not report itself ready: {}",
+        response.raw
+    );
+    assert_eq!(response.string("status"), "unavailable");
+
+    // `up`, because it is: the database answered. Reporting `down` would send an operator to
+    // investigate a database that is working perfectly.
+    assert_eq!(
+        response.string("database"),
+        "up",
+        "the database is healthy; the failure is this process's own startup ordering"
+    );
+
+    // Liveness is unaffected — an unpinned master is not a reason to restart the container, and
+    // restarting would not pin it either.
+    assert_eq!(send(&app, anonymous("/health")).await.status, StatusCode::OK);
 }

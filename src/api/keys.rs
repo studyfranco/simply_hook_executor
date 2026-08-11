@@ -45,9 +45,9 @@ use crate::state::AppState;
 
 use super::guards::{
     guard_delegated_hook_grant, has_permission_admin_standing, hook_permission,
-    is_permission_reduction, refuse_master_lifecycle_action, require_hook_manage_conjunction,
-    require_master_for_privileged_hook, require_master_self_edit_is_bound_ips_only,
-    require_master_to_administer, require_master_to_grant_scopes,
+    is_permission_reduction, refuse_master_lifecycle_action, guard_hook_manage_conjunction,
+    guard_master_for_privileged_hook, guard_master_self_edit_is_bound_ips_only,
+    guard_master_to_administer, guard_master_to_grant_scopes,
 };
 use super::support::{
     OptionalStrictJson, StrictJson, create_audit_log, describe_hmac_mode, format_reference, generate_random_key, hash_key,
@@ -481,7 +481,7 @@ pub async fn create_api_key(
     // Checked before any field validation, for the same reason `run_as_user` is in the hook
     // handlers: an escalation attempt must surface as `403` rather than be masked by a `400` about
     // some unrelated field in the same payload.
-    require_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
+    guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
@@ -638,12 +638,12 @@ pub async fn update_api_key(
 
     // Editing a master key is master-only: `bound_ips` alone would otherwise let a key manager
     // widen (or strand) the network binding of the system's root credential.
-    require_master_to_administer(&key, &target, "update")?;
+    guard_master_to_administer(&key, &target, "update")?;
     // ...and even for the master itself, `bound_ips` is the *only* field it reaches.
-    require_master_self_edit_is_bound_ips_only(&key, &target, &payload)?;
+    guard_master_self_edit_is_bound_ips_only(&key, &target, &payload)?;
     // `UpdateApiKeyPayload` deliberately carries no `is_master` field, so promotion is impossible
     // through this route regardless; the other two global scopes still need the gate.
-    require_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
+    guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
@@ -750,11 +750,19 @@ pub struct DeleteApiKeyPayload {
     pub resolutions: std::collections::HashMap<Uuid, EntityResolution>,
 }
 
-/// The structured refusal §6 specifies, returned as `409 Conflict` when the subtree owns anything.
+/// The machine-readable half of the refusal §6 specifies, merged into the `409 Conflict` body.
+///
+/// Carries no `error` field: the human-readable sentence is
+/// [`AppError::ConflictWithDetails::message`], which renders it into the same `error` key every
+/// other refusal in the service uses. Keeping the message out of this struct is what stops the two
+/// from drifting into a body with two summaries, or none.
+///
+/// These fields land at the **top level** of the response — `{"error":…, "subtree":[…],
+/// "inventory":[…]}` — because `AppError` merges an object `details` into the envelope rather than
+/// nesting it. That wire shape predates this refactor and is asserted by
+/// `s6_deletion_is_refused_until_every_owned_entity_is_resolved`.
 #[derive(Serialize)]
-pub(crate) struct InventoryRefusal {
-    /// Human-readable summary, in the same `error` field every other refusal uses.
-    error: String,
+pub(crate) struct InventoryRefusalDetails {
     /// Every key the cascade would remove, so the caller sees the true blast radius rather than
     /// just the id it named.
     subtree: Vec<DoomedKey>,
@@ -830,8 +838,7 @@ pub async fn delete_api_key(
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
     OptionalStrictJson(payload): OptionalStrictJson<DeleteApiKeyPayload>,
-) -> Result<axum::response::Response, AppError> {
-    use axum::response::IntoResponse as _;
+) -> Result<impl IntoResponse, AppError> {
 
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -843,7 +850,7 @@ pub async fn delete_api_key(
     // Fetched before deleting (rather than relying on rows_affected) so the name is still
     // available for the audit entry below.
     let target = load_administrable_key(&state.db, &key, id).await?;
-    require_master_to_administer(&key, &target, "delete")?;
+    guard_master_to_administer(&key, &target, "delete")?;
     refuse_master_lifecycle_action(&target, "delete")?;
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
@@ -869,19 +876,31 @@ pub async fn delete_api_key(
             unresolved = unresolved.len(),
             "§6: key deletion refused pending an ownership resolution map"
         );
-        return Ok((
-            axum::http::StatusCode::CONFLICT,
-            Json(InventoryRefusal {
-                error: format!(
-                    "Deletion refused: this key subtree owns {} entit{} with no resolution.                      Resubmit with a 'resolutions' map naming, for every id below, either                      {{\"action\":\"delete\"}} or {{\"action\":\"reassign\",\"to\":\"<key-id>\"}}.",
-                    unresolved.len(),
-                    if unresolved.len() == 1 { "y" } else { "ies" }
-                ),
-                subtree: doomed,
-                inventory,
-            }),
-        )
-            .into_response());
+        // Read before `inventory` is moved into the details below: `unresolved` borrows it, so the
+        // count has to outlive the borrow rather than be taken from it afterwards.
+        let unresolved_count = unresolved.len();
+
+        let details = serde_json::to_value(InventoryRefusalDetails {
+            subtree: doomed,
+            inventory,
+        })
+        .map_err(|e| {
+            // Unreachable in practice — both fields are plain `Serialize` structs of owned data —
+            // but serialising is fallible and `AGENT.MD` forbids unwrapping on a request path.
+            tracing::error!("Failed to serialise the §6 inventory refusal: {e}");
+            AppError::Internal
+        })?;
+
+        return Err(AppError::ConflictWithDetails {
+            message: format!(
+                "Deletion refused: this key subtree owns {} entit{} with no resolution. Resubmit \
+                 with a 'resolutions' map naming, for every id below, either \
+                 {{\"action\":\"delete\"}} or {{\"action\":\"reassign\",\"to\":\"<key-id>\"}}.",
+                unresolved_count,
+                if unresolved_count == 1 { "y" } else { "ies" }
+            ),
+            details,
+        });
     }
 
     // Validate every reassignment *before* applying any of them, so a bad target in the middle of
@@ -953,7 +972,7 @@ pub async fn delete_api_key(
     )
     .await?;
 
-    Ok(axum::http::StatusCode::NO_CONTENT.into_response())
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Response after rotating an API key's secrets.
@@ -984,7 +1003,7 @@ pub async fn rotate_api_key(
     let target = load_administrable_key(&state.db, &key, id).await?;
     // The response hands back the new plaintext secret, so rotating someone else's master key is
     // credential theft with a lockout attached rather than mere administration.
-    require_master_to_administer(&key, &target, "rotate")?;
+    guard_master_to_administer(&key, &target, "rotate")?;
     refuse_master_lifecycle_action(&target, "rotate")?;
     let reference = format_reference(&target.name, id);
     let name = target.name.clone();
@@ -1060,7 +1079,7 @@ pub async fn update_key_hook_permissions(
 ) -> Result<impl IntoResponse, AppError> {
     // Both halves of R2, as far as they can be known before the payload is parsed: the global flag,
     // and a manage row on *some* hook. Which hook is not known yet, so
-    // `require_hook_manage_conjunction` re-asks the second half against the resolved hook below.
+    // `guard_hook_manage_conjunction` re-asks the second half against the resolved hook below.
     // A caller failing this can pass neither, which is what makes refusing here safe rather than
     // merely early — and it must happen before the `find_by_id`, or the endpoint reports `404` for
     // a key id that does not exist and `403` for one that does.
@@ -1115,7 +1134,7 @@ pub async fn update_key_hook_permissions(
         // R6: manage authority on the resource is the whole requirement. The revoker need not hold
         // the verb being removed, and self-revocation is permitted — reducing your own row cannot
         // raise anyone's authority, so there is nothing for it to prove.
-        require_hook_manage_conjunction(&state.db, &key, hook_model.id).await?;
+        guard_hook_manage_conjunction(&state.db, &key, hook_model.id).await?;
     } else {
         // R7: R1 and R2 together. Self-granting is refused outright rather than left to R1 to
         // reduce to a no-op — the intent is escalation even when the arithmetic happens to fail,
@@ -1144,7 +1163,7 @@ pub async fn update_key_hook_permissions(
     if !key.is_master {
         // Rights over a *privileged* hook are the elevation itself, so distributing them stays
         // master-only even for a caller who legitimately manages the hook and holds both verbs.
-        require_master_for_privileged_hook(&key, &hook_model, "grant permissions on")?;
+        guard_master_for_privileged_hook(&key, &hook_model, "grant permissions on")?;
     }
 
     let perm = api_key_hook_permission::ActiveModel {
@@ -1221,7 +1240,7 @@ pub async fn revoke_key_hook_permission(
     // all-`false` write as a revocation and applies exactly this rule, so neither path can be used
     // to route around the other.
     if !key.is_master {
-        require_hook_manage_conjunction(&state.db, &key, hook_model.id).await?;
+        guard_hook_manage_conjunction(&state.db, &key, hook_model.id).await?;
     }
 
     let result = ApiKeyHookPermission::delete_many()

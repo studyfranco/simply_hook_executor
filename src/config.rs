@@ -711,6 +711,106 @@ pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
+/// Required width of `INITIAL_MASTER_KEY`, in hex characters.
+///
+/// Not an arbitrary number: [`crate::api::generate_random_key`] mints 32 random bytes and hex-encodes
+/// them, so 64 hex characters is exactly the shape this service issues for every key it generates. A
+/// bootstrap override that did not match that shape would be a credential of a different class
+/// wearing the same name.
+pub const INITIAL_MASTER_KEY_HEX_LEN: usize = 64;
+
+/// Why an `INITIAL_MASTER_KEY` was refused.
+///
+/// Each variant renders an operator-facing message naming the actual defect. A single "invalid key"
+/// error would be cheaper and worse: the three failures have three different fixes, and the operator
+/// cannot see the value in the log to work out which one they hit.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InitialMasterKeyError {
+    /// The variable was set to an empty or whitespace-only value.
+    #[error(
+        "INITIAL_MASTER_KEY is set but empty. Either unset it entirely — the daemon then generates \
+         a random master key and prints it once at startup — or set it to {INITIAL_MASTER_KEY_HEX_LEN} \
+         hex characters (`openssl rand -hex 32`)."
+    )]
+    Empty,
+    /// The value was the wrong width.
+    #[error(
+        "INITIAL_MASTER_KEY must be exactly {INITIAL_MASTER_KEY_HEX_LEN} hex characters (32 bytes); \
+         got {0}. Generate one with `openssl rand -hex 32`."
+    )]
+    BadLength(usize),
+    /// The value contained a character outside `[0-9a-fA-F]`.
+    #[error(
+        "INITIAL_MASTER_KEY must contain only hexadecimal characters (0-9, a-f, A-F); found {0:?} at \
+         position {1}. Generate one with `openssl rand -hex 32`."
+    )]
+    NonHex(char, usize),
+}
+
+/// Validates the `INITIAL_MASTER_KEY` bootstrap override.
+///
+/// # What each input means
+///
+/// | Input | Result | Why |
+/// | :--- | :--- | :--- |
+/// | Unset (`None`) | `Ok(None)` | The documented zero-config path: the daemon mints a random master key and prints it once |
+/// | Set, 64 hex chars | `Ok(Some(key))` | Accepted verbatim (after trimming surrounding whitespace) |
+/// | Set, empty/whitespace | `Err(Empty)` | **Fatal.** Setting the variable is a statement of intent; setting it to nothing is a mistake, most often an unexpanded shell variable |
+/// | Set, wrong width | `Err(BadLength)` | **Fatal** |
+/// | Set, non-hex | `Err(NonHex)` | **Fatal** |
+///
+/// # Why an unset variable is *not* an error
+///
+/// Making absence fatal would mean this daemon cannot start without an operator-supplied master key,
+/// which contradicts the bootstrap design in `src/main.rs`: `INITIAL_MASTER_KEY` exists for
+/// deterministic test and CI bootstrap and is explicitly **not** a normal deployment option, because
+/// a human-chosen secret defeats the point of a random 256-bit key. The zero-config path — generate,
+/// print once, warn — is the documented default in `README.md`. Absence is therefore the *expected*
+/// production state, and the strictness here applies to a value that was actually supplied.
+///
+/// An **empty** value is treated as a defect rather than as absence, and that distinction is the
+/// point of having both cases: `INITIAL_MASTER_KEY=""` and `INITIAL_MASTER_KEY=$UNSET_VAR` are what a
+/// broken deployment script produces, and silently generating a random key there would hand the
+/// operator a daemon whose master credential is not the one their tooling believes it configured.
+///
+/// # Why the value is trimmed
+///
+/// `INITIAL_MASTER_KEY=$(cat key.txt)` and `... $(echo -n ... )` differ by a trailing newline, and
+/// that footgun costs an hour to diagnose because the log cannot show it. Trimming cannot change the
+/// meaning of a hex string, so it is safe here in a way it would not be for an arbitrary secret. The
+/// trimmed value is what is returned and what becomes the key.
+pub fn validate_initial_master_key(
+    raw: Option<&str>,
+) -> Result<Option<String>, InitialMasterKeyError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return Err(InitialMasterKeyError::Empty);
+    }
+
+    // Character class before width: a 12-character value full of `z` should be told it is not hex,
+    // which is the more useful of the two complaints, rather than being told only that it is short.
+    if let Some((index, found)) = candidate
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_hexdigit())
+    {
+        return Err(InitialMasterKeyError::NonHex(found, index));
+    }
+
+    // `chars().count()` rather than `len()`: the two agree only for ASCII, and reporting a byte
+    // count for a value that reached here as non-ASCII would be a misleading diagnostic. The hex
+    // check above already guarantees ASCII, so this is defence against a future reordering.
+    let width = candidate.chars().count();
+    if width != INITIAL_MASTER_KEY_HEX_LEN {
+        return Err(InitialMasterKeyError::BadLength(width));
+    }
+
+    Ok(Some(candidate.to_owned()))
+}
+
 /// Parses `ALLOWED_SCRIPT_ROOTS` into a list of confinement directories.
 ///
 /// Relative entries are discarded with a warning rather than resolved against the daemon's
@@ -807,6 +907,174 @@ fn hostname_rejection(candidate: &str) -> Option<&'static str> {
 /// Test-only: the parser needs the *reason* a name was refused, not merely the verdict, because the
 /// reason is what the startup abort prints. This keeps the plausibility check expressible as the
 /// predicate it conceptually is, for the tests that enumerate both sides of it.
+#[cfg(test)]
+mod initial_master_key_tests {
+    use super::*;
+
+    /// A well-formed key is accepted and returned verbatim, in either hex case.
+    #[test]
+    fn a_64_character_hex_string_is_accepted() {
+        for valid in [
+            "0".repeat(64),
+            "f".repeat(64),
+            "F".repeat(64),
+            "0123456789abcdef".repeat(4),
+            "0123456789ABCDEF".repeat(4),
+            // Mixed case: hex is case-insensitive and both spellings name the same 32 bytes.
+            "0123456789aBcDeF".repeat(4),
+        ] {
+            assert_eq!(
+                validate_initial_master_key(Some(&valid)),
+                Ok(Some(valid.clone())),
+                "{valid:?} is exactly 64 hex characters and must be accepted"
+            );
+        }
+    }
+
+    /// The width this service actually mints round-trips through the validator.
+    ///
+    /// Pinned against `generate_random_key` rather than against the literal 64, so that if the
+    /// generator's width ever changed, this fails rather than silently accepting a key shape the
+    /// service no longer issues.
+    #[test]
+    fn a_freshly_generated_key_satisfies_the_validator() {
+        for _ in 0..16 {
+            let generated = crate::api::generate_random_key();
+            assert_eq!(
+                validate_initial_master_key(Some(&generated)),
+                Ok(Some(generated.clone())),
+                "the daemon must accept a key of the shape it generates itself"
+            );
+        }
+    }
+
+    /// Absence is the documented zero-config path and is **not** an error.
+    ///
+    /// This is the case most at risk of being "tightened" later: making it fatal would mean the
+    /// daemon cannot start without an operator-supplied master key, which contradicts the bootstrap
+    /// design and `README.md`. The assertion is here so that change has to be deliberate.
+    #[test]
+    fn an_unset_variable_is_not_an_error_and_asks_for_a_generated_key() {
+        assert_eq!(validate_initial_master_key(None), Ok(None));
+    }
+
+    /// A variable that is set but blank is a defect, not absence.
+    ///
+    /// `INITIAL_MASTER_KEY=""` and `INITIAL_MASTER_KEY=$UNSET_VAR` are what a broken deployment
+    /// script produces. Falling back to a generated key there would hand the operator a daemon whose
+    /// master credential is not the one their tooling believes it configured.
+    #[test]
+    fn a_set_but_empty_value_is_fatal_rather_than_treated_as_unset() {
+        for blank in ["", " ", "\t", "\n", "   \t\n  "] {
+            assert_eq!(
+                validate_initial_master_key(Some(blank)),
+                Err(InitialMasterKeyError::Empty),
+                "{blank:?} must be refused, not silently replaced with a generated key"
+            );
+        }
+    }
+
+    /// Anything other than exactly 64 hex characters is refused, on width.
+    #[test]
+    fn a_key_of_the_wrong_width_is_refused() {
+        for (value, width) in [
+            ("a".repeat(63), 63),
+            ("a".repeat(65), 65),
+            ("a".repeat(32), 32),
+            ("abcdef".to_owned(), 6),
+            ("a".repeat(128), 128),
+        ] {
+            assert_eq!(
+                validate_initial_master_key(Some(&value)),
+                Err(InitialMasterKeyError::BadLength(width)),
+                "a {width}-character key must be refused"
+            );
+        }
+    }
+
+    /// Non-hex characters are refused, and named.
+    ///
+    /// The reported position and character are asserted because the whole reason this error carries
+    /// them is that an operator cannot see the value in the log — a bare "invalid" would leave them
+    /// diffing the key by eye.
+    #[test]
+    fn non_hex_characters_are_refused_and_located() {
+        // Right width, wrong alphabet — this is the case a length-only check would wave through.
+        let mut sixty_four = "a".repeat(64);
+        sixty_four.replace_range(10..11, "z");
+        assert_eq!(
+            validate_initial_master_key(Some(&sixty_four)),
+            Err(InitialMasterKeyError::NonHex('z', 10)),
+            "a full-width key containing 'z' must be refused on its alphabet, not accepted on width"
+        );
+
+        for (value, expected_char, expected_index) in [
+            ("g".repeat(64), 'g', 0),
+            ("-".repeat(64), '-', 0),
+            (format!("{}!", "a".repeat(63)), '!', 63),
+            (format!("{} {}", "a".repeat(31), "a".repeat(32)), ' ', 31),
+        ] {
+            assert_eq!(
+                validate_initial_master_key(Some(&value)),
+                Err(InitialMasterKeyError::NonHex(expected_char, expected_index))
+            );
+        }
+    }
+
+    /// The alphabet is checked before the width, so the more useful complaint wins.
+    ///
+    /// A short value full of `z` is told it is not hex rather than merely that it is short, because
+    /// "not hex" is the defect the operator has to fix first — correcting the length of a value that
+    /// was never hex would not help.
+    #[test]
+    fn the_alphabet_complaint_takes_precedence_over_the_width_complaint() {
+        assert_eq!(
+            validate_initial_master_key(Some("zzzz")),
+            Err(InitialMasterKeyError::NonHex('z', 0))
+        );
+    }
+
+    /// Surrounding whitespace is trimmed, because `$(cat key.txt)` carries a newline.
+    ///
+    /// Trimming cannot change the meaning of a hex string, which is what makes it safe here.
+    #[test]
+    fn surrounding_whitespace_is_trimmed_rather_than_rejected() {
+        let key = "a".repeat(64);
+        for padded in [
+            format!("{key}\n"),
+            format!("  {key}  "),
+            format!("\t{key}\r\n"),
+        ] {
+            assert_eq!(
+                validate_initial_master_key(Some(&padded)),
+                Ok(Some(key.clone())),
+                "a trailing newline from a shell substitution must not be a fatal misconfiguration"
+            );
+        }
+    }
+
+    /// Every rejection names the actual defect, so the log is actionable without the value.
+    #[test]
+    fn each_error_renders_an_actionable_message() {
+        let empty = InitialMasterKeyError::Empty.to_string();
+        assert!(empty.contains("empty"), "{empty}");
+        assert!(empty.contains("unset it entirely"), "the zero-config escape must be offered");
+
+        let short = InitialMasterKeyError::BadLength(12).to_string();
+        assert!(short.contains("64"), "{short}");
+        assert!(short.contains("got 12"), "{short}");
+
+        let bad = InitialMasterKeyError::NonHex('z', 3).to_string();
+        assert!(bad.contains("'z'"), "{bad}");
+        assert!(bad.contains("position 3"), "{bad}");
+
+        // All three point at the same remedy, so an operator never has to work out how to make one.
+        for message in [empty, short, bad] {
+            assert!(message.contains("openssl rand -hex 32"), "{message}");
+        }
+    }
+}
+
 #[cfg(test)]
 fn is_hostname_like(candidate: &str) -> bool {
     hostname_rejection(candidate).is_none()

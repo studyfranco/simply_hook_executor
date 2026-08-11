@@ -8,7 +8,7 @@
 //!
 //! | Column | Status | Read by |
 //! | :--- | :--- | :--- |
-//! | `hooks.owner_key_id` | **Load-bearing — untouched by this migration** | `require_manage` (route 2), `require_lifecycle_authority`, `visible_hook_ids`, the §6 inventory |
+//! | `hooks.owner_key_id` | **Load-bearing — untouched by this migration** | `guard_manage` (route 2), `guard_lifecycle_authority`, `visible_hook_ids`, the §6 inventory |
 //! | `api_keys.owner_key_id` | **Dormant — dropped here** | Nothing |
 //!
 //! The distinction is the whole of this migration's risk, so it was established mechanically rather

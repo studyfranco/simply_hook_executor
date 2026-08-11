@@ -158,9 +158,36 @@ pub(crate) fn format_reference(name: &str, id: Uuid) -> String {
 
 /// Writes an audit log entry.
 ///
+/// # Attribution survives the key
+///
 /// The acting key's name and prefix are denormalized into the row so the trail stays legible after
 /// that key is deleted: its `api_key_id` FK is `ON DELETE SET NULL`, but these columns are a
 /// point-in-time snapshot rather than a live join.
+///
+/// All three attribution columns — `api_key_name`, `api_key_prefix`, `client_ip` — are **NOT NULL**
+/// in the schema, and that is load-bearing rather than incidental. A nullable snapshot permits a row
+/// that has lost both its foreign key and its denormalized copy, which is an audit entry attributable
+/// to nobody. Because they cannot be null, "who did this" is answerable for every row in the table,
+/// forever. `simply_ip_vault` declares the same three columns nullable; this is a deliberate
+/// divergence in this service's favour, recorded in `SECURITY_COMPARISON_REPORT.md` as **D3**.
+///
+/// # The `target_resource` convention
+///
+/// `target_resource` carries the affected entity's **human-readable name** — never a bare UUID. That
+/// is what makes `GET /api/audit-logs?action=…` legible to an operator and what makes the column
+/// worth filtering on; a truncated or full identifier there is unreadable and duplicates information
+/// the `details` string already carries.
+///
+/// Two shapes are permitted, and both are used deliberately:
+///
+/// | Situation | `target_resource` | Example |
+/// | :--- | :--- | :--- |
+/// | A single named entity | `Some(name)` | `Some(hook.name)` |
+/// | A bulk operation with no single target | `None` | retention sweeps, `HOOK_PURGE` |
+///
+/// An entity with no name of its own — an execution record — takes the name of the entity it hangs
+/// from, and puts its own id in `details`. Identifiers belong in `details`, formatted with
+/// [`format_reference`] so a name and a truncated id appear together.
 pub(crate) async fn create_audit_log(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,

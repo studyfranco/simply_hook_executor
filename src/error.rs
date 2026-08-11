@@ -39,6 +39,30 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A conflict that carries machine-readable context alongside the message.
+    ///
+    /// Exists for `RBAC_MODEL.md` §6: deleting a key whose subtree owns resources is refused with an
+    /// **inventory** of what would be stranded, because the caller is meant to be shown what it is
+    /// about to orphan and made to resolve each entity explicitly. A bare [`AppError::Conflict`]
+    /// could carry the sentence but not the list.
+    ///
+    /// `details` is merged into the response object rather than nested under a `details` key, so the
+    /// body stays `{"error": "...", "owned_entities": [...]}` — one flat envelope, matching every
+    /// other refusal. A non-object `details` is dropped rather than replacing the envelope; see
+    /// [`AppError::into_response`].
+    ///
+    /// The alternative — a handler returning `axum::response::Response` directly — is what this
+    /// replaces. That shape works, but it takes the handler out of `Result<_, AppError>` and so out
+    /// of the one place every refusal in the service is rendered, which is precisely where a
+    /// response envelope drifts.
+    #[error("Conflict: {message}")]
+    ConflictWithDetails {
+        /// The human-readable refusal, rendered as `error`.
+        message: String,
+        /// Additional top-level fields merged into the response body. Expected to be a JSON object.
+        details: serde_json::Value,
+    },
+
     /// The caller exceeded its `max_concurrent_jobs` execution budget.
     #[error("Too Many Requests: {0}")]
     TooManyRequests(String),
@@ -61,6 +85,29 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Handled before the shared envelope because it is the one variant that contributes extra
+        // top-level fields. Everything below renders exactly `{"error": ...}`.
+        if let AppError::ConflictWithDetails { message, details } = self {
+            let mut body = json!({ "error": message });
+            match (body.as_object_mut(), details.as_object()) {
+                (Some(envelope), Some(extra)) => {
+                    for (key, value) in extra {
+                        // `error` is the envelope's own field. A `details` object carrying one would
+                        // silently rewrite the refusal message, so the envelope wins.
+                        if key != "error" {
+                            envelope.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                // A non-object `details` has nowhere to merge into. Dropping it keeps the envelope
+                // well-formed rather than emitting a body whose shape depends on the call site.
+                _ => tracing::error!(
+                    "ConflictWithDetails carried non-object details; they were dropped: {details}"
+                ),
+            }
+            return (StatusCode::CONFLICT, Json(body)).into_response();
+        }
+
         let (status, error_message) = match self {
             AppError::DbError(err) => {
                 // Logged in full, reported generically: a raw driver error can expose schema and
@@ -73,6 +120,9 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::NotFound => (StatusCode::NOT_FOUND, "Resource not found".to_owned()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            // Unreachable: returned above, before this match. Kept exhaustive rather than swept
+            // into a `_` arm so that a future variant cannot be added without the compiler asking.
+            AppError::ConflictWithDetails { message, .. } => (StatusCode::CONFLICT, message),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
             AppError::BodyRejected(status, msg) => (status, msg),
             AppError::Internal => (

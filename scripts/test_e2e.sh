@@ -72,7 +72,13 @@ SERVER_PORT=""
 BASE_URL=""
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
-MASTER_KEY="e2e_master_secret_key_for_testing_123456789"
+#
+# Exactly 64 hex characters, and that is now enforced rather than conventional: the daemon validates
+# INITIAL_MASTER_KEY as 64 ASCII hex digits and exits non-zero otherwise (see
+# `config::validate_initial_master_key`). The previous value here was a 43-character English phrase,
+# which the daemon would now refuse to start on. Deterministic-but-well-formed is the point — a fixed
+# value the suite knows up front, in the shape the service actually issues.
+MASTER_KEY="e2e0000000000000000000000000000000000000000000000000000000000e2e"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_hook_executor_e2e.XXXXXX")"
 DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
@@ -2311,7 +2317,8 @@ while port_in_use "$STRICT_PORT"; do STRICT_PORT=$((STRICT_PORT + 1)); done
 STRICT_DB="$WORK_DIR/strict.db"
 STRICT_LOG="$WORK_DIR/strict_server.log"
 STRICT_BASE_URL="http://$BIND_HOST:$STRICT_PORT"
-STRICT_MASTER="e2e_strict_master_key_for_testing_987654321"
+# 64 hex characters — the daemon now refuses anything else (config::validate_initial_master_key).
+STRICT_MASTER="5721000000000000000000000000000000000000000000000000000000005721"
 
 log "Booting a second instance on port $STRICT_PORT with TRUSTED_PROXIES unset..."
 DATABASE_URL="sqlite://$STRICT_DB?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$STRICT_MASTER" \
@@ -2817,6 +2824,49 @@ api_call POST "/api/keys/$REVTGT_ID/permissions" "$MASTER_KEY" \
     "$(jq -nc --arg h "$REV_HOOK_ID" '{hook_id:$h,can_execute:true,can_manage:true}')"
 check "200" "and a master can put it back under governance"
 
+log_section "33b. INITIAL_MASTER_KEY must be 64 hex characters, or the daemon refuses to start"
+
+# The bootstrap override names the single most privileged credential in the system, so a value that
+# is not the shape this service issues is a misconfiguration worth refusing rather than accepting.
+# `generate_random_key` mints 32 random bytes hex-encoded, so 64 hex characters *is* the native
+# shape; anything else is a human-chosen secret wearing the same variable name.
+#
+# Asserted against the real binary, like §34: "refuses to start" is a property of the process, not of
+# a function, and a unit test cannot tell whether `main` actually honours the validator.
+#
+# Absence is deliberately **not** tested as fatal, because it is not: an unset INITIAL_MASTER_KEY is
+# the documented zero-config path and makes the daemon generate a random key. Every other section of
+# this suite exercises that path indirectly.
+IMK_DB="$WORK_DIR/imk.db"
+IMK_LOG="$WORK_DIR/imk_server.log"
+IMK_PORT=$((SERVER_PORT + 6))
+while port_in_use "$IMK_PORT"; do IMK_PORT=$((IMK_PORT + 1)); done
+
+# Three shapes, three different defects: too short, right width but not hex, and set-but-empty.
+for bad_key in "deadbeef" "zzzz0000000000000000000000000000000000000000000000000000000000zz" ""; do
+    rm -f "$IMK_DB"
+    DATABASE_URL="sqlite://$IMK_DB?mode=rwc" RUST_LOG=info \
+        BIND_HOST="$BIND_HOST" PORT="$IMK_PORT" INITIAL_MASTER_KEY="$bad_key" \
+        timeout 30 "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$IMK_LOG" 2>&1
+    IMK_CODE=$?
+    check_local "$IMK_CODE" "1" "INITIAL_MASTER_KEY='${bad_key:0:12}' (${#bad_key} chars) aborts startup"
+
+    # It aborts before the database is touched, so a refused boot leaves nothing behind — no
+    # migrations, and no master key minted for a daemon that never came up.
+    if [ -f "$IMK_DB" ]; then
+        check_local "created" "clean" "the refused boot created no database"
+    else
+        check_local "clean" "clean" "the refused boot created no database"
+    fi
+done
+
+# The message names the remedy, because the operator cannot see the value in the log.
+if grep -qF "openssl rand -hex 32" "$IMK_LOG"; then
+    check_local "stated" "stated" "the abort tells the operator how to generate a valid key"
+else
+    check_local "missing" "stated" "the abort tells the operator how to generate a valid key"
+fi
+
 log_section "34. TRUSTED_PROXIES syntax is fatal, unresolvable names are not"
 
 # The two failures look alike in a config file and are not alike at all — *typo versus timing*.
@@ -2883,7 +2933,7 @@ UNRESOLVED_PORT=$((ABORT_PORT + 1))
 while port_in_use "$UNRESOLVED_PORT"; do UNRESOLVED_PORT=$((UNRESOLVED_PORT + 1)); done
 
 DATABASE_URL="sqlite://$UNRESOLVED_DB?mode=rwc" RUST_LOG=info \
-    INITIAL_MASTER_KEY="e2e_unresolved_master_key_for_testing_5555" \
+    INITIAL_MASTER_KEY="c0ffee0000000000000000000000000000000000000000000000000000c0ffee" \
     BIND_HOST="$BIND_HOST" PORT="$UNRESOLVED_PORT" \
     TRUSTED_PROXIES="no-such-proxy.invalid, 127.0.0.1" \
     "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$UNRESOLVED_LOG" 2>&1 &

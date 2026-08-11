@@ -52,6 +52,23 @@ To keep this context clean and modular, responsibilities are split across three 
 
 **`guards` is one module, not one per domain, and must stay that way.** `RBAC_MODEL.md`'s rules are cross-cutting: R2's conjunction governs hooks, parameters and execution records alike, and §3's ownership test is consulted from three domains. Splitting guards by caller would put a single sentence of the specification in three files and invite the copies to drift — which is the exact failure the compliance suite exists to catch, and so must not be designed in.
 
+#### Naming conventions inside `guards.rs`
+
+| Prefix | Meaning | Examples |
+| :--- | :--- | :--- |
+| `guard_*` | **Enforces** a rule. Returns `Result<_, AppError>`, and the `Err` *is* the refusal | `guard_manage`, `guard_hook_manage_conjunction`, `guard_lifecycle_authority`, `guard_visibility`, `guard_execute` |
+| `is_*` / verb | **Answers** a question. Returns a `bool` or an `Option`, decides nothing on its own | `is_permission_reduction`, `manages_any_hook`, `hook_permission` |
+
+The `guard_*` prefix is shared with `simply_ip_vault`, which has always used it. Guards here were
+named `require_*` until this pass; the rename is cosmetic and touched no logic.
+
+**`is_permission_reduction` deliberately keeps its name.** The peer's equivalent is
+`widens_permissions`, and the two are **logical inverses** — adopting that name would require
+inverting every call site's branch, which is a semantic change to R6 enforcement bought with
+cosmetics, and the likeliest way to introduce a real vulnerability while "aligning naming". If the
+polarity is ever flipped, it must be a deliberate change with its own tests, separate from any
+renaming pass.
+
 #### The single-consumer exception
 
 An authorization helper belongs in its domain module rather than in `guards.rs` when **both** of these hold, and it belongs in `guards.rs` otherwise:
@@ -65,7 +82,7 @@ Three constraints make the exception safe rather than a hole:
 
 - **The relocated helpers are module-private.** That is what makes "only this domain uses it" a fact the compiler checks rather than a claim in a comment. A second domain needing one breaks the build, forcing an explicit choice — widen the visibility and accept it is cross-domain after all, or move the cluster back — instead of letting it drift.
 - **They keep `guards.rs`'s discipline wherever they live:** return `Result<_, AppError>`, write nothing, and preserve §4 oracle discipline (a `None`/`404` must be indistinguishable from what a nonexistent id produces, so callers propagate it rather than converting it to a `403`).
-- **"Feels related" is not criterion 1.** The rule counts consumers, because that is checkable. §4's *hook* visibility (`require_visibility`, `visible_hook_ids`, `execution_visible_hook_ids`) is the same section of the specification and stays in `guards.rs`, because three domains consult it. **One §4 is therefore split across two files.** That is the accepted cost of following consumer count rather than section numbering; the alternative — grouping by section — is the taste-based split that lets a rule get copied.
+- **"Feels related" is not criterion 1.** The rule counts consumers, because that is checkable. §4's *hook* visibility (`guard_visibility`, `visible_hook_ids`, `execution_visible_hook_ids`) is the same section of the specification and stays in `guards.rs`, because three domains consult it. **One §4 is therefore split across two files.** That is the accepted cost of following consumer count rather than section numbering; the alternative — grouping by section — is the taste-based split that lets a rule get copied.
 
 Outside `src/api/`, one boundary is a rule for the same reason:
 
@@ -73,6 +90,7 @@ Outside `src/api/`, one boundary is a rule for the same reason:
 | :--- | :--- | :--- |
 | `crypto.rs` | Every cryptographic primitive: `generate_signing_secret`, `canonical_v1_payload`, `compute_signature`, `verify_signature`, and `SecretCipher` | **Pure.** No database, no request, no `AppError`. A refusal is returned as `SignatureRejection`, never as an HTTP status |
 | `middleware.rs` | *When* a signature is required, which header carries it, and what a caller is told when one fails | Holds the policy, not the primitive. It must not reimplement an HMAC "just to check something first" |
+| `error.rs` | `AppError` and its single `IntoResponse` | **Every refusal in the service renders here.** A handler returning `axum::response::Response` directly takes itself out of that path, which is where a response envelope drifts — see `ConflictWithDetails` below |
 
 `generate_signing_secret` lives in `crypto.rs` and **must not** be moved to or re-exported from `api/support.rs`. `support.rs` mints the *public* `key_id`; the signing secret is the entropy every signature in the system rests on and belongs beside the HMAC that consumes it. `api/support.rs::mint_signing_pair` is where the two meet.
 
@@ -143,14 +161,14 @@ Rules the implementation MUST hold to:
 - **Parent and Daughter, defined for this service.** `RBAC_MODEL.md` §1 names the tiers; this is what they are in `simply_hook_executor`:
   - A key is a **Parent** iff `can_manage_keys == true`. There is no other test, and no derived one: lineage is not consulted (R3), and neither is `can_manage_hooks`.
   - A key is a **Daughter** iff `can_manage_keys == false`. A Daughter holding `can_manage_hooks` is still a Daughter — it may *create* hooks and may never *manage* anyone else's.
-  - **Only Master may set either global right**, on create or on update (R4). A non-master request for one is refused with `403` rather than silently downgraded: a `200` carrying a key that lacks what was asked for is the worse failure, because the caller walks away believing it provisioned a Parent and discovers otherwise in production. Enforced by `require_master_to_grant_scopes`, which gates *granting* only — clearing a scope stays available to any key manager, since removing authority is not escalation.
+  - **Only Master may set either global right**, on create or on update (R4). A non-master request for one is refused with `403` rather than silently downgraded: a `200` carrying a key that lacks what was asked for is the worse failure, because the caller walks away believing it provisioned a Parent and discovers otherwise in production. Enforced by `guard_master_to_grant_scopes`, which gates *granting* only — clearing a scope stays available to any key manager, since removing authority is not escalation.
   - **Therefore every key minted by a Parent is a Daughter**, necessarily and without a separate rule to enforce it.
 - **The Master's identity is pinned at boot, not read per request** (`src/master.rs`). Every authorization decision branches on `is_master`, which is a column; an attacker who reaches the database needs one `UPDATE` to become Master. §5's uniqueness constraint refuses that statement, and pinning is the layer behind it for the case where the constraint itself is dropped. At startup `MasterPin::pin_at_boot` asserts the §5 index exists and that exactly one master row exists, then freezes that id for the process lifetime; startup fails loudly on either. The check is applied at **one choke point** — `auth_middleware` demotes any authenticated key whose `is_master` column is set but whose id is not the pinned one, before any handler sees it. That is deliberate: there are dozens of `key.is_master` reads across `src/api/`, and a scheme requiring each to also compare an id would be one forgotten call site away from worthless. Handlers keep reading `key.is_master` and are automatically correct, because the principal they receive is the *effective* one. Restoring a tampered flag to meaning requires a restart, which is an event an operator can see.
 - **Exactly one master exists,** and the guarantee is a **database constraint**, not application logic (`RBAC_MODEL.md` §5). `api_keys` carries a `master_marker` column *generated by the engine* from `is_master`, under a plain unique index — see `SCHEMA.MD` and `m20230106_000001_master_key_uniqueness`. The marker is derived rather than assigned precisely so no writer can bypass it, and a plain unique index on a nullable column is used rather than a partial index because MySQL has no `WHERE` clause on `CREATE INDEX` and the MySQL driver is enabled. A database that somehow already holds two masters fails the migration and refuses to boot: which master is legitimate is an operator's judgement, not a schema change's.
 - **Hook Rights:** Managed via junction table `ApiKeyHookPermission` linking keys to `Hook` with three explicit flags (`can_execute`, `can_manage`, `can_view_execution`).
 - **Least Privilege:** any of the three verbs requires a valid key mapping unless `is_master`.
-- **Manage is a conjunction (`RBAC_MODEL.md` R2), with ownership as the one route around it.** A `can_manage` row is *never* sufficient on its own. Editing a specific hook — its definition, its dispatch configuration, its parameter contract, its execution records, its lifecycle — requires `is_master`, **or** being the hook's `owner_key_id`, **or** global `can_manage_keys` **AND** a `can_manage = true` row on that hook. §1's Tiers matrix is why the bare row fails: a Daughter (no `can_manage_keys`) "may manage resources: **Never**". R2 is evaluated in exactly one place, `require_hook_manage_conjunction`; `require_manage` is the master-and-owner short-circuit in front of it.
-- **Ownership edits, it does not delegate.** §3 makes `owner_key_id` "the key answerable for this hook" and the only non-Master identity that may delete or rename it. A model where you may destroy a resource but not edit its description is not one anyone would design on purpose, so ownership carries content editing too — which is also what makes `can_manage_hooks` coherent, since a Daughter that creates a hook can go on maintaining it. What ownership does **not** carry is **delegation**: granting or revoking another key's rights on that hook goes through `require_hook_manage_conjunction` directly and still needs R2 in full. Being answerable for a hook does not make you an administrator of credentials. A Daughter owner can therefore rewrite its own hook and cannot widen anyone's access to it, including its own. Ordering matters: the owner check runs *before* the conjunction, because the conjunction answers `404` when no permission row exists and an owner need not hold one.
+- **Manage is a conjunction (`RBAC_MODEL.md` R2), with ownership as the one route around it.** A `can_manage` row is *never* sufficient on its own. Editing a specific hook — its definition, its dispatch configuration, its parameter contract, its execution records, its lifecycle — requires `is_master`, **or** being the hook's `owner_key_id`, **or** global `can_manage_keys` **AND** a `can_manage = true` row on that hook. §1's Tiers matrix is why the bare row fails: a Daughter (no `can_manage_keys`) "may manage resources: **Never**". R2 is evaluated in exactly one place, `guard_hook_manage_conjunction`; `guard_manage` is the master-and-owner short-circuit in front of it.
+- **Ownership edits, it does not delegate.** §3 makes `owner_key_id` "the key answerable for this hook" and the only non-Master identity that may delete or rename it. A model where you may destroy a resource but not edit its description is not one anyone would design on purpose, so ownership carries content editing too — which is also what makes `can_manage_hooks` coherent, since a Daughter that creates a hook can go on maintaining it. What ownership does **not** carry is **delegation**: granting or revoking another key's rights on that hook goes through `guard_hook_manage_conjunction` directly and still needs R2 in full. Being answerable for a hook does not make you an administrator of credentials. A Daughter owner can therefore rewrite its own hook and cannot widen anyone's access to it, including its own. Ordering matters: the owner check runs *before* the conjunction, because the conjunction answers `404` when no permission row exists and an owner need not hold one.
 - **`can_view_execution` — the audit verb.** Execution records are creator-private (`RBAC_MODEL.md` Terminology + §4), so holding a verb on a hook does not by itself reveal what other keys' runs of it printed. An execution is readable by exactly four identities: **Master**, the **acting key** (`executions.api_key_id`), the **hook's owner**, or a key holding **`can_view_execution` or `can_manage`** on that hook. Everything else is `404`, never `403` — an unreadable record must be indistinguishable from one that was never written, or the endpoint reports how much history exists to someone entitled to none of it. It is its own verb rather than a facet of the other two because folding it into `can_execute` would give every caller entitled to run a hook the output of everyone else's runs, and folding it into `can_manage` would put read-only audit access behind R2, so an auditor could be granted logs only by first being made a Parent with editing rights. `can_manage` is included in the four because a key already entitled to rewrite `script_path` and delete the history outright cannot meaningfully be denied *reading* it. The verb is **read-only in every direction**: it never confers running, editing, or deleting a record.
 - **Auto-Provisioning:** When an API Key creates a new `Hook`, the backend MUST automatically generate full rights for that key on the new hook — all three verbs — **and record it as the hook's `owner_key_id`**. The two remain separate facts: the permission row is operational and delegable to others, the ownership column is lifecycle authority and moves only when master says so.
 - **Lineage confers nothing.** `api_keys.parent_key_id` records who created a key, for cascading deletion and visibility scoping only. `RBAC_MODEL.md` R3: "A daughter of the Master key is an ordinary daughter key with no elevated standing." No authorization check may read this column — if one ever needs to, the rule has been broken.
@@ -165,7 +183,7 @@ Rules the implementation MUST hold to:
 | `POST /api/hooks/{id}/test` (dry run) | `can_execute` — the preview reveals the fully-resolved command line and child environment, which is execution-shaped knowledge even though nothing is spawned |
 | `GET /api/hooks`, `GET /api/hooks/{id}`, `GET .../parameters` | derived read: ownership, **or** any of `can_execute` / `can_manage` / `can_view_execution`. `can_view_execution` is included because history is unreadable without being able to name the hook that produced it; ownership is included because otherwise a hook could be editable by a key that cannot list it |
 | `GET /api/executions`, `GET /api/executions/{id}` | **Creator-private, four routes in** (§4 scope 3): `is_master`, **or** the acting key (`executions.api_key_id`), **or** the hook's `owner_key_id`, **or** a row on that hook carrying `can_view_execution` **or** `can_manage`. Anything else is `404`, byte-identical to a record that never existed. The listing expresses the same disjunction as an indexed `WHERE` rather than filtering after `LIMIT`, which would page wrongly — a limit applied before a visibility filter returns fewer than *n* visible rows and hides the rest behind an offset that never advances past them |
-| `PUT`/`PATCH`/`DELETE /api/hooks/{id}`, parameter CRUD, `DELETE /api/executions/{id}` | `is_master`, **or** the hook's `owner_key_id`, **or** global `can_manage_keys` **AND** a `can_manage = true` row on that hook. A bare row does not suffice: the Terminology section names `script_path` and `run_as_user` as this service's **dispatch configuration** and puts editing them under R2, and the Tiers matrix says a Daughter never manages resources. A key holding only the row could otherwise repoint `script_path` at any binary and trigger it with `can_execute` from the same row — remote code execution, bounded by nothing, since `require_master_for_privileged_hook` fires only for hooks that *already* carry a `run_as_user` and `ALLOWED_SCRIPT_ROOTS` is empty (unrestricted) by default. Note `DELETE /api/executions/{id}` is deliberately *stricter* than reading one: `can_view_execution` buys visibility of a record, never the right to destroy it — an auditor is not a redactor. §4 decides the status: no row and no ownership is `404` (invisible), a row short of a conjunct is `403` |
+| `PUT`/`PATCH`/`DELETE /api/hooks/{id}`, parameter CRUD, `DELETE /api/executions/{id}` | `is_master`, **or** the hook's `owner_key_id`, **or** global `can_manage_keys` **AND** a `can_manage = true` row on that hook. A bare row does not suffice: the Terminology section names `script_path` and `run_as_user` as this service's **dispatch configuration** and puts editing them under R2, and the Tiers matrix says a Daughter never manages resources. A key holding only the row could otherwise repoint `script_path` at any binary and trigger it with `can_execute` from the same row — remote code execution, bounded by nothing, since `guard_master_for_privileged_hook` fires only for hooks that *already* carry a `run_as_user` and `ALLOWED_SCRIPT_ROOTS` is empty (unrestricted) by default. Note `DELETE /api/executions/{id}` is deliberately *stricter* than reading one: `can_view_execution` buys visibility of a record, never the right to destroy it — an auditor is not a redactor. §4 decides the status: no row and no ownership is `404` (invisible), a row short of a conjunct is `403` |
 | `POST /api/hooks` (create) | global `can_manage_hooks` (creation auto-provisions full rights on the new hook, and records the creator as `owner_key_id`). Creation is *not* under R2 — the rule is written about "a `can_manage = true` row for that specific resource", and a hook that does not yet exist can have no row. The consequence is deliberate: this scope defines automation, and editing it afterwards additionally needs `can_manage_keys` |
 | `POST`/`GET`/`PUT`/`DELETE /api/keys*` | global `can_manage_keys` |
 | `GET /api/audit-logs`, `GET /api/settings`, `DELETE /api/executions` (purge) | `is_master` |
@@ -287,11 +305,42 @@ is in their path:
   driver error. `readiness_check`'s `DbErr` is logged at `warn` and never returned: it renders
   connection strings and driver internals. A test asserts the body is exactly two fixed fields, so a
   field added later has to be justified rather than arriving unnoticed on a public endpoint.
-- **`SELECT 1` and nothing more.** A probe that read rows would let an anonymous caller provoke
-  unbounded work — a denial-of-service primitive aimed at the endpoint that reports health. It is the
-  third entry in the raw-SQL allowlist for exactly this reason.
+- **A bounded, typed read and nothing more.** `ApiKey::find().select_only().column(Id).limit(1)` —
+  at most one id, never `COUNT(*)`, which on a large table would make every probe a scan and turn the
+  health check into load. A probe an anonymous caller can amplify into unbounded work is a
+  denial-of-service primitive aimed at the endpoint that reports health. It is built with SeaORM's
+  typed builder rather than a literal `SELECT 1`, so it needs **no** raw-SQL allowlist entry.
+- **The Master identity must be pinned.** `readiness_check` returns `503` when
+  `master_pin.get().is_none()`. `main.rs` pins before binding the listener, so in production this
+  cannot be `None` — but that ordering is a convention held by one line, and an edit that bound first
+  would produce a process reporting itself ready while every master-only route quietly refused. The
+  unpinned case reports `"database":"up"`, because it is: the failure is this process's startup
+  ordering, and saying `down` would send an operator to investigate a healthy database.
 - `503` rather than `500`: nothing about the request failed. The answer *is* "not ready", and it was
   produced successfully.
+
+### 3e. Error Envelope
+
+Every refusal is `{"error": "<message>"}` with the status `AppError` maps it to. One variant
+contributes extra fields:
+
+| Variant | Status | Body |
+| :--- | :--- | :--- |
+| `ConflictWithDetails { message, details }` | `409` | `{"error": message, ...details}` — an object `details` is **merged into** the envelope, not nested |
+
+It exists for `RBAC_MODEL.md` §6: deleting a key whose subtree owns resources is refused with an
+inventory of what would be stranded, because the caller is meant to be *shown* what it is about to
+orphan and made to resolve each entity explicitly. A bare `Conflict` could carry the sentence but not
+the list.
+
+**Handlers must not build `axum::response::Response` by hand to achieve this.** `delete_api_key` did,
+and it worked — but it took the handler out of `Result<_, AppError>` and therefore out of the one
+place every refusal in the service is rendered, which is exactly where an envelope drifts. Two rules
+follow:
+
+- A `details` that is not a JSON object is **dropped** with an error log rather than replacing the
+  envelope, so the body's shape never depends on the call site.
+- A `details` carrying its own `error` key does **not** overwrite the message. The envelope wins.
 
 ### 4. History, Output Capture & Log Retention
 
@@ -337,9 +386,15 @@ The dashboard must not offer a control the backend will refuse, and must not *wi
 ### 7. Audit Logging
 
 - Every mutating configuration change (Key CRUD, Hook CRUD, Permission updates) writes an `AuditLog` entry storing `api_key_id`, `api_key_name`, `api_key_prefix`, `client_ip`, `action`, `target_resource`, `details`, and timestamp.
+- **Attribution is `NOT NULL` and must stay that way.** `api_key_id` is `ON DELETE SET NULL`, so the foreign key is allowed to go; `api_key_name`, `api_key_prefix` and `client_ip` are a point-in-time snapshot and are not. A nullable snapshot permits a row that has lost both the reference and the copy — an audit entry attributable to nobody. See `SCHEMA.MD`.
+- **`target_resource` carries the affected entity's human-readable name, never a bare UUID.** Identifiers belong in `details`, formatted with `api::support::format_reference`. A bulk operation with no single target writes `NULL`. An entity with no name of its own — an execution record — takes the name of the entity it hangs from. The writer is `api::support::create_audit_log`, whose rustdoc states the convention; `api/audit.rs` only reads.
 
 ### 8. Database Bootstrapping & Systemd Integration
 
+- **`INITIAL_MASTER_KEY`, when set, must be exactly 64 ASCII hex characters**, validated by `config::validate_initial_master_key`. Anything else — wrong width, a non-hex character, or set-but-empty — is **fatal**: the process logs the specific defect and exits non-zero. 64 hex is not arbitrary; it is the shape `api::generate_random_key` mints, so the override cannot be a credential of a different class wearing the same name.
+  - **Absence is not an error.** An unset variable is the documented zero-config path: the daemon generates a random master key and prints it once. Making absence fatal would mean the service cannot start without an operator-supplied master key, which contradicts this variable being test/CI-only.
+  - **Set-but-empty is fatal**, and that distinction is the point: `INITIAL_MASTER_KEY=$UNSET_VAR` is what a broken deployment script produces, and generating a random key there would hand the operator a daemon whose master credential is not the one their tooling believes it configured.
+  - Validation runs in `main` **beside `RuntimeConfig::from_env` and before the database is opened**, so a refused boot leaves no migrations applied and no master key minted.
 - Database connections use `ConnectOptions` with SQLx logging set to `DEBUG`.
 - Migrations run automatically on startup.
 - **Master Key Auto-Gen:** If `api_keys` contains no master keys at boot, generate a default Master Key and output it once clearly to `stdout`. This is now the **only** writer of `is_master = true` anywhere in the codebase, and therefore also the only way to regenerate a master: delete the row directly in the database and restart. The banner is the sole source of that key's signing secret, which is why `scripts/test_e2e.sh` scrapes it rather than minting a second master for signing.
@@ -365,7 +420,7 @@ Four things can ship broken while every other gate passes green, because no othe
 - **`static/app.js` must parse.** `static/` is served straight off disk by `ServeDir` and is never compiled, linted, or executed by anything else here — `cargo check`, `clippy`, the integration suite and the e2e suite all drive the HTTP API and never parse the file they serve. Checked with `oxc_parser` (a parser, not an engine: the file references `document` and `localStorage`, so *running* it would fail for reasons unrelated to syntax). The `oxc` crates are pinned with `=` because they are pre-1.0 and their `0.x` releases carry breaking changes under a caret requirement — a syntax checker that stops the build for reasons unrelated to syntax is worse than none.
 - **Every `getElementById` must resolve**, against ids declared in `index.html` *or* injected by the script's own templates.
 - **The dashboard must not send `is_master`** in a key payload.
-- **No raw SQL on any query path.** `src/` is scanned for `execute_unprepared`, `Statement::from_*`, `query_*_raw`, `execute_raw`, `from_raw_sql` and `Expr::cust`. Exactly **three** files are allowlisted, each with its reason recorded in the test and in `AGENT_NOTES.MD`: `src/db.rs` (SQLite `PRAGMA`s — not queries, and SeaORM's builders cannot express one), `m20230106_000001_master_key_uniqueness` (`GENERATED ALWAYS AS` DDL, which `ColumnDef` cannot express), and `src/api/health.rs` (`SELECT 1` — the readiness probe must touch no table, so there is no entity for the builder to hang a query on). **None interpolates a runtime value**: across the whole list the only substitution is a compile-time `const`, and the third entry's statement is a two-character literal. That is the property that makes these exemptions safe rather than merely tolerated, and a fourth entry must demonstrate the same. A companion test fails if an allowlisted file stops containing raw SQL, so an exemption cannot outlive its justification and be silently inherited by whatever lands at that path next.
+- **No raw SQL on any query path.** `src/` is scanned for `execute_unprepared`, `Statement::from_*`, `query_*_raw`, `execute_raw`, `from_raw_sql` and `Expr::cust`. Exactly **two** files are allowlisted, each with its reason recorded in the test and in `AGENT_NOTES.MD`: `src/db.rs` (SQLite `PRAGMA`s — not queries, and SeaORM's builders cannot express one) and `m20230106_000001_master_key_uniqueness` (`GENERATED ALWAYS AS` DDL, which `ColumnDef` cannot express). **Neither is reachable from a request, and neither interpolates a runtime value** — the sole substitution across both is a compile-time `const`. Those two properties are the test a third entry must pass; in particular, **an exemption must not be granted to a handler.** One was, briefly, for a literal `SELECT 1` in the readiness probe, and it was withdrawn when that probe moved to SeaORM's typed builder: it sat in code that is both request-reachable and unauthenticated, which is the worst place in the service to hold an exception, and it bought only a saved round-trip. A companion test fails if an allowlisted file stops containing raw SQL, so an exemption cannot outlive its justification and be silently inherited by whatever lands at that path next.
 
 ### Harness safety
 

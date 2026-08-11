@@ -105,7 +105,7 @@ enforceable rather than aspirational.
 > `api/mod.rs` re-exports every handler, and it is why the `src/api.rs` → `src/api/` split left this
 > file byte-identical.
 
-### `src/main.rs` — 327 lines
+### `src/main.rs` — 347 lines
 
 **Role & scope.** The binary. Runs migrations, bootstraps the Master key on an empty table, pins the
 Master identity, primes proxy resolution, binds the listener, and shuts down gracefully. Must **not**
@@ -170,7 +170,7 @@ unauthenticated garbage never buys an indexed query.
 This is also where `MasterPin::authenticate` runs, which is why a tampered `is_master` never reaches
 a handler.
 
-### `src/config.rs` — 1,374 lines
+### `src/config.rs` — 1,642 lines
 
 **Role & scope.** Turning the environment into typed, validated configuration, plus the trusted-proxy
 model and client-IP resolution. Must **not** read the database.
@@ -288,7 +288,7 @@ setting would trade a real outage for a theoretical slowdown.
 > against a dependency default changing, not a repair. `tests/referential_integrity.rs` now pins the
 > behaviour itself.
 
-### `src/error.rs` — 90 lines
+### `src/error.rs` — 140 lines
 
 **Role & scope.** The single error type crossing the handler boundary, and its HTTP mapping.
 
@@ -306,6 +306,14 @@ what keeps a `413` oversized-body rejection from being reported as a malformed p
 Split from a single 3,847-line file. The layout was chosen by measuring which private helpers cross
 domain boundaries (17 do); the full audit and rationale are in `AGENT_NOTES.MD`.
 
+`ConflictWithDetails { message, details }` is the one variant that contributes fields beyond `error`:
+an object `details` is **merged into** the envelope, producing `{"error":…, "subtree":[…],
+"inventory":[…]}` for `RBAC_MODEL.md` §6's pre-flight inventory. It exists so `delete_api_key` can
+stay in `Result<_, AppError>` rather than hand-building an `axum::response::Response` — a handler
+that leaves that path leaves the one place every refusal is rendered. A non-object `details` is
+dropped with an error log rather than replacing the envelope, and a `details` carrying its own
+`error` key does not overwrite the message.
+
 ### `src/api/mod.rs` — 95 lines
 
 **Role & scope.** Module declarations, router-facing re-exports, and shared policy constants. Must
@@ -320,7 +328,7 @@ blast radius nobody can review. The constants sit here rather than in `support.r
 policy numbers rather than plumbing, read by both the validators that enforce them and the handlers
 that document them.
 
-### `src/api/support.rs` — 399 lines
+### `src/api/support.rs` — 426 lines
 
 **Role & scope.** Shared plumbing used by three or more handler domains, plus the strict JSON
 extractors. **Must not decide anything.** Nothing here returns a refusal that depends on *who* is
@@ -352,20 +360,20 @@ state. §4's *key-subtree* visibility is the one exception and lives in `api/key
 
 | Rule | Guard |
 | :--- | :--- |
-| R2 conjunction (single evaluation point) | `require_hook_manage_conjunction` |
-| R2, master/owner short-circuit in front of it | `require_manage` |
+| R2 conjunction (single evaluation point) | `guard_hook_manage_conjunction` |
+| R2, master/owner short-circuit in front of it | `guard_manage` |
 | R2 pre-payload standing | `has_permission_admin_standing`, `manages_any_hook` |
 | R1 delegation bound | `guard_delegated_hook_grant` |
 | R6 revocation classification | `is_permission_reduction` |
-| R4 scope elevation | `require_master_to_grant_scopes`, `require_master_to_administer` |
-| §3 lifecycle | `require_lifecycle_authority` |
-| §4 hook visibility | `require_visibility`, `visible_hook_ids`, `verb_denied` |
+| R4 scope elevation | `guard_master_to_grant_scopes`, `guard_master_to_administer` |
+| §3 lifecycle | `guard_lifecycle_authority` |
+| §4 hook visibility | `guard_visibility`, `visible_hook_ids`, `verb_denied` |
 | §4 execution visibility | `may_read_execution`, `execution_visible_hook_ids` |
 | §4 key-subtree visibility | **moved to `api/keys.rs`** — single-consumer exception, `AGENT.MD` §0 |
-| §5 master protection | `refuse_master_lifecycle_action`, `require_master_self_edit_is_bound_ips_only` |
-| Privilege elevation | `normalize_run_as_user`, `require_master_for_privileged_hook` |
-| Execute verb | `require_execute` |
-| Trash visibility | `require_master_for_deleted_view` |
+| §5 master protection | `refuse_master_lifecycle_action`, `guard_master_self_edit_is_bound_ips_only` |
+| Privilege elevation | `normalize_run_as_user`, `guard_master_for_privileged_hook` |
+| Execute verb | `guard_execute` |
+| Trash visibility | `guard_master_for_deleted_view` |
 
 **Rationale.** One module rather than one per domain, **and it must stay that way.**
 `RBAC_MODEL.md`'s rules are cross-cutting: R2's conjunction governs hooks, parameters and execution
@@ -384,14 +392,14 @@ across two files. That is the accepted cost of counting consumers rather than se
 
 Two ordering rules inside this file are load-bearing:
 
-- `require_manage` checks **ownership before the conjunction**, because the conjunction answers `404`
+- `guard_manage` checks **ownership before the conjunction**, because the conjunction answers `404`
   when the caller holds no permission row and an owner need not hold one. Asking the conjunction
   first would hide a hook from the very key answerable for it.
-- `require_hook_manage_conjunction` decides **visibility before the verb**: any row at all makes the
+- `guard_hook_manage_conjunction` decides **visibility before the verb**: any row at all makes the
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,255 lines
+### `src/api/keys.rs` — 1,274 lines
 
 **Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
 **key-subtree** visibility.
@@ -431,12 +439,12 @@ trash lifecycle. Must **not** hold execution: that is `executions.rs`.
 `grant_full_hook_permission`.
 
 **Rationale.** `script_path` and `run_as_user` are this service's **dispatch configuration**, which
-`RBAC_MODEL.md` places under R2 in full — which is why `update_hook` is gated by `require_manage` and
+`RBAC_MODEL.md` places under R2 in full — which is why `update_hook` is gated by `guard_manage` and
 not by a bare permission row. Parameter CRUD sits in the same file and behind the same gate because a
 parameter is argv for whatever `script_path` names: a defaulted parameter on a hook running `/bin/sh`
 supplies `-c` and a command string without the caller ever touching `script_path`.
 
-### `src/api/executions.rs` — 436 lines
+### `src/api/executions.rs` — 446 lines
 
 **Role & scope.** Triggering hooks and reading the records that result.
 
@@ -486,7 +494,7 @@ surfaced because "is my proxy actually trusted?" is otherwise answerable only by
 daemon's environment, and getting it wrong silently changes which address every `bound_ips` check is
 evaluated against.
 
-### `src/api/health.rs` — 102 lines
+### `src/api/health.rs` — 131 lines
 
 **Role & scope.** Liveness and readiness probes — **the only unauthenticated routes in the
 service**. Must disclose nothing an anonymous caller could not already infer.
@@ -504,11 +512,16 @@ load balancer uses it to decide whether to *route*. If liveness also checked the
 thirty-second database blip would fail liveness on every replica and the orchestrator would restart
 all of them — which does not fix a database and does destroy in-flight executions.
 
-The `SELECT 1` is the third and last entry in the raw-SQL allowlist. It must touch no table (a probe
-that read rows would let an anonymous caller provoke unbounded work), so there is no entity for the
-builder to hang a query on; the statement is a literal with nothing to interpolate. The `DbErr` is
-logged and never returned — it renders connection strings and driver internals, and this endpoint is
-public.
+The database check is a **typed** SeaORM query — `ApiKey::find().select_only().column(Id).limit(1)`
+— bounded to at most one id so an anonymous caller cannot amplify the probe into a table scan. It
+carried a raw `SELECT 1` and a third raw-SQL allowlist entry until this pass; that exemption was
+withdrawn because it sat in a request-reachable, unauthenticated handler and bought only a saved
+round-trip.
+
+`readiness_check` also returns `503` when `master_pin.get().is_none()` — catching a process that
+bound its listener before pinning, which would otherwise report itself ready while every master-only
+route quietly refused. The `DbErr` is logged and never returned: it renders connection strings and
+driver internals, and this endpoint is public.
 
 ---
 
@@ -554,7 +567,7 @@ entities, and a key is neither. The key column was write-only for its whole life
 `s7_every_required_index_and_constraint_exists` now asserts its absence *and* the hook column's
 presence, so neither the removal nor its limit can drift.
 
-**`m20230106` is the second of the three files permitted to contain raw SQL.** SeaORM's `ColumnDef` has
+**`m20230106` is the second of the two files permitted to contain raw SQL.** SeaORM's `ColumnDef` has
 no generated-column support at all, and §5 requires the marker to be engine-derived rather than
 application-maintained. The storage keyword is dialect-dependent — `STORED` for PostgreSQL (which
 gained `VIRTUAL` only in 18), `VIRTUAL` for SQLite (which permits only that on an added column) and

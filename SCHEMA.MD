@@ -258,9 +258,34 @@ System-wide audit trail for configuration changes.
 | `api_key_prefix` | String | NOT NULL | Denormalized key prefix. |
 | `client_ip` | String | NOT NULL | IP address of caller. |
 | `action` | String | NOT NULL | Action name (e.g. `HOOK_CREATE`, `KEY_ROTATE`). |
-| `target_resource`| String | NULLABLE | Target resource identifier or name. |
-| `details` | String | NULLABLE | Additional details or changed parameters. |
+| `target_resource`| String | NULLABLE | The affected entity's **human-readable name**, never a bare UUID — see the convention below. `NULL` for bulk operations with no single target. |
+| `details` | String | NULLABLE | Additional context, including any identifiers. |
 | `timestamp` | DateTime | NOT NULL | Event timestamp (UTC). |
+
+> **The three attribution columns are `NOT NULL`, and that is load-bearing.** `api_key_id` is
+> `ON DELETE SET NULL`, so the foreign key is deliberately allowed to go. `api_key_name`,
+> `api_key_prefix` and `client_ip` are a **point-in-time snapshot** and must not: a nullable snapshot
+> permits a row that has lost both the key reference *and* the copy, which is an audit entry
+> attributable to nobody. Because they cannot be null, "who did this, and from where" is answerable
+> for every row in the table, forever — including rows written by keys that were deleted years ago.
+>
+> `simply_ip_vault` declares the same three columns nullable. That is a deliberate divergence in this
+> service's favour, recorded as **D3** in `SECURITY_COMPARISON_REPORT.md`.
+
+> **`target_resource` carries a name, not an identifier.** It is what makes
+> `GET /api/audit-logs?action=…` legible to an operator and worth filtering on; a UUID there is
+> unreadable and duplicates what `details` already says. Two shapes are permitted:
+>
+> | Situation | Value | Example |
+> | :--- | :--- | :--- |
+> | A single named entity | the name | `"nftables_ban"` |
+> | A bulk operation with no single target | `NULL` | retention sweeps, `HOOK_PURGE` |
+>
+> An entity with no name of its own — an execution record — takes the name of the entity it hangs
+> from, and puts its own id in `details`. `EXECUTION_DELETE` was the one call site that wrote a bare
+> UUID here; it now writes the parent hook's name and moves the record id into `details`. Identifiers
+> in `details` are formatted with `api::support::format_reference`, which pairs a name with a
+> truncated id (`'nftables_ban' (65cf11ce...)`).
 
 ---
 

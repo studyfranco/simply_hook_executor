@@ -157,7 +157,7 @@ async fn r2_neither_half_of_the_conjunction_suffices_alone() {
 /// once rewrite it and then trigger the hook with `can_execute` from the same row — arbitrary code
 /// execution reachable from a key the Tiers matrix says "may manage resources: **Never**".
 ///
-/// `require_master_for_privileged_hook` was never a defence here: it fires only for a hook that
+/// `guard_master_for_privileged_hook` was never a defence here: it fires only for a hook that
 /// *already* carries a `run_as_user`, and this attack works on an ordinary one. `ALLOWED_SCRIPT_ROOTS`
 /// was not one either — it is empty by default, which means unrestricted.
 #[tokio::test]
@@ -256,7 +256,7 @@ async fn r2_the_conjunction_governs_content_routes_not_only_delegation() {
     let params_uri = format!("{hook_uri}/parameters");
     let param_uri = format!("{params_uri}/{param}");
 
-    // Every content route behind `require_manage`. A Daughter holds a row on this hook, so it can
+    // Every content route behind `guard_manage`. A Daughter holds a row on this hook, so it can
     // see the hook — §4 is satisfied by a `403`, and a `404` here would be a lie it could disprove.
     let refusals: [(&str, &str, Option<serde_json::Value>); 5] = [
         ("PUT", &hook_uri, Some(json!({ "description": "seized" }))),
