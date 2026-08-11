@@ -48,7 +48,7 @@ jobs:
         with:
           tag_name: "latest"
           name: "Latest Master Build"
-          body: "Dernière version compilée automatiquement à chaque commit sur la branche master."
+          body: "Latest Master Build to install in production."
           prerelease: false
           files: ${{ matrix.artifact_name }}.tar.gz
         env:
