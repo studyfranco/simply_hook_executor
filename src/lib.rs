@@ -32,11 +32,16 @@ use tower_http::trace::TraceLayer;
 ///
 /// A body over the limit is rejected with `413 Payload Too Large` before it is read to completion.
 ///
-/// The value is the converged figure shared with `simply_ip_vault`: 3 MiB, chosen so both services
-/// refuse the same payloads. It is applied as a single router-wide layer with **no per-route
-/// override** — a route permitted to raise it would reintroduce exactly the differential this
-/// constant exists to remove, and would do so at whichever route someone judged special enough to
-/// deserve the exception.
+/// 3 MiB was originally the figure converged with `simply_ip_vault`. **It is no longer shared**:
+/// that service has since made its ceiling runtime-configurable (`MAX_BODY_SIZE_MIB`, defaulting to
+/// 10 MiB) and derives its constant from that default. The divergence is accepted and recorded in
+/// `scripts/verify_convergence.sh` — it runs in the conservative direction, and nothing this daemon
+/// accepts needs a 10 MiB body. A limit an operator can raise is a limit an operator can raise by
+/// mistake.
+///
+/// It is applied as a single router-wide layer with **no per-route override** — a route permitted to
+/// raise it would reintroduce exactly the differential this constant exists to remove, and would do
+/// so at whichever route someone judged special enough to deserve the exception.
 pub const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 pub mod api;

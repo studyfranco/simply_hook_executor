@@ -449,7 +449,7 @@ compare "SQLite pragma initialization" \
 compare_value "Request body ceiling" \
     '3 \* 1024 \* 1024' '3 \* 1024 \* 1024' \
     "missing-in-peer" \
-    "Retired: peer adopted the 3 MiB DefaultBodyLimit and the shared constant."
+    "Peer made the ceiling runtime-configurable (MAX_BODY_SIZE_MIB, default 10 MiB) and derives its constant from that default, so the literal no longer appears there. This service keeps a fixed 3 MiB with no override. Divergence in the conservative direction and accepted: a limit an operator can raise is a limit an operator can raise by mistake, and nothing here needs a 10 MiB body. Re-check if this service ever grows an override."
 
 # Both services keep a 92-day soft-delete window; only the resource differs (hooks vs ip_records),
 # so the constants are compared by value rather than by name.

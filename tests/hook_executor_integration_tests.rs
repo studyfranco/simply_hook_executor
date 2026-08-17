@@ -2437,7 +2437,23 @@ async fn run_as_user_rejects_option_injection_and_malformed_accounts() {
     assert_eq!(still_unprivileged.field("run_as_user"), &json!(null));
 }
 
+/// # Why this is `#[ignore]`d rather than skipped
+///
+/// It used to run by default and `return` early when `/usr/bin/sudo` was absent — which reports
+/// **PASS** while asserting nothing. That is the same failure class as a green audit over a stale
+/// tree: a signal that says "covered" over work that never happened, and it is worst on the machine
+/// that lacks the dependency, which is exactly where someone would want to know.
+///
+/// The convention is adapted from `example/simply_ip_sync/tests/live_feed_ingestion_tests.rs`, whose
+/// header states the rule directly: an `#[ignore]`d test "panics (failing the test) rather than
+/// skipping — a `#[ignore]`d test that silently passes when the [dependency] is unreachable would
+/// stop meaning anything the first time someone actually needed it to fail."
+///
+/// So the precondition below is an **assertion**, not a guard. The default `cargo test` run no
+/// longer claims this coverage; `cargo test -- --ignored` runs it and fails loudly on a host without
+/// sudo, which is the honest answer to "is this covered here?".
 #[tokio::test]
+#[ignore = "requires /usr/bin/sudo on the host; run with `cargo test -- --ignored`"]
 async fn a_privileged_hook_actually_executes_through_sudo() {
     let dir = ScriptDir::new();
     let script = dir.write_script("via_sudo.sh", "echo ran");
@@ -2451,10 +2467,12 @@ async fn a_privileged_hook_actually_executes_through_sudo() {
     let hook_id = insert_hook_as(&db, "via_sudo", &script, 30, Some(&whoami)).await;
     grant(&db, key_id, hook_id, true, false).await;
 
-    if !std::path::Path::new("/usr/bin/sudo").exists() {
-        eprintln!("skipping: /usr/bin/sudo is not installed");
-        return;
-    }
+    assert!(
+        std::path::Path::new("/usr/bin/sudo").exists(),
+        "/usr/bin/sudo is not installed, so this test cannot observe what it exists to observe. \
+         Asserted rather than skipped: a silent `return` here would report PASS while proving \
+         nothing about the sudo boundary"
+    );
 
     let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
     assert_eq!(response.status, StatusCode::OK, "the request itself must complete");
@@ -3656,7 +3674,12 @@ async fn timeout_kills_backgrounded_grandchildren_in_the_same_process_group() {
 /// namespace, or a session-wide sweep), and pretending otherwise in a test would leave an operator
 /// believing in an isolation property that does not exist. If a future change adds cgroup
 /// confinement, this test failing is precisely the signal that the boundary moved.
+/// `#[ignore]`d for the same reason as [`a_privileged_hook_actually_executes_through_sudo`]: it
+/// depends on a host tool that is not POSIX, and a silent early `return` reported PASS on hosts
+/// lacking it. The precondition is asserted, not guarded — see that test for the convention and
+/// where it comes from.
 #[tokio::test]
+#[ignore = "requires setsid(1) from util-linux; run with `cargo test -- --ignored`"]
 async fn a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill() {
     // `setsid(1)` is util-linux, not POSIX; without it there is nothing to measure.
     let has_setsid = std::process::Command::new("sh")
@@ -3664,10 +3687,11 @@ async fn a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill()
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !has_setsid {
-        eprintln!("skipping: setsid(1) is not available on this system");
-        return;
-    }
+    assert!(
+        has_setsid,
+        "setsid(1) is not available, so the process-escape boundary cannot be measured here. \
+         Asserted rather than skipped, so this reports absence instead of success"
+    );
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));

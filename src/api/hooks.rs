@@ -595,13 +595,34 @@ pub async fn delete_hook(
         return Ok(axum::http::StatusCode::NO_CONTENT);
     }
 
-    let mut active: hook::ActiveModel = model.into();
-    active.is_deleted = Set(true);
-    active.deleted_at = Set(Some(Utc::now().naive_utc()));
-    // Stored as text so the attribution outlives the acting key.
-    active.deleted_by = Set(Some(key.id.to_string()));
-    active.updated_at = Set(Utc::now().naive_utc());
-    active.update(&state.db).await?;
+    // Conditional on the row still being live, and the affected count is checked — the same shape
+    // the hard-delete branch above uses, and for the same reason.
+    //
+    // `resolve_hook` already refuses a trashed hook, so a *sequential* second delete is a `404`
+    // before reaching here. What that leaves is the concurrent case: two callers can both resolve a
+    // live hook and arrive here, and an unconditional `ActiveModel::update` would let both succeed.
+    // The visible damage is not the row — the second write is idempotent — but the audit trail:
+    // each caller would go on to write its own `HOOK_DELETE` entry, leaving two records of one
+    // deletion and two operators each told they performed it. Filtering on `is_deleted = false`
+    // makes the database pick the winner, and the loser takes the same `404` it would have taken a
+    // moment later.
+    let now = Utc::now().naive_utc();
+    let soft_deleted = Hook::update_many()
+        .col_expr(hook::Column::IsDeleted, sea_orm::sea_query::Expr::value(true))
+        .col_expr(hook::Column::DeletedAt, sea_orm::sea_query::Expr::value(Some(now)))
+        // Stored as text so the attribution outlives the acting key.
+        .col_expr(
+            hook::Column::DeletedBy,
+            sea_orm::sea_query::Expr::value(Some(key.id.to_string())),
+        )
+        .col_expr(hook::Column::UpdatedAt, sea_orm::sea_query::Expr::value(now))
+        .filter(hook::Column::Id.eq(model.id))
+        .filter(hook::Column::IsDeleted.eq(false))
+        .exec(&state.db)
+        .await?;
+    if soft_deleted.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
 
     create_audit_log(
         &state.db,

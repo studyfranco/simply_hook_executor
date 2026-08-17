@@ -620,9 +620,10 @@ cannot tell whether `main` actually honours it.
 
 | Gate | Size | Covers | Cannot cover |
 | :--- | :--- | :--- | :--- |
-| `cargo test` | **285** across 8 binaries | Handler logic through the real router (`oneshot`, no port), RBAC compliance, schema/referential integrity, health probes, source hygiene | Anything about the process: argv, signals, exit codes, real spawned children |
-| `scripts/test_e2e.sh` | **946 checks**, 46 sections | The live daemon over HTTP: hook lifecycle, parameter contracts, real script execution, the RBAC matrix, HMAC signing, timeouts and `killpg`, startup refusals, and the §42–§46 robustness set | Anything needing a second host, a real proxy, or a non-SQLite backend |
-| `scripts/verify_convergence.sh` | 19 checks | Behavioural drift against `example/simply_ip_vault` — three byte-identical functions, shared constants, and `RBAC_MODEL.md` identity | Anything the peer does not also implement |
+| `cargo test` | **287** across 9 binaries, **2 ignored** | Handler logic through the real router (`oneshot`, no port), RBAC compliance, schema/referential integrity, health probes, source hygiene, request races | Anything about the process: argv, signals, exit codes, real spawned children |
+| `cargo test -- --ignored` | **2** | The two tests needing a host tool — `sudo` and `setsid(1)`. They **assert** their precondition rather than skipping, so a host without the tool fails loudly instead of reporting a pass over nothing | Nothing else; it is a deliberate opt-in set |
+| `scripts/test_e2e.sh` | **948 checks**, 46 sections | The live daemon over HTTP: hook lifecycle, parameter contracts, real script execution, the RBAC matrix, HMAC signing, timeouts and `killpg`, startup refusals, and the §42–§46 robustness set | Anything needing a second host, a real proxy, or a non-SQLite backend |
+| `scripts/verify_convergence.sh` | 19 checks (18 converged, 1 accepted divergence) | Behavioural drift against `example/simply_ip_vault` — three byte-identical functions, shared constants, and `RBAC_MODEL.md` identity | Anything the peer does not also implement |
 
 ### E2E robustness sections (§42–§46)
 
@@ -637,6 +638,25 @@ Each exists for a failure mode nothing else in the tree would notice:
 | **45** | SIGTERM with a 15 s hook in flight | Three separable halves of graceful shutdown: the listener closes **at once**, in-flight work **runs to completion** (a half-finished deployment script is worse than none), and the process exits **0** rather than 143. Also asserts no orphaned child and that the retention worker was stopped |
 | **46** | Two kinds of client disconnect | Leaked tasks and parked workers. A half-open request with an unfulfilled `Content-Length`, plus an upload aborted mid-stream; then asserts the next requests are served *immediately* and that the truncated body created nothing |
 
+### Request races (`tests/concurrency_and_contracts.rs`)
+
+Added after auditing the three sibling services under `example/`, which all test concurrency and this
+one did not: before that file there was not a single `tokio::spawn` or `JoinSet` anywhere in
+`tests/`. A check-then-act bug is invisible to a sequential test by construction — it needs two
+callers interleaving between the check and the act.
+
+| Test | Adapted from | Catches |
+| :--- | :--- | :--- |
+| `two_concurrent_identical_signed_requests_only_one_succeeds` | `simply_ip_exporter` | A replay ledger that reads then inserts, making "single use" mean "usually single use" |
+| `two_concurrent_deletes_of_the_same_hook_do_not_both_report_success` | `simply_ip_exporter` | **Found a real defect** — two `204`s and two `HOOK_DELETE` audit rows for one deletion. Fixed by making the soft delete conditional on the row still being live, matching the hard-delete branch |
+| `concurrent_writers_queue_cleanly_and_the_row_count_is_exact` | `simply_ip_vault` | A lost write, a double insert, or a queued writer giving up with `SQLITE_BUSY`. Two phases: disjoint names for throughput, one contested name for the uniqueness race |
+| `malformed_input_is_refused_and_reported_on_every_extractor` | `simply_ip_exporter` | A panic or hang on garbage input across the body, path and query extractors |
+
+**Note on the production pool.** That file does *not* test `db::connect`, WAL or `busy_timeout`,
+despite those being invisible to every `sqlite::memory:` fixture — because `src/db.rs` already
+carries eight file-backed tests in its own `#[cfg(test)]` module. Look there, not in `tests/`, before
+concluding the pool is uncovered.
+
 Two mechanics in those sections are load-bearing and easy to undo by accident:
 
 - **Never `wait` without arguments.** The API server is itself a background job, so a bare `wait`
@@ -646,6 +666,10 @@ Two mechanics in those sections are load-bearing and easy to undo by accident:
   non-interactive bash terminates the script. §46 opens `/dev/tcp` inside `( … )`, as `port_in_use`
   already does; the descriptor dying with the subshell is also exactly the connection cut being
   tested.
+- **A skipped section is counted, not merely warned about.** `skip()` increments `SKIP_COUNT`, and
+  the summary reports it and downgrades the closing line. A run that skipped two sections must not
+  read as identical to one that ran them — the same rule the two `#[ignore]`d Rust tests exist to
+  honour.
 
 ## Where things are *not*
 

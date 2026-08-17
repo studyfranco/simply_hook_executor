@@ -5698,3 +5698,124 @@ re-derive it.
 `cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` exit 0 ·
 `cargo test` **285 passed / 0 failed** across 8 binaries · `./scripts/test_e2e.sh` **946/946**,
 exit 0 · `bash -n scripts/test_e2e.sh` clean · `git diff RBAC_MODEL.md` empty.
+
+---
+
+# 2026-08-17 — Reference-project audit (`example/`) and adapted test patterns
+
+## 0. What was audited
+
+`example/` now holds **three** sibling services, not one. All were pulled first, per `AGENT.MD`
+§ Peer Repository Synchronization:
+
+| Project | Pulled | Test surface audited |
+| :--- | :--- | :--- |
+| `simply_ip_vault` | `f6e8444` → **`d49a192`** | 6 suites, 14 603 lines — incl. the new `test_concurrent_batch_writes_under_wal`, canonical-spelling and queue-saturation tests |
+| `simply_ip_exporter` | `bd90b7c` → **`f23e17c`** | `integration.rs` (642), `source_hygiene.rs`, `common/mod.rs` |
+| `simply_ip_sync` | `7610d78` → **`4630e76`** | 11 suites, 3 121 lines — incl. `client_resilience_tests.rs` and the `#[ignore]` live-feed convention |
+
+The vault's pull was not cosmetic: it brought 14 changed source files and ~2 700 new test lines.
+Auditing the snapshot that was on disk at the start of this session would have described a tree that
+no longer existed.
+
+## 1. A premise of my own that did not survive the audit
+
+My first pass concluded "nothing in Rust exercises the production pool — `db::connect`, WAL,
+`busy_timeout` — because every suite uses `sqlite::memory:`", and I began writing a
+`tests/pool_behaviour.rs` to close it. **That was wrong.** `src/db.rs` already carries a file-backed
+`#[cfg(test)]` module with eight tests: `connect_applies_all_four_pragmas`,
+`synchronous_normal_is_a_real_change_from_the_driver_default`,
+`foreign_keys_are_enforced_not_just_reported_as_on`, `the_sqlite_pool_holds_exactly_one_connection`,
+`wal_survives_reconnection`, and three more. The gap was in my search, not in the suite: I had
+grepped `tests/` and not `src/`.
+
+The half-written file was deleted rather than committed as duplicate coverage — Task 2's "ensure no
+duplicate tests are created" is the rule that caught it.
+
+## 2. Patterns adopted
+
+| Pattern | Source | Landed as |
+| :--- | :--- | :--- |
+| Two identical signed requests at once | `simply_ip_exporter::two_concurrent_identical_signed_requests_only_one_succeeds` | `two_concurrent_identical_signed_requests_only_one_succeeds` |
+| Two deletes of one resource at once | `simply_ip_exporter::two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed` | `two_concurrent_deletes_of_the_same_hook_do_not_both_report_success` |
+| Contended writes with an **exact** final row count | `simply_ip_vault::test_concurrent_batch_writes_under_wal` | `concurrent_writers_queue_cleanly_and_the_row_count_is_exact` |
+| Malformed body / path / query as contract tests | `simply_ip_exporter`'s three "normal error envelope" tests | `malformed_input_is_refused_and_reported_on_every_extractor` |
+| `#[ignore]` + **asserted** precondition instead of a silent skip | `simply_ip_sync/tests/live_feed_ingestion_tests.rs` | The sudo and setsid tests |
+| Counted, reported `skip()` | `simply_ip_sync/scripts/test_e2e.sh` | `skip()` + `SKIP_COUNT` in the summary |
+| `check_not_contains` | `simply_ip_exporter/scripts/test_e2e.sh` | Helper + a real use on `/api/settings` |
+| `tempfile` as a dev-dependency | All three | Added, with the rationale in `Cargo.toml` |
+
+**The unifying idea in the last three is one rule: a test that does nothing must not report the same
+green as a test that ran.** Three of our tests used to `return` early when `sudo`, `setsid`, or root
+permissions made them unobservable, reporting PASS while asserting nothing — worst on the host that
+lacked the dependency, which is the host where someone would want to know. `simply_ip_sync` states
+the rule outright in its live-feed header. The two tool-dependent tests are now `#[ignore]`d with the
+precondition **asserted** rather than guarded, so `cargo test` no longer claims that coverage and
+`cargo test -- --ignored` fails loudly on a host that cannot provide it. The root-permission guard
+stays as-is: it is about the runner's identity, not an optional dependency, and the test still
+asserts plenty when non-root.
+
+`cargo test -- --ignored` previously ran **zero** tests — a gate that passed vacuously. It now runs 2.
+
+## 3. A defect the adopted tests found
+
+**Two concurrent `DELETE /api/hooks/{id}` both returned `204`.**
+
+`delete_hook`'s soft path resolved the hook, authorized, then issued an unconditional
+`ActiveModel::update`. `resolve_hook` already refuses a trashed hook, so a *sequential* second delete
+is a `404` — the window is only reachable when two callers resolve a live hook and interleave.
+
+The row was not the damage: writing `is_deleted = true` twice leaves the same row. The **audit trail**
+was: each caller went on to write its own `HOOK_DELETE` entry, so one deletion produced two records
+and two operators each held proof they performed it.
+
+Fixed by making the write conditional on the row still being live and checking `rows_affected` — the
+same shape the **hard**-delete branch thirty lines above already used, so this brings one path in
+line with its neighbour rather than inventing a policy. The loser now takes the `404` it would have
+taken a moment later. The test asserts both halves: exactly one `204`, and exactly one `HOOK_DELETE`
+audit row.
+
+No sequential test could have found this, which is the point of the borrowed pattern: before this
+pass there was not one `tokio::spawn` or `JoinSet` anywhere in `tests/`.
+
+## 4. Two findings reported rather than fixed
+
+**Malformed input is refused, but not in the standard envelope.** The exporter asserts that a
+malformed body, an unparseable UUID path parameter, and a bad query parameter each come back as
+`{"error": …}`. Measured here, all three return **`400` with bare `text/plain`**:
+
+| Input | Status | Body |
+| :--- | :--- | :--- |
+| `{not json` to `POST /api/hooks` | 400 | `Failed to parse the request body as JSON: …` |
+| `GET /api/executions/not-a-uuid` | 400 | `Invalid URL: Cannot parse \`id\` …` |
+| `GET /api/executions?limit=abc` | 400 | `Failed to deserialize query string: …` |
+
+The status is right and the message names the problem, and that is what the new test asserts. The
+envelope is not asserted in either direction on purpose: writing `{"error": …}` would be a green test
+over a body this service does not produce, and pinning the plain text would enshrine a shape that
+probably should change. **The fix is small** — `AppError::BodyRejected` already exists to carry an
+extractor's status into the envelope, and `StrictJson` already uses it; applying `StrictJson` to the
+hook and execution routes would close the body case with no semantic change (`deny_unknown_fields` is
+a serde attribute on the payload type, not something `StrictJson` imposes). Left for a decision,
+because it changes the client contract on every hook route.
+
+**The 3 MiB body ceiling is no longer a shared figure.** `simply_ip_vault` has made its limit
+runtime-configurable (`MAX_BODY_SIZE_MIB`, default **10 MiB**) and derives its constant from that
+default, so the literal `3 * 1024 * 1024` is gone from that tree. The convergence gate reports this
+as a KNOWN divergence — correctly — but its recorded rationale still read *"Retired: peer adopted the
+3 MiB DefaultBodyLimit and the shared constant"*, which is the opposite of what happened, and
+`src/lib.rs` described 3 MiB as "the converged figure shared with `simply_ip_vault`". Both notes are
+corrected. The divergence itself is accepted: ours runs in the conservative direction, and a limit an
+operator can raise is a limit an operator can raise by mistake.
+
+## 5. Metrics
+
+| Gate | Before | After |
+| :--- | ---: | ---: |
+| `cargo test` | 285 passed, 0 ignored, 8 binaries | **287 passed, 2 ignored, 9 binaries** |
+| `cargo test -- --ignored` | 0 (vacuous) | **2 passed** |
+| `./scripts/test_e2e.sh` | 946 checks | **948 checks**, 0 skipped |
+| `./scripts/verify_convergence.sh` | 19 converged, 0 known | **18 converged, 1 known** (the body ceiling above) |
+
+Net Rust movement: +4 new tests in `tests/concurrency_and_contracts.rs`, −2 from the default run
+into the `--ignored` set. E2E: +2 checks, both `check_not_contains` on `/api/settings`.

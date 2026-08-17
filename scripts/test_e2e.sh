@@ -96,6 +96,9 @@ SHUTDOWN_SERVER_PID=""
 
 PASS_COUNT=0
 FAIL_COUNT=0
+# Sections that could not run for want of an optional host dependency. Reported in the summary so a
+# partial run never looks like a complete one — see `skip`.
+SKIP_COUNT=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -229,6 +232,42 @@ check_stdout_contains() {
         FAIL_COUNT=$((FAIL_COUNT + 1))
         echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (stdout lacked '$needle')" >&2
     fi
+}
+
+# Usage: check_not_contains "literal substring" "description"
+#
+# The negative counterpart to `check_stdout_contains`, over the *whole* response body rather than
+# `.stdout`, and the shape most security assertions actually need: "this response must not carry
+# that secret". Adopted from `example/simply_ip_exporter`, which pairs it with `check_contains`.
+#
+# Matched against the raw body, not through jq, so a value leaking in an unexpected *field* is still
+# caught — a jq path assertion only ever looks where you already suspected.
+check_not_contains() {
+    local needle="$1" description="$2"
+    if [ -z "$needle" ]; then
+        # An empty needle matches everything and would pass silently forever.
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (empty needle — the assertion is vacuous)" >&2
+        return
+    fi
+    if [[ "$RESP_BODY" == *"$needle"* ]]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (the body contains it)" >&2
+    else
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    fi
+}
+
+# Usage: skip "why this section did not run"
+#
+# A *counted, reported* skip. Adopted from `example/simply_ip_sync`, and it exists for the same
+# reason the two `#[ignore]`d Rust tests do: a section that quietly does nothing reports the same
+# green as one that ran, and it does so precisely on the host that lacks the dependency — the host
+# where someone would most want to know. `warn` alone scrolls past; this lands in the summary.
+skip() {
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    echo -e "$(ts)   ${YELLOW}⊘ SKIP${RESET} $*" >&2
 }
 
 # Usage: check_local "actual" "expected" "description" — for assertions about local state
@@ -1089,7 +1128,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     EXEC_KEY_ID="$ROTATED_KEY_ID"
     EXEC_SIGNING_SECRET="$ROTATED_SECRET"
 else
-    warn "Skipping §12: openssl is not available to compute an HMAC signature."
+    skip "§12 HMAC signature verification: openssl is not available to compute a signature."
 fi
 
 # ── 13. Webhook alias ───────────────────────────────────────────────────────
@@ -1278,6 +1317,21 @@ api_call GET "/api/settings" "$MASTER_KEY"
 check "200" "master reads the runtime configuration"
 check_jq ".allowed_env_vars | join(\",\")" "PATH" "the configured passthrough allowlist is reported"
 check_jq ".log_retention_days" "30" "the configured retention window is reported"
+
+# This endpoint reports the *effective configuration*, which is exactly the kind of surface that
+# grows a credential by accident: a future field echoing SIGNING_SECRET_KEY, or a bound key, would
+# be a one-line change that looks like an improvement. Asserted over the raw body rather than
+# through jq paths, because a jq assertion only ever looks where someone already suspected — the
+# leak worth catching is the one in a field nobody thought to check.
+check_not_contains "$MASTER_KEY" "the settings body never echoes the caller's own API key"
+# The signing secret is scraped from the bootstrap banner inside the openssl-gated §12, so it may
+# genuinely not exist on a host without openssl. Reported as a skip rather than assumed empty — an
+# empty needle would make `check_not_contains` vacuous, which is why that helper refuses one.
+if [ -n "${MASTER_SIGNING_SECRET:-}" ]; then
+    check_not_contains "$MASTER_SIGNING_SECRET" "nor any signing secret"
+else
+    skip "§19 signing-secret leak check: the master signing secret was never scraped (openssl absent)."
+fi
 # Which peers may speak for a client decides what every bound_ips check compares against, so an
 # operator must be able to read it back rather than infer it from the daemon's environment.
 check_jq ".trusted_proxies | join(\",\")" "$BIND_HOST/32,localhost" \
@@ -1837,7 +1891,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     check "200" "list keys after the rejected creation"
     check_true '[.[] | select(.name == "bogus_mode")] | length == 0' "no key was created with an invalid mode"
 else
-    warn "Skipping §24: openssl is not available to compute body-only signatures."
+    skip "§24 per-key HMAC modes: openssl is not available to compute body-only signatures."
 fi
 
 # ── 25. Large signed payloads & buffer limits ───────────────────────────────
@@ -4059,11 +4113,19 @@ check_jq ".status" "SUCCESS" "the executor is unaffected by the dropped connecti
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"
-echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
+echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}   ${YELLOW}Skipped: $SKIP_COUNT${RESET}" >&2
 
 if [ "$FAIL_COUNT" -gt 0 ]; then
     err "E2E suite FAILED ($FAIL_COUNT failing check(s))."
     exit 1
+fi
+
+# A skip is not a failure, but it is not coverage either. Saying so here is the whole point of
+# counting them: a run that skipped two sections must not read as identical to one that ran them.
+if [ "$SKIP_COUNT" -gt 0 ]; then
+    warn "E2E suite PASSED with $SKIP_COUNT skipped section(s) — this run did not exercise everything."
+    log "$PASS_COUNT checks succeeded."
+    exit 0
 fi
 
 log "E2E suite PASSED — all $PASS_COUNT checks succeeded."

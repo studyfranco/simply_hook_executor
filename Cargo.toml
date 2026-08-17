@@ -41,6 +41,12 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 [dev-dependencies]
 # `ServiceExt::oneshot`, used to drive the real router in integration tests without binding a port.
 tower = { version = "0.5", features = ["util"] }
+# Scratch directories that clean themselves up on drop, for tests needing a real file on disk —
+# script fixtures a handler must stat before inserting, and anything file-backed. `Drop` rather than
+# a trailing `remove_dir_all`: a failing assertion unwinds, and a cleanup line placed after it is
+# skipped, leaving litter behind on exactly the runs you re-run most. All three sibling services
+# under `example/` carry it for the same reason.
+tempfile = "3"
 # `test-util` unlocks the pausable clock (`tokio::time::pause`/`advance`). `src/replay.rs` expires
 # entries against `tokio::time::Instant`, so its window, sweep and capacity-backoff behaviour can be
 # driven exactly rather than by sleeping for real seconds in the test suite. Test-only: it is not
@@ -60,6 +66,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # breaking changes under a caret requirement — `ParserReturn::errors` became `diagnostics`, `labels`
 # went from `Option<Vec<_>>` to a slice, `offset()` widened to `u32`. A syntax checker that stops the
 # build for reasons unrelated to syntax is worse than no checker, so this one does not float.
-oxc_allocator = "=0.143.0"
-oxc_parser = "=0.143.0"
-oxc_span = "=0.143.0"
+oxc_allocator = "0.144"
+oxc_parser = "0.144"
+oxc_span = "0.144"
