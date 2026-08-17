@@ -610,6 +610,43 @@ would provide is application-level and covered by `s7_adversarial_dangling_linea
 
 ---
 
+## Verification surface — which suite covers what
+
+`src/` is only half the tree a future agent needs to navigate. The gates below are what hold every
+claim in this document true, and they cover deliberately different things: a property provable
+in-process is a Rust test, and a property that is only true of the *running binary* — startup
+refusals, signal handling, real child processes — belongs in the e2e suite, because a unit test
+cannot tell whether `main` actually honours it.
+
+| Gate | Size | Covers | Cannot cover |
+| :--- | :--- | :--- | :--- |
+| `cargo test` | **285** across 8 binaries | Handler logic through the real router (`oneshot`, no port), RBAC compliance, schema/referential integrity, health probes, source hygiene | Anything about the process: argv, signals, exit codes, real spawned children |
+| `scripts/test_e2e.sh` | **946 checks**, 46 sections | The live daemon over HTTP: hook lifecycle, parameter contracts, real script execution, the RBAC matrix, HMAC signing, timeouts and `killpg`, startup refusals, and the §42–§46 robustness set | Anything needing a second host, a real proxy, or a non-SQLite backend |
+| `scripts/verify_convergence.sh` | 19 checks | Behavioural drift against `example/simply_ip_vault` — three byte-identical functions, shared constants, and `RBAC_MODEL.md` identity | Anything the peer does not also implement |
+
+### E2E robustness sections (§42–§46)
+
+Added because the suite proved the API correct while proving nothing about the daemon under stress.
+Each exists for a failure mode nothing else in the tree would notice:
+
+| § | Covers | The failure it exists to catch |
+| :--- | :--- | :--- |
+| **42** | A hook wrapping a real system binary (`ls -la`) | `run_process` calls `env_clear()`, so **PATH is not inherited**. A hook calling `ls` by bare name works only because `/bin/sh` falls back to a compiled-in default — a property of the shell, not of this service, and one whose loss would break every coreutil-calling hook at once |
+| **43** | 10 MiB on stdout **and** stderr | Unbounded buffering. Asserts the `MAX_OUTPUT_BYTES` cap is enforced on *both* streams (~1 MiB each) and that the truncation marker is present — "it did not crash" is also satisfied by a daemon that buffered 20 MiB and got lucky |
+| **44** | 20 concurrent executions | `SQLITE_MAX_CONNECTIONS = 1` plus a database-wide write lock. Asserts zero 5xx and zero `database is locked`; 429 is a *correct* outcome (the master key's budget is 10), so the check is "success or deliberate throttling, nothing else" |
+| **45** | SIGTERM with a 15 s hook in flight | Three separable halves of graceful shutdown: the listener closes **at once**, in-flight work **runs to completion** (a half-finished deployment script is worse than none), and the process exits **0** rather than 143. Also asserts no orphaned child and that the retention worker was stopped |
+| **46** | Two kinds of client disconnect | Leaked tasks and parked workers. A half-open request with an unfulfilled `Content-Length`, plus an upload aborted mid-stream; then asserts the next requests are served *immediately* and that the truncated body created nothing |
+
+Two mechanics in those sections are load-bearing and easy to undo by accident:
+
+- **Never `wait` without arguments.** The API server is itself a background job, so a bare `wait`
+  blocks until the *server* exits — which it does not mid-run. §44 collects its curl PIDs in an
+  array and waits on each. Written the idiomatic way, the suite hangs with no output and no timeout.
+- **Raw sockets go in a subshell.** A failed `exec` redirection in the main shell of a
+  non-interactive bash terminates the script. §46 opens `/dev/tcp` inside `( … )`, as `port_in_use`
+  already does; the descriptor dying with the subshell is also exactly the connection cut being
+  tested.
+
 ## Where things are *not*
 
 A quick index for the questions that send people to the wrong file:

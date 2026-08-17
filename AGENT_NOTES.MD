@@ -5635,3 +5635,66 @@ is the point for a move that was meant to be behaviour-free · `./scripts/verify
 **19 converged, 0 known, 0 drifted, 0 skipped**, exit 0 · `SKIP_PEER_SYNC=1` path exercised ·
 `FILE_MAP.MD` re-verified exhaustive (13 crate-root files now, 40 total) · `git diff RBAC_MODEL.md`
 empty.
+
+---
+
+# 2026-08-11 (fourth pass) — E2E robustness: §42–§46
+
+Five new sections in `scripts/test_e2e.sh`. **893 → 946 checks (+53)**, 41 → 46 sections, 0 failures.
+
+The suite proved the API correct and proved nothing about the daemon under stress. Each section
+below covers a failure mode no other gate in this tree would notice, because each is a property of
+the *running process* rather than of a function.
+
+## What each section is actually for
+
+| § | Surface | The failure it exists to catch |
+| :--- | :--- | :--- |
+| 42 | `ls -la` wrapper | `run_process` calls `env_clear()`, so **PATH is not inherited**. A hook calling `ls` by bare name works only because `/bin/sh` falls back to a compiled-in default — a property of the shell, not of this service. If that ever stopped holding, every coreutil-calling hook in the wild would break at once and nothing else here would notice |
+| 43 | 10 MiB on stdout **and** stderr | Unbounded buffering. Asserted as the **cap being enforced** (~1 MiB per stream, truncation marker present) rather than as survival: "it did not crash" is also satisfied by a daemon that buffered 20 MiB and got lucky on a roomy machine |
+| 44 | 20 concurrent executions | `SQLITE_MAX_CONNECTIONS = 1` plus a database-wide write lock, with `busy_timeout=5000` as the only mitigation. Asserts zero 5xx and zero `database is locked` |
+| 45 | SIGTERM with a 15 s hook in flight | Three separable halves of graceful shutdown, each of which can fail alone |
+| 46 | Two kinds of client disconnect | Leaked tasks and parked workers |
+
+## Behaviour measured before it was asserted
+
+Every expectation below was probed against the real binary in a throwaway instance first. Writing
+the assertions from the design docs would have produced at least three wrong ones.
+
+| Question | Measured answer |
+| :--- | :--- |
+| What does a 10 MiB flood return? | `SUCCESS`, exit 0, **1 048 623 bytes** per stream — the 1 MiB cap plus `[output truncated: exceeded MAX_OUTPUT_BYTES]`. Not "large output"; *bounded* output |
+| Does SIGTERM abandon an in-flight hook? | **No.** The server waits for it, the caller still receives its execution record with `SUCCESS`, and the process exits **0** — not 143 |
+| Does it keep accepting during the drain? | **No.** The port refuses new connections within a second of the signal |
+| Do 20 concurrent executions produce lock errors? | **No.** 15 × 200, 5 × 429 (the master key's budget is 10), zero 5xx, zero `database is locked` in bodies or log |
+| Is `nc` available for a raw socket test? | **No** — exit 127. Rewritten on bash's `/dev/tcp`, which the suite already depends on in `port_in_use` |
+
+**429 is a correct outcome in §44, not a tolerated one.** The check is "every outcome is either
+success or deliberate throttling", so a future change that turned shed load into a 500 fails here
+even though the request count is unchanged.
+
+## Two bash traps this cost, both now commented at the site
+
+Worth recording because both are silent and both are the *idiomatic* spelling:
+
+1. **A bare `wait` hangs the suite forever.** The API server is itself a background job
+   (`SERVER_PID`), so argument-less `wait` blocks until the server exits — which it never does
+   mid-run. The first §44 draft hung with no output and no timeout until it was killed manually.
+   §44 now collects its curl PIDs in an array and waits on each.
+2. **A failed `exec` redirection in the main shell kills a non-interactive bash.** The first §46
+   draft opened `/dev/tcp` directly and **ended the suite between §45 and the summary** — exit 1, no
+   report, every earlier check discarded. The existing `port_in_use` already wraps its connect in a
+   subshell and says why; §46 now does the same, and the descriptor dying with the subshell *is* the
+   connection cut being tested.
+
+One assertion was wrong on the first run for a third reason: `/api/executions` filters on `hook`,
+not `hook_id`, and returns a **bare array** rather than an envelope. `?hook_id=` was silently
+ignored as an unknown query key, which would have quietly turned that check into an assertion about
+every execution in the run. Fixed to `?hook=fast_hook`, with a comment so the next person does not
+re-derive it.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` exit 0 ·
+`cargo test` **285 passed / 0 failed** across 8 binaries · `./scripts/test_e2e.sh` **946/946**,
+exit 0 · `bash -n scripts/test_e2e.sh` clean · `git diff RBAC_MODEL.md` empty.

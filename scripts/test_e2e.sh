@@ -89,6 +89,10 @@ SERVER_PID=""
 # both sides of the forwarding-header trust decision in one run.
 STRICT_SERVER_PID=""
 STRICT_BASE_URL=""
+# Third, short-lived instance booted by §45, which exists to be shut down. Declared here rather than
+# in the section because `cleanup` runs from an EXIT trap that can fire long before §45 does, and
+# under `set -u` an unset name there would turn any earlier failure into a confusing trap error.
+SHUTDOWN_SERVER_PID=""
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -292,6 +296,13 @@ pick_port() {
 }
 
 cleanup() {
+    # §45 clears this once its instance has exited on its own. A value still here means the section
+    # was interrupted, so the instance is stopped rather than left holding a port and a database.
+    if [ -n "$SHUTDOWN_SERVER_PID" ] && kill -0 "$SHUTDOWN_SERVER_PID" 2>/dev/null; then
+        log "Stopping shutdown-test server (pid $SHUTDOWN_SERVER_PID)..."
+        kill "$SHUTDOWN_SERVER_PID" 2>/dev/null || true
+        wait "$SHUTDOWN_SERVER_PID" 2>/dev/null || true
+    fi
     if [ -n "$STRICT_SERVER_PID" ] && kill -0 "$STRICT_SERVER_PID" 2>/dev/null; then
         log "Stopping strict-proxy server (pid $STRICT_SERVER_PID)..."
         kill "$STRICT_SERVER_PID" 2>/dev/null || true
@@ -3695,6 +3706,355 @@ api_call GET "/api/auth/me" "$R41_PEER_KEY"
 check "200" "§4 fetch the peer's own profile"
 check_true '[.hook_permissions[] | select(.can_view_execution == true)] | length == 1' \
     "§4 the profile reports can_view_execution so a client can render it"
+
+# ── 42. System binary execution (a wrapper around a real coreutil) ──────────
+
+log_section "42. System Binary Execution (ls wrapper)"
+
+# Everything above executes scripts this suite wrote. That leaves one thing unproven: whether a hook
+# can drive an *ordinary system binary* under the executor's own environment. It is not obvious that
+# it can. `run_process` builds its environment with `env_clear()` and re-adds only ALLOWED_ENV_VARS
+# plus the `HOOK_PARAM_*` injections, so **PATH is not inherited** — a hook calling `ls` by bare name
+# depends entirely on `/bin/sh` falling back to its compiled-in default PATH. That fallback is a
+# property of the shell, not of this service, and a hook author will absolutely write `ls` rather
+# than `/bin/ls`. If it ever stopped holding, every hook in the wild that calls a coreutil by name
+# would break at once and nothing else in this suite would notice.
+LS_SCRIPT=$(make_hook_script "ls_hook.sh" 'ls -la "${HOOK_PARAM_DIR:-.}"')
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "{\"name\":\"ls_hook\",\"script_path\":\"$LS_SCRIPT\",\"parameters\":[{\"param_key\":\"dir\",\"default_value\":\".\",\"is_required\":false}]}"
+check "200" "register a hook wrapping a system binary"
+LS_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$LS_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"dir":"/tmp"}}'
+check "200" "execute the ls wrapper against /tmp"
+check_jq ".status" "SUCCESS" "a system binary invoked by bare name resolves and succeeds"
+check_jq ".exit_code" "0" "the coreutil's own exit status is recorded"
+
+# `total <blocks>` is the header GNU and BusyBox `ls -la` both emit for a directory listing. Asserting
+# it — rather than merely that stdout is non-empty — is what distinguishes "ls ran" from "the shell
+# printed a not-found diagnostic and the script still exited 0".
+check_stdout_contains "total " "stdout carries the ls -la header, so the listing really happened"
+check_true '.stdout | contains("\n")' "a multi-line listing was captured, not a one-line error"
+check_jq ".stderr" "" "nothing was written to stderr"
+check_jq ".parameters.dir" "/tmp" "the supplied directory is recorded on the execution"
+
+# The declared default is what makes the parameter optional, and it has to survive the round trip
+# through the contract rather than being re-invented by the `${HOOK_PARAM_DIR:-.}` fallback in the
+# script. Those are two different defaults that happen to agree; this asserts the service's one.
+api_call POST "/api/hooks/$LS_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "the parameter is genuinely optional"
+check_jq ".status" "SUCCESS" "the declared default is substituted when the caller omits it"
+check_jq ".parameters.dir" "." "the recorded parameter is the contract's default, not the shell's"
+
+# ── 43. Output stream saturation ────────────────────────────────────────────
+
+log_section "43. Output Stream Saturation (10 MiB on both streams)"
+
+# A hook that prints more than the daemon can hold is not an exotic case — it is `set -x` left on, or
+# a build log, or a `find /`. The failure mode being tested for is unbounded buffering: if the pumps
+# accumulated everything a child writes, a single verbose hook would decide this daemon's memory
+# ceiling, and `max_concurrent_jobs` would bound *processes* while bounding nothing that matters.
+#
+# `MAX_OUTPUT_BYTES` (1 MiB by default) is the control, and the assertion below is deliberately about
+# the **cap** rather than about survival alone. "The daemon did not crash" is satisfied by a daemon
+# that buffered all 20 MiB and got lucky on a machine with free RAM; "stdout came back at 1 MiB when
+# the child wrote 10" can only be satisfied by the bound actually being enforced.
+FLOOD_SCRIPT=$(make_hook_script "flood_hook.sh" 'head -c 10485760 /dev/zero | tr "\0" "A"
+head -c 10485760 /dev/zero | tr "\0" "B" >&2')
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "{\"name\":\"flood_hook\",\"script_path\":\"$FLOOD_SCRIPT\",\"default_timeout_seconds\":120}"
+check "200" "register the flooding hook"
+FLOOD_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$FLOOD_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "20 MiB of child output does not fail the request"
+check_jq ".status" "SUCCESS" "the execution completes normally despite saturating both streams"
+check_jq ".exit_code" "0" "the child's exit status survives the flood"
+
+# Bounded, and bounded on *both* streams — a cap applied to stdout alone would leave stderr as the
+# unbounded path, which is the one a runaway `set -x` writes to.
+FLOOD_OUT_BYTES=$(echo "$RESP_BODY" | jq -r '.stdout' | wc -c)
+FLOOD_ERR_BYTES=$(echo "$RESP_BODY" | jq -r '.stderr' | wc -c)
+check_local "$([ "$FLOOD_OUT_BYTES" -lt 2097152 ] && echo bounded || echo unbounded)" "bounded" \
+    "stdout is capped well below the 10 MiB written ($FLOOD_OUT_BYTES bytes)"
+check_local "$([ "$FLOOD_ERR_BYTES" -lt 2097152 ] && echo bounded || echo unbounded)" "bounded" \
+    "stderr is capped well below the 10 MiB written ($FLOOD_ERR_BYTES bytes)"
+
+# The marker is the difference between a truncated log and a log that silently lies about being
+# complete. An operator reading 1 MiB of output has to be able to tell which one they have.
+check_true '.stdout | contains("[output truncated: exceeded MAX_OUTPUT_BYTES]")' \
+    "truncated stdout says so, so a partial log is never mistaken for a whole one"
+check_true '.stderr | contains("[output truncated: exceeded MAX_OUTPUT_BYTES]")' \
+    "truncated stderr says so too"
+
+# Persistence is the half that a purely in-memory test would miss: a ~1 MiB TEXT column per stream
+# still has to reach SQLite and come back out through the history endpoint.
+FLOOD_EXEC_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call GET "/api/executions/$FLOOD_EXEC_ID" "$MASTER_KEY"
+check "200" "the saturated execution was persisted and is readable back"
+check_jq ".status" "SUCCESS" "the stored row agrees with the response"
+check_true '(.stdout | length) > 1000' "the stored stdout survived the round trip to the database"
+
+# And the daemon is still the same process, still serving. A panic in a stream pump would have taken
+# the worker down without necessarily failing the request that caused it.
+api_call GET "/health"
+check "200" "the daemon is still serving after the flood"
+
+# ── 44. SQLite write concurrency ────────────────────────────────────────────
+
+log_section "44. Concurrent Execution Storm (SQLite write contention)"
+
+# `SQLITE_MAX_CONNECTIONS = 1`: every request in this service — the auth middleware's key lookup, the
+# execution row, the audit row — contends for a single pooled connection, and SQLite itself takes a
+# database-wide write lock. That is a deliberate design (see `src/db.rs`), and the risk it carries is
+# `SQLITE_BUSY` surfacing as a 500 under a burst. `busy_timeout=5000` is the mitigation; this section
+# is what proves the mitigation is load-bearing rather than aspirational.
+FAST_SCRIPT=$(make_hook_script "fast_hook.sh" 'echo ok')
+
+api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"fast_hook\",\"script_path\":\"$FAST_SCRIPT\"}"
+check "200" "register the lightweight hook"
+FAST_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+STORM_N=20
+STORM_DIR="$WORK_DIR/storm"
+mkdir -p "$STORM_DIR"
+# Collected explicitly, and never waited on with a bare `wait`. This suite keeps the API server
+# itself in the background ($SERVER_PID), so an argument-less `wait` would block until the *server*
+# exits — which it never does mid-run. That hangs the whole suite with no output and no timeout, and
+# it is an easy mistake to make because a bare `wait` is the idiom everywhere else.
+STORM_PIDS=()
+
+for i in $(seq 1 "$STORM_N"); do
+    # -m 30 so a genuinely wedged request fails the check instead of stalling the suite.
+    curl -s -m 30 -o "$STORM_DIR/body_$i" -w "%{http_code}" \
+        -X POST "$BASE_URL/api/hooks/$FAST_HOOK_ID/execute" \
+        -H "X-API-Key: $MASTER_KEY" -H "Content-Type: application/json" -d '{}' \
+        > "$STORM_DIR/status_$i" 2>/dev/null &
+    STORM_PIDS+=($!)
+done
+for pid in "${STORM_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+STORM_OK=0; STORM_THROTTLED=0; STORM_5XX=0; STORM_EMPTY=0
+for i in $(seq 1 "$STORM_N"); do
+    SC=$(cat "$STORM_DIR/status_$i" 2>/dev/null)
+    case "$SC" in
+        200) STORM_OK=$((STORM_OK + 1)) ;;
+        429) STORM_THROTTLED=$((STORM_THROTTLED + 1)) ;;
+        5??) STORM_5XX=$((STORM_5XX + 1)) ;;
+        *) STORM_EMPTY=$((STORM_EMPTY + 1)) ;;
+    esac
+done
+log "Storm outcome: $STORM_OK ok, $STORM_THROTTLED throttled, $STORM_5XX server errors, $STORM_EMPTY no-response"
+
+# 429 is a *correct* answer here, not a failure: the master key's default budget is 10 concurrent
+# jobs, so a 20-wide burst is expected to shed load. What must never appear is a 5xx — that is the
+# shape a lock timeout would take.
+check_local "$STORM_5XX" "0" "no request in a ${STORM_N}-wide burst failed with a server error"
+check_local "$STORM_EMPTY" "0" "every request in the burst got an HTTP response"
+check_local "$([ "$((STORM_OK + STORM_THROTTLED))" -eq "$STORM_N" ] && echo all || echo partial)" "all" \
+    "every outcome is either success or deliberate throttling"
+check_local "$([ "$STORM_OK" -ge 1 ] && echo yes || echo no)" "yes" \
+    "at least one execution completed rather than the burst being shed entirely"
+
+STORM_LOCKED=$(cat "$STORM_DIR"/body_* 2>/dev/null | grep -ci "database is locked" || true)
+check_local "$STORM_LOCKED" "0" "no response body mentions a SQLite lock"
+SERVER_LOCKED=$(grep -ci "database is locked" "$SERVER_LOG" 2>/dev/null || true)
+check_local "$SERVER_LOCKED" "0" "the server log records no SQLite lock contention"
+
+# Every accepted execution left a durable row: the burst must not have traded persistence for speed.
+# The filter is `hook` (an id *or* a name) and the body is a bare array — `?hook_id=` would be
+# silently ignored as an unknown query key, quietly turning this into an assertion about every
+# execution in the run rather than about this hook's.
+api_call GET "/api/executions?hook=fast_hook&limit=100" "$MASTER_KEY"
+check "200" "the burst's execution history is readable"
+check_true "length >= $STORM_OK" "every accepted execution was persisted"
+check_true 'all(.[]; .status == "SUCCESS")' "every persisted row from the burst recorded a clean run"
+
+# ── 45. Graceful shutdown ───────────────────────────────────────────────────
+
+log_section "45. Graceful Shutdown (SIGTERM with work in flight)"
+
+# `main.rs` wires `axum::serve(...).with_graceful_shutdown(shutdown_signal())`. The contract that
+# buys is precise, and each half is worth an assertion because they fail independently:
+#
+#   1. The listener closes at once, so no *new* work is accepted. A daemon that kept accepting
+#      during the drain would never finish draining under load.
+#   2. Work already in flight runs to completion. A hook is a side effect on the host — half a
+#      deployment script is worse than none — so abandoning it at the signal would be the
+#      destructive choice, not the safe one.
+#   3. The process then exits **0**, having also stopped the retention worker. An exit status of
+#      143 would mean the signal killed it rather than it choosing to stop.
+#
+# Run against its own instance and its own database: the whole point is to terminate the server, and
+# the primary instance has 40-odd sections' worth of state the rest of this suite still needs.
+SHUTDOWN_DB="$WORK_DIR/shutdown.db"
+SHUTDOWN_LOG="$WORK_DIR/shutdown_server.log"
+SHUTDOWN_HOOK_SCRIPT=$(make_hook_script "shutdown_sleeper.sh" 'sleep 15')
+SHUTDOWN_KEY="5147d0000000000000000000000000000000000000000000000000000051470d"
+SHUTDOWN_PORT=$((SERVER_PORT + 20))
+while port_in_use "$SHUTDOWN_PORT"; do SHUTDOWN_PORT=$((SHUTDOWN_PORT + 1)); done
+SHUTDOWN_URL="http://$BIND_HOST:$SHUTDOWN_PORT"
+
+DATABASE_URL="sqlite://$SHUTDOWN_DB?mode=rwc" RUST_LOG=info \
+    INITIAL_MASTER_KEY="$SHUTDOWN_KEY" BIND_HOST="$BIND_HOST" PORT="$SHUTDOWN_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_hook_executor" >"$SHUTDOWN_LOG" 2>&1 &
+SHUTDOWN_SERVER_PID=$!
+
+SHUTDOWN_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$SHUTDOWN_SERVER_PID" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "$SHUTDOWN_URL/api/hooks" 2>/dev/null)
+    case "$SC" in 200|401) SHUTDOWN_READY=1; break ;; esac
+    sleep 0.5
+done
+check_local "$SHUTDOWN_READY" "1" "the short-lived shutdown instance came up"
+
+if [ "$SHUTDOWN_READY" = "1" ]; then
+    SLEEPER_ID=$(curl -s -X POST "$SHUTDOWN_URL/api/hooks" -H "X-API-Key: $SHUTDOWN_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"sleeper\",\"script_path\":\"$SHUTDOWN_HOOK_SCRIPT\",\"default_timeout_seconds\":60}" \
+        2>/dev/null | jq -r '.id')
+    check_local "$([ -n "$SLEEPER_ID" ] && [ "$SLEEPER_ID" != "null" ] && echo created || echo missing)" \
+        "created" "registered a 15-second hook on the shutdown instance"
+
+    SLEEPER_RESP="$WORK_DIR/sleeper_resp.json"
+    curl -s -m 60 -o "$SLEEPER_RESP" -X POST "$SHUTDOWN_URL/api/hooks/$SLEEPER_ID/execute" \
+        -H "X-API-Key: $SHUTDOWN_KEY" -H "Content-Type: application/json" -d '{}' 2>/dev/null &
+    SLEEPER_CURL_PID=$!
+
+    # Long enough for the request to be accepted and the child spawned, short enough that the hook
+    # is unambiguously still running when the signal lands.
+    sleep 3
+    SLEEPER_RUNNING=$(pgrep -f "$SHUTDOWN_HOOK_SCRIPT" 2>/dev/null | wc -l)
+    check_local "$([ "$SLEEPER_RUNNING" -ge 1 ] && echo running || echo absent)" "running" \
+        "the hook's child process is alive when the signal is sent"
+
+    log "Sending SIGTERM to the shutdown instance (pid $SHUTDOWN_SERVER_PID)..."
+    kill -TERM "$SHUTDOWN_SERVER_PID" 2>/dev/null
+    sleep 1
+
+    # (1) The listener is gone immediately — the drain does not keep taking new work.
+    if port_in_use "$SHUTDOWN_PORT"; then
+        check_local "accepting" "refusing" "the listener stops accepting new connections at once"
+    else
+        check_local "refusing" "refusing" "the listener stops accepting new connections at once"
+    fi
+
+    # (2)+(3) It exits on its own, and the wait status says how. 0 = it chose to stop; 143 would mean
+    # SIGTERM killed it outright, which is the ungraceful outcome this test exists to exclude.
+    SHUTDOWN_EXITED=0
+    for _ in $(seq 1 120); do
+        if ! kill -0 "$SHUTDOWN_SERVER_PID" 2>/dev/null; then SHUTDOWN_EXITED=1; break; fi
+        sleep 0.5
+    done
+    check_local "$SHUTDOWN_EXITED" "1" "the server exits on its own after SIGTERM"
+
+    wait "$SHUTDOWN_SERVER_PID" 2>/dev/null
+    SHUTDOWN_STATUS=$?
+    check_local "$SHUTDOWN_STATUS" "0" "it exits cleanly rather than being killed by the signal"
+
+    # The in-flight execution was not abandoned: the caller still gets its record, with the hook's
+    # real outcome in it.
+    wait "$SLEEPER_CURL_PID" 2>/dev/null || true
+    SLEEPER_STATUS=$(jq -r '.status' "$SLEEPER_RESP" 2>/dev/null)
+    check_local "$SLEEPER_STATUS" "SUCCESS" "the in-flight hook ran to completion and answered its caller"
+
+    # Nothing outlives the daemon. An orphaned child would keep holding whatever the hook held.
+    sleep 1
+    SLEEPER_ORPHANS=$(pgrep -f "$SHUTDOWN_HOOK_SCRIPT" 2>/dev/null | wc -l)
+    check_local "$SLEEPER_ORPHANS" "0" "no hook process outlives the daemon that spawned it"
+
+    if grep -qF "Graceful shutdown complete." "$SHUTDOWN_LOG"; then
+        check_local "complete" "complete" "the shutdown path ran to its end and said so"
+    else
+        check_local "incomplete" "complete" "the shutdown path ran to its end and said so"
+    fi
+    if grep -qF "Stopping log retention worker" "$SHUTDOWN_LOG"; then
+        check_local "stopped" "stopped" "the background retention worker is stopped, not abandoned"
+    else
+        check_local "abandoned" "stopped" "the background retention worker is stopped, not abandoned"
+    fi
+fi
+SHUTDOWN_SERVER_PID=""
+
+# The primary instance is untouched by any of the above.
+api_call GET "/health"
+check "200" "the primary instance is unaffected by the second instance's shutdown"
+
+# ── 46. Interrupted connections ─────────────────────────────────────────────
+
+log_section "46. Interrupted Connection Resilience"
+
+# Clients vanish mid-request: a proxy times out, a laptop lid closes, a CI job is cancelled. What
+# must not happen is a leaked task or a held connection slot — a daemon that parks a worker on every
+# abandoned upload is one a bored client can wedge without ever completing a request.
+#
+# Two different cuts, because they exercise different code:
+#
+#   (a) A half-open request: headers promise `Content-Length: 4096`, a fragment of body arrives, and
+#       the socket closes. The body reader is left waiting for bytes that will never come.
+#   (b) A real client killed mid-upload of a large body, which is the same shape a cancelled `curl`
+#       produces in practice.
+#
+# Written with bash's own `/dev/tcp` rather than `nc`, which is not a dependency of this suite and is
+# absent on plenty of minimal images — the same reason `port_in_use` is written that way.
+# The socket work happens inside a subshell, exactly as `port_in_use` does it and for the same
+# reason: a failed `exec` redirection in the *main* shell of a non-interactive bash terminates the
+# script outright. Written the direct way, this section ended the suite here — after §45 and before
+# the summary — with an exit status and no report. In a subshell the descriptor dies with the child,
+# which is also precisely the connection cut being tested.
+CUT_ISSUED=0
+if (
+    exec 9<>"/dev/tcp/$BIND_HOST/$SERVER_PORT" || exit 1
+    printf 'POST /api/hooks HTTP/1.1\r\nHost: %s:%s\r\nX-API-Key: %s\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{"name":"this_body_never_arrives"' \
+        "$BIND_HOST" "$SERVER_PORT" "$MASTER_KEY" >&9
+) 2>/dev/null; then
+    CUT_ISSUED=1
+fi
+check_local "$CUT_ISSUED" "1" "a truncated request with an unfulfilled Content-Length was issued"
+
+CUT_PAYLOAD="$WORK_DIR/cut_payload.bin"
+head -c 2000000 /dev/zero | tr '\0' 'x' > "$CUT_PAYLOAD"
+# Aborts the transfer well before 2 MB can be sent. curl exits non-zero (28, timed out); the
+# interesting party is the server, not curl, so the exit status is deliberately not asserted.
+curl -s -m 0.25 -o /dev/null -X POST "$BASE_URL/api/hooks" \
+    -H "X-API-Key: $MASTER_KEY" -H "Content-Type: application/json" \
+    --data-binary "@$CUT_PAYLOAD" >/dev/null 2>&1 || true
+log "Issued an upload aborted mid-stream."
+
+# "Immediately afterwards", with no grace period and no retry loop: a daemon that needs a moment to
+# recover from a dropped connection is a daemon whose recovery is a race.
+api_call GET "/health"
+check "200" "liveness answers immediately after both connection cuts"
+api_call GET "/ready"
+check "200" "readiness answers, so the database handle was not lost with the connection"
+check_jq ".database" "up" "the pool is still up after the interrupted writes"
+
+api_call GET "/api/hooks" "$MASTER_KEY"
+check "200" "an authenticated request succeeds immediately after the cuts"
+
+# The truncated POST must not have been *acted on*. It named a hook; a partial body that got parsed
+# anyway would be a far worse bug than a leaked connection.
+check_true '[.[] | select(.name == "this_body_never_arrives")] | length == 0' \
+    "the abandoned request created nothing"
+
+# Throughput is unchanged: three sequential requests still complete promptly, which is the observable
+# form of "no worker was parked". A leaked task holding the single pooled connection would show up
+# here as a stall, not as an error.
+CUT_T0=$(date +%s)
+for _ in 1 2 3; do
+    curl -s -m 10 -o /dev/null -w "" "$BASE_URL/health" 2>/dev/null || true
+done
+CUT_ELAPSED=$(( $(date +%s) - CUT_T0 ))
+check_local "$([ "$CUT_ELAPSED" -le 5 ] && echo prompt || echo stalled)" "prompt" \
+    "subsequent requests are served without delay (${CUT_ELAPSED}s for three)"
+
+# And a full execution still runs end to end — the path that touches the database twice.
+api_call POST "/api/hooks/$FAST_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "a full execution round trip still works after the interruptions"
+check_jq ".status" "SUCCESS" "the executor is unaffected by the dropped connections"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
