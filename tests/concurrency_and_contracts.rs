@@ -295,29 +295,66 @@ async fn concurrent_writers_queue_cleanly_and_the_row_count_is_exact() {
     assert_eq!(contested_rows, 1, "the unique index left exactly one row behind");
 }
 
-/// Malformed input on any of the three extractors is **refused, reported, and survivable**.
+/// Asserts one refusal is a real `{"error": …}` JSON document, not merely a correct status.
+///
+/// Three separate properties, because they fail independently and a partial fix would satisfy any
+/// two of them: the **status**, the **`Content-Type`** (a client picks its parser from this header
+/// before it ever looks at the bytes), and an `error` field carrying **non-empty text** (an envelope
+/// whose message is blank is a machine-readable way of saying nothing).
+fn assert_error_envelope(response: &TestResponse, expected: StatusCode, context: &str) {
+    assert_eq!(
+        response.status, expected,
+        "{context}: expected {expected}, got {} — body: {}",
+        response.status, response.raw
+    );
+    assert_eq!(
+        response.content_type.as_deref().map(|ct| ct.starts_with("application/json")),
+        Some(true),
+        "{context}: refusals must be served as application/json, got {:?} — a client picks its \
+         parser from this header before it reads a byte of the body",
+        response.content_type
+    );
+    let message = response
+        .json
+        .get("error")
+        .unwrap_or_else(|| panic!("{context}: no `error` field in {}", response.raw));
+    let text = message
+        .as_str()
+        .unwrap_or_else(|| panic!("{context}: `error` must be a string, got {message}"));
+    assert!(
+        !text.trim().is_empty(),
+        "{context}: the envelope carried an empty message, which tells a caller nothing"
+    );
+}
+
+/// Malformed input on **every** extractor is refused in the standard envelope.
 ///
 /// Adapted from `simply_ip_exporter`, which covers a malformed body, an unparseable UUID path
-/// parameter, and an oversized body as three separate contract tests. The three exercise different
-/// Axum extractors and fail in different places, so a service can easily handle one and panic on
-/// another.
+/// parameter, and a bad query as three separate contract tests. They exercise different Axum
+/// extractors and fail in different places, so a service can easily handle one and leak plain text
+/// from another — which is exactly what this service used to do on all three.
 ///
-/// # A divergence from the peer, stated rather than asserted
+/// # Why this is a security-adjacent contract and not cosmetics
 ///
-/// The exporter additionally asserts each refusal arrives in the standard `{"error": …}` envelope.
-/// **This service does not do that for these three cases** — they are rendered by Axum's own
-/// rejections as bare `text/plain`. The status is right and the message names the problem, which is
-/// what is asserted below; the envelope divergence is recorded as a finding in `AGENT_NOTES.MD`
-/// rather than being asserted here in either direction, because writing it as `{"error": …}` would
-/// be a green test over a body this service does not produce, and writing it as plain text would
-/// pin a shape that should probably change.
+/// A refusal a client cannot parse is a refusal a client cannot *act* on. The three inputs below are
+/// the most common things a caller gets wrong — a truncated body, a mistyped identifier, a bad
+/// filter — and before this they were the only refusals in the service that arrived as bare
+/// `text/plain`, with no `error` field for a client written against the documented envelope. Worse,
+/// they are produced *before any handler runs*, so no handler test covered them: the gap was
+/// invisible from inside the code that appeared to own those routes.
+///
+/// The sweep is deliberately over every extractor rather than a representative one. The contract is
+/// "every refusal looks the same", and a contract verified at one of five sites is a contract with
+/// four places left to drift.
 #[tokio::test]
-async fn malformed_input_is_refused_and_reported_on_every_extractor() {
+async fn malformed_input_is_refused_in_the_json_envelope_on_every_extractor() {
     let db = setup_test_db().await;
     let (master_id, master_key) = insert_key(&db, "Fuzzer", "", KeyScopes::master()).await;
+    let (_dir, script) = noop_script();
+    let hook_id = insert_hook(&db, "probe", &script, 30).await;
     let app = simply_hook_executor::create_app(test_state(&db).with_pinned_master(master_id));
 
-    // 1. A body that is not JSON at all.
+    // 1. `StrictJson` — a body that is not JSON at all.
     let broken_body = with_connect_info(
         axum::http::Request::builder()
             .method("POST")
@@ -328,33 +365,56 @@ async fn malformed_input_is_refused_and_reported_on_every_extractor() {
     .body(axum::body::Body::from("{not json"))
     .expect("the request builds");
     let response = send(&app, broken_body).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "a non-JSON body is a 400");
+    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "malformed JSON body");
     assert!(
-        response.raw.to_lowercase().contains("json"),
-        "the refusal should name the problem, got: {}",
+        response.field("error").as_str().unwrap_or_default().to_lowercase().contains("json"),
+        "the message should still name the problem — wrapping the shape must not withhold the \
+         reason: {}",
         response.raw
     );
 
-    // 2. A path parameter that cannot be a UUID. This is rejected by the extractor before the
-    //    handler runs, which is exactly why it is worth a test: no handler code is involved, so no
-    //    handler test covers it.
+    // 2. `StrictPath` — a path parameter that cannot be a UUID.
     let response = send(&app, json_request("GET", "/api/executions/not-a-uuid", &master_key, None)).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "an unparseable UUID path param is a 400");
-    assert!(
-        !response.raw.is_empty(),
-        "the refusal must say something rather than returning an empty body"
-    );
+    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "unparseable UUID path parameter");
 
-    // 3. A query parameter of the wrong type.
+    // 3. `StrictPath` again, on a *tuple* path. Two-parameter routes deserialize through a different
+    //    code path than single ones, so one working proves little about the other.
+    let response = send(
+        &app,
+        json_request("DELETE", "/api/hooks/probe/parameters/not-a-uuid", &master_key, None),
+    )
+    .await;
+    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "unparseable UUID in a tuple path");
+
+    // 4. `StrictQuery` — a query parameter of the wrong type.
     let response = send(&app, json_request("GET", "/api/executions?limit=abc", &master_key, None)).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "a non-numeric limit is a 400");
+    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "non-numeric query parameter");
 
-    // 4. The service is unharmed by all three — the point of the sweep. A rejection that poisoned
+    // 5. `StrictBytes` — the raw-body routes. Their rejection type is different again, and they are
+    //    the endpoints most likely to receive a body worth rejecting.
+    let oversized = with_connect_info(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/hooks/{hook_id}/execute"))
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"),
+    )
+    .body(axum::body::Body::from(vec![
+        b'a';
+        simply_hook_executor::MAX_REQUEST_BODY_BYTES + 1024
+    ]))
+    .expect("the request builds");
+    let response = send(&app, oversized).await;
+    // Status is Axum's, not flattened: an oversized body is `413`, and demoting it to `400` would
+    // lose the one piece of information that tells a client to send less rather than send different.
+    assert_error_envelope(&response, StatusCode::PAYLOAD_TOO_LARGE, "oversized raw body");
+
+    // 6. The service is unharmed by all of it — the point of the sweep. A rejection that poisoned
     //    shared state would show up here and nowhere else.
     let response = send(&app, json_request("GET", "/api/hooks", &master_key, None)).await;
     assert_eq!(
         response.status,
         StatusCode::OK,
-        "an ordinary request still succeeds after three malformed ones"
+        "an ordinary request still succeeds after five malformed ones"
     );
 }

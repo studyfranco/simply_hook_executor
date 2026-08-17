@@ -7,7 +7,7 @@
 
 use axum::{
     Extension,
-    extract::{Json, Path, Query, State},
+    extract::{Json, State},
     response::IntoResponse,
 };
 use chrono::Utc;
@@ -22,6 +22,7 @@ use crate::entities::{
     api_key, api_key_hook_permission, hook, hook_parameter, prelude::*,
 };
 use crate::error::AppError;
+use crate::extract::{StrictJson, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 use crate::executor;
@@ -220,7 +221,7 @@ pub async fn create_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateHookPayload>,
+    StrictJson(payload): StrictJson<CreateHookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_hooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -354,7 +355,7 @@ pub struct ListHooksQuery {
 pub async fn list_hooks(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Query(params): Query<ListHooksQuery>,
+    StrictQuery(params): StrictQuery<ListHooksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let include_deleted = params.include_deleted.unwrap_or(false);
     guard_master_for_deleted_view(&key, include_deleted)?;
@@ -386,8 +387,8 @@ pub async fn list_hooks(
 pub async fn get_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Path(identifier): Path<String>,
-    Query(params): Query<ListHooksQuery>,
+    StrictPath(identifier): StrictPath<String>,
+    StrictQuery(params): StrictQuery<ListHooksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let include_deleted = params.include_deleted.unwrap_or(false);
     guard_master_for_deleted_view(&key, include_deleted)?;
@@ -406,8 +407,8 @@ pub async fn update_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(identifier): Path<String>,
-    Json(payload): Json<UpdateHookPayload>,
+    StrictPath(identifier): StrictPath<String>,
+    StrictJson(payload): StrictJson<UpdateHookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     guard_manage(&state.db, &key, &model).await?;
@@ -545,8 +546,8 @@ pub async fn delete_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(identifier): Path<String>,
-    Query(query): Query<DeleteHookQuery>,
+    StrictPath(identifier): StrictPath<String>,
+    StrictQuery(query): StrictQuery<DeleteHookQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let hard = query.hard.unwrap_or(false);
     // A hard delete may target something already in the trash, which is the normal way an operator
@@ -650,7 +651,7 @@ pub async fn restore_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(identifier): Path<String>,
+    StrictPath(identifier): StrictPath<String>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(
@@ -701,7 +702,7 @@ pub async fn purge_deleted_hooks(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Query(query): Query<PurgeQuery>,
+    StrictQuery(query): StrictQuery<PurgeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(
@@ -755,7 +756,7 @@ pub struct UpdateParameterPayload {
 pub async fn list_hook_parameters(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Path(identifier): Path<String>,
+    StrictPath(identifier): StrictPath<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     guard_visibility(&state.db, &key, &model).await?;
@@ -767,8 +768,8 @@ pub async fn create_hook_parameter(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(identifier): Path<String>,
-    Json(payload): Json<ParameterInput>,
+    StrictPath(identifier): StrictPath<String>,
+    StrictJson(payload): StrictJson<ParameterInput>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     guard_manage(&state.db, &key, &model).await?;
@@ -830,8 +831,8 @@ pub async fn update_hook_parameter(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path((identifier, param_id)): Path<(String, Uuid)>,
-    Json(payload): Json<UpdateParameterPayload>,
+    StrictPath((identifier, param_id)): StrictPath<(String, Uuid)>,
+    StrictJson(payload): StrictJson<UpdateParameterPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     guard_manage(&state.db, &key, &model).await?;
@@ -879,7 +880,7 @@ pub async fn delete_hook_parameter(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path((identifier, param_id)): Path<(String, Uuid)>,
+    StrictPath((identifier, param_id)): StrictPath<(String, Uuid)>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     guard_manage(&state.db, &key, &model).await?;

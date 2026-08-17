@@ -8,7 +8,7 @@
 
 use axum::{
     Extension,
-    extract::{Json, Path, Query, State},
+    extract::{Json, State},
     response::IntoResponse,
 };
 use sea_orm::{
@@ -23,6 +23,7 @@ use crate::entities::{
     execution::ExecutionStatus, prelude::*,
 };
 use crate::error::AppError;
+use crate::extract::{StrictBytes, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 use crate::executor;
@@ -146,8 +147,8 @@ pub async fn execute_hook_endpoint(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(identifier): Path<String>,
-    body: axum::body::Bytes,
+    StrictPath(identifier): StrictPath<String>,
+    StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
     run_hook_request(state, key, client_ip.0, &identifier, &body).await
 }
@@ -158,8 +159,8 @@ pub async fn webhook_execute(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(identifier): Path<String>,
-    body: axum::body::Bytes,
+    StrictPath(identifier): StrictPath<String>,
+    StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
     run_hook_request(state, key, client_ip.0, &identifier, &body).await
 }
@@ -191,8 +192,8 @@ pub struct TestHookResponse {
 pub async fn test_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Path(identifier): Path<String>,
-    body: axum::body::Bytes,
+    StrictPath(identifier): StrictPath<String>,
+    StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
     let hook_model = resolve_hook(&state.db, &identifier).await?;
     // `can_execute`, not merely visibility: a dry run reveals the fully-resolved command line and
@@ -268,7 +269,7 @@ pub(crate) fn parse_status(raw: &str) -> Result<ExecutionStatus, AppError> {
 pub async fn list_executions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Query(query): Query<ExecutionQuery>,
+    StrictQuery(query): StrictQuery<ExecutionQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut q = Execution::find().order_by_desc(execution::Column::Timestamp);
 
@@ -321,7 +322,7 @@ pub async fn list_executions(
 pub async fn get_execution(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     // §4, third scope. `404` rather than `403` per oracle discipline: a record the caller may not
@@ -345,7 +346,7 @@ pub async fn delete_execution(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     // The parent hook is loaded rather than passed by id because authority over an execution record
@@ -403,7 +404,7 @@ pub async fn purge_executions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Query(query): Query<PurgeQuery>,
+    StrictQuery(query): StrictQuery<PurgeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(

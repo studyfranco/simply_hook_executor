@@ -24,7 +24,7 @@
 
 use axum::{
     Extension,
-    extract::{Json, Path, State},
+    extract::{Json, State},
     response::IntoResponse,
 };
 use chrono::Utc;
@@ -39,7 +39,7 @@ use crate::entities::{
     api_key, api_key::HmacMode, api_key_hook_permission, hook, prelude::*,
 };
 use crate::error::AppError;
-use crate::extract::{OptionalStrictJson, StrictJson};
+use crate::extract::{OptionalStrictJson, StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -628,7 +628,7 @@ pub async fn update_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
@@ -837,7 +837,7 @@ pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     OptionalStrictJson(payload): OptionalStrictJson<DeleteApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
 
@@ -995,7 +995,7 @@ pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -1075,8 +1075,8 @@ pub async fn update_key_hook_permissions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<HookPermInput>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<HookPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
     // Both halves of R2, as far as they can be known before the payload is parsed: the global flag,
     // and a manage row on *some* hook. Which hook is not known yet, so
@@ -1218,7 +1218,7 @@ pub async fn revoke_key_hook_permission(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path((id, hook_identifier)): Path<(Uuid, String)>,
+    StrictPath((id, hook_identifier)): StrictPath<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     // Same standing check as the grant path, for the same reason: a caller with no administrative
     // role at all must not be able to probe key UUIDs by reading `404` instead of `403`.

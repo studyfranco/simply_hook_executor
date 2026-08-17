@@ -308,7 +308,8 @@ rejection; `OptionalStrictJson` additionally treats an **empty body** as `T::def
 what lets `DELETE /api/keys/{id}` be called with no body at all on the first request and with a §6
 resolution map on the resubmission.
 
-**Key exports.** `StrictJson`, `OptionalStrictJson`.
+**Key exports.** `StrictJson`, `OptionalStrictJson`, `StrictPath`, `StrictQuery`, `StrictBytes` —
+one per extractor any handler in this service uses, and handlers use **nothing else**.
 
 **Rationale — why this is a crate-root module and not part of `api/support.rs`.** These are not
 helpers. `StrictJson` is the mechanism that turns `#[serde(deny_unknown_fields)]` from an annotation
@@ -323,9 +324,20 @@ service's domain. `simply_ip_vault` places the identical pair in its own `src/ex
 placement closes structural divergence **S2** and gives both services one address for "how does a
 body become a typed payload here".
 
-**Invariant worth preserving.** Both extractors pass the rejection's **own status** through rather
+**The contract, and why completeness is the whole point.** Every refusal this service produces is
+`{"error": "…"}` served as `application/json`. That held for everything a *handler* returned and, until
+the extractors were wrapped, for nothing rejected **before** one ran — a malformed body, a mistyped
+UUID, a bad query value and an oversized raw body all came back with the right status and a bare
+`text/plain` body carrying no `error` field. Those are the most common things a caller gets wrong,
+which made them the worst place for the contract to lapse, and because no handler is involved no
+handler test could see it. A single bare `Path<Uuid>` left in a handler reopens it for that route, so
+the rule is that `src/api/` imports its extractors from here and never from `axum::extract`.
+
+**Invariant worth preserving.** Every extractor passes the rejection's **own status** through rather
 than flattening it to `400`. The router-wide `DefaultBodyLimit` surfaces here as a rejection too, so
-flattening would silently demote `413 Payload Too Large` into an indistinguishable bad request.
+flattening would silently demote `413 Payload Too Large` into an indistinguishable bad request — and
+`PathRejection::MissingPathParams` is a `500` describing a defect in *this service*, which must never
+be reported to a caller as their bad request.
 
 ---
 
@@ -622,7 +634,7 @@ cannot tell whether `main` actually honours it.
 | :--- | :--- | :--- | :--- |
 | `cargo test` | **287** across 9 binaries, **2 ignored** | Handler logic through the real router (`oneshot`, no port), RBAC compliance, schema/referential integrity, health probes, source hygiene, request races | Anything about the process: argv, signals, exit codes, real spawned children |
 | `cargo test -- --ignored` | **2** | The two tests needing a host tool — `sudo` and `setsid(1)`. They **assert** their precondition rather than skipping, so a host without the tool fails loudly instead of reporting a pass over nothing | Nothing else; it is a deliberate opt-in set |
-| `scripts/test_e2e.sh` | **948 checks**, 46 sections | The live daemon over HTTP: hook lifecycle, parameter contracts, real script execution, the RBAC matrix, HMAC signing, timeouts and `killpg`, startup refusals, and the §42–§46 robustness set | Anything needing a second host, a real proxy, or a non-SQLite backend |
+| `scripts/test_e2e.sh` | **958 checks**, 47 sections | The live daemon over HTTP: hook lifecycle, parameter contracts, real script execution, the RBAC matrix, HMAC signing, timeouts and `killpg`, startup refusals, the §42–§46 robustness set, and the §47 error-envelope contract | Anything needing a second host, a real proxy, or a non-SQLite backend |
 | `scripts/verify_convergence.sh` | 19 checks (18 converged, 1 accepted divergence) | Behavioural drift against `example/simply_ip_vault` — three byte-identical functions, shared constants, and `RBAC_MODEL.md` identity | Anything the peer does not also implement |
 
 ### E2E robustness sections (§42–§46)
@@ -650,7 +662,7 @@ callers interleaving between the check and the act.
 | `two_concurrent_identical_signed_requests_only_one_succeeds` | `simply_ip_exporter` | A replay ledger that reads then inserts, making "single use" mean "usually single use" |
 | `two_concurrent_deletes_of_the_same_hook_do_not_both_report_success` | `simply_ip_exporter` | **Found a real defect** — two `204`s and two `HOOK_DELETE` audit rows for one deletion. Fixed by making the soft delete conditional on the row still being live, matching the hard-delete branch |
 | `concurrent_writers_queue_cleanly_and_the_row_count_is_exact` | `simply_ip_vault` | A lost write, a double insert, or a queued writer giving up with `SQLITE_BUSY`. Two phases: disjoint names for throughput, one contested name for the uniqueness race |
-| `malformed_input_is_refused_and_reported_on_every_extractor` | `simply_ip_exporter` | A panic or hang on garbage input across the body, path and query extractors |
+| `malformed_input_is_refused_in_the_json_envelope_on_every_extractor` | `simply_ip_exporter` | A refusal a client cannot parse. Asserts status, `Content-Type: application/json`, and a non-empty `error` string across all five extractors |
 
 **Note on the production pool.** That file does *not* test `db::connect`, WAL or `busy_timeout`,
 despite those being invisible to every `sqlite::memory:` fixture — because `src/db.rs` already

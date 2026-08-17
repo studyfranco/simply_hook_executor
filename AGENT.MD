@@ -16,9 +16,10 @@ To keep this context clean and modular, responsibilities are split across three 
 
 ## 🔄 Peer Repository Synchronization
 
-`example/` holds **live git clones** of the peer services (today: `example/simply_ip_vault`), not flat snapshots. They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
+`example/` holds **live git clones** of the peer services, not flat snapshots.
+They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
 
-### The directive
+### Mandatory: pull before you analyse
 
 **Before reading any file under `example/`, and before generating a convergence, parity, or security report, you MUST run:**
 
@@ -101,8 +102,24 @@ That automation does **not** discharge the directive above. The script syncs onl
 | `api/system.rs` | The effective runtime configuration and instance counters | Master-only. Split from `audit.rs` because a shared audience is the weakest reason to share a file |
 | `api/health.rs` | Liveness and readiness probes | **The only unauthenticated routes in the service.** Must disclose nothing an anonymous caller could not already infer |
 
-**The strict JSON extractors are deliberately *outside* `src/api/`.** `StrictJson` and
-`OptionalStrictJson` live in **`src/extract.rs`**, a crate-root module, and must stay there. Three
+**Handlers import every extractor from `src/extract.rs`, never from `axum::extract`.** There is one
+wrapper per extractor this service uses — `StrictJson`, `OptionalStrictJson`, `StrictPath`,
+`StrictQuery`, `StrictBytes` — and each renders its rejection as `{"error": "…"}` with
+`Content-Type: application/json`, preserving Axum's own status. `axum::extract::{Json, State}` may
+still be imported for *responses* and for `State`; what must not appear in a handler signature is a
+bare `Path<T>`, `Query<T>`, `Json<T>` or `Bytes`.
+
+**This is a completeness rule, not a style preference.** Every refusal in this service is the
+`{"error": …}` envelope. That held for everything a handler returned and, before the wrappers, for
+nothing rejected *before* one ran: a malformed body, a mistyped UUID, a bad query value and an
+oversized raw body were refused with the right status and a bare `text/plain` body carrying no
+`error` field. Those are the most common things a caller gets wrong, and because no handler is
+involved, **no handler test can see the gap**. One bare `Path<Uuid>` reopens it for that route.
+`tests/concurrency_and_contracts.rs` and e2e §47 assert the envelope on all five extractors rather
+than on a representative one, because a contract verified at one of five sites has four places left
+to drift.
+
+**They are deliberately *outside* `src/api/`**, in a crate-root module, and must stay there. Three
 reasons, in order of weight:
 
 1. **They enforce a `RBAC_MODEL.md` §5 control, so they are not plumbing.** §5 requires that
@@ -115,7 +132,7 @@ reasons, in order of weight:
 3. **An Axum `FromRequest` impl is a framework concern, not a domain one.** Keeping it under `api/`
    filed HTTP plumbing inside the tree that models this service's domain.
 
-`simply_ip_vault` has always placed the identical pair in its own `src/extract.rs`. This placement
+`simply_ip_vault` has always placed the strict JSON pair in its own `src/extract.rs`. This placement
 closes structural divergence **S2** and gives both services one address for "how does a body become a
 typed payload here". Moving them back into `api/` would reopen it.
 

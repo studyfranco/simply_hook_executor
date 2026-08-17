@@ -5819,3 +5819,87 @@ operator can raise is a limit an operator can raise by mistake.
 
 Net Rust movement: +4 new tests in `tests/concurrency_and_contracts.rs`, −2 from the default run
 into the `--ignored` set. E2E: +2 checks, both `check_not_contains` on `/api/settings`.
+
+---
+
+# 2026-08-17 (second pass) — Every 400 now returns the JSON error envelope
+
+Closes the finding raised by the previous pass's reference-project audit: refusals produced *before*
+a handler ran were the only ones in the service that did not use the `{"error": …}` envelope.
+
+## What was broken, and why nothing caught it
+
+Every documented failure in this service is `{"error": "<message>"}` served as `application/json`.
+That held for everything a **handler** returned. It did not hold for anything Axum's own extractors
+rejected, and those rejections are exactly the most common caller mistakes:
+
+| Input | Before | After |
+| :--- | :--- | :--- |
+| `{not json` to `POST /api/hooks` | `400` + `text/plain` | `400` + `{"error": "Failed to parse the request body as JSON: …"}` |
+| `GET /api/executions/not-a-uuid` | `400` + `text/plain` | `400` + envelope |
+| `DELETE /api/hooks/x/parameters/not-a-uuid` (tuple path) | `400` + `text/plain` | `400` + envelope |
+| `GET /api/executions?limit=abc` | `400` + `text/plain` | `400` + envelope |
+| `GET /api/hooks?include_deleted=maybe` | `400` + `text/plain` | `400` + envelope |
+| 10 MiB body on an execute route | `413` + `text/plain` | `413` + envelope |
+
+**No handler test could have caught this, because no handler is involved.** The rejection happens
+during extraction; the handler never runs. That is what let a documented, otherwise universal API
+contract have a hole in it for the entire life of the codebase, and it is why the gap surfaced only
+when a sibling project (`simply_ip_exporter`) was found asserting the property directly.
+
+## The fix
+
+One wrapper per extractor in `src/extract.rs`, joining the two that were already there:
+
+| Wrapper | Wraps | Rejection type |
+| :--- | :--- | :--- |
+| `StrictJson` / `OptionalStrictJson` | `Json<T>` | `JsonRejection` |
+| `StrictPath` | `Path<T>` | `PathRejection` |
+| `StrictQuery` | `Query<T>` | `QueryRejection` |
+| `StrictBytes` | `Bytes` | `BytesRejection` |
+
+All 28 handler parameter positions across `api/{audit,executions,hooks,keys}.rs` were switched.
+`axum::extract::Json` is still imported where it is used to build a *response*; what no longer
+appears in any handler signature is a bare `Path<T>`, `Query<T>`, `Json<T>` or `Bytes`.
+
+**Wrappers rather than one piece of middleware.** A middleware sees the response after the fact — a
+`400` carrying `text/plain` — and would have to *guess* whether that body is an extractor rejection
+worth rewriting or a handler's deliberate output. Rewriting by inspection is the kind of rule that
+silently mangles a future endpoint that legitimately returns text. Wrapping at the extraction point
+keeps the decision where the information is.
+
+**The status is Axum's, never flattened to 400.** Two cases make this load-bearing rather than
+pedantic: `DefaultBodyLimit` surfaces as a rejection, and demoting its `413` to `400` would lose the
+one bit that tells a client to send *less* rather than send *different*; and
+`PathRejection::MissingPathParams` is a `500` describing a route/handler mismatch — a defect in this
+service, which must never be reported to a caller as their bad request.
+
+**One implementation detail worth not repeating.** The first version funnelled all four rejection
+types through a generic `envelope()` function via a local bridging trait, whose method bodies read
+`self.status()`. That compiles only because inherent methods win name resolution — remove the
+inherent method and the same line becomes silent infinite recursion. It is now a macro expanded at
+each call site, where the calls are unambiguous and the hazard does not exist.
+
+## Tests
+
+`malformed_input_is_refused_in_the_json_envelope_on_every_extractor` asserts **three** properties per
+case, because they fail independently and any two passing still leaves a client unable to act: the
+status, the `Content-Type` (a client picks its parser from the header before reading a byte), and a
+non-empty `error` **string** (an envelope whose message is blank is a machine-readable way of saying
+nothing). E2E §47 does the same over the wire, plus a control: a handler-level validation refusal
+must keep the identical shape, since this pass harmonises extractor rejections and must not have
+quietly rewritten anything else.
+
+Both sweep **all five** extractors rather than a representative one. A contract verified at one of
+five sites has four places left to drift, and the tuple-path case (`/parameters/{param_id}`) is
+included precisely because two-parameter routes deserialize through a different code path than
+single ones.
+
+## Metrics
+
+| Gate | Before | After |
+| :--- | ---: | ---: |
+| `cargo test` | 287 passed, 2 ignored | **287 passed, 2 ignored** (assertions strengthened, no count change) |
+| `cargo test -- --ignored` | 2 | **2** |
+| `./scripts/test_e2e.sh` | 948 checks, 46 sections | **958 checks, 47 sections** |
+| `./scripts/verify_convergence.sh` | 18 converged, 1 known | **18 converged, 1 known** |

@@ -22,7 +22,7 @@
 
 use axum::{
     Extension,
-    extract::{Json, Query, State},
+    extract::{Json, State},
     response::IntoResponse,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -30,6 +30,7 @@ use serde::Deserialize;
 
 use crate::entities::{api_key, audit_log, prelude::*};
 use crate::error::AppError;
+use crate::extract::{StrictQuery};
 use crate::state::AppState;
 
 use super::DEFAULT_PAGE_LIMIT;
@@ -55,7 +56,7 @@ pub struct AuditLogQuery {
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Query(query): Query<AuditLogQuery>,
+    StrictQuery(query): StrictQuery<AuditLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(

@@ -83,6 +83,8 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_hook_executor_e2e.XXXXXX")"
 DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
+# Populated by `envelope_call` only; declared here because `set -u` makes an unset name fatal.
+RESP_CTYPE=""
 HOOK_DIR="$WORK_DIR/hooks"
 SERVER_PID=""
 # Second, short-lived instance booted by §30 with TRUSTED_PROXIES unset, so the suite can cover
@@ -256,6 +258,55 @@ check_not_contains() {
     else
         PASS_COUNT=$((PASS_COUNT + 1))
         echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    fi
+}
+
+# Performs a request and additionally captures the response `Content-Type` into $RESP_CTYPE.
+#
+# Separate from `api_call` rather than folded into it: every other assertion in this suite is about
+# the body or the status, and widening the common path to capture headers for all ~900 of them would
+# make every request write and read a second temporary file for the benefit of one section.
+#
+# Usage: envelope_call METHOD PATH [API_KEY] [RAW_BODY]
+envelope_call() {
+    local method="$1" path="$2" api_key="${3:-}" data="${4:-}"
+    local headers="$WORK_DIR/resp_headers"
+    local args=(-s -o "$RESP_BODY_FILE" -D "$headers" -w "%{http_code}" -X "$method")
+    [ -n "$api_key" ] && args+=(-H "X-API-Key: $api_key")
+    [ -n "$data" ] && args+=(-H "Content-Type: application/json" --data-binary "$data")
+    RESP_STATUS=$(curl "${args[@]}" "$BASE_URL$path")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    # Lowercased and trimmed: header names are case-insensitive and the value carries a trailing CR.
+    RESP_CTYPE=$(grep -i '^content-type:' "$headers" 2>/dev/null | tail -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')
+    local color; color=$(status_color "$RESP_STATUS")
+    printf "%s ${color}[%s]${RESET} %-6s %s ${DIM}(%s)${RESET}\n" \
+        "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" "${RESP_CTYPE:-no content-type}" >&2
+    print_response_body
+}
+
+# Usage: check_envelope EXPECTED_STATUS "description"
+#
+# The three properties that make a refusal machine-readable, asserted together because they fail
+# independently and any two passing would still leave a client unable to act: the status, the
+# `Content-Type` a client picks its parser from, and a non-empty `error` string.
+check_envelope() {
+    local expected="$1" description="$2"
+    local problems=""
+    [ "$RESP_STATUS" != "$expected" ] && problems="status=$RESP_STATUS (want $expected)"
+    case "$RESP_CTYPE" in
+        application/json*) ;;
+        *) problems="$problems content-type='${RESP_CTYPE:-none}'" ;;
+    esac
+    local message
+    message=$(echo "$RESP_BODY" | jq -r 'if type == "object" and has("error") then .error else empty end' 2>/dev/null)
+    [ -z "$message" ] && problems="$problems body-has-no-error-string"
+
+    if [ -z "$problems" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description ($problems)" >&2
     fi
 }
 
@@ -2209,9 +2260,11 @@ oversized_call() {
     printf "%s ${color}[%s]${RESET} %-6s %s (10 MiB body)\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" >&2
 }
 
-# Bytes-extractor routes.
+# Bytes-extractor routes. The status is the assertion here; §47 additionally pins the *shape* of
+# these refusals, which used to be bare text/plain on exactly this path.
 oversized_call POST "/api/hooks/$ARGV_HOOK_ID/execute" "$MASTER_KEY"
 check "413" "a 10 MiB body is refused on the execute route"
+check_true 'has("error")' "and the refusal is the standard envelope, not bare text"
 oversized_call POST "/webhook/argv_hook" "$MASTER_KEY"
 check "413" "a 10 MiB body is refused on the webhook route"
 # Json<T>-extractor routes reject through a different code path, so both shapes are covered.
@@ -4109,6 +4162,52 @@ check_local "$([ "$CUT_ELAPSED" -le 5 ] && echo prompt || echo stalled)" "prompt
 api_call POST "/api/hooks/$FAST_HOOK_ID/execute" "$MASTER_KEY" '{}'
 check "200" "a full execution round trip still works after the interruptions"
 check_jq ".status" "SUCCESS" "the executor is unaffected by the dropped connections"
+
+# ── 47. Error-envelope contract on every extractor ──────────────────────────
+
+log_section "47. Error Envelope on Every Extractor"
+
+# Every documented refusal in this service is `{"error": "…"}` served as `application/json`. Until
+# now that held for everything a *handler* produced and for nothing rejected *before* one ran: a
+# malformed body, a mistyped identifier, a bad query value and an oversized raw body were all
+# refused with the right status and a bare `text/plain` body carrying no `error` field at all.
+#
+# Those are the most common things a caller gets wrong, which made them the worst possible place for
+# the contract to lapse — and because no handler is involved, no handler test could see it. Each of
+# the five extractors is now wrapped (`src/extract.rs`), and each is asserted here rather than one
+# being taken as representative: a contract verified at one of five sites has four places left to
+# drift.
+
+envelope_call POST "/api/hooks" "$MASTER_KEY" '{not json'
+check_envelope "400" "a malformed JSON body is refused in the envelope"
+check_true '.error | test("JSON"; "i")' "and the message still names the problem"
+
+envelope_call GET "/api/executions/not-a-uuid" "$MASTER_KEY"
+check_envelope "400" "an unparseable UUID path parameter is refused in the envelope"
+
+envelope_call DELETE "/api/hooks/echo_hook/parameters/not-a-uuid" "$MASTER_KEY"
+check_envelope "400" "an unparseable UUID inside a two-segment path is too"
+
+envelope_call GET "/api/executions?limit=abc" "$MASTER_KEY"
+check_envelope "400" "a non-numeric query parameter is refused in the envelope"
+
+envelope_call GET "/api/hooks?include_deleted=maybe" "$MASTER_KEY"
+check_envelope "400" "a non-boolean query flag is refused in the envelope"
+
+# The raw-body routes reject through a different extractor again, and they are the endpoints most
+# likely to receive a body worth rejecting. The status stays 413 rather than being flattened to 400:
+# demoting it would lose the one bit that tells a client to send *less* rather than send *different*.
+envelope_call POST "/api/hooks/$ARGV_HOOK_ID/execute" "$MASTER_KEY" "@$WORK_DIR/oversized.bin"
+check_envelope "413" "an oversized raw body is refused in the envelope, still as 413"
+
+# A refusal that *is* a handler decision must be unchanged — this section is about harmonising the
+# shape of extractor rejections, not about rewriting anything else into it.
+envelope_call POST "/api/hooks" "$MASTER_KEY" '{"name":"","script_path":"/bin/true"}'
+check_envelope "400" "a handler-level validation refusal keeps the same envelope"
+
+# And the daemon is unaffected by the sweep.
+api_call GET "/api/hooks" "$MASTER_KEY"
+check "200" "an ordinary request still succeeds after every malformed shape"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
