@@ -536,6 +536,46 @@ The dashboard must not offer a control the backend will refuse, and must not *wi
 - **Master Key Auto-Gen:** If `api_keys` contains no master keys at boot, generate a default Master Key and output it once clearly to `stdout`. This is now the **only** writer of `is_master = true` anywhere in the codebase, and therefore also the only way to regenerate a master: delete the row directly in the database and restart. The banner is the sole source of that key's signing secret, which is why `scripts/test_e2e.sh` scrapes it rather than minting a second master for signing.
 - Include a production-ready `simply_hook_executor.service` file for systemd deployment under a dedicated non-root user (`hookrunner`).
 
+### 9. SeaORM Migration Standards
+
+- **Naming convention: `mYYYYMMDD_NNNNNN_<slug>.rs`.** The date the migration was authored, then a
+  zero-padded sequence number unique within that date (not a clock time), then a short snake_case
+  slug describing what it does. Every migration in this repository has used this shape since
+  `m20230101_000001_initial_schema`, and it is the identical shape `simply_ip_vault` uses —
+  `STRUCTURAL_CONVERGENCE_REPORT.md` confirms it; the two projects diverge only in whether the
+  sequence number resets per date (here) or runs globally monotonic (there), which is cosmetic and
+  not worth reconciling.
+- **Applied migration files are never renamed, and reordering them is the same mistake.** SeaORM
+  tracks applied migrations by the file-derived version string recorded in `seaql_migrations`.
+  Renaming a migration that has already run does not rename the row that recorded it — it produces a
+  *second*, unrecognized version string, so every already-migrated database sees the renamed file as
+  a brand-new, unapplied migration on its next start. Against a non-idempotent `up()` (any
+  `ADD COLUMN`, any `CREATE TABLE`) that is a hard failure the moment it reapplies against a schema
+  that already has the object; against an idempotent one it is silent double-application. **There is
+  no safe way to rename a migration once it has shipped.** If a filename turns out to be wrong, the
+  fix is a new migration that corrects the mistake going forward — never an edit to history.
+- **A migration that tightens a constraint on existing data must backfill first, inside the same
+  `up()`, before the constraint is applied.** SQLite has no `ALTER TABLE … ADD CONSTRAINT`, so
+  tightening an existing column to `NOT NULL` there is a create-copy-drop-rename table rebuild — the
+  highest-risk shape of migration there is, because anything the copy step forgets to carry over
+  simply stops existing, with no error. No migration in this repository has needed that rebuild yet:
+  `audit_logs`' three attribution columns (`api_key_name`, `api_key_prefix`, `client_ip`) were
+  declared `NOT NULL` in `m20230101_000001_initial_schema`, the very first migration, so there has
+  never been a nullable row to backfill here. If a future migration needs to tighten a *different*
+  column that already holds data, `simply_ip_vault`'s `m20260811_000010_audit_attribution_not_null`
+  is the reference implementation for the rebuild, and its backfill value convention is worth keeping:
+  the literal `"(unknown)"` rather than an empty string, so a reader can tell "not recorded" from
+  "recorded as this".
+- **A `NOT NULL` denormalized column and an `ON DELETE SET NULL` foreign key are not in conflict —
+  they are different columns describing different things.** `audit_logs.api_key_id` is the foreign
+  key; it is nullable, and `SET NULL` is what lets the acting key be deleted without deleting its
+  history. `audit_logs.api_key_name`, `.api_key_prefix` and `.client_ip` are denormalized snapshots of
+  that same key, declared `NOT NULL`, and populated at write time rather than joined at read time —
+  deleting the key later clears the FK's target, not the snapshot taken before it was deleted. See §7
+  for the attribution rule itself; the point here is structural, and it generalizes: `ON DELETE SET
+  NULL` only ever touches the column it is declared on, so a foreign key being nullable is never a
+  reason a denormalized copy of the same fact must be.
+
 ---
 
 ## 🧪 Testing & Validation Standards

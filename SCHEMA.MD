@@ -269,8 +269,11 @@ System-wide audit trail for configuration changes.
 > attributable to nobody. Because they cannot be null, "who did this, and from where" is answerable
 > for every row in the table, forever — including rows written by keys that were deleted years ago.
 >
-> `simply_ip_vault` declares the same three columns nullable. That is a deliberate divergence in this
-> service's favour, recorded as **D3** in `SECURITY_COMPARISON_REPORT.md`.
+> `simply_ip_vault` declares the same three columns `NOT NULL` too — it started nullable and was
+> tightened via its own `m20260811_000010_audit_attribution_not_null`, with the same reasoning. Both
+> services in the gold-standard pair now enforce this identically; see
+> `SECURITY_COMPARISON_REPORT.md` for current ecosystem-wide parity, and `AGENT.MD` §9 for the
+> migration-standards rule this constraint is an instance of.
 
 > **`target_resource` carries a name, not an identifier.** It is what makes
 > `GET /api/audit-logs?action=…` legible to an operator and worth filtering on; a UUID there is
