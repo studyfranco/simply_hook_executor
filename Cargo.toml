@@ -66,6 +66,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # breaking changes under a caret requirement — `ParserReturn::errors` became `diagnostics`, `labels`
 # went from `Option<Vec<_>>` to a slice, `offset()` widened to `u32`. A syntax checker that stops the
 # build for reasons unrelated to syntax is worse than no checker, so this one does not float.
-oxc_allocator = "0.144"
-oxc_parser = "0.144"
-oxc_span = "0.144"
+oxc_allocator = "0.145"
+oxc_parser = "0.145"
+oxc_span = "0.145"
