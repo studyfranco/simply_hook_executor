@@ -6014,3 +6014,120 @@ convergence gate has no peer to compare against (**S1**), its extractor rollout 
 
 `SECURITY_COMPARISON_REPORT.md` (overwritten, as instructed) · `STRUCTURAL_CONVERGENCE_REPORT.md`
 (rewritten) · this note. No application code touched.
+
+---
+
+# 2026-08-18 (second pass) — Ecosystem-wide clean-room audit (4 projects)
+
+Scope widened from the previous pass: **all three** peers under `example/`, not just the vault.
+
+**Mode:** read-only over all application code in every repository. The only files written were
+`SECURITY_COMPARISON_REPORT.md`, `STRUCTURAL_CONVERGENCE_REPORT.md`, `AGENT.MD` (Task 3) and this
+note. `RBAC_MODEL.md` untouched everywhere.
+
+**Clean-room constraint.** Findings derived from `RBAC_MODEL.md` and current `.rs` source only. No
+prior audit report was opened in any of the four repositories. Peer history was consulted only via
+`git rev-parse` for commit identifiers.
+
+## 0. Task 0 — peer synchronization
+
+| Project | `git pull --ff-only` | Before → after | Tree |
+| :--- | :--- | :--- | :--- |
+| `simply_ip_vault` | Already up to date | `14c8fa3` | clean |
+| `simply_ip_exporter` | **Updated** | `52651e5` → **`80a3b31`** | clean |
+| `simply_ip_sync` | **Updated** | `c283911` → **`72cce13`** | clean |
+
+Two of three had moved. Auditing the trees as they sat on disk would have described two revisions
+that no longer existed — which is the whole reason the directive exists.
+
+## 1. What widening the scope changed
+
+The previous pass compared this service against one peer and concluded the R2/ownership finding was a
+two-way disagreement. **With four services in view it is not.** Every other service in the ecosystem
+re-checks the standing scope *before* the ownership test on the equivalent dispatch-target edit:
+
+| Service | Path | Standing scope re-checked before ownership? |
+| :--- | :--- | :---: |
+| `simply_hook_executor` | `update_hook` → `guard_manage` | ❌ |
+| `simply_ip_vault` | `update_webhook` | ✅ |
+| `simply_ip_exporter` | `update_endpoint` | ✅ (no standing scope exists to bypass) |
+| `simply_ip_sync` | `guard_resource_manage` | ✅ (R2 in full) |
+
+Three-to-one is a different piece of evidence than one-to-one. It is what moves this from "a
+defensible design choice one peer made differently" to "the only service in the ecosystem that
+answers this question this way".
+
+## 2. Findings the wider scope surfaced
+
+**EXP-1 (LOW today, latent escalation).** `simply_ip_exporter` stores `can_manage_keys`, sets it from
+the create/update payloads, and reports it on `/api/auth/me` and the key listing — and **never reads
+it**. All five key-administration routes gate on `require_master`, i.e. `is_master` alone. The Parent
+tier the specification defines does not exist there.
+
+Fail-closed today, which is why it is `LOW`. Reported because of the second-order shape: the day
+someone wires the column into a gate — the obvious change, since the column exists and the tier is in
+the document C ships — *every key already carrying `true` silently becomes a Parent*. Those grants
+were handed out when they meant nothing, so no operator reviewed one and no audit entry reads as a
+privilege decision. The escalation would arrive with no event to point at.
+
+**EXP-2 (LOW).** `simply_ip_exporter` has **zero** `deny_unknown_fields` (against 6 here, 5 vault, 10
+sync). §5's literal requirement is met — `is_master` is absent from the payload type and hardcoded
+`false` — so there is no escalation path. What is missing is the *refusal*: `{"name":"x","is_master":
+true}` returns `200` and an ordinary key. The caller believes it minted a Master and nothing records
+the attempt. The other three treat the attribute as the §5 control precisely so that becomes a logged
+`400` naming the field.
+
+**SYN-1 (LOW).** `simply_ip_sync`'s audit attribution columns are `Option<String>` where the other
+three are `NOT NULL`. Graded LOW rather than higher after checking the writer: `create_audit_log`
+takes `&api_key::Model` and `IpAddr` **by value**, so no call site can produce a null. The guarantee
+rests on one signature instead of on the column — a migration backfill or a second writer would not
+be stopped.
+
+**Structural: `simply_ip_exporter` has no `api/guards.rs`.** It has `api/auth.rs` with one function
+(`get_me`) and enforces authorization inline. This is the one structural divergence in the ecosystem
+**not** explained by size — and it is the same service where EXP-1 was found, which is the argument
+for the single-file authorization surface stated as a rule in `AGENT.MD`.
+
+## 3. A check that could have produced a false accusation
+
+Four `pub is_master` fields exist across the four trees, which §5 would forbid on a payload. Reading
+each struct's **derive** showed every one is `Serialize`-only — response views, not deserialized
+types. No finding. The derive, not the grep, is the evidence; a report naming those four would have
+been confidently wrong.
+
+## 4. What was attacked and held
+
+Across all four: minting a second Master through a payload, through `deny_unknown_fields`, and through
+direct SQL against the generated marker; self-granting a global scope; granting an unheld verb;
+routing a grant through an update endpoint to dodge R1; probing existence through `403`/`404`;
+rotating or deleting the Master; editing a Master field other than `bound_ips`; bypassing `bound_ips`
+as Master; forging `client_ip`; replaying a captured signature. All refused everywhere, each at a
+named enforcement point — **except** the payload case on the exporter, which is ignored rather than
+refused (EXP-2).
+
+Cryptography is the ecosystem's most uniform layer: identical primitives, identical canonicalization,
+identical replay invariants, four for four, with no finding against any project.
+
+## 5. Task 3 — `AGENT.MD`
+
+New top-level section **"The `example/` Directory — Sibling Projects as Live References"**, placed
+ahead of the synchronization directive it now contains. It records that convergence originated with
+`simply_ip_vault` and `simply_hook_executor` and that the pair is the **gold standard**; tables the
+three current occupants and their relationship; states the three purposes (security posture parity,
+architectural alignment, testing strategy) with a concrete example of each; and sets the rules —
+read-only, never committed, and "a peer differing from us is not automatically wrong".
+
+## 6. Metrics gathered
+
+| Metric | executor | vault | exporter | sync |
+| :--- | ---: | ---: | ---: | ---: |
+| `src/` lines | 12 688 | 13 012 | 4 801 | 7 016 |
+| Tests | 182 | 197 | 33 | 108 |
+| `deny_unknown_fields` | 6 | 5 | **0** | **10** |
+| Bare extractor positions | **0** | 25 | 1 | **0** |
+| Guard functions | 21 | 12 | **0** | 12 |
+
+## 7. Written
+
+`SECURITY_COMPARISON_REPORT.md` (overwritten) · `STRUCTURAL_CONVERGENCE_REPORT.md` (rewritten) ·
+`AGENT.MD` (Task 3) · this note. No application code touched in any repository.

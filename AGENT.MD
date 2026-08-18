@@ -10,11 +10,61 @@ To keep this context clean and modular, responsibilities are split across three 
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, process execution rules, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: Peer repositories — the code of the other linked projects in this ecosystem. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
+4. **`example/`**: Live clones of this service's **sibling projects** — real services, not sample code. They are the ecosystem's reference points for security posture, architecture and testing strategy. **Read [The `example/` Directory](#-the-example-directory--sibling-projects-as-live-references) before reading anything in here, and synchronize first.**
 
 ---
 
-## 🔄 Peer Repository Synchronization
+## 🧬 The `example/` Directory — Sibling Projects as Live References
+
+`example/` holds **live git clones of this service's sibling projects**, not flat snapshots and not
+sample code. They are working checkouts of production services built by the same authors against the
+same specification, kept here so that alignment can be *measured* rather than remembered.
+
+### Why they exist
+
+This ecosystem's convergence originated with **two** services — **`simply_ip_vault`** and
+**`simply_hook_executor`** (this one). They were aligned first and most tightly: they are the two
+named in `RBAC_MODEL.md`'s Scope line, the two whose shared logic `scripts/verify_convergence.sh`
+holds byte-identical, and the pair every later service was built against. **Treat them as the gold
+standard.** Where a third service differs from both of them, the third service is usually the one
+that drifted.
+
+The ecosystem has since grown. Current occupants:
+
+| Project | Domain | Relationship |
+| :--- | :--- | :--- |
+| `simply_ip_vault` | IP blocklists, webhook dispatch | **Gold standard.** In `RBAC_MODEL.md`'s scope; diffed by `verify_convergence.sh` |
+| `simply_ip_exporter` | Aggregated feed serving | Later adopter |
+| `simply_ip_sync` | External-source ingestion into vaults | Later adopter; restates `RBAC_MODEL.md` in its own terminology |
+
+### What they are for
+
+Three things, and they are the reason a peer checkout earns its disk space:
+
+1. **Security posture parity.** The same normative rules are enforced in each service against
+   different nouns. When a control here looks correct in isolation, the useful question is how the
+   siblings answer the *same* question — and a difference is evidence. The clearest finding of the
+   2026-08-18 audit was found exactly this way: three siblings re-check a standing scope before an
+   ownership test and this service does not, which is what turned "a defensible design choice" into
+   "the only service that answers this differently".
+2. **Architectural alignment.** Module layout, naming conventions, error envelopes and audit
+   structures are compared against them, not invented locally. A new module here should have an
+   obvious address in the siblings; if it does not, that is worth a sentence of justification.
+3. **Testing strategy.** Their suites are a source of test *patterns*, not just reassurance. The
+   concurrency and error-envelope suites in `tests/` were adapted from sibling projects that were
+   asserting properties this service was not.
+
+### Rules
+
+- **They are read-only.** Never modify, stage, or commit inside a peer checkout. `git pull --ff-only`
+  is the only write this repository's tooling performs there.
+- **Never commit them.** `example/` is `.gitignore`d. Reports *about* the peers belong here; their
+  code does not.
+- **A peer differing from us is not automatically wrong** — each service has a real domain, and a
+  difference is a finding only when it has no domain justification. Say which it is.
+- **Synchronize before reading.** See below; this is not optional.
+
+### 🔄 Peer Repository Synchronization
 
 `example/` holds **live git clones** of the peer services, not flat snapshots.
 They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
