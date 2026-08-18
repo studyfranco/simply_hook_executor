@@ -573,7 +573,7 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 
 | File | Table | Note |
 | :--- | :--- | :--- |
-| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_000001`. Also defines `HmacMode` |
+| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` |
 | `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
@@ -590,15 +590,15 @@ one that has shipped.
 
 | Migration | Adds |
 | :--- | :--- |
-| `m20230101_000001_initial_schema` | All six tables |
-| `m20230102_000001_add_run_as_user` | `hooks.run_as_user` |
-| `m20230103_000001_add_signing_secret` | `api_keys.key_id`, `api_keys.signing_secret` |
-| `m20230104_000001_add_hmac_mode` | `api_keys.hmac_mode` |
-| `m20230105_000001_add_hook_soft_delete` | The trash columns on `hooks` |
-| `m20230106_000001_master_key_uniqueness` | `api_keys.master_marker` — **§5's engine-derived generated column** |
-| `m20230107_000001_key_lineage_and_resource_ownership` | `parent_key_id`, `owner_key_id` (on both `api_keys` and `hooks`), and §7's indexes |
-| `m20260809_000001_add_can_view_execution` | The third permission verb |
-| `m20260810_000001_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
+| `m20230101_090000_initial_schema` | All six tables |
+| `m20230102_090000_add_run_as_user` | `hooks.run_as_user` |
+| `m20230103_090000_add_signing_secret` | `api_keys.key_id`, `api_keys.signing_secret` |
+| `m20230104_090000_add_hmac_mode` | `api_keys.hmac_mode` |
+| `m20230105_090000_add_hook_soft_delete` | The trash columns on `hooks` |
+| `m20230106_090000_master_key_uniqueness` | `api_keys.master_marker` — **§5's engine-derived generated column** |
+| `m20230107_090000_key_lineage_and_resource_ownership` | `parent_key_id`, `owner_key_id` (on both `api_keys` and `hooks`), and §7's indexes |
+| `m20260809_090000_add_can_view_execution` | The third permission verb |
+| `m20260810_090000_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the

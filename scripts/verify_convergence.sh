@@ -428,7 +428,7 @@ compare "Signature canonicalization" \
 # them.
 #
 # One claim attached to the old baseline was **wrong and is corrected here**: it stated that the six
-# foreign keys declared in `m20230101_000001_initial_schema` were therefore *inert* on SQLite. They
+# foreign keys declared in `m20230101_090000_initial_schema` were therefore *inert* on SQLite. They
 # were not. SQLx enables foreign keys on every SQLite connection it opens, so they have always been
 # enforced — `PRAGMA foreign_keys` reads back `1` on a bare `Database::connect`, and an orphan insert
 # is refused with `(code: 787) FOREIGN KEY constraint failed`. Setting the pragma explicitly is

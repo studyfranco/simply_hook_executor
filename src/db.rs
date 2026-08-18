@@ -58,7 +58,7 @@ pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
 /// Connections in the SQLite pool. **One**, and not a tuning knob.
 ///
 /// SQLite permits a single writer, and a DDL sequence spread across connections does not survive it:
-/// `m20230106_000001_master_key_uniqueness` drops and re-adds `master_marker` as a generated column,
+/// `m20230106_090000_master_key_uniqueness` drops and re-adds `master_marker` as a generated column,
 /// and a pool wide enough to serve those two statements from different connections would run the
 /// `ADD` against a schema that still holds the old column. SeaORM's own `Database::connect` pins
 /// this to 1 for SQLite; building a pool by hand opts out of that default, so it is restored here

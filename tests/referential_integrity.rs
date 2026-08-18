@@ -2,7 +2,7 @@
 //!
 //! # Why this file exists
 //!
-//! `m20230101_000001_initial_schema` declares six foreign keys — four `ON DELETE CASCADE`, two
+//! `m20230101_090000_initial_schema` declares six foreign keys — four `ON DELETE CASCADE`, two
 //! `ON DELETE SET NULL` — and until now **nothing in the repository asserted that any of them
 //! fired**. On SQLite that is a materially dangerous gap, because SQLite is the one engine where
 //! declaring a foreign key and enforcing it are separate decisions: with `PRAGMA foreign_keys=OFF`,

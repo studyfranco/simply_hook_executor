@@ -436,7 +436,7 @@ pub(crate) fn guard_master_to_administer(
 ///
 /// [`guard_master_to_administer`] answers a different question: it stops *other* keys from
 /// touching the master. Once the constraint in
-/// `m20230106_000001_master_key_uniqueness` guarantees there is exactly one master, "another key
+/// `m20230106_090000_master_key_uniqueness` guarantees there is exactly one master, "another key
 /// administering the master" and "the master administering itself" are the same request, and the
 /// second one was still permitted.
 ///

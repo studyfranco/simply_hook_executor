@@ -1033,7 +1033,7 @@ async fn s7_every_required_index_and_constraint_exists() {
         // `api_keys.owner_key_id` index — there was never a column for it to require.
         //
         // `api_keys.owner_key_id` did exist, dormant and never read, and was dropped by
-        // `m20260810_000001`. This list previously asserted its index; that assertion was over-strict
+        // `m20260810_090000`. This list previously asserted its index; that assertion was over-strict
         // rather than normative, and removing it is a correction to the test, not a relaxation of §7.
         // The check immediately below is what stops that being a convenient story.
         ("hooks", "idx_hooks_owner_key_id"),

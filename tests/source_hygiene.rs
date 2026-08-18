@@ -148,7 +148,7 @@ const ALLOWED: [(&str, &str); 2] = [
          SQLite and issued once at startup.",
     ),
     (
-        "src/migration/m20230106_000001_master_key_uniqueness.rs",
+        "src/migration/m20230106_090000_master_key_uniqueness.rs",
         "`ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (...)`. SeaORM's `ColumnDef` has no \
          generated-column support at all, and RBAC_MODEL.md §5 requires the master marker to be \
          engine-derived rather than application-maintained. DDL, run once, with no user input.",

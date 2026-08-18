@@ -60,7 +60,7 @@ Stores authentication keys, global scopes, and network restrictions.
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
 
-> **Removed in `m20260810_000001`: `api_keys.owner_key_id`.** It was added alongside
+> **Removed in `m20260810_090000`: `api_keys.owner_key_id`.** It was added alongside
 > `hooks.owner_key_id` on the symmetric assumption that if a hook has an owner, a key might as well.
 > It was **write-only** for its whole life — set to the creator at creation, and read by no guard, no
 > query, no response, and no page of the dashboard.
@@ -97,7 +97,7 @@ rather than by application logic alone." Two design choices make that portable a
   against *any* writer: a future handler, a migration, a restored backup, or an operator at a SQL
   prompt.
 
-One dialect split, in `m20230106_000001_master_key_uniqueness`: PostgreSQL generated columns must be
+One dialect split, in `m20230106_090000_master_key_uniqueness`: PostgreSQL generated columns must be
 `STORED` (it gained `VIRTUAL` only in 18), while SQLite permits only `VIRTUAL` for a column added
 through `ALTER TABLE`. MySQL accepts either and is given `VIRTUAL`. Semantics are identical.
 
@@ -382,7 +382,7 @@ mutation-verified: five of the six go red with `foreign_keys=OFF`.
 ### Two columns deliberately carry no foreign key
 
 `api_keys.parent_key_id` and `hooks.owner_key_id` reference `api_keys.id` and are **intentionally
-unconstrained**, as documented in `m20230107_000001_key_lineage_and_resource_ownership`:
+unconstrained**, as documented in `m20230107_090000_key_lineage_and_resource_ownership`:
 
 - `ON DELETE CASCADE` would delete a hook when its owner key is deleted — exactly what
   `RBAC_MODEL.md` §6 forbids.

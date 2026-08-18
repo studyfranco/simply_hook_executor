@@ -2,7 +2,7 @@
 //!
 //! # What this column was, and why it never did anything
 //!
-//! `m20230107_000001_key_lineage_and_resource_ownership` added `owner_key_id` to **two** tables at
+//! `m20230107_090000_key_lineage_and_resource_ownership` added `owner_key_id` to **two** tables at
 //! once, on the symmetric-looking reasoning that if a hook has an owner then a key might as well.
 //! Only one of the two turned out to mean anything:
 //!
