@@ -5903,3 +5903,114 @@ single ones.
 | `cargo test -- --ignored` | 2 | **2** |
 | `./scripts/test_e2e.sh` | 948 checks, 46 sections | **958 checks, 47 sections** |
 | `./scripts/verify_convergence.sh` | 18 converged, 1 known | **18 converged, 1 known** |
+
+---
+
+# 2026-08-18 — Independent clean-room audit (`818740f` ↔ vault `14c8fa3`)
+
+**Mode:** strictly read-only over `src/`, `tests/`, `scripts/`, `static/` and `migration/` in every
+repository. `RBAC_MODEL.md` untouched. Only the three documents named at the end were written.
+
+**Clean-room constraint.** Findings were derived from `RBAC_MODEL.md` and current `.rs` source only.
+No prior audit report was opened in any repository — including the two this repo carries and the
+peer's own. Peer history was consulted only via `git rev-parse` for the commit identifiers.
+
+## 0. Task 0 — peer synchronization
+
+Per `AGENT.MD` § Peer Repository Synchronization, every checkout under `example/` was pulled before a
+single file was read:
+
+| Project | `git pull --ff-only` | HEAD | Tree |
+| :--- | :--- | :--- | :--- |
+| `simply_ip_vault` | **Already up to date** | `14c8fa3` | clean |
+| `simply_ip_exporter` | Already up to date | `52651e5` | clean |
+| `simply_ip_sync` | Already up to date | `c283911` | clean |
+
+`simply_ip_vault` is the comparison subject: it is the service `RBAC_MODEL.md` names alongside this
+one, and the only one `verify_convergence.sh` diffs.
+
+## 1. Method
+
+Every claim was settled mechanically where a mechanical check existed, and the negative results were
+recorded as well as the positive — an audit that lists only what it found is indistinguishable from
+one that did not look.
+
+| Question | How it was settled |
+| :--- | :--- |
+| Is the normative document still shared? | `md5sum` across all four trees |
+| Where is R2 enforced, and can it be reached around? | Enumerated every `fn` in both `guards.rs`; read `guard_manage`'s three routes and traced `update_hook` back to its gate |
+| Is `is_master` settable anywhere? | Found four `pub is_master` fields across both trees, then **checked each struct's derive** — all four are `Serialize`-only response views. No finding |
+| What does an empty `ALLOWED_SCRIPT_ROOTS` mean? | Read `is_within_roots`: `roots.is_empty() \|\| …` — empty permits every path |
+| Does the peer have the same containment gap? | Read `update_webhook`: it re-checks `can_manage_webhooks` **and then** ownership. It does not |
+| Which payloads are strict? | `grep deny_unknown_fields`, then read each decorated struct — the attribute's line number proves nothing about which type it sits on |
+| How far does each side's error envelope reach? | Counted bare `Path(`/`Query(`/`Json<T>` positions in handler signatures: **0 here, 25 on the peer** |
+| Does the peer's own test see that gap? | `grep -c content_type` in its `concurrency_and_contracts.rs` → **0**. It asserts status only |
+
+## 2. Findings
+
+**SHE-1 (MEDIUM, this service).** `guard_manage` admits ownership as a third route that returns
+before R2 is consulted, while `RBAC_MODEL.md`'s *Dispatch configuration* clause says editing
+`script_path` is "governed by R2 in full". `create_hook` records the creator as owner and
+auto-provisions `can_execute`/`can_manage`/`can_view_execution`, so **revoking `can_manage_hooks`
+takes none of it back**: the key keeps repointing every hook it created at any absolute path — the
+root allowlist is empty by default — and running it. Bounded by `guard_master_for_privileged_hook`
+(a hook with `run_as_user` is master-only to touch), by hooks never being spawned through a shell,
+and by the fact that a key *currently* holding the scope could set the same path at creation. The
+delta is persistence after revocation, plus Master's §3 reassignment route.
+
+This finding is unchanged from what an earlier pass reported, and was re-derived here from source
+without reading that report. The peer remains the model for the fix.
+
+**SHE-2 (LOW, this service).** No refusal when the caller's own key is inside the subtree being
+deleted; reachable only through a `parent_key_id` cycle the API cannot create. The peer refuses it
+explicitly.
+
+**SIV-1 (LOW, peer).** Only 2 of 5 extractors are wrapped; **25 bare positions** remain, so a bad
+UUID path parameter, a mistyped query value, and a malformed body on most routes return the right
+status with a `text/plain` body carrying no `error` field. `AppError::BodyRejected` already exists
+there — this is an unfinished rollout, not a design disagreement. The sharper half: **the peer's own
+contract test asserts status only**, with zero `Content-Type` assertions, so its suite reports the
+property covered while the body shape goes unchecked.
+
+That is the transferable lesson from this pass, and it applies here too: *a test that verifies two of
+a control's three observable properties is how a gap survives an audit.* This repository's equivalent
+test asserts status, `Content-Type` **and** a non-empty `error` string for exactly that reason.
+
+**SIV-2 (LOW, peer).** `DeleteKeyPayload` lacks `deny_unknown_fields`. Fails safe — a dropped map
+yields the `409` inventory rather than a deletion. The attribute belongs on `DeleteKeyPayload` and
+*cannot* go on the `flatten`ed `ResolutionEntry`; serde rejects that combination.
+
+**ECO-1 (INFO, ecosystem).** `simply_ip_exporter` ships the byte-identical shared `RBAC_MODEL.md`
+whose Scope line names `simply_ip_vault` and `simply_hook_executor` — i.e. the document does not
+claim to govern the repository carrying it. `simply_ip_sync` handles the same situation correctly:
+its copy differs (md5 `792fb269…`) precisely because it restates the model in its own terminology and
+says in its header that it is out of the shared document's scope. Recommend the exporter adopt that
+treatment.
+
+## 3. What was attacked and held
+
+On this service: minting a second Master through a payload, through `deny_unknown_fields`, and
+through direct SQL against the generated marker; self-granting a global scope; granting an unheld
+verb; trading a held verb for an unheld one in one write; routing a grant through the update endpoint
+to dodge R1; probing hook existence and key UUIDs through `403`/`404`; rotating or deleting the
+Master; editing a Master field other than `bound_ips`; orphaning hooks through a key deletion;
+forging `client_ip`; bypassing `bound_ips` as Master; assigning `run_as_user` without Master. All
+refused, each at a named enforcement point. The peer's equivalents were attacked and held too,
+including R4 across all three of its global scopes.
+
+## 4. Structural notes
+
+Convergence is still actively happening rather than merely being preserved: `src/extract.rs` and
+`tests/concurrency_and_contracts.rs` now exist on **both** sides, with the same filenames and the
+same first two tests. 13 of 13 shared crate-root modules, 6 of 6 structural `api/` modules, 6 of 6
+`MasterPin` methods, 11 of 11 shared `api_key` columns, 9 of 9 error variants, 8 of 8 non-domain
+audit columns, and 3 of 3 gate-enforced byte-identical functions.
+
+Nine structural items remain open; the material three are process rather than product — the peer's
+convergence gate has no peer to compare against (**S1**), its extractor rollout is unfinished
+(**S6**), and **neither** repository runs any gate in CI (**S9**).
+
+## 5. Written
+
+`SECURITY_COMPARISON_REPORT.md` (overwritten, as instructed) · `STRUCTURAL_CONVERGENCE_REPORT.md`
+(rewritten) · this note. No application code touched.
