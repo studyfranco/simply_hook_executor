@@ -6714,3 +6714,65 @@ actually meant to test.
 `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **971 passed / 0 failed** — up from
 960 before this pass · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence
 (pre-existing, unrelated), 0 drifted**.
+
+---
+
+# 2026-08-19 (fifth pass) — E2E-only: races, binary streams, auth-bypass, env-collision (§48–§51)
+
+A five-task request, e2e-only by its own scope (no Rust test or source changes) — race conditions
+during hook execution, non-UTF8 binary output, `AuthMode` bypass rules, and environment-variable
+collision isolation. Before writing anything, checked which asks were genuinely new against what
+`§24`/`§42` already covered.
+
+## What was already true
+
+- Task 3.1 ("a valid API key bypasses a hook's own `HMAC_ONLY` requirement") is the same property
+  §24 already demonstrated (`a keyed CANONICAL_V1 caller succeeds on an HMAC_ONLY hook too`). Written
+  again here anyway, self-contained and independent of §24's `HAVE_OPENSSL` guard — it needs no
+  signature at all, so it runs unconditionally and gives Task 3 its own dedicated, literal assertion
+  rather than a cross-reference.
+- Task 4's premise (`HOOK_PARAM_PATH` cannot overwrite `PATH`) was already structurally guaranteed by
+  `build_command_plan` — it only ever writes `HOOK_PARAM_<UPPERCASED_KEY>`, a different map key by
+  construction, so no collision is reachable through the API at all. Worth a dedicated regression
+  test precisely *because* it can never fail today — the assertion is what keeps that true if the
+  naming scheme ever changes.
+
+## What needed real design work
+
+- **§48.2 (concurrent modification)**: read `src/db.rs` first — WAL journal mode plus a 5s
+  `busy_timeout` mean the "no SQLite lock errors" half of the ask is already handled by
+  infrastructure, not something to work around in the test. The other half needed thinking through:
+  changing a hook's `script_path` mid-execution cannot retroactively affect an *already-`execve`'d*
+  child process (the running one keeps running whatever program it was actually launched with,
+  regardless of what the DB row says a moment later), so the meaningful assertions are that the
+  in-flight run finishes against the *original* script and the *next* invocation picks up the new
+  one — not that the update somehow reaches into a live process.
+- **§50.2 (body-excluding `canonical_template`)**: the literal task wording ("alter the payload body
+  while keeping the signature fixed") reads as two requests reusing one signature. That collides with
+  `src/replay.rs`'s single-use enforcement, keyed on `(key_id, digest)` — the digest is identical for
+  both requests when the template excludes `{body}`, so a second use of it would be correctly
+  rejected as a replay, not accepted as proof the template ignores the body. Resolved by using one
+  request: sign once, then send a body whose content was never referenced while computing that
+  signature, and assert it verifies — proving the property without conflating it with replay
+  protection, which the test comment says explicitly so a future reader doesn't try to "fix" it into
+  two requests.
+- **§49.1 (binary streams)**: `String::from_utf8_lossy` is already what `src/executor.rs` uses when a
+  captured stream is finalized, so the risk being tested for is real but already closed. Asserted the
+  U+FFFD replacement marker's actual presence (`check_stdout_contains $'\xef\xbf\xbd' ...`), not just
+  "200 and non-empty" — 200 random bytes forming valid UTF-8 by chance is astronomically unlikely, so
+  this is a reliable proof that lossy conversion ran, in the same spirit as §43's "assert the cap, not
+  merely survival."
+- **§49.2 (complex parameters)**: reused `jq -nc --arg` (established at §6/§27) to build a payload
+  containing an emoji, a literal embedded newline, consecutive spaces, and mixed quotes without any
+  of it being reinterpreted by the shell that builds the JSON string. `coerce_param_value` only
+  rejects NUL bytes, so nothing here needed a source change to support.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**307 passed / 0 failed / 2 ignored** (unchanged — this pass touched no Rust test file) ·
+`cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **1030 passed / 0 failed** — up from
+971 before this pass, stable across two consecutive full runs (the timing-sensitive concurrency check
+and the random-byte UTF-8 check were each specifically re-verified for flakiness) ·
+`./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing, unrelated), 0
+drifted**.

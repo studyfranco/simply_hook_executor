@@ -4410,6 +4410,263 @@ check_envelope "400" "a handler-level validation refusal keeps the same envelope
 api_call GET "/api/hooks" "$MASTER_KEY"
 check "200" "an ordinary request still succeeds after every malformed shape"
 
+# ── 48. Hook CRUD edge cases & concurrency race conditions ─────────────────
+
+log_section "48. Hook CRUD Edge Cases & Concurrency Race Conditions"
+
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    # 48.1 — Partial auth updates via PATCH: naming only one of hmac_secret/signature_header/
+    # signature_prefix must merge over the existing configuration, not reset the fields left unnamed
+    # — `update_hook`'s `effective_auth_mode = payload.auth_mode.unwrap_or(model.auth_mode)` and the
+    # per-field `if let Some(...)` blocks are what make that true; this proves it end to end rather
+    # than by reading the handler.
+    PATCH_SCRIPT=$(make_hook_script "patch_auth_hook.sh" 'echo patch-ok')
+    api_call POST "/api/hooks" "$MASTER_KEY" \
+        "$(jq -nc --arg p "$PATCH_SCRIPT" '{name:"patch_auth_hook",script_path:$p,auth_mode:"HMAC_ONLY",hmac_secret:"first-secret",signature_header:"X-Patch-Sig",signature_prefix:"pfx="}')"
+    check "200" "create an HMAC_ONLY hook with a custom header and prefix"
+    PATCH_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    # PATCH only hmac_secret, naming neither auth_mode nor the header/prefix at all.
+    api_call PATCH "/api/hooks/$PATCH_HOOK_ID" "$MASTER_KEY" '{"hmac_secret":"second-secret"}'
+    check "200" "PATCH rotates hmac_secret alone, omitting auth_mode entirely"
+    check_jq ".auth_mode" "HMAC_ONLY" "auth_mode survives untouched, having never been named"
+    check_jq ".signature_header" "X-Patch-Sig" "the custom header survives a secret-only PATCH"
+    check_jq ".signature_prefix" "pfx=" "the custom prefix survives a secret-only PATCH"
+
+    # PATCH only signature_prefix this time — the just-rotated secret and the header must survive.
+    api_call PATCH "/api/hooks/$PATCH_HOOK_ID" "$MASTER_KEY" '{"signature_prefix":"v2="}'
+    check "200" "PATCH updates only signature_prefix"
+    check_jq ".auth_mode" "HMAC_ONLY" "auth_mode is still untouched after a second partial PATCH"
+    check_jq ".signature_header" "X-Patch-Sig" "the custom header still survives"
+    check_jq ".signature_prefix" "v2=" "the prefix reflects the latest partial update"
+    check_true '.hmac_secret_configured' "a secret is still configured after two updates that never cleared it"
+
+    # Functional proof, not just reported fields: the *second* secret, under the *original* header,
+    # with the *newest* prefix — the exact merge of three separate partial updates — is what verifies.
+    PATCH_BODY='{}'
+    PATCH_SIG=$(printf '%s' "$PATCH_BODY" | openssl dgst -sha256 -hmac "second-secret" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "X-Patch-Sig: v2=$PATCH_SIG" -d "$PATCH_BODY" "$BASE_URL/webhook/patch_auth_hook")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "the merged configuration — new secret, original header, newest prefix — verifies end to end"
+else
+    skip "§48.1 partial auth updates via PATCH: openssl is not available to compute signatures."
+fi
+
+# 48.2 — Concurrent modification during execution: updating a hook's script_path and description
+# while an invocation against it is still in flight must not deadlock or 500 (SQLite is WAL-mode
+# with a busy_timeout — see src/db.rs), the in-flight process must run to completion against the
+# script it was actually spawned from (changing the DB pointer cannot retroactively affect an already
+# `execve`'d child), and the *next* invocation must pick up the new script.
+CONC_MARKER="$WORK_DIR/conc_started"
+CONC_ORIG_SCRIPT=$(make_hook_script "conc_original.sh" 'touch "$HOOK_PARAM_MARKER"
+sleep 5
+echo original-script-ran')
+CONC_NEW_SCRIPT=$(make_hook_script "conc_updated.sh" 'echo updated-script-ran')
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "{\"name\":\"conc_hook\",\"script_path\":\"$CONC_ORIG_SCRIPT\",\"default_timeout_seconds\":30,\"description\":\"original description\",\"parameters\":[{\"param_key\":\"marker\",\"default_value\":\"$CONC_MARKER\",\"is_required\":true}]}"
+check "200" "create a long-running hook to modify mid-execution"
+CONC_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+log "Starting a long-running (5s) background execution of conc_hook..."
+curl -s -o "$WORK_DIR/conc_resp" -w "%{http_code}" -X POST \
+    -H "X-API-Key: $MASTER_KEY" -H "Content-Type: application/json" -d '{}' \
+    "$BASE_URL/api/hooks/$CONC_HOOK_ID/execute" > "$WORK_DIR/conc_status" &
+CONC_REQ_PID=$!
+
+CONC_STARTED=0
+for _ in $(seq 1 100); do
+    if [ -e "$CONC_MARKER" ]; then
+        CONC_STARTED=1
+        break
+    fi
+    sleep 0.05
+done
+check_local "$CONC_STARTED" "1" "the long-running execution actually started before the update"
+
+api_call PATCH "/api/hooks/$CONC_HOOK_ID" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$CONC_NEW_SCRIPT" '{script_path:$p,description:"updated mid-flight"}')"
+check "200" "script_path and description update cleanly while an execution against the hook is in flight — no SQLite lock error"
+check_jq ".description" "updated mid-flight" "the description update was applied"
+check_jq ".script_path" "$CONC_NEW_SCRIPT" "the script_path update was applied"
+
+api_call GET "/api/hooks/$CONC_HOOK_ID" "$MASTER_KEY"
+check "200" "an ordinary read against the hook succeeds too, concurrently with the in-flight execution"
+
+wait "$CONC_REQ_PID" 2>/dev/null || true
+check_local "$(cat "$WORK_DIR/conc_status" 2>/dev/null)" "200" "the in-flight execution completed successfully despite the concurrent update"
+check_local "$(jq -r '.stdout' "$WORK_DIR/conc_resp" 2>/dev/null | tr -d '\n')" "original-script-ran" \
+    "the in-flight execution ran the *original* script — a DB pointer change cannot rewrite an already-spawned process"
+
+api_call POST "/api/hooks/$CONC_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "a fresh execution after the update succeeds"
+check_jq ".stdout | rtrimstr(\"\n\")" "updated-script-ran" "the fresh execution runs the *newly assigned* script"
+
+# 48.3 — Unauthorized hook modification: an execute-only key (can_execute, no can_manage) must be
+# refused 403 when it attempts to change hook configuration, even a field as innocuous as the
+# timeout — RBAC_MODEL.md R2 makes managing a resource a conjunction, and holding the operational
+# verb alone satisfies neither half of it.
+api_call PUT "/api/hooks/$ECHO_HOOK_ID" "$EXEC_KEY" '{"default_timeout_seconds":99}'
+check "403" "an execute-only key cannot modify a hook's timeout"
+api_call PUT "/api/hooks/$ECHO_HOOK_ID" "$EXEC_KEY" '{"description":"hijacked"}'
+check "403" "...nor any other content field, description included"
+api_call GET "/api/hooks/$ECHO_HOOK_ID" "$MASTER_KEY"
+check_true '.default_timeout_seconds != 99' "the refused timeout change did not take effect"
+check_true '.description != "hijacked"' "the refused description change did not take effect either"
+
+# ── 49. Non-UTF8 binary streams & complex parameter encoding ───────────────
+
+log_section "49. Non-UTF8 Binary Streams & Complex Parameter Encoding"
+
+# 49.1 — Raw binary bytes on stdout and stderr must come back as a lossily-converted JSON string
+# (src/executor.rs uses String::from_utf8_lossy when a captured stream is finalized), never as a 500
+# from a JSON encoder choking on invalid UTF-8.
+BINARY_SCRIPT=$(make_hook_script "binary_output_hook.sh" 'head -c 200 /dev/urandom
+head -c 100 /dev/urandom >&2
+exit 0')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$BINARY_SCRIPT" '{name:"binary_output_hook",script_path:$p}')"
+check "200" "create a hook that writes raw random bytes to stdout and stderr"
+BINARY_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$BINARY_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "raw non-UTF8 binary output does not fail the request"
+check_jq ".status" "SUCCESS" "the execution itself completed normally"
+check_true '(.stdout | type) == "string"' "binary stdout was captured as a JSON string, not a serialization failure"
+check_true '(.stderr | type) == "string"' "binary stderr was captured as a JSON string too"
+check_true '(.stdout | length) > 0' "stdout is non-empty"
+check_true '(.stderr | length) > 0' "stderr is non-empty"
+# 200 random bytes forming valid UTF-8 by chance is astronomically unlikely (each of the ~140
+# possible invalid lead/continuation byte values would have to happen not to appear at all), so the
+# lossy replacement marker's presence is a reliable, not merely probable, signal that the conversion
+# actually ran rather than the bytes happening to already be valid text.
+check_stdout_contains $'\xef\xbf\xbd' "non-UTF8 bytes were lossily replaced with U+FFFD rather than corrupting the response"
+
+# 49.2 — Complex parameter encoding: an emoji, a real embedded newline (not "\n" as two characters),
+# runs of consecutive spaces, and mixed single/double quotes must all survive byte-for-byte into both
+# HOOK_PARAM_TEXT and the $1 positional argument — hooks are never spawned through a shell (see
+# §6/§27), so there is no second round of interpretation to corrupt them.
+COMPLEX_SCRIPT=$(make_hook_script "complex_param_hook.sh" 'printf "ENV_START>>>%s<<<ENV_END\n" "$HOOK_PARAM_TEXT"
+printf "ARG_START>>>%s<<<ARG_END\n" "$1"')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$COMPLEX_SCRIPT" '{name:"complex_param_hook",script_path:$p,parameters:[{param_key:"text",is_required:true}]}')"
+check "200" "create a hook that echoes its parameter back both ways"
+COMPLEX_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+COMPLEX_VALUE="🚀 rocket"$'\n'"second line   with    consecutive spaces and \"double\" 'single' quotes"
+
+api_call POST "/api/hooks/$COMPLEX_HOOK_ID/execute" "$MASTER_KEY" \
+    "$(jq -nc --arg v "$COMPLEX_VALUE" '{parameters:{text:$v}}')"
+check "200" "an emoji/newline/quote-laden parameter is accepted"
+check_jq ".status" "SUCCESS" "the execution completed"
+check_jq ".parameters.text" "$COMPLEX_VALUE" "the resolved parameter round-trips exactly through the execution record"
+check_stdout_contains "ENV_START>>>$COMPLEX_VALUE<<<ENV_END" \
+    "the HOOK_PARAM_* environment variable carries the exact bytes supplied, uncorrupted"
+check_stdout_contains "ARG_START>>>$COMPLEX_VALUE<<<ARG_END" \
+    "the positional \$1 argument carries the exact same bytes"
+
+# ── 50. AuthMode precedence & custom template exclusions ───────────────────
+
+log_section "50. AuthMode Precedence & Custom Template Exclusions"
+
+# 50.1 — A valid, permitted X-API-Key always bypasses a hook's own HMAC_ONLY requirement: holding a
+# real key is sufficient authentication and authorization on its own, regardless of what the hook
+# additionally accepts from a *keyless* sender (hooks.auth_mode's doc comment is explicit that it
+# "only ever adds a way in for a keyless caller; it never removes the always-available keyed path").
+# No signature header is sent at all — plain X-API-Key only.
+BYPASS_SCRIPT=$(make_hook_script "bypass_hmac_hook.sh" 'echo bypass-ok')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$BYPASS_SCRIPT" '{name:"bypass_hmac_hook",script_path:$p,auth_mode:"HMAC_ONLY",hmac_secret:"bypass-secret"}')"
+check "200" "create an HMAC_ONLY hook for the API-key-bypass check"
+BYPASS_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+create_scoped_key "HMAC Bypass Key"
+BYPASS_KEY="$CREATED_KEY"; BYPASS_ID="$CREATED_ID"
+api_call POST "/api/keys/$BYPASS_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$BYPASS_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+check "200" "grant the new key execute rights on the HMAC_ONLY hook"
+
+api_call POST "/api/hooks/$BYPASS_HOOK_ID/execute" "$BYPASS_KEY" '{}'
+check "200" "a valid X-API-Key with can_execute succeeds with no HMAC signature header at all"
+check_jq ".status" "SUCCESS" "the bypassed execution actually ran"
+
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    # 50.2 — A canonical_template that omits {body} does not authenticate the body at all: an operator
+    # who chooses this template has explicitly opted the body out of what the signature covers
+    # (hooks.canonical_template's doc comment: substitution is textual and this service does not
+    # validate a template's shape beyond that placeholder list). Exercised with a single request, not
+    # two identical-signature replays of it — reusing the very same digest a second time would
+    # correctly be refused by single-use replay protection (src/replay.rs), which is an orthogonal
+    # property this test is not about.
+    NOBODY_SCRIPT=$(make_hook_script "nobody_template_hook.sh" 'printf "marker=%s\n" "$HOOK_PARAM_MARKER"')
+    api_call POST "/api/hooks" "$MASTER_KEY" \
+        "$(jq -nc --arg p "$NOBODY_SCRIPT" '{name:"nobody_template_hook",script_path:$p,canonical_template:"{method}:{path}:{timestamp}",parameters:[{param_key:"marker",default_value:"none",is_required:false}]}')"
+    check "200" "create a hook whose canonical_template omits {body}"
+    NOBODY_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".canonical_template" "{method}:{path}:{timestamp}" "the hook reports the body-excluding template"
+
+    create_scoped_key "No-Body Template Key"
+    NOBODY_KEY="$CREATED_KEY"; NOBODY_SECRET="$CREATED_SIGNING_SECRET"; NOBODY_ID="$CREATED_ID"
+    api_call POST "/api/keys/$NOBODY_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$NOBODY_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+    check "200" "grant the templated key rights on the no-body hook"
+
+    NOBODY_PATH="/api/hooks/$NOBODY_HOOK_ID/execute"
+    NOBODY_TS=$(date +%s)
+    NOBODY_SIG=$(printf 'POST:%s:%s' "$NOBODY_PATH" "$NOBODY_TS" | openssl dgst -sha256 -hmac "$NOBODY_SECRET" -r | cut -d' ' -f1)
+
+    # This body was never referenced while computing the signature above — the template simply has
+    # nowhere to put it — so any body at all must verify against this one signature.
+    NOBODY_BODY='{"marker":"a-body-the-signer-never-committed-to"}'
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $NOBODY_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $NOBODY_TS" -H "X-Signature-256: sha256=$NOBODY_SIG" \
+        -d "$NOBODY_BODY" "$BASE_URL$NOBODY_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "a signature over a {body}-excluding template verifies regardless of the body actually sent"
+    check_jq ".parameters.marker" "a-body-the-signer-never-committed-to" \
+        "the unauthenticated body was still applied — its content, just not its authenticity, is what the template excludes"
+else
+    skip "§50.2 body-excluding canonical templates: openssl is not available to compute signatures."
+fi
+
+# ── 51. Environment variable collision isolation ────────────────────────────
+
+log_section "51. Environment Variable Collision Isolation (HOOK_PARAM_PATH / HOOK_PARAM_IFS)"
+
+# A parameter named PATH or IFS becomes HOOK_PARAM_PATH / HOOK_PARAM_IFS — a distinct environment
+# variable name from PATH/IFS themselves, by construction (build_command_plan only ever writes
+# `HOOK_PARAM_<UPPERCASED_KEY>`). This proves that structural guarantee end to end: the shell's own
+# PATH must still resolve commands and its own IFS must still split words normally, while the
+# HOOK_PARAM_* variables carry the caller-supplied values and nothing overwrites the other.
+ENV_COLLISION_SCRIPT=$(make_hook_script "env_collision_hook.sh" 'printf "SYS_PATH:%s\n" "$PATH"
+WORDS="alpha beta gamma"
+set -- $WORDS
+printf "SYS_IFS_WORDCOUNT:%s\n" "$#"
+printf "PARAM_PATH:[%s]\n" "$HOOK_PARAM_PATH"
+printf "PARAM_IFS:[%s]\n" "$HOOK_PARAM_IFS"')
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ENV_COLLISION_SCRIPT" '{name:"env_collision_hook",script_path:$p,parameters:[{param_key:"PATH",is_required:true},{param_key:"IFS",is_required:true}]}')"
+check "200" "create a hook declaring parameters literally named PATH and IFS"
+ENV_COLLISION_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$ENV_COLLISION_HOOK_ID/execute" "$MASTER_KEY" \
+    '{"parameters":{"PATH":"not-a-real-path","IFS":"X"}}'
+check "200" "execute with attacker-chosen PATH and IFS parameter values"
+check_jq ".status" "SUCCESS" "the script ran to completion — the real PATH was not clobbered into unusability"
+check_jq ".parameters.PATH" "not-a-real-path" "the supplied PATH parameter value is recorded as-is"
+check_jq ".parameters.IFS" "X" "the supplied IFS parameter value is recorded as-is"
+
+check_stdout_contains "SYS_PATH:$PATH" \
+    "the interpreter's own \$PATH is untouched — HOOK_PARAM_PATH is a distinct variable, never PATH itself"
+check_stdout_contains "SYS_IFS_WORDCOUNT:3" \
+    "the interpreter's own \$IFS still splits words normally — HOOK_PARAM_IFS never touches it"
+check_stdout_contains "PARAM_PATH:[not-a-real-path]" \
+    "the PATH parameter's value reaches the script as HOOK_PARAM_PATH, not as PATH"
+check_stdout_contains "PARAM_IFS:[X]" \
+    "the IFS parameter's value reaches the script as HOOK_PARAM_IFS, not as IFS"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"
