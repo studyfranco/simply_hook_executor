@@ -41,6 +41,7 @@ jobs:
           cp target/${{ matrix.target }}/release/simply_hook_executor staging/
           cp README.md LICENSE staging/
           cp -r deploy staging/
+          cp -r static staging/
           tar -czf ${{ matrix.artifact_name }}.tar.gz -C staging .
 
       - name: Update Latest Release
