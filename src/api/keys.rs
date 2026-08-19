@@ -233,6 +233,9 @@ pub struct MeResponse {
     pub key_id: Option<String>,
     /// Signature verification mode this key's requests are checked under.
     pub hmac_mode: HmacMode,
+    /// Configured `CANONICAL_V1` template override, or `None` for the service-wide default. Always
+    /// `None` while `can_manage_keys` is `true` — see `guards::guard_canonical_v1_for_key_management`.
+    pub canonical_template: Option<String>,
     /// Bound CIDRs.
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget.
@@ -285,6 +288,7 @@ pub async fn get_me(
         prefix: key.prefix,
         key_id: key.key_id,
         hmac_mode: key.hmac_mode,
+        canonical_template: key.canonical_template,
         bound_ips: key.bound_ips,
         max_concurrent_jobs: key.max_concurrent_jobs,
         is_master: key.is_master,
@@ -319,15 +323,20 @@ pub struct CreateApiKeyPayload {
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget. Defaults to 10.
     pub max_concurrent_jobs: Option<i32>,
-    /// Signature verification mode. Defaults to `CANONICAL_V1`; `BODY_ONLY` opts out of replay
-    /// protection for third-party webhook senders whose format cannot be changed.
+    /// Signature verification mode. `CANONICAL_V1` is the only accepted value; present so a client
+    /// can state its intent explicitly, but there is nothing else to select.
     ///
     /// **Fixed for the key's entire life.** Set here or never; `UpdateApiKeyPayload` carries no
-    /// `hmac_mode` field at all, so there is no request that can change it later. A security level a
-    /// key can downgrade itself into (or be downgraded into) after the fact is not a fixed level —
-    /// this is the guarantee `can_manage_keys` below leans on: once granted to a `CANONICAL_V1` key,
-    /// it cannot be left holding that scope while quietly weakened to `BODY_ONLY`.
+    /// `hmac_mode` field at all, so there is no request that can change it later.
     pub hmac_mode: Option<HmacMode>,
+    /// Override of the `CANONICAL_V1` canonical string this key signs over. Omit (or send `null`)
+    /// for the service-wide default, `{method}\n{path}\n{timestamp}\n{body}`.
+    ///
+    /// **Refused outright when `can_manage_keys` is also requested** — see
+    /// `guards::guard_canonical_v1_for_key_management`. Unlike `hmac_mode`, this field **is**
+    /// mutable later through `UpdateApiKeyPayload`, for any key that is not (and does not become) a
+    /// `can_manage_keys` holder.
+    pub canonical_template: Option<String>,
     /// Global key-management scope.
     pub can_manage_keys: Option<bool>,
     /// Global hook-creation scope.
@@ -371,6 +380,8 @@ pub struct ApiKeySummary {
     pub has_signing_secret: bool,
     /// Signature verification mode.
     pub hmac_mode: HmacMode,
+    /// Configured `CANONICAL_V1` template override, or `None` for the service-wide default.
+    pub canonical_template: Option<String>,
     /// Bound CIDRs.
     pub bound_ips: Option<String>,
     /// Simultaneous execution budget.
@@ -464,6 +475,7 @@ pub(crate) async fn build_api_key_summary(
         key_id: model.key_id,
         has_signing_secret: model.signing_secret.is_some(),
         hmac_mode: model.hmac_mode,
+        canonical_template: model.canonical_template,
         bound_ips: model.bound_ips,
         max_concurrent_jobs: model.max_concurrent_jobs,
         is_master: model.is_master,
@@ -495,7 +507,12 @@ pub async fn create_api_key(
     // guard can run in the same "authorization before validation" position as the guard above —
     // and so it is set exactly once, since `hmac_mode` is immutable from here on.
     let hmac_mode = payload.hmac_mode.unwrap_or_default();
-    guard_canonical_v1_for_key_management(payload.can_manage_keys.unwrap_or(false), hmac_mode)?;
+    let canonical_template = payload.canonical_template.clone().filter(|s| !s.is_empty());
+    guard_canonical_v1_for_key_management(
+        payload.can_manage_keys.unwrap_or(false),
+        hmac_mode,
+        canonical_template.as_deref(),
+    )?;
 
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
@@ -518,6 +535,7 @@ pub async fn create_api_key(
         key_id: Set(Some(key_id.clone())),
         signing_secret: Set(Some(sealed_secret)),
         hmac_mode: Set(hmac_mode),
+        canonical_template: Set(canonical_template),
         bound_ips: Set(payload.bound_ips.clone()),
         max_concurrent_jobs: Set(max_concurrent_jobs),
         // Hard-wired, not read from the payload. There is no field to read, and the database's
@@ -632,6 +650,11 @@ pub struct UpdateApiKeyPayload {
     // the payload type rather than accepted-and-ignored, for the same reason `is_master` is absent:
     // `deny_unknown_fields` above is what turns an attempt to change it into a `400` naming the
     // field, instead of a silently no-op `200` that leaves the caller believing it took effect.
+    /// New `CANONICAL_V1` template override. Send `""` to reset to the service-wide default;
+    /// omitting the field leaves the current value untouched. Refused (`400`) if the *effective*
+    /// `can_manage_keys` (this payload's, else the target's current value) is `true` — see
+    /// `guards::guard_canonical_v1_for_key_management`.
+    pub canonical_template: Option<String>,
     /// New key-management scope.
     pub can_manage_keys: Option<bool>,
     /// New hook-creation scope.
@@ -667,7 +690,18 @@ pub async fn update_api_key(
     // than `false`; using `false` here would let this guard be bypassed by simply not mentioning
     // the field on a key that already (illegitimately) held both.
     let effective_can_manage_keys = payload.can_manage_keys.unwrap_or(target.can_manage_keys);
-    guard_canonical_v1_for_key_management(effective_can_manage_keys, target.hmac_mode)?;
+    // Same "effective" reasoning for `canonical_template`: the payload's, if it named one
+    // (non-empty), else whatever the target already has.
+    let effective_canonical_template = match &payload.canonical_template {
+        Some(t) if !t.is_empty() => Some(t.as_str()),
+        Some(_) => None,
+        None => target.canonical_template.as_deref(),
+    };
+    guard_canonical_v1_for_key_management(
+        effective_can_manage_keys,
+        target.hmac_mode,
+        effective_canonical_template,
+    )?;
 
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
@@ -685,6 +719,9 @@ pub async fn update_api_key(
     }
     if let Some(jobs) = payload.max_concurrent_jobs {
         active.max_concurrent_jobs = Set(jobs);
+    }
+    if let Some(template) = payload.canonical_template {
+        active.canonical_template = Set(if template.is_empty() { None } else { Some(template) });
     }
     if let Some(v) = payload.can_manage_keys {
         active.can_manage_keys = Set(v);

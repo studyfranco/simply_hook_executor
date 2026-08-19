@@ -203,7 +203,6 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
         StatusCode::UNAUTHORIZED,
         "the retired X-Key-Id header must not resolve a key"
     );
-    assert!(response.string("error").contains("X-API-Key"));
 
     let key_id_as_bearer = signed_request("POST", uri, &sender.key_id, &sender.signing_secret, &body);
     assert_eq!(
@@ -218,9 +217,10 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
+    // The message is not asserted: this is a webhook-invocation route, and Task 2 collapses every
+    // authentication failure there into one fixed body.
     let response = send(&app, anonymous).await;
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert!(response.string("error").contains("X-API-Key"));
 }
 
 #[tokio::test]
@@ -266,11 +266,11 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
             StatusCode::UNAUTHORIZED,
             "offset {offset}s should be outside the window"
         );
-        assert!(
-            response.string("error").contains("window"),
-            "the error should explain the window: {}",
-            response.string("error")
-        );
+        // The message itself is not asserted here: this is a webhook-invocation route, and Task 2
+        // collapses every authentication failure there into one fixed body — see
+        // `middleware::invocation_unauthorized`. The window's exact boundary behavior (which is
+        // what this test is really pinning) is unaffected by what the body says; that boundary is
+        // asserted precisely, with no I/O to skew it, in `middleware::tests::timestamps_*`.
     }
 
     // A correctly-signed request replayed *later* is refused once its timestamp ages out — which
@@ -317,8 +317,9 @@ async fn signed_requests_require_a_well_formed_timestamp_header() {
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
     let response = send(&app, no_timestamp).await;
+    // The message is not asserted: this is a webhook-invocation route, and Task 2 collapses every
+    // authentication failure there into one fixed body.
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert!(response.string("error").contains("X-Timestamp"));
 
     // Malformed timestamps are rejected rather than coerced.
     for malformed in ["", "not-a-number", "1700000000.5", "17e9", "-"] {
@@ -463,78 +464,14 @@ async fn require_signed_requests_makes_the_protocol_mandatory() {
     assert_eq!(send(&app, signed_exec).await.status, StatusCode::OK);
 }
 
+/// `X-Hub-Signature-256` was the alternate header key-level `BODY_ONLY` verification accepted;
+/// that mode is retired (see `HmacMode`'s doc comment), and this pins that no residue of it
+/// survives at the key level — the header is dead weight there now, never read, never honoured,
+/// regardless of what it carries. A hook's own `HMAC_ONLY` `auth_mode` may still configure it as
+/// its `signature_header` (covered in `tests/auth_mode_tests.rs`), which is an entirely separate,
+/// keyless code path.
 #[tokio::test]
-async fn body_only_mode_accepts_github_style_webhook_signatures() {
-    use simply_hook_executor::entities::api_key::HmacMode;
-
-    let dir = ScriptDir::new();
-    let script = dir.write_script("gh.sh", "echo \"pushed:$HOOK_PARAM_REF\"");
-
-    let db = setup_test_db().await;
-    let app = create_app(test_state(&db));
-    let sender = insert_key_with_mode(&db, "Forgejo", "0.0.0.0/0", KeyScopes::plain(), HmacMode::BodyOnly).await;
-    let hook_id = insert_hook(&db, "on_push", &script, 30).await;
-    insert_parameter(&db, hook_id, "ref", Some("refs/heads/main"), true).await;
-    grant(&db, sender.id, hook_id, true, false).await;
-
-    let uri = "/webhook/on_push";
-    let body = json!({ "ref": "refs/heads/release" }).to_string();
-
-    // Both header spellings are honoured in this mode: GitHub and Forgejo send
-    // `X-Hub-Signature-256`, while other senders use `X-Signature-256`.
-    for header in ["X-Signature-256", "X-Hub-Signature-256"] {
-        let response = send(
-            &app,
-            body_only_request(uri, &sender.plaintext, &sender.signing_secret, &body, header),
-        )
-        .await;
-        assert_eq!(response.status, StatusCode::OK, "{header} should be accepted in BODY_ONLY mode");
-        assert_eq!(response.string("stdout").trim(), "pushed:refs/heads/release");
-    }
-
-    // No timestamp is required, and one supplied anyway is simply not part of the signed material.
-    let with_stray_timestamp = with_connect_info(
-        axum::http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("X-API-Key", &sender.plaintext)
-            .header("Content-Type", "application/json")
-            .header("X-Timestamp", "1")
-            .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
-    )
-    .body(axum::body::Body::from(body.clone()))
-    .expect("request builds");
-    assert_eq!(send(&app, with_stray_timestamp).await.status, StatusCode::OK);
-
-    // A tampered body still fails, and so does the wrong secret.
-    let tampered = with_connect_info(
-        axum::http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("X-API-Key", &sender.plaintext)
-            .header("Content-Type", "application/json")
-            .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
-    )
-    .body(axum::body::Body::from(json!({ "ref": "refs/heads/evil" }).to_string()))
-    .expect("request builds");
-    assert_eq!(send(&app, tampered).await.status, StatusCode::UNAUTHORIZED);
-
-    let wrong_secret = body_only_request(uri, &sender.plaintext, "not-the-secret", &body, "X-Hub-Signature-256");
-    assert_eq!(send(&app, wrong_secret).await.status, StatusCode::UNAUTHORIZED);
-
-    // A canonical-style signature is *not* valid for a BODY_ONLY key: the modes are distinct, not
-    // a fallback chain.
-    let canonical = signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &body);
-    assert_eq!(send(&app, canonical).await.status, StatusCode::UNAUTHORIZED);
-
-    // The bearer key alone still authenticates (signing is optional unless REQUIRE_SIGNED_REQUESTS
-    // is on): BODY_ONLY governs how a signature is *verified*, not whether the key is a credential.
-    let unsigned = json_request("POST", uri, &sender.plaintext, Some(json!({ "ref": "refs/heads/main" })));
-    assert_eq!(send(&app, unsigned).await.status, StatusCode::OK);
-}
-
-#[tokio::test]
-async fn canonical_mode_ignores_the_hub_signature_header() {
+async fn x_hub_signature_256_is_never_honoured_at_the_key_level() {
     use simply_hook_executor::entities::api_key::HmacMode;
 
     let dir = ScriptDir::new();
@@ -549,8 +486,9 @@ async fn canonical_mode_ignores_the_hub_signature_header() {
     let uri = "/webhook/strict_hook";
     let body = json!({}).to_string();
 
-    // A CANONICAL_V1 key must not be downgradeable to body-only verification just by choosing the
-    // other header name — otherwise the per-key mode would be advisory rather than enforced.
+    // The hub header carries a real, correctly-computed body-only signature — and is still not
+    // read at all, so this counts as an *unsigned* request, which a valid bearer key still
+    // authenticates.
     let hub_only = with_connect_info(
         axum::http::Request::builder()
             .method("POST")
@@ -583,9 +521,10 @@ async fn canonical_mode_ignores_the_hub_signature_header() {
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
+    // The message is not asserted: this is a webhook-invocation route, and Task 2 collapses every
+    // authentication failure there into one fixed body.
     let response = send(&strict_app, hub_only_again).await;
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert!(response.string("error").contains("must be signed"));
 
     // A body-only signature sent under the correct header name is still wrong material here.
     let body_only_sig = with_connect_info(
@@ -612,7 +551,7 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
     let app = create_app(test_state(&db));
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
 
-    // Omitted -> the strict default, never the relaxed one.
+    // Omitted -> the (only) default.
     let defaulted = send(
         &app,
         json_request("POST", "/api/keys", &master, Some(json!({ "name": "defaulted", "bound_ips": "0.0.0.0/0" }))),
@@ -626,67 +565,60 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
     let defaulted_row = rows.iter().find(|k| k["id"] == json!(defaulted_id)).expect("the key is listed");
     assert_eq!(defaulted_row["hmac_mode"], json!("CANONICAL_V1"));
 
-    // Explicitly requested at creation.
-    let body_only = send(
+    // Explicitly requested at creation is equally fine — there is nothing else to choose from, but
+    // a client stating its intent explicitly must not be refused for doing so.
+    let explicit = send(
         &app,
         json_request(
             "POST",
             "/api/keys",
             &master,
-            Some(json!({ "name": "webhook_sender", "bound_ips": "0.0.0.0/0", "hmac_mode": "BODY_ONLY" })),
+            Some(json!({ "name": "explicit", "bound_ips": "0.0.0.0/0", "hmac_mode": "CANONICAL_V1" })),
         ),
     )
     .await;
-    assert_eq!(body_only.status, StatusCode::OK);
-    let body_only_id = body_only.string("id");
+    assert_eq!(explicit.status, StatusCode::OK);
 
-    // Choosing the weaker mode is recorded in the audit trail, since it is a security decision.
-    let audit = send(&app, json_request("GET", "/api/audit-logs?action=KEY_CREATE&limit=5", &master, None)).await;
-    let details = audit.json.as_array().cloned().unwrap_or_default();
-    assert!(
-        details.iter().any(|e| e["details"].as_str().unwrap_or_default().contains("BODY_ONLY")
-            && e["details"].as_str().unwrap_or_default().contains("no replay protection")),
-        "creating a BODY_ONLY key must be audited as such: {details:?}"
-    );
+    // A retired or otherwise unrecognized mode is rejected by deserialization rather than silently
+    // defaulting — `BODY_ONLY` no longer parses at all, having been removed from the enum entirely.
+    for bogus in ["BODY_ONLY", "NO_SUCH_MODE"] {
+        let invalid = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/keys",
+                &master,
+                Some(json!({ "name": format!("bogus-{bogus}"), "bound_ips": "0.0.0.0/0", "hmac_mode": bogus })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            invalid.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{bogus:?} must not be accepted as hmac_mode: {}",
+            invalid.raw
+        );
+    }
 
     // Immutable after creation: `UpdateApiKeyPayload` carries no `hmac_mode` field at all, so an
-    // attempt to change it is refused by `deny_unknown_fields` at the extractor — a 400 naming the
-    // field, before any handler runs — rather than a 200 that silently ignores it or, worse, a 200
-    // that once quietly applied it. Tried in both directions, against keys currently in each mode.
-    let widen_attempt = send(
+    // attempt to name it — even to the value it already holds — is refused by `deny_unknown_fields`
+    // at the extractor, before any handler runs.
+    let attempt = send(
         &app,
-        json_request("PUT", &format!("/api/keys/{defaulted_id}"), &master, Some(json!({ "hmac_mode": "BODY_ONLY" }))),
+        json_request(
+            "PUT",
+            &format!("/api/keys/{defaulted_id}"),
+            &master,
+            Some(json!({ "hmac_mode": "CANONICAL_V1" })),
+        ),
     )
     .await;
     assert_eq!(
-        widen_attempt.status,
+        attempt.status,
         StatusCode::UNPROCESSABLE_ENTITY,
         "hmac_mode must be immutable — an update naming it should be refused, not applied: {}",
-        widen_attempt.raw
+        attempt.raw
     );
-    let listed_after_first_refusal = send(&app, json_request("GET", "/api/keys", &master, None)).await;
-    let rows_after_first = listed_after_first_refusal.json.as_array().cloned().unwrap_or_default();
-    let defaulted_row_after = rows_after_first.iter().find(|k| k["id"] == json!(defaulted_id)).expect("listed");
-    assert_eq!(
-        defaulted_row_after["hmac_mode"], json!("CANONICAL_V1"),
-        "the refused update must not have taken effect"
-    );
-
-    let narrow_attempt = send(
-        &app,
-        json_request("PUT", &format!("/api/keys/{body_only_id}"), &master, Some(json!({ "hmac_mode": "CANONICAL_V1" }))),
-    )
-    .await;
-    assert_eq!(
-        narrow_attempt.status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "immutability applies in both directions, not only to weakening: {}",
-        narrow_attempt.raw
-    );
-    let listed_after_second_refusal = send(&app, json_request("GET", "/api/keys", &master, None)).await;
-    let rows_after_second = listed_after_second_refusal.json.as_array().cloned().unwrap_or_default();
-    let body_only_row_after = rows_after_second.iter().find(|k| k["id"] == json!(body_only_id)).expect("listed");
-    assert_eq!(body_only_row_after["hmac_mode"], json!("BODY_ONLY"));
 
     // An update naming no fields hmac_mode isn't among still succeeds — the field's absence from the
     // type is what is being asserted, not that the endpoint has become unusable.
@@ -697,23 +629,6 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
     .await;
     assert_eq!(ordinary_update.status, StatusCode::OK, "an update that never mentions hmac_mode still works: {}", ordinary_update.raw);
     assert_eq!(ordinary_update.field("hmac_mode"), &json!("CANONICAL_V1"), "and update_api_key's own response still reports the untouched mode");
-
-    // An unrecognized mode is rejected by deserialization rather than silently defaulting.
-    let invalid = send(
-        &app,
-        json_request(
-            "POST",
-            "/api/keys",
-            &master,
-            Some(json!({ "name": "bogus", "bound_ips": "0.0.0.0/0", "hmac_mode": "NO_SUCH_MODE" })),
-        ),
-    )
-    .await;
-    assert!(
-        invalid.status.is_client_error(),
-        "an unknown hmac_mode must not be accepted, got {}",
-        invalid.status
-    );
 
     // The key's own identity endpoint reports its mode, which is what the SPA signs with.
     let me = send(&app, json_request("GET", "/api/auth/me", &master, None)).await;
@@ -745,6 +660,87 @@ async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
     assert_eq!(stored.hmac_mode, HmacMode::CanonicalV1);
 
     Migrator::up(&db, None).await.expect("migrations are idempotent");
+}
+
+/// `m20260819_141730_consolidate_hmac_modes`'s data fix: a row still holding the literal string
+/// `BODY_ONLY` (written by a pre-upgrade deployment) is rewritten to `CANONICAL_V1` as part of the
+/// migration that removes the Rust variant, not left to fail to parse the first time a request
+/// touches it.
+#[tokio::test]
+async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm_migration::MigratorTrait;
+    use simply_hook_executor::{
+        entities::api_key::{self, HmacMode},
+        migration::Migrator,
+    };
+
+    let db = sea_orm::Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory SQLite is available");
+
+    // Stop just before the consolidation migration (the 11th of 11): `canonical_template` does not
+    // exist on this schema yet, so the row is seeded with a raw `ActiveModel` rather than
+    // `insert_key_full` (which would set that column and fail against a table that lacks it) —
+    // matching exactly what a row written before this migration shipped actually looked like.
+    Migrator::up(&db, Some(10)).await.expect("earlier migrations apply");
+    let id = Uuid::new_v4();
+    let plaintext = simply_hook_executor::api::generate_random_key();
+    let now = chrono::Utc::now().naive_utc();
+    api_key::ActiveModel {
+        id: sea_orm::Set(id),
+        key_hash: sea_orm::Set(simply_hook_executor::api::hash_key(&plaintext)),
+        name: sea_orm::Set("Legacy Sender".to_owned()),
+        prefix: sea_orm::Set(plaintext.chars().take(8).collect()),
+        key_id: sea_orm::Set(None),
+        signing_secret: sea_orm::Set(None),
+        // `Expr::value` bypasses the (already-updated) Rust `HmacMode` type at the SQL layer.
+        hmac_mode: sea_orm::ActiveValue::Set(HmacMode::CanonicalV1),
+        bound_ips: sea_orm::Set(Some("0.0.0.0/0".to_owned())),
+        max_concurrent_jobs: sea_orm::Set(10),
+        is_master: sea_orm::Set(false),
+        parent_key_id: sea_orm::Set(None),
+        can_manage_keys: sea_orm::Set(false),
+        can_manage_hooks: sea_orm::Set(false),
+        created_at: sea_orm::Set(now),
+        updated_at: sea_orm::Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("seeding a legacy row succeeds");
+    // Overwritten to the literal `BODY_ONLY` string afterward — `Expr::value` bypasses the
+    // (already-updated) Rust `HmacMode` type at the SQL layer, since it now has nowhere to put
+    // that variant.
+    api_key::Entity::update_many()
+        .col_expr(api_key::Column::HmacMode, sea_orm::sea_query::Expr::value("BODY_ONLY"))
+        .filter(api_key::Column::Id.eq(id))
+        .exec(&db)
+        .await
+        .expect("seeding a legacy BODY_ONLY row succeeds");
+
+    Migrator::up(&db, None).await.expect("the consolidation migration applies");
+
+    let stored = simply_hook_executor::entities::prelude::ApiKey::find_by_id(id)
+        .one(&db)
+        .await
+        .expect("query succeeds")
+        .expect("the key still exists");
+    assert_eq!(
+        stored.hmac_mode,
+        HmacMode::CanonicalV1,
+        "a legacy BODY_ONLY row must be rewritten, not left to fail to parse"
+    );
+
+    // A brand new key created after the upgrade still defaults correctly, unaffected by the data
+    // fix having run.
+    let fresh_id = insert_key_full(&db, "Fresh", "0.0.0.0/0", KeyScopes::plain()).await.id;
+    let fresh = simply_hook_executor::entities::prelude::ApiKey::find_by_id(fresh_id)
+        .one(&db)
+        .await
+        .expect("query succeeds")
+        .expect("the key exists");
+    assert_eq!(fresh.hmac_mode, HmacMode::CanonicalV1);
 }
 
 #[tokio::test]
@@ -809,7 +805,9 @@ async fn signature_rejection_leaks_no_oracle_about_the_correct_digest() {
         assert_eq!(status, first_status, "{label}: status differs from the other rejections");
         assert_eq!(error, first_error, "{label}: error message differs from the other rejections");
     }
-    assert_eq!(first_error, "Invalid request signature");
+    // Task 2's uniform 401 for invocation routes — every authentication failure here, not only a
+    // signature mismatch, collapses into this one body.
+    assert_eq!(first_error, "Unauthorized");
 
     // No rejected attempt reached the engine.
     assert!(!std::path::Path::new(&side_effect).exists());
@@ -819,64 +817,102 @@ async fn signature_rejection_leaks_no_oracle_about_the_correct_digest() {
     assert_eq!(send(&app, attempt(valid)).await.status, StatusCode::OK);
 }
 
+/// The whole point of `CANONICAL_V1`'s anti-replay property, demonstrated rather than merely
+/// asserted in prose: the timestamp is part of the signed material, so a captured request cannot
+/// be re-dated, and every key — the only mode there is, since `BODY_ONLY` was retired — gets this
+/// property uniformly. `tests/hook_executor_integration_tests.rs`'s
+/// `an_intercepted_signed_request_cannot_be_replayed_inside_the_window` covers the companion
+/// single-use property (a *fresh*, byte-identical replay is refused); this one covers staleness.
 #[tokio::test]
-async fn replay_differs_between_hmac_modes() {
-    use simply_hook_executor::entities::api_key::HmacMode;
-
+async fn a_stale_signature_is_refused_regardless_of_key() {
     let dir = ScriptDir::new();
     let script = dir.write_script("replay_diff.sh", "echo replayed");
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let strict = insert_key_with_mode(&db, "Strict", "0.0.0.0/0", KeyScopes::plain(), HmacMode::CanonicalV1).await;
-    let lenient = insert_key_with_mode(&db, "Lenient", "0.0.0.0/0", KeyScopes::plain(), HmacMode::BodyOnly).await;
+    let key = insert_key_full(&db, "Strict", "0.0.0.0/0", KeyScopes::plain()).await;
 
     let hook_id = insert_hook(&db, "replay_diff", &script, 30).await;
-    grant(&db, strict.id, hook_id, true, false).await;
-    grant(&db, lenient.id, hook_id, true, false).await;
+    grant(&db, key.id, hook_id, true, false).await;
 
     let uri = "/webhook/replay_diff";
     let body = json!({}).to_string();
     // Ten minutes in the past — comfortably outside the 300s window in either direction.
     let ten_minutes_ago = now_timestamp() - 600;
 
-    // CANONICAL_V1: the timestamp is part of the signed material, so a captured request cannot be
-    // re-dated, and its original date has aged out. This is the anti-replay property.
-    let stale_canonical = signed_request_at(
-        "POST",
-        uri,
-        &strict.plaintext,
-        &strict.signing_secret,
-        &body,
-        ten_minutes_ago,
-    );
-    let response = send(&app, stale_canonical).await;
+    let stale = signed_request_at("POST", uri, &key.plaintext, &key.signing_secret, &body, ten_minutes_ago);
+    let response = send(&app, stale).await;
+    // The message is not asserted: this is a webhook-invocation route, and Task 2 collapses every
+    // authentication failure there into one fixed body (`middleware::invocation_unauthorized`). The
+    // window's exact boundary behavior is asserted precisely, with no I/O to skew it, in
+    // `middleware::tests::timestamps_*`.
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert!(response.string("error").contains("window"));
 
     // The same key with a fresh timestamp works, so the rejection above is about age, not the key.
-    let fresh_canonical = signed_request("POST", uri, &strict.plaintext, &strict.signing_secret, &body);
-    assert_eq!(send(&app, fresh_canonical).await.status, StatusCode::OK);
+    let fresh = signed_request("POST", uri, &key.plaintext, &key.signing_secret, &body);
+    assert_eq!(send(&app, fresh).await.status, StatusCode::OK);
+    assert_eq!(execution_count(&db).await, 1, "only the fresh signature should have executed anything");
+}
 
-    // BODY_ONLY: the signature covers the body alone, so age is not expressible and the identical
-    // payload stays valid indefinitely. This is the documented trade-off of the mode, demonstrated
-    // rather than merely asserted in prose.
-    let replayed = body_only_request(uri, &lenient.plaintext, &lenient.signing_secret, &body, "X-Hub-Signature-256");
-    assert_eq!(send(&app, replayed).await.status, StatusCode::OK);
+/// A key's own `canonical_template` override (as opposed to a hook's — see `tests/auth_mode_tests.rs`
+/// for that side) governs *every* request the key signs, not only hook invocations: it applies here
+/// on an ordinary `/api/hooks` admin route. A signature computed over the service-wide default is
+/// wrong material once the key has overridden it, and a tampered/altered template string produces a
+/// signature that verifies against nothing at all.
+#[tokio::test]
+async fn a_keys_own_canonical_template_override_governs_every_route_it_signs() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let template = "{method}:{path}:{timestamp}:{body}";
+    let key = insert_key_with_template(&db, "templated-caller", "0.0.0.0/0", KeyScopes::plain(), template).await;
 
-    // Replaying the byte-identical request again also succeeds — the actual replay exposure.
-    for attempt in 0..3 {
-        let again = body_only_request(uri, &lenient.plaintext, &lenient.signing_secret, &body, "X-Hub-Signature-256");
-        assert_eq!(
-            send(&app, again).await.status,
-            StatusCode::OK,
-            "BODY_ONLY replay attempt {attempt} should still be accepted"
-        );
-    }
+    let uri = "/api/hooks";
+    let ts = now_timestamp();
 
-    // Two accepted canonical runs would be wrong; count what actually executed: 1 fresh canonical
-    // + 4 body-only = 5, and zero from the stale canonical attempt.
-    assert_eq!(execution_count(&db).await, 5);
+    // Signed against the key's own overridden template: verifies.
+    let base = template
+        .replace("{method}", "GET")
+        .replace("{path}", uri)
+        .replace("{timestamp}", &ts.to_string())
+        .replace("{body}", "");
+    let sig = sign_request_bytes(&key.signing_secret, base.as_bytes());
+    let matching = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("X-API-Key", &key.plaintext)
+            .header("X-Timestamp", ts.to_string())
+            .header("X-Signature-256", &sig),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(send(&app, matching).await.status, StatusCode::OK);
+
+    // The service-wide default template, over the identical request: wrong material now that this
+    // key has overridden it.
+    let default_signed = signed_request_at("GET", uri, &key.plaintext, &key.signing_secret, "", ts);
+    assert_eq!(send(&app, default_signed).await.status, StatusCode::UNAUTHORIZED);
+
+    // An altered template string (a single character changed from what the key was configured
+    // with) is, unsurprisingly, also wrong material — the signature was never computed against it.
+    let altered = "{method}|{path}|{timestamp}|{body}";
+    let altered_base = altered
+        .replace("{method}", "GET")
+        .replace("{path}", uri)
+        .replace("{timestamp}", &ts.to_string())
+        .replace("{body}", "");
+    let altered_sig = sign_request_bytes(&key.signing_secret, altered_base.as_bytes());
+    let altered_request = with_connect_info(
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("X-API-Key", &key.plaintext)
+            .header("X-Timestamp", ts.to_string())
+            .header("X-Signature-256", &altered_sig),
+    )
+    .body(axum::body::Body::empty())
+    .expect("request builds");
+    assert_eq!(send(&app, altered_request).await.status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -4008,6 +4044,7 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
         key_id: Set(Some(simply_hook_executor::api::generate_key_id())),
         signing_secret: Set(None),
         hmac_mode: Set(simply_hook_executor::entities::api_key::HmacMode::CanonicalV1),
+        canonical_template: Set(None),
         bound_ips: Set(Some(String::new())),
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
@@ -5695,14 +5732,17 @@ async fn an_intercepted_signed_request_cannot_be_replayed_inside_the_window() {
     assert_eq!(first.status, StatusCode::OK, "the legitimate request goes through");
     assert_eq!(first.field("status"), &json!("SUCCESS"));
 
-    // Byte-for-byte the same request: same key, same timestamp, same signature, same body.
+    // Byte-for-byte the same request: same key, same timestamp, same signature, same body. The
+    // message is not asserted: this is a hook-invocation route, and Task 2 collapses every
+    // authentication failure there into one fixed body — the replay-specific wording is asserted
+    // on an administrative route instead, in `middleware::tests` and wherever else in this suite
+    // targets `/api/keys` or similar.
     let replay = send(&app, intercepted()).await;
     assert_eq!(
         replay.status,
         StatusCode::UNAUTHORIZED,
         "a signature that has already been honoured must not be honoured twice"
     );
-    assert!(replay.string("error").contains("already been used"));
 
     // Replaying it repeatedly stays refused rather than sliding through on a later attempt.
     for _ in 0..3 {
@@ -5725,32 +5765,52 @@ async fn an_intercepted_signed_request_cannot_be_replayed_inside_the_window() {
     assert_eq!(fresh.status, StatusCode::OK, "a distinct signature is not a replay");
 }
 
-/// `BODY_ONLY` is deliberately exempt: it carries no timestamp, so there is no window to be
-/// single-use within, and per `AGENT.MD` it exists to accept third-party senders whose format
-/// cannot be changed — senders that redeliver on purpose.
+/// `HMAC_ONLY` (`hooks.auth_mode`) is deliberately exempt from single-use enforcement: it carries
+/// no timestamp, so there is no window to be single-use within, and per `AGENT.MD` it exists to
+/// accept third-party senders whose format cannot be changed — senders that redeliver on purpose.
+/// The key-level equivalent of this test (`BODY_ONLY`) was retired along with that mode; this is
+/// its replacement, at the hook level `HMAC_ONLY` now occupies.
 #[tokio::test]
-async fn body_only_keys_are_not_subject_to_single_use_enforcement() {
-    use simply_hook_executor::entities::api_key::HmacMode;
-
+async fn hmac_only_hooks_are_not_subject_to_single_use_enforcement() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let sender =
-        insert_key_with_mode(&db, "github", "", KeyScopes::hook_manager(), HmacMode::BodyOnly).await;
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
     let scripts = ScriptDir::new();
     let script = scripts.write_script("redeliver.sh", "#!/bin/sh\necho ok\n");
-    let hook = insert_hook(&db, "redeliver_hook", &script, 30).await;
-    grant(&db, sender.id, hook, true, true).await;
-    let uri = format!("/webhook/{hook}");
-    let body = json!({}).to_string();
+    let create = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "redeliver_hook",
+                "script_path": script,
+                "auth_mode": "HMAC_ONLY",
+                "hmac_secret": "redeliver-secret"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(create.status, StatusCode::OK, "{}", create.raw);
+
+    let uri = "/api/hooks/redeliver_hook/execute";
+    let body = "{}";
+    let signature = sign_body_only("redeliver-secret", body);
 
     // A webhook sender's redelivery is the same bytes twice, and must keep working.
     for attempt in 0..3 {
-        let response = send(
-            &app,
-            body_only_request(&uri, &sender.plaintext, &sender.signing_secret, &body, "X-Hub-Signature-256"),
+        let request = with_connect_info(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("X-Signature-256", &signature),
         )
-        .await;
+        .body(axum::body::Body::from(body))
+        .expect("request builds");
+        let response = send(&app, request).await;
         assert_eq!(response.status, StatusCode::OK, "redelivery {attempt} must be accepted");
     }
 }
@@ -6722,24 +6782,18 @@ async fn a_stale_timestamp_is_refused_before_the_api_key_is_looked_up() {
 /// Moving the window check earlier must not let it reach traffic it was never meant to judge.
 ///
 /// The pre-check keys off the *shape* of the request — `X-Timestamp` alongside `X-Signature-256` —
-/// because the mode that owns the window lives in the row the lookup fetches. That boundary is the
+/// because a bare timestamp with no signature is not signed material at all. That boundary is the
 /// whole reason this is safe to hoist, so it is pinned here rather than left as an implementation
-/// detail: an unsigned bearer request and a `BODY_ONLY` webhook both carry a stale timestamp
-/// through untouched, exactly as they did before, while a signed one is refused.
+/// detail: an unsigned bearer request carries a stale timestamp through untouched, exactly as it
+/// did before, while a signed one is refused. (Key-level `BODY_ONLY` — a *signed* request with no
+/// timestamp in its material — was the other traffic shape this hoist had to leave alone; it was
+/// retired along with that mode, and there is no longer a second keyed shape without one.)
 #[tokio::test]
-async fn hoisting_the_window_check_does_not_reach_unsigned_or_body_only_traffic() {
-    use simply_hook_executor::entities::api_key::HmacMode;
-
+async fn hoisting_the_window_check_does_not_reach_unsigned_traffic() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let scripts = ScriptDir::new();
-    let script = scripts.write_script("shape.sh", "#!/bin/sh\necho ok\n");
 
     let bearer = insert_key_full(&db, "bearer", "", KeyScopes::plain()).await;
-    let sender = insert_key_with_mode(&db, "forgejo", "", KeyScopes::plain(), HmacMode::BodyOnly)
-        .await;
-    let hook = insert_hook(&db, "shaped_hook", &script, 30).await;
-    grant(&db, sender.id, hook, true, false).await;
 
     let ancient = "1";
 
@@ -6758,26 +6812,6 @@ async fn hoisting_the_window_check_does_not_reach_unsigned_or_body_only_traffic(
         send(&app, unsigned).await.status,
         StatusCode::OK,
         "an unsigned request's stray timestamp is still ignored"
-    );
-
-    // A `BODY_ONLY` webhook, whose sender's format we do not control: the timestamp is not part of
-    // its signed material, so rejecting over it would break the integration this mode exists for.
-    let body = json!({}).to_string();
-    let webhook = with_connect_info(
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/webhook/shaped_hook")
-            .header("X-API-Key", sender.plaintext.as_str())
-            .header("Content-Type", "application/json")
-            .header("X-Timestamp", ancient)
-            .header("X-Hub-Signature-256", sign_body_only(&sender.signing_secret, &body)),
-    )
-    .body(axum::body::Body::from(body))
-    .expect("request builds");
-    assert_eq!(
-        send(&app, webhook).await.status,
-        StatusCode::OK,
-        "a body-only sender's stray timestamp is still ignored"
     );
 
     // The canonical shape — both headers — is where the window applies, and it is enforced before

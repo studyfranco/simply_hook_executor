@@ -458,41 +458,58 @@ pub(crate) fn guard_master_to_grant_scopes(
     )))
 }
 
-/// **Mandatory `CANONICAL_V1` for `can_manage_keys`.** Refuses granting the global key-management
-/// scope to a key whose signature verification mode is `BODY_ONLY`.
+/// **Mandatory standard `CANONICAL_V1` for `can_manage_keys`.** Refuses granting the global
+/// key-management scope to a key whose signature verification mode is not `CANONICAL_V1`, or which
+/// has customized [`api_key::Model::canonical_template`] away from the service-wide default.
 ///
 /// `can_manage_keys` is the scope that lets a key mint, delegate to, and administer every other
 /// credential in the deployment (R4) — it is the highest-value target in the system short of
-/// `is_master` itself. `BODY_ONLY` carries no timestamp and therefore no replay window: a captured
-/// request against a `BODY_ONLY` key is replayable indefinitely. Pairing the two is not a
-/// hypothetical risk to note and move past; it is the one combination this function exists to make
-/// unreachable.
+/// `is_master` itself. `hmac_mode` no longer has a weaker value to opt into (`BODY_ONLY` was
+/// retired), but `canonical_template` reopens the same shape of risk from a different angle: a key
+/// free to sign over a template of its own choosing could in principle be steered toward one this
+/// codebase's signature verification has not been reviewed against. Pairing `can_manage_keys` with
+/// either is not a hypothetical risk to note and move past; it is the combination this function
+/// exists to make unreachable.
 ///
 /// # Why this is checked at grant time rather than left as documentation
 ///
-/// `hmac_mode` is immutable after creation (`CreateApiKeyPayload`'s field doc; `UpdateApiKeyPayload`
-/// carries no `hmac_mode` field at all). That immutability is what makes a *creation-time-only*
-/// check sufficient and correct: a key that passes this guard when `can_manage_keys` is granted
-/// cannot later have its `hmac_mode` weakened out from under that grant, because nothing can change
-/// it at all. Without the immutability this guard would only be checking a snapshot; with it, the
-/// combination it refuses can never arise later either.
+/// `hmac_mode` and `canonical_template` are **both** immutable after creation
+/// (`CreateApiKeyPayload`'s field docs; `UpdateApiKeyPayload` carries no `hmac_mode` field at all,
+/// and this guard is what makes `canonical_template` itself unwritable once `can_manage_keys` is
+/// granted). That immutability is what makes a *grant-time-only* check sufficient and correct: a key
+/// that passes this guard cannot later have either weakened out from under the grant, because
+/// nothing can change `hmac_mode` at all, and this same guard blocks any later attempt to set a
+/// custom `canonical_template` while `can_manage_keys` stays `true`.
 ///
 /// # Where this is called
 ///
 /// Both `create_api_key` and `update_api_key`, immediately after [`guard_master_to_grant_scopes`] —
 /// R4 (who may grant `can_manage_keys` at all) is checked first, and this is the narrower rule about
 /// *what else must be true* for that grant to be safe. At update time the caller passes the target's
-/// **current** `hmac_mode`, not a payload value — there is no payload value to pass, by the
-/// immutability guarantee above.
+/// **current** `hmac_mode` (immutable, so always current) and the **effective** `canonical_template`
+/// — the payload's, if it named one, else the target's existing value.
 pub(crate) fn guard_canonical_v1_for_key_management(
     can_manage_keys: bool,
     hmac_mode: api_key::HmacMode,
+    canonical_template: Option<&str>,
 ) -> Result<(), AppError> {
-    if can_manage_keys && hmac_mode != api_key::HmacMode::CanonicalV1 {
+    if !can_manage_keys {
+        return Ok(());
+    }
+    if hmac_mode != api_key::HmacMode::CanonicalV1 {
         return Err(AppError::InvalidInput(
             "can_manage_keys requires hmac_mode = CANONICAL_V1: a key that can administer other \
              credentials must not opt out of replay protection. Create or promote it as a \
              CANONICAL_V1 key, or leave can_manage_keys unset."
+                .to_owned(),
+        ));
+    }
+    if canonical_template.is_some_and(|t| !t.is_empty()) {
+        return Err(AppError::InvalidInput(
+            "can_manage_keys requires the standard canonical_template: a key that can administer \
+             other credentials must sign over the template this codebase's verification has been \
+             reviewed against, not one of its own choosing. Clear canonical_template, or leave \
+             can_manage_keys unset."
                 .to_owned(),
         ));
     }
@@ -594,10 +611,17 @@ pub(crate) fn guard_master_self_edit_is_bound_ips_only(
     // `hmac_mode` is absent from this list on purpose, not by oversight: it is no longer a field
     // on `UpdateApiKeyPayload` at all (immutable after creation, for every key), so there is nothing
     // here to check — `deny_unknown_fields` refuses the attempt before this function ever runs.
-    let other_fields: [(&str, bool); 3] = [
+    //
+    // `canonical_template` *is* listed: master's `can_manage_keys` column reads `true` (a bootstrap
+    // artifact), so `guard_canonical_v1_for_key_management` would refuse a custom value anyway — but
+    // catching it here first gives the specific "bound_ips only" message rather than the generic
+    // can_manage_keys one, which is the more useful answer for an attempt that was really about
+    // editing the master's own record.
+    let other_fields: [(&str, bool); 4] = [
         ("name", payload.name.is_some()),
         ("max_concurrent_jobs", payload.max_concurrent_jobs.is_some()),
         ("can_manage_keys", payload.can_manage_keys.is_some()),
+        ("canonical_template", payload.canonical_template.is_some()),
     ];
     let requested = other_fields
         .into_iter()

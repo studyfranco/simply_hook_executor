@@ -242,22 +242,24 @@ Handlers keep their exact Axum signatures, extractors, error responses and guard
 
 #### HMAC Signature Protocol
 
-Each API key carries an `hmac_mode` selecting how its signatures are verified:
+Every API key's `hmac_mode` is `CANONICAL_V1` — **the only value the enum accepts.** `BODY_ONLY`
+(raw-body-only signing, `X-Signature-256` **or** `X-Hub-Signature-256`, no timestamp, no replay
+protection) was retired once `hooks.auth_mode = HMAC_ONLY` began serving the exact same
+third-party-webhook use case at the **hook** level — keyless, which is the shape a GitHub/
+Forgejo/GitLab-style sender actually has, rather than requiring one to hold a bearer key at all. See
+the Per-Hook Keyless Authentication section below for that mode. A migration
+(`m20260819_141730_consolidate_hmac_modes`) rewrote every row still holding the literal `BODY_ONLY`
+string to `CANONICAL_V1` before the Rust type stopped accepting it.
 
-| Mode | Signed material | Headers | Replay protection |
-| :--- | :--- | :--- | :--- |
-| `CANONICAL_V1` *(default)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` | `X-Signature-256` + `X-Timestamp` | yes — 300s window **and** single use |
-| `BODY_ONLY` | `RAW_BODY` only | `X-Signature-256` **or** `X-Hub-Signature-256`, no timestamp | **none** |
+**`hmac_mode` is fixed at creation and immutable for the rest of the key's life.** `UpdateApiKeyPayload` does not carry the field at all — not accepted-and-ignored, *absent* — so `#[serde(deny_unknown_fields)]` refuses any request naming it with a `422` before a handler runs, for every caller including the master. Rotation mints a fresh `signing_secret`; it does not touch the mode.
 
-`BODY_ONLY` exists only to accept GitHub/Forgejo/GitLab-style webhooks whose format cannot be changed. It MUST remain opt-in per key, `X-Hub-Signature-256` MUST be ignored for `CANONICAL_V1` keys (so the stricter mode cannot be downgraded by header choice), and it MUST still require *a* signature — it relaxes the format, never the requirement.
+**`canonical_template` is the customization surface `BODY_ONLY`'s removal left in its place.** Every non-`can_manage_keys` key may set `api_keys.canonical_template` — a per-key override of the four-placeholder canonical string (`{method}`, `{path}`, `{timestamp}`, `{body}`) applied to **every** request that key signs, not only hook invocations. Unlike `hmac_mode` it **is** mutable (`""` resets it to the service-wide default). A `Hook` may *also* set its own `canonical_template` (see below), scoped to just that hook's invocation routes; when a keyed caller signs a `CANONICAL_V1` hook that sets one, the hook's template wins over the key's own.
 
-**`hmac_mode` is fixed at creation and immutable for the rest of the key's life.** `UpdateApiKeyPayload` does not carry the field at all — not accepted-and-ignored, *absent* — so `#[serde(deny_unknown_fields)]` refuses any request naming it with a `422` before a handler runs, for every caller including the master. Rotation mints a fresh `signing_secret`; it does not touch the mode. This exists because a mutable mode is a downgrade lever: a key minted `CANONICAL_V1` that could later be flipped to `BODY_ONLY` would have its replay protection removable by whoever can already reach the update route, which for a `can_manage_keys` holder is itself.
-
-**`can_manage_keys` requires `hmac_mode = CANONICAL_V1`, checked at both creation and update** (`guard_canonical_v1_for_key_management`, `src/api/guards.rs`). A key that can administer every other credential in the deployment must not be reachable over a scheme with no replay window. This is a service-specific policy layered on top of R4, not part of `RBAC_MODEL.md` itself, and is harmless for the ordinary case: an omitted `hmac_mode` already defaults to `CANONICAL_V1`.
+**`can_manage_keys` requires `hmac_mode = CANONICAL_V1` and no custom `canonical_template`, checked at both creation and update** (`guard_canonical_v1_for_key_management`, `src/api/guards.rs`). A key that can administer every other credential in the deployment must sign over the one canonical string this codebase's verification has actually been reviewed against, not one of its own choosing — a key free to pick its own signed material could in principle be steered toward one this service does not scrutinize as closely. This is a service-specific policy layered on top of R4, not part of `RBAC_MODEL.md` itself, and is harmless for the ordinary case: an omitted `hmac_mode`/`canonical_template` already default to the strict values.
 
 **A non-master `can_manage_keys` holder MUST sign every request, unconditionally — overriding `REQUIRE_SIGNED_REQUESTS=false`.** `auth_middleware`'s `signature_required` is `state.config.require_signed_requests || (key_record.can_manage_keys && !key_record.is_master)`. The two rules above guarantee such a key is always `CANONICAL_V1`-capable, so this can never demand a scheme the key cannot present. **Master is deliberately excluded** even though the bootstrap row's `can_manage_keys` column also reads `true`: RBAC_MODEL.md §1 names Master a distinct, superior tier that bypasses scoping outright rather than a Parent that happens to hold every scope, and that column's value on the master row is a bootstrap artifact, not a grant this policy is about. Master already carries independent, stronger hardening (immutable except `bound_ips`, unrotatable, undeletable).
 
-The rest of this section describes `CANONICAL_V1`. Signatures are HMAC-SHA256, keyed on the API key's `signing_secret` (**never** the bearer key), over a canonical string built from four newline-delimited components:
+The rest of this section describes `CANONICAL_V1`. Signatures are HMAC-SHA256, keyed on the API key's `signing_secret` (**never** the bearer key), over a canonical string built from four newline-delimited components (or the caller's `canonical_template`, substituted textually — see above):
 
 ```text
 <METHOD>\n<PATH_AND_QUERY>\n<TIMESTAMP>\n<RAW_BODY>
@@ -271,16 +273,32 @@ The rest of this section describes `CANONICAL_V1`. Signatures are HMAC-SHA256, k
 
 Rules the implementation MUST hold to:
 
-- **Newline delimiters are mandatory.** Plain concatenation is ambiguous (`POST` + `/api/x` collides with `POS` + `T/api/x`), which would let a signature be replayed across a different method/path split.
+- **Newline delimiters are mandatory** in the default (non-`canonical_template`) form. Plain concatenation is ambiguous (`POST` + `/api/x` collides with `POS` + `T/api/x`), which would let a signature be replayed across a different method/path split.
 - **`PATH_AND_QUERY` is the target the *client* requested**, including the `/api` prefix and any query string. Because `Router::nest` strips the prefix from the URI inner layers observe, the middleware MUST read `OriginalUri`, not `parts.uri`. Signing only the path would leave `?older_than_days=0` freely rewritable on an otherwise-valid signed request.
 - **`RAW_BODY` is the bytes as received**, never a re-serialized form. An absent body signs as the empty string.
 - **Anti-replay is two checks, not one.** The window bounds *how long* a captured request stays useful; single-use enforcement bounds *how many times* it may be used. Only both together are replay protection:
-  1. **Window:** `X-Timestamp` must be within **300 seconds** (`SIGNATURE_MAX_AGE_SECONDS`) of server time, applied **symmetrically** — a forward-dated request is refused too, since it would otherwise stay replayable for the length of its skew. A missing or malformed timestamp on a signed request is a `401`; it is never coerced to "now".
-  2. **Single use:** a `CANONICAL_V1` signature is accepted exactly once. `src/replay.rs` remembers each verified `(api_key_id, digest)` for the length of the window and refuses a second presentation, so an intercepted request cannot simply be resent. The digest is recorded **only after** it verifies — recording unverified signatures would let anyone who merely *observed* a request burn it before the legitimate copy arrived, turning the control into a denial-of-service primitive aimed at the client it protects. `BODY_ONLY` is exempt: it carries no timestamp, so there is no window to be single-use within, and the third-party senders it exists for redeliver on purpose.
+  1. **Window:** `X-Timestamp` must be within **300 seconds** (`SIGNATURE_MAX_AGE_SECONDS`) of server time, applied **symmetrically** — a forward-dated request is refused too, since it would otherwise stay replayable for the length of its skew. A missing or malformed timestamp on a signed request is a `401`; it is never coerced to "now". Required unconditionally now that `CANONICAL_V1` is the only key-level mode.
+  2. **Single use:** a signature is accepted exactly once. `src/replay.rs` remembers each verified `(api_key_id, digest)` for the length of the window and refuses a second presentation, so an intercepted request cannot simply be resent. The digest is recorded **only after** it verifies — recording unverified signatures would let anyone who merely *observed* a request burn it before the legitimate copy arrived, turning the control into a denial-of-service primitive aimed at the client it protects.
 - **Constant-time comparison** via `Mac::verify_slice`. Comparing hex strings with `==` would leak the signature one byte at a time.
-- **Timestamp before the key lookup, and again before the HMAC.** A timestamp is self-contained, so freshness is checked *first* — before `api_keys` is queried at all, let alone before the secret is decrypted and the body hashed. Otherwise every stale capture, broken client clock and scanner spraying garbage buys an indexed query from an unauthenticated caller; the checks that cost us nothing belong in front of the ones that do. The pre-lookup check is scoped to requests carrying `X-Timestamp` **and** `X-Signature-256`, which is the shape of a `CANONICAL_V1` request and the only shape that has a window: `hmac_mode` lives in the row the lookup fetches, and a stray `X-Timestamp` from a `BODY_ONLY` sender is not part of its signed material and MUST stay ignored. The authoritative window check remains in the `CANONICAL_V1` path, so the guarantee never rests on which header names an earlier step happened to inspect.
+- **Timestamp before the key lookup, and again before the HMAC.** A timestamp is self-contained, so freshness is checked *first* — before `api_keys` is queried at all, let alone before the secret is decrypted and the body hashed. Otherwise every stale capture, broken client clock and scanner spraying garbage buys an indexed query from an unauthenticated caller; the checks that cost us nothing belong in front of the ones that do. The pre-lookup check is scoped to requests carrying `X-Timestamp` **and** `X-Signature-256` — a bare timestamp with no signature is unsigned bearer traffic, not signed material, and MUST stay ignored. The authoritative window check remains in the signature-verification path, so the guarantee never rests on which header an earlier step happened to inspect.
 - **Authenticate, then authorize.** The whole authentication sequence — key lookup, timestamp, signature, single-use — runs **strictly before** the `bound_ips` CIDR check. Running the network check first let a caller holding only a leaked `X-API-Key` distinguish `403 Client IP not allowed` from `401`, and so learn whether a key it had merely found is bound to networks excluding it: a map of the deployment's topology, handed to someone who had proven nothing. An unauthenticated caller must receive `401` for every key, indistinguishably.
 - **`REQUIRE_SIGNED_REQUESTS=true`** makes signatures mandatory on every authenticated route, bearer or not. It defaults to `false` so existing bearer-only clients keep working across an upgrade.
+
+#### Uniform Authentication-Failure Responses on Invocation Routes (Anti-Enumeration)
+
+The three hook-invocation routes collapse **every genuine authentication failure** into one fixed body, `{"error": "Unauthorized"}` (`middleware::invocation_unauthorized`), regardless of *why* authentication failed:
+
+- an `X-API-Key` that does not name a real key;
+- a signature that does not verify, or a timestamp outside the window;
+- (keyless) no such hook, a hook whose `auth_mode` requires a key, a `NONE` hook currently blocked by `REQUIRE_SIGNED_REQUESTS`, or unexpected signature material presented against a mode that does not use one (`API_KEY_ONLY`/`NONE` — see below).
+
+The goal is closing a credential-enumeration oracle: a caller holding a guessed or stolen key string must not be able to learn, from the response alone, whether that string names a real key — an invalid key and a bad signature must be **indistinguishable**. `authenticate_bearer_key`'s normal, detailed error messages (`"Invalid API Key"`, `"Invalid request signature"`, `"...window..."`, etc.) are what every *other* route — including every administrative `/api/*` route — still returns; `middleware::uniformize_keyed_auth_failure` is what collapses them into the fixed body, applied only inside `invocation_auth_middleware`.
+
+**This does NOT apply to authorization failures.** A caller presenting a genuinely *valid* key that simply lacks `can_execute` on the target hook still gets `guard_execute`'s ordinary `403` with its own specific message — that caller has already proven a real credential, so answering "Unauthorized" would misdescribe why it was refused, and would incorrectly trigger the dashboard's global-401-logout interceptor (`static/app.js`) for what is actually just a permission gap. The line is exactly the authenticate/authorize boundary this whole section already draws: `401` means "not authenticated", never "authenticated but forbidden".
+
+#### Unexpected Signature Material Is Refused, Not Ignored
+
+A keyless request against a hook whose `auth_mode` is `API_KEY_ONLY` or `NONE` — neither of which uses a signature — is refused outright if it *nonetheless* carries something that looks like one (`X-Signature-256`, or the hook's own configured `signature_header`), rather than silently succeeding with the header ignored (`middleware::signature_material_present`). For `API_KEY_ONLY` this changes nothing observable — that mode already refuses every keyless caller regardless — but for `NONE` it closes a real gap: without the check, a caller sending a stale or garbage signature to an otherwise fully-open hook would still be let through, which is exactly the "unexpected input silently accepted" shape this codebase refuses everywhere else (`deny_unknown_fields`, strict extractors, etc.).
 
 #### Signing Secret Storage
 
@@ -313,10 +331,11 @@ existed.
   signing rules apply unchanged, and the handler's `guard_execute` checks the key's own `can_execute`
   row. **The target hook's `auth_mode` is not consulted for this caller at all** — a valid, permitted
   key is always sufficient, regardless of what the hook additionally accepts from callers with none.
-  The one exception: if the hook's own `auth_mode` is `CANONICAL_V1` and it has set a
-  `canonical_template`, a keyed `CANONICAL_V1` caller's signature is verified against that template
-  instead of the service-wide default — a per-hook override of the *signed material's shape*, not of
-  whether a key is required.
+  The one exception: the signed material's *shape* can be overridden — the hook's own
+  `canonical_template`, if its `auth_mode` is `CANONICAL_V1` and it has set one, wins; failing that,
+  the calling key's own `canonical_template` (see the HMAC Signature Protocol section) applies;
+  failing that, the service-wide default. This overrides *what is signed*, never *whether* a key is
+  required.
 - **Keyless.** The target hook is resolved from the request path and its `auth_mode` decides:
 
   | `auth_mode` | Keyless caller |
@@ -326,17 +345,21 @@ existed.
   | `HMAC_ONLY` | Accepted with a valid HMAC-SHA256 signature over the raw body, verified against `hooks.hmac_secret` (**never** a key's secret) on `hooks.signature_header`/`signature_prefix` or their defaults (`X-Signature-256` / `sha256=`). **No anti-replay protection** — no timestamp is involved, matching the GitHub/Forgejo/GitLab third-party webhook convention this mode exists for |
   | `NONE` | Accepted outright — no authentication of any kind — but **only** when `REQUIRE_SIGNED_REQUESTS` is `false`. A deployment that opted into mandatory signing everywhere else must not have one hook silently exempted from it |
 
-**Oracle discipline extends to the keyless path.** Every refusal a keyless caller can receive — no
-such hook, a hook whose `auth_mode` requires a key, or a `NONE` hook currently blocked by
-`REQUIRE_SIGNED_REQUESTS` — returns the **exact same** `401` a missing `X-API-Key` produces on every
-other route. Distinguishing any of these would let an unauthenticated caller enumerate hook names,
-and which of those are configured for public access, purely by probing paths — the same class of
-oracle `RBAC_MODEL.md` §4 and the authenticate-then-authorize ordering close off for authenticated
-callers, extended here to the one surface that now accepts none at all. The single place this
-distinction is *not* made is once a caller has presented signature material for an `HMAC_ONLY` hook:
-a malformed or non-matching signature is reported specifically, exactly as an invalid signature is on
-every keyed route — a caller that already knows to try signing something has proven it knows more
-than a bare prober does.
+**Oracle discipline extends to the keyless path, and to the keyed path's authentication failures
+too** — see "Uniform Authentication-Failure Responses on Invocation Routes" above for the full
+statement. Every keyless refusal — no such hook, a hook whose `auth_mode` requires a key, a `NONE`
+hook currently blocked by `REQUIRE_SIGNED_REQUESTS`, or unexpected signature material on
+`API_KEY_ONLY`/`NONE` (see "Unexpected Signature Material Is Refused, Not Ignored" above) — returns
+the **exact same** `401` a missing `X-API-Key` produces everywhere, *and* the same one a keyed
+caller's invalid key or bad signature produces. Distinguishing any of these would let a caller — with
+no credential, a guessed one, or a stolen one it cannot yet prove — enumerate hook names, which are
+configured for public access, or whether a key string is real, purely by probing responses — the
+same class of oracle `RBAC_MODEL.md` §4 and the authenticate-then-authorize ordering close off for
+authenticated callers, extended here to the one surface that now accepts none at all. The single
+place this distinction is *not* made is once a caller has presented signature material for an
+`HMAC_ONLY` hook: a malformed or non-matching signature is reported specifically, exactly as an
+invalid signature is on every keyed route — a caller that already knows to try signing something has
+proven it knows more than a bare prober does.
 
 **`auth_mode` is not "dispatch configuration".** `RBAC_MODEL.md`'s Terminology section names only
 `script_path` and `run_as_user` as this service's dispatch configuration, governed by R2 in full with
@@ -567,7 +590,7 @@ follow:
 
 - Single Page Application (SPA) served from `static/`.
 - **Authenticates with full-HMAC `CANONICAL_V1` signing, unconditionally.** The session stores both an `X-API-Key` and its signing secret in `localStorage`, and *every* request the dashboard sends carries `X-API-Key`, `X-Timestamp` and `X-Signature-256`. There is no unsigned path, no bearer-only path, and no per-key mode selection in the browser: the SPA is a first-party client whose key we provision ourselves, so it is held to the strongest posture the backend offers rather than the most permissive one it accepts. Signing CANONICAL_V1 is also what puts the dashboard's own traffic under the anti-replay window and the single-use guard in `src/replay.rs`.
-  - This is a *client* policy, not a backend one. The per-key `hmac_mode` column and the `BODY_ONLY` mode remain permanent backend features for third-party webhook senders (§1), and the dashboard still **provisions and displays** them for other keys — it simply never uses `BODY_ONLY` for itself. A `BODY_ONLY` key therefore cannot log into the dashboard.
+  - This is a *client* policy, not a backend one. Every key's `hmac_mode` is `CANONICAL_V1` now (`BODY_ONLY` was retired — see the HMAC Signature Protocol section), so this is no longer a choice between per-key modes; what the dashboard still deliberately avoids is signing over a *custom* `canonical_template` for its own session, always using the service-wide default shape, even though the API key it holds is free to have one set. Third-party senders needing a keyless, unsigned-timestamp signature scheme now target a hook's own `HMAC_ONLY` `auth_mode` instead of a key-level mode — the dashboard never touches that path either, since it always authenticates with a real key.
   - **What is mandatory is the signature, not the implementation.** Signing prefers `window.crypto.subtle`, which browsers expose **only in a secure context** (HTTPS or a `localhost` origin) and which is constant-time. Because this daemon is routinely reached over plain HTTP at a LAN address — a deployment choice, not an authentication one — a self-contained pure-JS HMAC-SHA256 (`PureCrypto`, FIPS 180-4 + RFC 2104, no dependencies per the Tech Stack rule) covers the origins where Web Crypto does not exist at all. The two produce **byte-identical** signatures, so the backend cannot distinguish them and the security property never depends on which ran. The fallback validates itself against an RFC 4231 vector before it is trusted with a credential; if *neither* implementation is usable the login screen refuses and says so, rather than silently downgrading. The fallback is not constant-time — an accepted, narrow trade-off, since it runs only on a plain-HTTP origin where the request and its headers are already fully visible on the path.
 - **Dynamic Scope Rendering:** On startup, `app.js` calls `GET /api/auth/me` and renders/hides tabs and controls (Executions/Dashboard, Hooks Management, API Keys & Permissions, System Settings) based on the returned permissions. Because that call is itself signed, reaching the dashboard proves the caller holds the signing secret — not merely that the key exists.
 - Global fetch wrapper injects and signs the three authentication headers. `401` returns to the login screen (the credential itself is unusable, so the session is unrecoverable); `403` does **not** — the key is valid and merely lacks permission for that one action, so the server's specific message is surfaced as a toast instead of logging the user out. `404` is surfaced the same way, which is also what oracle discipline requires: the dashboard must not translate a `404` into "you lack permission", because the whole point is that the two are indistinguishable.

@@ -1139,7 +1139,8 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     check "200" "modest forward clock skew is tolerated"
     SIGN_TS=$((NOW - 360)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
     check "401" "an expired timestamp is rejected (replay window)"
-    check_true '.error | contains("window")' "the error names the replay window"
+    # The message is not asserted: invocation routes collapse every authentication failure into
+    # one fixed body (Task 2's anti-enumeration uniformity).
     SIGN_TS=$((NOW - 86400)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
     check "401" "a day-old capture is rejected"
     SIGN_TS=$((NOW + 3600)); signed_call POST "$EXEC_PATH" "$SIGNED_BODY"
@@ -1152,7 +1153,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
         -H "X-Signature-256: sha256=$GOOD_SIG" -d "$SIGNED_BODY" "$BASE_URL$EXEC_PATH")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "a signed request with no X-Timestamp is rejected"
-    check_true '.error | contains("X-Timestamp")' "the error names the missing header"
+    # The message is not asserted here either, for the same reason.
 
     # Malformed timestamps are rejected rather than coerced to 'now'.
     for BAD_TS in "not-a-number" "1700000000.5" ""; do
@@ -1217,7 +1218,8 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
         -d '{"target":"legacy"}' "$BASE_URL/webhook/echo_hook")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "the retired X-Key-Id header does not authenticate"
-    check_true '.error | contains("X-API-Key")' "the error names the one header that works"
+    # The message is not asserted: /webhook/{id} is an invocation route, and every authentication
+    # failure there collapses into one fixed body.
 
     # Rotation issues a new pair and invalidates the old secret immediately. All three credentials
     # are captured here, before any later call overwrites $RESP_BODY.
@@ -1890,15 +1892,23 @@ check "403" "...but still cannot modify the hook"
 api_call DELETE "/api/hooks/$TL_HOOK_ID" "$NOACCESS_KEY"
 check "403" "...nor delete it"
 
-# ── 24. Per-key HMAC modes (CANONICAL_V1 vs BODY_ONLY) ──────────────────────
+# ── 24. Key hmac_mode/canonical_template, and hook-level HMAC_ONLY ──────────
+#
+# `api_keys.hmac_mode` no longer has a BODY_ONLY value — it was retired once `hooks.auth_mode =
+# HMAC_ONLY` began serving the exact third-party-webhook use case at the hook level, keyless, which
+# is the shape that kind of sender actually has. This section covers both halves: the key-level
+# `canonical_template` override that replaced it as the customization surface, and the hook-level
+# `HMAC_ONLY` mode that replaced it as the third-party-sender mechanism.
 
-log_section "24. Per-Key HMAC Modes"
+log_section "24. Key hmac_mode / canonical_template, and Hook-Level HMAC_ONLY"
 
 if [ "$HAVE_OPENSSL" -eq 1 ]; then
     GH_SCRIPT=$(make_hook_script "gh_push.sh" 'echo "pushed:${HOOK_PARAM_REF}"')
-    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"on_push\",\"script_path\":\"$GH_SCRIPT\",\"parameters\":[{\"param_key\":\"ref\",\"default_value\":\"refs/heads/main\",\"is_required\":true}]}"
-    check "200" "create a hook for third-party push webhooks"
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"on_push\",\"script_path\":\"$GH_SCRIPT\",\"parameters\":[{\"param_key\":\"ref\",\"default_value\":\"refs/heads/main\",\"is_required\":true}],\"auth_mode\":\"HMAC_ONLY\",\"hmac_secret\":\"forgejo-secret\"}"
+    check "200" "create a keyless HMAC_ONLY hook for third-party push webhooks"
     GH_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".auth_mode" "HMAC_ONLY" "the hook reports its auth_mode"
+    check_true '.hmac_secret_configured' "the hook reports a secret is configured, never the secret itself"
 
     # A key created without hmac_mode must default to the strict scheme.
     create_scoped_key "Default Mode Key"
@@ -1909,103 +1919,135 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     check_true "[.[] | select(.id == \"$DEFAULT_MODE_ID\") | .hmac_mode == \"CANONICAL_V1\"] | all" \
         "an omitted hmac_mode defaults to CANONICAL_V1"
 
-    # A key explicitly created in BODY_ONLY mode.
-    create_scoped_key "Forgejo Webhook Key" ',"hmac_mode":"BODY_ONLY"'
-    GH_KEY="$CREATED_KEY"; GH_KEY_ID_VAL="$CREATED_KEY_ID"; GH_SECRET="$CREATED_SIGNING_SECRET"; GH_ID="$CREATED_ID"
-
-    api_call GET "/api/keys" "$MASTER_KEY"
-    check "200" "list keys again"
-    check_true "[.[] | select(.id == \"$GH_ID\") | .hmac_mode == \"BODY_ONLY\"] | all" \
-        "the requested BODY_ONLY mode is stored and reported"
-
-    api_call POST "/api/keys/$GH_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$GH_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
-    check "200" "grant the webhook key execute rights on the hook"
-
-    # Body-only signature, exactly as GitHub/Forgejo compute it: HMAC over the raw body, nothing else.
+    # Body-only-style signature, exactly as GitHub/Forgejo compute it: HMAC over the raw body,
+    # nothing else, no bearer key at all — the hook's own secret, not any key's.
     GH_BODY='{"ref":"refs/heads/release"}'
-    GH_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "$GH_SECRET" -r | cut -d' ' -f1)
+    GH_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "forgejo-secret" -r | cut -d' ' -f1)
 
-    # X-Hub-Signature-256 is the header GitHub and Forgejo actually send.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
-        -H "X-Hub-Signature-256: sha256=$GH_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
-    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "200" "a GitHub-style X-Hub-Signature-256 body-only signature is accepted"
-    check_jq ".stdout | rtrimstr(\"\n\")" "pushed:refs/heads/release" "the third-party webhook executed"
-
-    # The same signature under the other accepted header name.
-    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
+        -H "Content-Type: application/json" \
         -H "X-Signature-256: sha256=$GH_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "200" "X-Signature-256 is accepted in BODY_ONLY mode too"
+    check "200" "a keyless HMAC_ONLY signature is accepted on the default header"
+    check_jq ".stdout | rtrimstr(\"\n\")" "pushed:refs/heads/release" "the third-party webhook executed"
 
     # No X-Timestamp is required in this mode — that is the whole point of it.
-    check_true '.status == "SUCCESS"' "the body-only request needed no timestamp"
+    check_true '.status == "SUCCESS"' "the HMAC_ONLY request needed no timestamp"
 
     # Tampering with the body still fails.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
-        -H "X-Hub-Signature-256: sha256=$GH_SIG" -d '{"ref":"refs/heads/evil"}' "$BASE_URL/webhook/on_push")
+        -H "Content-Type: application/json" \
+        -H "X-Signature-256: sha256=$GH_SIG" -d '{"ref":"refs/heads/evil"}' "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a body-only signature over an altered body is rejected"
+    check "401" "an HMAC_ONLY signature over an altered body is rejected"
 
     # ...as does the wrong secret.
     BAD_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "not-the-secret" -r | cut -d' ' -f1)
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
-        -H "X-Hub-Signature-256: sha256=$BAD_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+        -H "Content-Type: application/json" \
+        -H "X-Signature-256: sha256=$BAD_SIG" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a body-only signature made with the wrong secret is rejected"
+    check "401" "an HMAC_ONLY signature made with the wrong secret is rejected"
 
-    # An unsigned request still authenticates on the bearer key alone — the mode governs how a
-    # signature is verified, not whether the key is a credential. (REQUIRE_SIGNED_REQUESTS is what
-    # makes signing compulsory.)
+    # No signature at all: refused identically to a missing key everywhere else (Task 2/oracle
+    # discipline) — never silently accepted just because no material was presented.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-API-Key: $GH_KEY" -H "Content-Type: application/json" \
-        -d "$GH_BODY" "$BASE_URL/webhook/on_push")
+        -H "Content-Type: application/json" -d "$GH_BODY" "$BASE_URL/webhook/on_push")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "200" "an unsigned request still authenticates on the bearer key"
+    check "401" "an unsigned keyless request against an HMAC_ONLY hook is refused"
 
-    # A CANONICAL_V1 key must NOT be downgradeable by sending the hub header instead.
+    # A *keyed* caller with a real, permitted key bypasses the hook's own auth_mode entirely —
+    # holding a valid key is always sufficient, regardless of what the hook additionally accepts.
     api_call POST "/api/keys/$EXEC_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$GH_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
-    check "200" "grant the canonical-mode key rights on the same hook"
-    # A body-only signature offered to a CANONICAL_V1 key under the *recognised* header must fail:
-    # the mode decides what material is signed, and body-only material is not canonical material.
-    STRICT_SIG=$(printf '%s' "$GH_BODY" | openssl dgst -sha256 -hmac "$EXEC_SIGNING_SECRET" -r | cut -d' ' -f1)
-    STRICT_TS=$(date +%s)
-    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-API-Key: $EXEC_KEY" -H "Content-Type: application/json" \
-        -H "X-Timestamp: $STRICT_TS" -H "X-Signature-256: sha256=$STRICT_SIG" \
-        -d "$GH_BODY" "$BASE_URL/webhook/on_push")
-    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a body-only signature is rejected for a CANONICAL_V1 key"
+    check "200" "grant the canonical-mode key rights on the HMAC_ONLY hook"
+    # $EXEC_KEY was rotated in §12; SIGN_AUTH/SIGN_SECRET were interpolated before that and never
+    # refreshed, so they must be re-set explicitly here rather than assumed current.
+    SIGN_AUTH="X-API-Key: $EXEC_KEY"; SIGN_SECRET="$EXEC_SIGNING_SECRET"
+    signed_call POST "/webhook/on_push" "$GH_BODY"
+    check "200" "a keyed CANONICAL_V1 caller succeeds on an HMAC_ONLY hook too"
 
-    # `hmac_mode` is immutable after creation (Task 4.1): `UpdateApiKeyPayload` no longer carries
-    # the field at all, so naming it in a PUT is an unknown field under `deny_unknown_fields` and
-    # never reaches a handler — Axum's own 422, not our JSON error envelope. The mode must survive
+    # `hmac_mode` is immutable after creation (Task 1): `UpdateApiKeyPayload` no longer carries the
+    # field at all, so naming it in a PUT is an unknown field under `deny_unknown_fields` and never
+    # reaches a handler — Axum's own 422, not our JSON error envelope. The mode must survive
     # unchanged.
-    api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"BODY_ONLY"}'
-    check "422" "hmac_mode cannot be changed by update, even by master"
+    api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"CANONICAL_V1"}'
+    check "422" "hmac_mode cannot be changed by update, even by master, even to its own value"
     api_call GET "/api/keys" "$MASTER_KEY"
     check_true "[.[] | select(.id == \"$DEFAULT_MODE_ID\") | .hmac_mode == \"CANONICAL_V1\"] | all" \
         "the mode is unchanged after the refused update"
 
-    api_call GET "/api/audit-logs?action=KEY_CREATE&limit=20" "$MASTER_KEY"
-    check "200" "fetch key-creation audit entries"
-    check_true '[.[] | select(.target_resource == "Forgejo Webhook Key") | .details | test("BODY_ONLY.*no replay protection")] | length == 1' \
-        "choosing BODY_ONLY is audited as removing replay protection"
-
-    # An unknown variant is refused by deserialization before the handler runs, so this is Axum's
-    # own 422 with a plain-text body — not the JSON `{"error": ...}` shape our handlers emit.
-    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"bogus_mode","bound_ips":"0.0.0.0/0","hmac_mode":"NO_SUCH_MODE"}'
-    check "422" "an unrecognized hmac_mode is rejected rather than silently defaulted"
+    # An unknown variant (including the retired BODY_ONLY) is refused by deserialization before the
+    # handler runs, so this is Axum's own 422 with a plain-text body — not the JSON `{"error": ...}`
+    # shape our handlers emit.
+    for BOGUS_MODE in "BODY_ONLY" "NO_SUCH_MODE"; do
+        api_call POST "/api/keys" "$MASTER_KEY" "{\"name\":\"bogus_mode_$BOGUS_MODE\",\"bound_ips\":\"0.0.0.0/0\",\"hmac_mode\":\"$BOGUS_MODE\"}"
+        check "422" "hmac_mode '$BOGUS_MODE' is rejected rather than silently defaulted"
+    done
 
     api_call GET "/api/keys" "$MASTER_KEY"
-    check "200" "list keys after the rejected creation"
-    check_true '[.[] | select(.name == "bogus_mode")] | length == 0' "no key was created with an invalid mode"
+    check "200" "list keys after the rejected creations"
+    check_true '[.[] | select(.name | startswith("bogus_mode"))] | length == 0' \
+        "no key was created with an invalid mode"
+
+    # ── canonical_template: a non-admin key may customize it; an admin key may not ──────────────
+    create_scoped_key "Templated Sender" ',"canonical_template":"{method}|{path}|{timestamp}|{body}"'
+    TPL_KEY="$CREATED_KEY"; TPL_SECRET="$CREATED_SIGNING_SECRET"; TPL_ID="$CREATED_ID"
+    # `CreateApiKeyResponse` (this call's response) does not echo scope/mode fields back — asserted
+    # from the listing instead, matching the pattern used for hmac_mode above.
+    api_call GET "/api/keys" "$MASTER_KEY"
+    check_true "[.[] | select(.id == \"$TPL_ID\") | .canonical_template == \"{method}|{path}|{timestamp}|{body}\"] | all" \
+        "the custom template is stored and reported"
+
+    api_call POST "/api/keys/$TPL_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$ECHO_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+    check "200" "grant the templated key rights on echo_hook"
+
+    TPL_TS=$(date +%s)
+    TPL_PATH="/api/hooks/$ECHO_HOOK_ID/execute"
+    TPL_BODY='{"target":"templated"}'
+    TPL_BASE="POST|$TPL_PATH|$TPL_TS|$TPL_BODY"
+    TPL_SIG=$(printf '%s' "$TPL_BASE" | openssl dgst -sha256 -hmac "$TPL_SECRET" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $TPL_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $TPL_TS" -H "X-Signature-256: sha256=$TPL_SIG" \
+        -d "$TPL_BODY" "$BASE_URL$TPL_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "a signature over the key's own custom template verifies"
+
+    # The service-wide default template, over the identical request: wrong material now that this
+    # key has overridden it.
+    TPL_DEFAULT_SIG=$(printf 'POST\n%s\n%s\n%s' "$TPL_PATH" "$TPL_TS" "$TPL_BODY" | openssl dgst -sha256 -hmac "$TPL_SECRET" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $TPL_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $TPL_TS" -H "X-Signature-256: sha256=$TPL_DEFAULT_SIG" \
+        -d "$TPL_BODY" "$BASE_URL$TPL_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "the service-wide default template is wrong material once the key overrides it"
+
+    # An altered template string is, unsurprisingly, also wrong material — the signature was never
+    # computed against it.
+    TPL_ALTERED_SIG=$(printf 'POST:%s:%s:%s' "$TPL_PATH" "$TPL_TS" "$TPL_BODY" | openssl dgst -sha256 -hmac "$TPL_SECRET" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $TPL_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $TPL_TS" -H "X-Signature-256: sha256=$TPL_ALTERED_SIG" \
+        -d "$TPL_BODY" "$BASE_URL$TPL_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "an altered template string produces the wrong signature too"
+
+    # Task 3: can_manage_keys cannot be paired with a custom canonical_template.
+    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"admin_with_template","can_manage_keys":true,"canonical_template":"{method}|{path}|{timestamp}|{body}"}'
+    check "400" "can_manage_keys + a custom canonical_template is refused at creation"
+
+    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"admin_no_template","can_manage_keys":true}'
+    check "200" "can_manage_keys with the standard default template is still permitted"
+    ADMIN_NO_TPL_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call PUT "/api/keys/$CREATED_ID" "$MASTER_KEY" '{"can_manage_keys":true}'
+    check "400" "promoting a templated key to can_manage_keys is refused"
+
+    api_call PUT "/api/keys/$ADMIN_NO_TPL_ID" "$MASTER_KEY" '{"canonical_template":"{method}|{path}|{timestamp}|{body}"}'
+    check "400" "setting a custom template on an existing can_manage_keys holder is refused"
 else
-    skip "§24 per-key HMAC modes: openssl is not available to compute body-only signatures."
+    skip "§24 key hmac_mode/canonical_template and hook-level HMAC_ONLY: openssl is not available to compute signatures."
 fi
 
 # ── 25. Large signed payloads & buffer limits ───────────────────────────────
@@ -2663,7 +2705,8 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     replay_call
     check "401" "an intercepted signature replayed inside the window is rejected"
-    check_true '.error | contains("already been used")' "the refusal names signature reuse"
+    # The message is not asserted: this is a hook-invocation route, and every authentication
+    # failure there collapses into one fixed body (Task 2's anti-enumeration uniformity).
 
     replay_call
     check "401" "the replay stays rejected on later attempts rather than sliding through"

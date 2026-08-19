@@ -255,6 +255,7 @@ pub async fn insert_key_with_mode(
                 .expect("sealing a test secret succeeds"),
         )),
         hmac_mode: Set(hmac_mode),
+        canonical_template: Set(None),
         bound_ips: Set(Some(bound_ips.to_owned())),
         max_concurrent_jobs: Set(scopes.max_concurrent_jobs.max(1)),
         is_master: Set(scopes.is_master),
@@ -272,6 +273,29 @@ pub async fn insert_key_with_mode(
     .expect("seeding an API key succeeds");
 
     SeededKey { id, plaintext, key_id, signing_secret }
+}
+
+/// Inserts an API key with a custom `canonical_template` override. Only meaningful for a
+/// non-`can_manage_keys` key — `guard_canonical_v1_for_key_management` refuses this combination
+/// through the API, and a test seeding it directly against a `can_manage_keys` key would be testing
+/// a state the API can never actually produce.
+pub async fn insert_key_with_template(
+    db: &DatabaseConnection,
+    name: &str,
+    bound_ips: &str,
+    scopes: KeyScopes,
+    template: &str,
+) -> SeededKey {
+    let seeded = insert_key_full(db, name, bound_ips, scopes).await;
+    api_key::ActiveModel {
+        id: Set(seeded.id),
+        canonical_template: Set(Some(template.to_owned())),
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .expect("setting a test key's canonical_template succeeds");
+    seeded
 }
 
 /// Records `child` as having been created by `parent`.
@@ -300,10 +324,17 @@ pub fn now_timestamp() -> i64 {
 /// Computes an `X-Signature-256` value over the canonical
 /// `METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY` string.
 pub fn sign_request(signing_secret: &str, method: &str, path: &str, timestamp: i64, body: &str) -> String {
+    sign_request_bytes(signing_secret, format!("{method}\n{path}\n{timestamp}\n{body}").as_bytes())
+}
+
+/// As [`sign_request`], but over an already-assembled byte string — for tests computing a
+/// signature against a **custom** `canonical_template`, where the four components are not
+/// newline-joined.
+pub fn sign_request_bytes(signing_secret: &str, base: &[u8]) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
         .expect("HMAC accepts any key length");
-    mac.update(format!("{method}\n{path}\n{timestamp}\n{body}").as_bytes());
+    mac.update(base);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
@@ -381,27 +412,6 @@ pub fn sign_body_only(signing_secret: &str, body: &str) -> String {
         .expect("HMAC accepts any key length");
     mac.update(body.as_bytes());
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
-}
-
-/// Builds a request signed the way a GitHub/Forgejo webhook would: body-only signature, no
-/// timestamp, and a configurable signature header name.
-pub fn body_only_request(
-    uri: &str,
-    api_key: &str,
-    signing_secret: &str,
-    body: &str,
-    header_name: &str,
-) -> Request<Body> {
-    with_connect_info(
-        Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("X-API-Key", api_key)
-            .header("Content-Type", "application/json")
-            .header(header_name, sign_body_only(signing_secret, body)),
-    )
-    .body(Body::from(body.to_owned()))
-    .expect("request builds")
 }
 
 /// Builds a bearer-authenticated request that additionally carries a valid signature.

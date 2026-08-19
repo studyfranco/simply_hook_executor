@@ -24,8 +24,8 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 | Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 11 | Table under **`src/migration/`** (10 migrations + `mod.rs`) |
-| **Total** | **41** | — |
+| Migrations (`src/migration/*.rs`) | 12 | Table under **`src/migration/`** (11 migrations + `mod.rs`) |
+| **Total** | **42** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
 (verified passing 2026-08-19, all three silent):
@@ -114,7 +114,7 @@ for.
 > `api/mod.rs` re-exports every handler, and it is why the `src/api.rs` → `src/api/` split left this
 > file byte-identical.
 
-### `src/main.rs` — 347 lines
+### `src/main.rs` — 349 lines
 
 **Role & scope.** The binary. Runs migrations, bootstraps the Master key on an empty table, pins the
 Master identity, primes proxy resolution, binds the listener, and shuts down gracefully. Must **not**
@@ -162,7 +162,7 @@ would be one forgotten call site away from worthless — including every call si
 someone who never read this file. Handlers keep reading `key.is_master` and are automatically
 correct, because the principal they receive is the *effective* one.
 
-### `src/middleware.rs` — 815 lines
+### `src/middleware.rs` — 848 lines
 
 **Role & scope.** Authentication only — establishing *who* is calling. Bearer key lookup, HMAC
 signature verification, timestamp freshness, replay rejection, and bound-IP enforcement. Must **not**
@@ -188,11 +188,20 @@ callers cannot drift into two copies of the same security-critical sequence. `in
 additionally branches on whether `X-API-Key` is present at all: absent, it resolves the target hook
 from the request path (`hook_identifier_from_path`, a pure function — the router-nest prefix is
 already stripped by the time this middleware runs, matching the `OriginalUri` note above) and
-authorizes per its `AuthMode`. Every keyless refusal — no such hook, a hook requiring a key, or a
-`NONE` hook currently blocked by `REQUIRE_SIGNED_REQUESTS` — returns the **identical** `401` a missing
-key gets everywhere else, so an unauthenticated caller cannot enumerate hook names or which are
-configured for public access by probing paths — the same oracle discipline `RBAC_MODEL.md` §4
-enforces for authenticated callers, extended to the one surface that now accepts none at all.
+authorizes per its `AuthMode`.
+
+**One uniform `401` for every authentication failure on an invocation route** — `invocation_unauthorized`,
+returning `{"error": "Unauthorized"}` verbatim, is what both branches of `invocation_auth_middleware`
+collapse into: a keyless caller that cannot proceed (no such hook, a hook requiring a key, a `NONE`
+hook blocked by `REQUIRE_SIGNED_REQUESTS`, or unexpected signature material on a mode that does not
+use one — see `signature_material_present`), *and* a keyed caller whose key does not exist or whose
+signature does not verify (`uniformize_keyed_auth_failure`, wrapping `authenticate_bearer_key`'s
+errors). A caller holding no credential, a guessed one, or a stolen one it cannot yet prove must learn
+nothing beyond "not authenticated" — closing that oracle across both paths at once is why this lives
+as one shared function rather than two similar-looking ones. A genuinely *valid* key that merely lacks
+`can_execute` is deliberately **not** folded in: `guard_execute` still answers its own `403` with its
+own message, since that caller has proven a real credential and "unauthorized" would misdescribe why
+it was refused.
 
 ### `src/config.rs` — 1,642 lines
 
@@ -393,7 +402,7 @@ blast radius nobody can review. The constants sit here rather than in `support.r
 policy numbers rather than plumbing, read by both the validators that enforce them and the handlers
 that document them.
 
-### `src/api/support.rs` — 403 lines
+### `src/api/support.rs` — 401 lines
 
 **Role & scope.** Shared plumbing used by three or more handler domains. **Must not decide
 anything.** Nothing here returns a refusal that depends on *who* is calling — a helper that starts
@@ -418,7 +427,7 @@ The credential primitives are `pub` because `tests/common/mod.rs` mints keys dir
 database, hashing a plaintext exactly as the service would — the only way to seed a key whose secret
 the test already knows.
 
-### `src/api/guards.rs` — 1,029 lines
+### `src/api/guards.rs` — 1,053 lines
 
 **Role & scope.** Every **cross-domain** authorization decision in the API layer. **Must not write
 anything.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no
@@ -469,7 +478,7 @@ Two ordering rules inside this file are load-bearing:
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,290 lines
+### `src/api/keys.rs` — 1,327 lines
 
 **Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
 **key-subtree** visibility.
@@ -497,6 +506,14 @@ rather than letting the boundary erode. They keep `guards.rs`'s discipline regar
 returning `Result<_, AppError>`, writing nothing, and preserving §4 oracle discipline, where a
 `None`/`404` must be indistinguishable from a nonexistent id and is propagated rather than converted
 to a `403`.
+
+`create_api_key`/`update_api_key` also own `canonical_template` — a per-key override of the
+`CANONICAL_V1` canonical string, added alongside `HmacMode::BodyOnly`'s retirement as the
+replacement customization surface. `hmac_mode` stays immutable after creation exactly as before
+(still no field on `UpdateApiKeyPayload` at all); `canonical_template` **is** mutable, but only for
+a key that is not (and does not become) a `can_manage_keys` holder —
+`guards::guard_canonical_v1_for_key_management` refuses either direction (granting the scope to an
+already-templated key, or templating an already-scoped one) with `400`.
 
 ### `src/api/hooks.rs` — 1,063 lines
 
@@ -619,8 +636,8 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 
 | File | Table | Note |
 | :--- | :--- | :--- |
-| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` — a key's **own** signature mode, unrelated to `hook.rs`'s `AuthMode` below |
-| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*, deliberately kept off `ApiKey`: `NONE`/`HMAC_ONLY` describe a keyless caller, which is incoherent as a property of a credential object. See `middleware.rs` below |
+| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` — a key's **own** signature mode, unrelated to `hook.rs`'s `AuthMode` below. `HmacMode` now has **one** variant (`CANONICAL_V1`) — `BODY_ONLY` was retired in `m20260819_141730`, superseded by hook-level `HMAC_ONLY`. `canonical_template` (added the same migration) is the per-key customization surface that replaced it |
+| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. See `middleware.rs` below |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
 | `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus` |
@@ -646,6 +663,7 @@ one that has shipped.
 | `m20260809_090000_add_can_view_execution` | The third permission verb |
 | `m20260810_090000_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
 | `m20260819_120414_add_hook_auth_mode` | `hooks.auth_mode` (`NOT NULL DEFAULT 'CANONICAL_V1'`), `hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template` (all nullable) — per-hook inbound authentication, see `entities/hook.rs` above |
+| `m20260819_141730_consolidate_hmac_modes` | **Retires** `api_keys.hmac_mode = BODY_ONLY` (rewrites any stored row to `CANONICAL_V1` via a typed `sea_query::Query::update`, not raw SQL) and **adds** `api_keys.canonical_template` — see `entities/api_key.rs` above |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the

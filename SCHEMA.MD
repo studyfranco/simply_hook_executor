@@ -49,7 +49,8 @@ Stores authentication keys, global scopes, and network restrictions.
 | `key_hash` | String | NOT NULL, UNIQUE | Argon2id or SHA-256 hash of the secret key. |
 | `key_id` | String | NULLABLE, UNIQUE | Public, non-secret identifier (`shk_<32 hex>`) for display and log correlation. Safe to log. **Not a credential and not an authentication header** — callers identify themselves with `X-API-Key`, which is the only key lookup path. `NULL` only for keys issued before signing secrets existed; rotate such a key to mint a pair. |
 | `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret — see the storage model below. Returned in plaintext exactly once, in the `POST /api/keys` (or `/rotate`) response. `NULL` alongside a `NULL` `key_id`. |
-| `hmac_mode` | String | NOT NULL, DEFAULT `'CANONICAL_V1'` | Signature verification scheme: `CANONICAL_V1` or `BODY_ONLY`. See the enumeration section below. **Fixed at creation, immutable thereafter** — absent from `UpdateApiKeyPayload` entirely, so naming it in an update is a `422` from `deny_unknown_fields` rather than a value that reaches this column again. Its only writers are `create_api_key` and `rotate_api_key` (which preserves the existing mode rather than resetting it). A key holding `can_manage_keys = true` MUST have this column `= 'CANONICAL_V1'`, enforced at both creation and update by `guard_canonical_v1_for_key_management`. |
+| `hmac_mode` | String | NOT NULL, DEFAULT `'CANONICAL_V1'` | Signature verification scheme. **`CANONICAL_V1` is the only value the column accepts** — `BODY_ONLY` was retired in `m20260819_141730`, superseded by `hooks.auth_mode = HMAC_ONLY` at the hook level, which serves the same third-party-sender use case keyless. Any row still holding the literal string `BODY_ONLY` from before that migration was rewritten to `CANONICAL_V1` as part of it. See the enumeration section below. **Fixed at creation, immutable thereafter** — absent from `UpdateApiKeyPayload` entirely, so naming it in an update is a `422` from `deny_unknown_fields` rather than a value that reaches this column again. Its only writers are `create_api_key` and `rotate_api_key` (which preserves the existing mode rather than resetting it). A key holding `can_manage_keys = true` MUST have this column `= 'CANONICAL_V1'`, enforced at both creation and update by `guard_canonical_v1_for_key_management`. |
+| `canonical_template` | Text | NULLABLE | Override of the `CANONICAL_V1` canonical string **this key's own signatures are verified against**. `NULL` means the service-wide default, `{method}\n{path}\n{timestamp}\n{body}`. Added in `m20260819_141730` as the replacement customization surface for the retired `BODY_ONLY` mode. **Mutable** — unlike `hmac_mode` — but never `NOT NULL` while `can_manage_keys = true`: `guard_canonical_v1_for_key_management` refuses either direction (granting the scope to an already-templated key, or templating an already-scoped one) with `400`. Distinct from `hooks.canonical_template` (per-hook, applies only to invocation routes and only for that specific hook); when both are set for one request, the hook's wins — see `AGENT.MD`'s HMAC Signature Protocol section. |
 | `bound_ips` | String | NOT NULL, DEFAULT `'0.0.0.0/0,::/0'` | Comma-separated CIDR ranges permitted to use this key. Enforced for **every** key including `is_master` (see below); an empty value means "unrestricted". The address compared against it is the TCP peer unless that peer is in `TRUSTED_PROXIES`. |
 | `max_concurrent_jobs`| Integer | NOT NULL, DEFAULT `10` | Maximum simultaneous script executions allowed for this key. |
 | `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all **RBAC** checks if `true`. It does **not** bypass the `bound_ips` network check, which is a transport boundary rather than a permission. **Not settable through any API endpoint** — it is absent from every request payload, and at most one row may carry it (see `master_marker` below). Its only writer is the boot-time bootstrap against an empty table. |
@@ -155,16 +156,20 @@ Defines executable script definitions and execution constraints.
 | `signature_prefix` | String | NULLABLE | Prefix stripped from an `HMAC_ONLY` signature before hex-decoding it. `NULL` means the built-in default, `sha256=`. |
 | `canonical_template` | Text | NULLABLE | Override of the `CANONICAL_V1` canonical string, consulted only when a **keyed** `CANONICAL_V1` caller invokes a hook whose own `auth_mode` is `CANONICAL_V1`. `NULL` means the service-wide default, `{method}\n{path}\n{timestamp}\n{body}`. Recognized placeholders: `{method}`, `{path}`, `{timestamp}`, `{body}`; substitution is purely textual. |
 
-#### `auth_mode` is orthogonal to `api_keys.hmac_mode`
+#### `auth_mode` is orthogonal to `api_keys.hmac_mode` and `api_keys.canonical_template`
 
 Two different questions, deliberately kept on two different tables. `api_keys.hmac_mode`
-(`CANONICAL_V1`/`BODY_ONLY`) governs how a **specific credential's own** signature verifies, and is
-unchanged by this column. `hooks.auth_mode` governs what a request targeting **this endpoint** may
-present when it has **no credential at all** — a question a key cannot answer about itself, since
-`NONE`/`HMAC_ONLY` describe the *absence* of a key. A caller presenting a valid `X-API-Key` is always
-authorized by the key (per its own `hmac_mode` and the service's `REQUIRE_SIGNED_REQUESTS` setting,
-per `AGENT.MD`'s HMAC Signature Protocol section) regardless of the target hook's `auth_mode`; the
-column exists purely to widen what a *keyless* caller may do, never to narrow what a keyed one may.
+(`CANONICAL_V1` — the only value; see the enumeration section below) governs how a **specific
+credential's own** signature verifies, and is unchanged by this column. `hooks.auth_mode` governs
+what a request targeting **this endpoint** may present when it has **no credential at all** — a
+question a key cannot answer about itself, since `NONE`/`HMAC_ONLY` describe the *absence* of a key.
+A caller presenting a valid `X-API-Key` is always authorized by the key (per its own `hmac_mode` and
+the service's `REQUIRE_SIGNED_REQUESTS` setting, per `AGENT.MD`'s HMAC Signature Protocol section)
+regardless of the target hook's `auth_mode`; the column exists purely to widen what a *keyless*
+caller may do, never to narrow what a keyed one may. `api_keys.canonical_template` is a third,
+narrower axis again — a per-key override of the signed material's *shape*, not of whether a key is
+required — and this hook-level `canonical_template` takes precedence over it when a keyed caller
+signs a `CANONICAL_V1` hook that sets its own.
 
 #### Soft delete
 
@@ -321,26 +326,34 @@ Stored as a plain string (portable across SQLite/PostgreSQL/MySQL), selected **p
 
 | Value | Signed material | Accepted headers | `X-Timestamp` | Replay protection |
 | :--- | :--- | :--- | :--- | :--- |
-| `CANONICAL_V1` *(default)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` | `X-Signature-256` | **required** | **yes** — 300s window, and the timestamp is inside the signed material so it cannot be re-dated |
-| `BODY_ONLY` | `RAW_BODY` | `X-Signature-256` **or** `X-Hub-Signature-256` | not required, ignored if sent | **none** |
+| `CANONICAL_V1` *(default, and only)* | `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY`, or `api_keys.canonical_template` when set | `X-Signature-256` | **required** | **yes** — 300s window, and the timestamp is inside the signed material so it cannot be re-dated |
 
-- `BODY_ONLY` exists solely for third-party senders (GitHub, Forgejo, GitLab) whose signature format
-  cannot be changed. An intercepted request in this mode stays replayable indefinitely, so it should
-  be scoped to a key that can execute only the hooks that sender is meant to trigger.
-- `X-Hub-Signature-256` is honoured **only** in `BODY_ONLY`. A `CANONICAL_V1` key cannot be
-  downgraded to body-only verification by sending the other header name — the per-key mode is
-  enforced, not advisory.
+**`BODY_ONLY` was retired in `m20260819_141730`.** It signed the raw body alone, accepted either
+`X-Signature-256` or `X-Hub-Signature-256`, needed no timestamp, and carried no replay protection —
+existing solely for third-party senders (GitHub, Forgejo, GitLab) whose format cannot be changed.
+`hooks.auth_mode = HMAC_ONLY` (below) now serves that exact use case at the hook level, keyless,
+which is the shape that kind of sender actually has; the key-level mode had no remaining use case it
+didn't share, and removing it collapsed key-level signing onto one well-understood scheme.
+`X-Hub-Signature-256` is no longer read at the key level at all, under any circumstance.
+
 - The column defaults to `CANONICAL_V1`, including for rows backfilled by the migration that adds
-  it: an upgrade must never silently strip replay protection from an existing key.
+  it: an upgrade must never silently strip replay protection from an existing key. Any row still
+  holding the literal `BODY_ONLY` string from before the consolidation migration was rewritten to
+  `CANONICAL_V1` as part of it, rather than left to fail to parse.
 - **Immutable after creation.** `UpdateApiKeyPayload` does not carry the field at all — not
   accepted-and-ignored, *absent* — so naming it in an update is a `422` from `deny_unknown_fields`
-  before any handler runs. A mutable mode would be a downgrade lever: a key minted `CANONICAL_V1`
-  that could later be flipped to `BODY_ONLY` would have its replay protection removable by whoever
-  can already reach the update route. Selecting `BODY_ONLY` **at creation** is still recorded in the
-  audit trail, explicitly labelled as removing replay protection.
-- A key holding `can_manage_keys = true` **must** be `CANONICAL_V1`, enforced at both creation and
-  update by `guard_canonical_v1_for_key_management` — the scope that can administer every other
-  credential must not be reachable over a scheme with no replay window.
+  before any handler runs, for every caller including the master.
+- A key holding `can_manage_keys = true` **must** be `CANONICAL_V1` (trivially true now — see
+  `canonical_template` immediately below for the customization axis that actually needs locking) and
+  must leave `canonical_template` unset, enforced at both creation and update by
+  `guard_canonical_v1_for_key_management` — the scope that can administer every other credential
+  must sign over the one canonical string this codebase's verification has actually been reviewed
+  against, not one of its own choosing.
+
+**`canonical_template`** is the customization surface `BODY_ONLY`'s removal left in its place: any
+non-`can_manage_keys` key may set its own override of the four-placeholder canonical string
+(`{method}`, `{path}`, `{timestamp}`, `{body}`), applied to every request that key signs. Unlike
+`hmac_mode`, this field **is** mutable — send `""` to reset it to the service-wide default.
 
 ### `AuthMode` (`hooks.auth_mode`)
 
@@ -351,7 +364,7 @@ Governs only what a **keyless** caller of that hook may do; a caller presenting 
 
 | Value | Keyless caller | Notes |
 | :--- | :--- | :--- |
-| `CANONICAL_V1` *(default)* | refused (`401`, identical to a missing key everywhere else) | A keyed caller's signature is verified against `canonical_template` when the hook sets one, else the service-wide default |
+| `CANONICAL_V1` *(default)* | refused (`401`, identical to a missing key everywhere else) | A keyed caller's signature is verified against, in order: this hook's own `canonical_template` if it sets one, else the calling key's own `api_keys.canonical_template` if *it* sets one, else the service-wide default |
 | `API_KEY_ONLY` | refused, identically to `CANONICAL_V1` | Records operator intent — "a bearer key alone suffices for this integration" — without changing verification, which is entirely the presenting key's own `HmacMode` |
 | `HMAC_ONLY` | accepted with a valid signature over the raw body, verified against `hooks.hmac_secret` (never a key's) on `signature_header`/`signature_prefix` (or their defaults) | **No anti-replay protection** — no timestamp is involved. The GitHub/Forgejo/GitLab third-party webhook shape |
 | `NONE` | accepted outright — **no authentication at all** | **Only** when the deployment's `REQUIRE_SIGNED_REQUESTS` is `false`. A deployment that opted into mandatory signing everywhere else must not have one hook silently exempted |

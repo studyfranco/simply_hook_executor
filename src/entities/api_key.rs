@@ -6,6 +6,21 @@ use serde::{Deserialize, Serialize};
 
 /// How a key's `X-Signature-256` is verified.
 ///
+/// **`CANONICAL_V1` is the only value this enum accepts.** `BODY_ONLY` — the GitHub/Forgejo/GitLab
+/// raw-body-only convention, with no timestamp and no replay protection — was retired once
+/// `hooks.auth_mode = HMAC_ONLY` began serving the exact same third-party-sender use case at the
+/// **hook** level, with no bearer key involved at all, which is the shape that kind of sender
+/// actually has. `m20260819_141730_consolidate_hmac_modes` rewrote every row still holding the old
+/// value to `CANONICAL_V1` before this variant was removed from the type, so no stored row can fail
+/// to parse.
+///
+/// A single-variant enum rather than removing `hmac_mode` outright: the column, and the `From`/
+/// `TryFrom` machinery `DeriveActiveEnum` generates for it, are still how the row round-trips through
+/// SeaORM, and a future second mode (if one is ever justified) has a type to extend rather than a
+/// column to reintroduce. [`Model::canonical_template`] is the customization surface now — a key
+/// that needs its `CANONICAL_V1` signature computed over something other than the service-wide
+/// default template sets that instead of switching modes.
+///
 /// Stored as a plain string rather than a native database enum so the schema stays portable across
 /// SQLite/PostgreSQL/MySQL without vendor-specific DDL.
 #[derive(
@@ -14,24 +29,15 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HmacMode {
-    /// Signature covers `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY`, with a mandatory
-    /// `X-Timestamp` inside the anti-replay window.
+    /// Signature covers `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY` (or [`Model::canonical_template`],
+    /// when set), with a mandatory `X-Timestamp` inside the anti-replay window.
     ///
-    /// The default, and the only mode that resists replay: because the timestamp is *inside* the
-    /// signed material, a captured request cannot be re-dated, and because the method and target
-    /// are too, it cannot be aimed at a different route.
+    /// The only mode: because the timestamp is *inside* the signed material, a captured request
+    /// cannot be re-dated, and because the method and target are too, it cannot be aimed at a
+    /// different route.
     #[default]
     #[sea_orm(string_value = "CANONICAL_V1")]
     CanonicalV1,
-    /// Signature covers the raw body only, accepted from either `X-Signature-256` or
-    /// `X-Hub-Signature-256`, with no timestamp required.
-    ///
-    /// This is the GitHub/Forgejo/GitLab webhook convention, and exists solely for compatibility
-    /// with senders whose signature format cannot be changed. It provides **no replay protection**
-    /// — an intercepted request stays valid forever — so it must be opted into per key, and only
-    /// for keys scoped to the hooks that third party is meant to trigger.
-    #[sea_orm(string_value = "BODY_ONLY")]
-    BodyOnly,
 }
 
 /// A single API key: its identity, global RBAC scopes, execution budget, and network binding rule.
@@ -88,6 +94,17 @@ pub struct Model {
     pub created_at: DateTime,
     /// Key last-update timestamp.
     pub updated_at: DateTime,
+    /// Override of the `CANONICAL_V1` canonical string template this key's own signatures are
+    /// verified against. `None` means the service-wide default,
+    /// `{method}\n{path}\n{timestamp}\n{body}`.
+    ///
+    /// **Never `Some` while [`Model::can_manage_keys`] is `true`** — enforced by
+    /// `guards::guard_canonical_v1_for_key_management` at both creation and update. The credential
+    /// that can administer every other one stays on the one canonical string this codebase's
+    /// signature verification has actually been reviewed against; every other key is free to
+    /// customize it (e.g. for compatibility with an existing signing client that already computes a
+    /// different canonical shape).
+    pub canonical_template: Option<String>,
 }
 
 /// Relations from `api_keys` to other entities.

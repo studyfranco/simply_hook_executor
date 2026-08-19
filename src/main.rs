@@ -112,8 +112,10 @@ async fn bootstrap_master_key(
         prefix: Set(prefix),
         key_id: Set(Some(key_id.clone())),
         signing_secret: Set(Some(cipher.seal(&signing_secret)?)),
-        // The bootstrap key gets the strict mode; relaxing it is a deliberate per-key choice.
         hmac_mode: Set(entities::api_key::HmacMode::CanonicalV1),
+        // The standard template, unset: `guard_canonical_v1_for_key_management` requires exactly
+        // this for a `can_manage_keys` holder, which the master always is.
+        canonical_template: Set(None),
         bound_ips: Set(Some(bound_ip.clone())),
         max_concurrent_jobs: Set(10),
         is_master: Set(true),

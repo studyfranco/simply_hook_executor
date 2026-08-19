@@ -6542,3 +6542,105 @@ passing) · `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **
 entirely unaffected, plus the new `auth_mode`/`hmac_secret_configured`/etc. fields now visible in every
 hook response · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing,
 unrelated), 0 drifted** after the mid-file-test-module fix above.
+
+---
+
+# 2026-08-19 (third pass) — Retire `BODY_ONLY`, uniform invocation-route auth errors, strict HMAC rejection
+
+A five-task refinement pass on the auth surface built in the previous two sessions. Two of the five
+tasks, as literally specified, conflicted with load-bearing, heavily-tested architecture — both were
+raised via `AskUserQuestion` before writing any code, per this session's established pattern, rather
+than implemented blind or silently reinterpreted.
+
+## What was clarified before implementing
+
+1. **Task 2 asked that a valid key lacking `can_execute` return `401` instead of `403`** on the three
+   invocation routes. This inverts AGENT.MD's documented "authenticate, then authorize" convention
+   (401 = not authenticated, 403 = authenticated but forbidden) used everywhere else in the API, and
+   concretely breaks the dashboard: `static/app.js` has a global 401-interceptor that force-logs-out
+   on any 401, so an operator with a real, valid key merely lacking rights on one hook would be
+   unexpectedly logged out. **Resolved: narrowed to the two genuine authentication failures** (unknown
+   key; bad signature/timestamp) — these collapse into one identical `401` body,
+   `{"error":"Unauthorized"}`. "Valid key, no `can_execute`" stays `403` with its own message,
+   unchanged, preserving both the dashboard's behavior and RFC 7231 semantics. This still closes the
+   oracle Task 2 actually cared about — a caller holding a guessed/stolen key string still cannot tell
+   "doesn't exist" from "bad signature" — without collapsing authentication into authorization.
+2. **Task 3 assumed admin keys have a `canonical_template` field to lock** — but that field was
+   deliberately kept off `ApiKey` in the immediately preceding session (hook-only design, confirmed
+   explicitly at the time). **Resolved: the decision was reopened.** `ApiKey` gains its own
+   `canonical_template` (nullable, mutable, distinct from `hooks.canonical_template`), and
+   `guard_canonical_v1_for_key_management` now refuses pairing it with `can_manage_keys` in either
+   direction (granting the scope to an already-templated key, or templating an already-scoped one),
+   `400`.
+
+## Task 1 — `BODY_ONLY` retired
+
+`api_keys.hmac_mode`'s `BODY_ONLY` value is gone; `HmacMode` is now a single-variant enum
+(`CANONICAL_V1`). The premise held up under inspection: the previous session's hook-level
+`HMAC_ONLY` `auth_mode` already serves the exact use case `BODY_ONLY` existed for (a keyless
+third-party sender whose format cannot be changed) — better, in fact, since it needs no bearer key
+at all, which is the shape that kind of sender actually has. Key-level `BODY_ONLY` was a redundant,
+narrower path to the same place.
+
+- **Migration** (`m20260819_141730_consolidate_hmac_modes`): a data fix (any stored `'BODY_ONLY'`
+  row rewritten to `'CANONICAL_V1'`, via a typed `sea_query::Query::update` — not raw SQL, so
+  `tests/source_hygiene.rs`'s allowlist needed no new entry) plus adding `api_keys.canonical_template`
+  (nullable — the replacement customization surface, per the reopened decision above).
+- **`middleware.rs`**: `X-Hub-Signature-256` is no longer read at the key level under any
+  circumstance (still relevant for hook-level `HMAC_ONLY`, a separate code path). The
+  timestamp-required branch collapsed from a two-arm match to unconditional, since there's only one
+  mode left. A key's own `canonical_template` now participates in the signature-base precedence:
+  hook-level override (if the target hook's `auth_mode` is `CANONICAL_V1` and it sets one) beats
+  key-level (if the calling key sets one) beats the service default.
+- **Test fallout**: 4 tests whose entire premise was key-level `BODY_ONLY` (GitHub-header
+  acceptance, replay-exemption, immutability-toggle) were deleted or rewritten against hook-level
+  `HMAC_ONLY` instead; several others lost a now-inapplicable message-text assertion. A new test,
+  `the_consolidation_migration_rewrites_stored_body_only_rows`, seeds a pre-migration row with the
+  literal string (bypassing the now-restricted Rust enum via `Entity::update_many().col_expr`) and
+  confirms the data fix.
+
+## Task 2 — Uniform invocation-route auth failures (narrowed, see above)
+
+`middleware::invocation_unauthorized` returns the fixed `{"error":"Unauthorized"}` body;
+`uniformize_keyed_auth_failure` wraps `authenticate_bearer_key`'s errors specifically inside
+`invocation_auth_middleware`'s keyed branch, converting only `AppError::Unauthorized` and passing
+every other variant (`Forbidden` for `bound_ips`, `InvalidInput` for an oversized body, `Internal`)
+through unchanged. The keyless path's existing "no eligible mode" refusal was folded into the same
+function, so a keyless prober and a keyed prober with a bad credential now get byte-identical
+responses. Every administrative `/api/*` route (behind `auth_middleware`) keeps its detailed,
+per-failure messages — the uniformity is scoped to the three invocation routes only, as asked.
+
+**Test fallout**: 7 existing tests asserted specific message text ("...window...", "X-Timestamp",
+"X-API-Key", "Invalid request signature", "already been used") on what turned out to be invocation
+routes; each was updated to assert status only (with a comment explaining why), except
+`signature_rejection_leaks_no_oracle_about_the_correct_digest`, whose assertion was updated to the
+new literal `"Unauthorized"` — its actual point (every forged-signature variant produces an
+identical response) is unchanged and, if anything, more strongly demonstrated now.
+
+## Task 3 — Unexpected signature material is refused, not ignored
+
+A keyless request against a hook whose `auth_mode` is `API_KEY_ONLY` or `NONE` — neither of which
+uses a signature — is now refused outright if it carries something that looks like one
+(`middleware::signature_material_present`, checking `X-Signature-256` and the hook's own configured
+`signature_header`), rather than silently succeeding with the header ignored. Observable only for
+`NONE`: without this, a stray or garbage signature on an otherwise fully-open hook would still have
+been accepted — the general "fail loud on unexpected input" posture this codebase already applies via
+`deny_unknown_fields` and the strict extractors, extended to this one gap.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**305 passed / 0 failed / 2 ignored** across all binaries (`auth_mode_tests` grew from 8 to 12) ·
+`cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **960 passed / 0 failed** — up from
+958 before this pass (§24 rewritten in full: hook-level `HMAC_ONLY` replaces the retired key-level
+scenario, plus new `canonical_template` coverage — creation/storage, keyed verification against a
+custom template, the default-template-now-wrong-material check, an altered-template negative case,
+and the four `can_manage_keys` + `canonical_template` admin-lock combinations) ·
+`./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing, unrelated), 0
+drifted**.
+
+One real bug surfaced by the e2e run rather than by review: a stale `SIGN_AUTH`/`SIGN_SECRET` pair
+in `scripts/test_e2e.sh`, interpolated once well before §12's key-rotation step and never refreshed
+afterward, silently signed with a since-invalidated secret the first time §24's rewritten section
+tried to use it. Fixed by re-setting both explicitly immediately before use, rather than assuming a
+global set many hundred lines earlier was still current.

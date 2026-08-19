@@ -252,10 +252,8 @@ pub(crate) async fn load_parameters(
 /// `BODY_ONLY` is called out as replay-vulnerable rather than merely named: choosing it is a
 /// security-relevant decision, and the audit trail should say so where an operator will read it.
 pub(crate) fn describe_hmac_mode(mode: HmacMode) -> &'static str {
-    match mode {
-        HmacMode::CanonicalV1 => "signatures: CANONICAL_V1",
-        HmacMode::BodyOnly => "signatures: BODY_ONLY — body-only, no replay protection",
-    }
+    let HmacMode::CanonicalV1 = mode;
+    "signatures: CANONICAL_V1"
 }
 
 /// Renders a hook's elevation setting for an audit log entry.

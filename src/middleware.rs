@@ -17,7 +17,6 @@ use crate::crypto::{
     SIGNATURE_PREFIX, SignatureRejection, canonical_v1_payload, render_canonical_template,
     verify_signature, verify_signature_with_prefix,
 };
-use crate::entities::api_key::HmacMode;
 use crate::entities::hook::{self, AuthMode};
 use crate::entities::prelude::ApiKey;
 use crate::error::AppError;
@@ -26,11 +25,11 @@ use crate::state::AppState;
 /// Header carrying the caller's secret key. The single, canonical way a caller identifies itself —
 /// every request resolves its key record by hashing this value and matching `api_keys.key_hash`.
 const API_KEY_HEADER: &str = "X-API-Key";
-/// Header carrying the `sha256=<hex>` request signature.
+/// Header carrying the `sha256=<hex>` request signature. This is the **key-level** signature
+/// header; a hook's own `HMAC_ONLY` `auth_mode` may configure a different header
+/// (`hook::Model::signature_header`, checked in [`invocation_auth_middleware`]) for its keyless
+/// senders, independent of this constant.
 const SIGNATURE_HEADER: &str = "X-Signature-256";
-/// Alternate signature header used by GitHub-style webhook senders. Accepted only in
-/// [`HmacMode::BodyOnly`], which is the mode that exists to accommodate them.
-const HUB_SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
 /// Header carrying the Unix-seconds timestamp a signature was computed at.
 const TIMESTAMP_HEADER: &str = "X-Timestamp";
 /// Default signature header for a hook whose `auth_mode` is [`AuthMode::HmacOnly`] and which has
@@ -89,18 +88,12 @@ fn validate_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
 /// belong in front of the ones that do, so an unauthenticated caller cannot choose how much work
 /// we perform on its behalf.
 ///
-/// # Scope: the shape of the request, not the mode of the key
+/// # Scope: requests carrying a signature, not every request carrying a timestamp
 ///
-/// The window is applied only when [`SIGNATURE_HEADER`] is present alongside the timestamp, which
-/// is precisely the shape of a `CANONICAL_V1` request — the only mode that has a window at all.
-/// The mode itself lives in the row the lookup fetches, so it cannot be consulted here; the pair of
-/// headers is the closest thing to it that is free.
-///
-/// Widening this to "any request carrying a timestamp" was tried and is wrong. `BODY_ONLY` exists
-/// to accept senders whose format cannot be changed (`AGENT.MD` §1), and a stray `X-Timestamp` from
-/// one of them is documented as ignored — enforcing a window over it would reject a webhook for a
-/// header that is not even part of its signed material, buying nothing, since `BODY_ONLY` carries
-/// no replay protection to strengthen either way.
+/// The window is applied only when [`SIGNATURE_HEADER`] is present alongside the timestamp. A bare
+/// `X-Timestamp` with no signature is not a signed request at all — enforcing a window over it would
+/// reject ordinary unsigned bearer traffic that happens to carry a stray header, for a value that is
+/// not part of any signed material and buys nothing.
 ///
 /// # This is an optimization, not the guarantee
 ///
@@ -225,12 +218,44 @@ fn hook_identifier_from_path(path: &str) -> Option<&str> {
     }
 }
 
-/// The message every keyless caller of an invocation route is told when it is not eligible to
-/// proceed without an `X-API-Key` — whether that is because none was sent, the hook does not exist,
-/// or the hook exists but its `auth_mode` demands a key. See [`invocation_auth_middleware`]'s doc
-/// comment for why these three cases are deliberately not told apart.
-fn missing_credentials_error() -> AppError {
-    AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header"))
+/// The **one** `401` body every authentication failure on an invocation route collapses into —
+/// `{"error": "Unauthorized"}`, verbatim. Covers both directions this middleware can fail a
+/// caller:
+///
+/// - **Keyless**: not eligible to proceed without an `X-API-Key` — whether that is because none
+///   was sent, the hook does not exist, or the hook exists but its `auth_mode` demands a key.
+/// - **Keyed**: the presented `X-API-Key` does not name a real key, or its signature (or
+///   timestamp) does not verify.
+///
+/// See [`invocation_auth_middleware`]'s doc comment for why every one of these is deliberately told
+/// apart from none of the others: an attacker probing these three routes must learn nothing beyond
+/// "not authenticated", whether it holds no credential, a guessed one, or a stolen one it cannot
+/// yet prove.
+fn invocation_unauthorized() -> AppError {
+    AppError::Unauthorized("Unauthorized".to_owned())
+}
+
+/// Collapses every [`AppError::Unauthorized`] from [`authenticate_bearer_key`] into
+/// [`invocation_unauthorized`]'s fixed body, for [`invocation_auth_middleware`]'s keyed path. Every
+/// other variant — [`AppError::Forbidden`] (`bound_ips`), [`AppError::InvalidInput`] (oversized
+/// body), [`AppError::Internal`] — passes through unchanged: those are not part of the oracle this
+/// exists to close, and folding them in too would blur genuinely different failure classes
+/// together (a `403` for a network restriction is not "not authenticated").
+fn uniformize_keyed_auth_failure(err: AppError) -> AppError {
+    match err {
+        AppError::Unauthorized(_) => invocation_unauthorized(),
+        other => other,
+    }
+}
+
+/// Whether `headers` carries anything that looks like signature material — for the keyless path's
+/// "reject unexpected signing" check against a hook whose `auth_mode` (`ApiKeyOnly` or `NoAuth`)
+/// does not use one. Checks the fixed [`SIGNATURE_HEADER`] as well as the target's own configured
+/// `signature_header`, if it has one — stale configuration from a hook once switched away from
+/// `HMAC_ONLY` should still be caught, not silently ignored.
+fn signature_material_present(headers: &axum::http::HeaderMap, target: &hook::Model) -> bool {
+    headers.contains_key(SIGNATURE_HEADER)
+        || target.signature_header.as_deref().is_some_and(|h| headers.contains_key(h))
 }
 
 /// Authenticates a presented `X-API-Key`, verifying its signature (when one is required or
@@ -280,17 +305,12 @@ async fn authenticate_bearer_key(
     // Signature verification requires the raw body, which means buffering it and rebuilding the
     // request. That only happens when a signature is actually presented — unsigned requests keep
     // streaming through untouched.
-    // Which signature header applies depends on the key's mode: `X-Hub-Signature-256` is only
-    // honoured for BODY_ONLY keys, so a CANONICAL_V1 key cannot be downgraded to the weaker scheme
-    // simply by sending the other header name.
-    let signature = headers
-        .get(SIGNATURE_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| match key_record.hmac_mode {
-            HmacMode::BodyOnly => headers.get(HUB_SIGNATURE_HEADER).and_then(|h| h.to_str().ok()),
-            HmacMode::CanonicalV1 => None,
-        })
-        .map(str::to_owned);
+    //
+    // `X-Hub-Signature-256` is never honoured here: it was the alternate header `BODY_ONLY` keys
+    // accepted, and that mode is retired (see `HmacMode`'s doc comment). A caller wanting that
+    // header's semantics now targets a hook whose `auth_mode` is `HMAC_ONLY`
+    // (`invocation_auth_middleware`'s keyless path) instead of a key.
+    let signature = headers.get(SIGNATURE_HEADER).and_then(|h| h.to_str().ok()).map(str::to_owned);
 
     // The bearer key is itself the credential, so a signature is optional by default — when
     // present it must still verify, adding request integrity on top. `REQUIRE_SIGNED_REQUESTS`
@@ -319,26 +339,17 @@ async fn authenticate_bearer_key(
     let req = match signature {
         Some(signature) => {
             // CANONICAL_V1 binds the timestamp into the signed material and enforces the replay
-            // window. BODY_ONLY signs the body alone, which is what GitHub-style senders produce —
-            // it cannot resist replay, and deliberately does not pretend to by demanding a
-            // timestamp it would not actually cover.
-            // Two things happen here that could not happen before the lookup. First, whether the
-            // header had to be present at all — that is what `hmac_mode` decides. Second, the
-            // authoritative window check: `prevalidate_timestamp_header` already applied it to
-            // every request shaped like this one, but the guarantee lives here, where it cannot be
-            // sidestepped by a future change to which signature headers this branch accepts.
-            let timestamp = match key_record.hmac_mode {
-                HmacMode::CanonicalV1 => {
-                    let timestamp = presented_timestamp.ok_or_else(|| {
-                        AppError::Unauthorized(format!(
-                            "A signed request must include an {TIMESTAMP_HEADER} header"
-                        ))
-                    })?;
-                    validate_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
-                    Some(timestamp)
-                }
-                HmacMode::BodyOnly => None,
-            };
+            // window — the only mode a key can be in, so a timestamp is unconditionally required
+            // once a signature is presented. The authoritative window check runs here rather than
+            // relying solely on `prevalidate_timestamp_header`'s pre-check: that check is an
+            // optimization (reject cheap garbage before the database), not the guarantee, and a
+            // security property must not rest on an invariant held two functions apart.
+            let timestamp = presented_timestamp.ok_or_else(|| {
+                AppError::Unauthorized(format!(
+                    "A signed request must include an {TIMESTAMP_HEADER} header"
+                ))
+            })?;
+            validate_timestamp(&timestamp, state.config.signature_max_age_seconds)?;
 
             let secret = recover_signing_secret(state, &key_record)?;
 
@@ -347,56 +358,49 @@ async fn authenticate_bearer_key(
                 .await
                 .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
 
-            // A hook whose own `auth_mode` is `CANONICAL_V1` and which has set a
-            // `canonical_template` overrides the canonical string this *keyed* signature is
-            // verified against — see `AuthMode::CanonicalV1`'s doc comment. Every other route
-            // (every non-invocation route, and every invocation route whose target hook keeps the
-            // default template or is not itself `CANONICAL_V1`) is unaffected and keeps signing the
-            // service-wide default exactly as before this feature existed.
+            // The canonical string a keyed signature is verified against, in precedence order:
+            //
+            // 1. The **target hook's** `canonical_template`, when the invocation route resolved one
+            //    and its own `auth_mode` is `CANONICAL_V1` — the specific endpoint's declared
+            //    expectation wins, matching `AuthMode::CanonicalV1`'s doc comment.
+            // 2. The **key's own** `canonical_template`, when it has set one — a general
+            //    customization that applies to every route this key signs, not only invocations.
+            // 3. The service-wide default, `crypto::canonical_v1_payload`.
+            //
+            // Every route outside the three invocation routes only ever reaches step 2 or 3, since
+            // `InvocationHook` is only ever inserted by `invocation_auth_middleware`.
             let template = match &parts.extensions.get::<InvocationHook>() {
                 Some(InvocationHook(hook)) if hook.auth_mode == AuthMode::CanonicalV1 => {
                     hook.canonical_template.as_deref()
                 }
                 _ => None,
-            };
+            }
+            .or(key_record.canonical_template.as_deref());
 
-            let base = match &timestamp {
-                Some(timestamp) => {
-                    // The signature covers the method and full request target as well as the
-                    // timestamp and body, so a captured signature cannot be replayed against a
-                    // different route — a signed `GET /api/hooks` cannot become a
-                    // `DELETE /api/hooks/{id}`.
-                    //
-                    // `OriginalUri` is essential here, not a nicety: `Router::nest("/api", ..)`
-                    // strips the prefix from the URI inner layers observe, so `parts.uri` would
-                    // read `/hooks/x` while the client signed `/api/hooks/x`. Signing must use the
-                    // target the client actually requested, which is what `OriginalUri` preserves.
-                    let original_uri = parts
-                        .extensions
-                        .get::<axum::extract::OriginalUri>()
-                        .map(|original| &original.0)
-                        .unwrap_or(&parts.uri);
-                    let path_and_query = original_uri
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or_else(|| original_uri.path());
-                    match template {
-                        Some(template) => render_canonical_template(
-                            template,
-                            parts.method.as_str(),
-                            path_and_query,
-                            timestamp,
-                            &bytes,
-                        ),
-                        None => canonical_v1_payload(
-                            parts.method.as_str(),
-                            path_and_query,
-                            timestamp,
-                            &bytes,
-                        ),
-                    }
-                }
-                None => bytes.to_vec(),
+            // The signature covers the method and full request target as well as the timestamp and
+            // body, so a captured signature cannot be replayed against a different route — a signed
+            // `GET /api/hooks` cannot become a `DELETE /api/hooks/{id}`.
+            //
+            // `OriginalUri` is essential here, not a nicety: `Router::nest("/api", ..)` strips the
+            // prefix from the URI inner layers observe, so `parts.uri` would read `/hooks/x` while
+            // the client signed `/api/hooks/x`. Signing must use the target the client actually
+            // requested, which is what `OriginalUri` preserves.
+            let original_uri = parts
+                .extensions
+                .get::<axum::extract::OriginalUri>()
+                .map(|original| &original.0)
+                .unwrap_or(&parts.uri);
+            let path_and_query =
+                original_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or_else(|| original_uri.path());
+            let base = match template {
+                Some(template) => render_canonical_template(
+                    template,
+                    parts.method.as_str(),
+                    path_and_query,
+                    &timestamp,
+                    &bytes,
+                ),
+                None => canonical_v1_payload(parts.method.as_str(), path_and_query, &timestamp, &bytes),
             };
 
             let digest = verify_signature(&secret, &base, &signature)
@@ -406,14 +410,7 @@ async fn authenticate_bearer_key(
             // an unverified signature would let anyone who merely *observed* a request burn it
             // before the legitimate client's copy arrived — turning replay protection into a
             // denial-of-service primitive aimed at the client it exists to protect.
-            //
-            // `CANONICAL_V1` only, which is what `timestamp.is_some()` selects for. `BODY_ONLY`
-            // carries no timestamp and therefore has no window to be single-use within; per
-            // `AGENT.MD` that mode exists to accept third-party senders whose format cannot be
-            // changed, and those senders redeliver on purpose.
-            if timestamp.is_some()
-                && !state.replay_guard.check_and_record(key_record.id, &digest)
-            {
+            if !state.replay_guard.check_and_record(key_record.id, &digest) {
                 tracing::warn!(
                     key = %key_record.prefix,
                     "Rejected replay: this signature was already used inside the {}s window",
@@ -427,14 +424,9 @@ async fn authenticate_bearer_key(
             Request::from_parts(parts, Body::from(bytes))
         }
         None if signature_required => {
-            return Err(AppError::Unauthorized(match key_record.hmac_mode {
-                HmacMode::CanonicalV1 => format!(
-                    "This request must be signed: send {SIGNATURE_HEADER} and {TIMESTAMP_HEADER}"
-                ),
-                HmacMode::BodyOnly => format!(
-                    "This request must be signed: send {SIGNATURE_HEADER} or {HUB_SIGNATURE_HEADER}"
-                ),
-            }));
+            return Err(AppError::Unauthorized(format!(
+                "This request must be signed: send {SIGNATURE_HEADER} and {TIMESTAMP_HEADER}"
+            )));
         }
         None => req,
     };
@@ -529,8 +521,15 @@ pub async fn auth_middleware(
 
     // One canonical way to name yourself: the bearer API key. It is hashed and matched against
     // `api_keys.key_hash`, which is the only key lookup path in the system.
-    let presented_key =
-        headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok()).ok_or_else(missing_credentials_error)?;
+    //
+    // The specific "provide an X-API-Key header" message is fine here, unlike on the three
+    // invocation routes (`invocation_unauthorized`): every `/api/*` administrative route already
+    // requires a key unconditionally, with no keyless path to protect an oracle around, so naming
+    // the missing header is only ever a diagnostic, never a disclosure.
+    let presented_key = headers
+        .get(API_KEY_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header")))?;
 
     let (mut req, key_record) =
         authenticate_bearer_key(&state, &headers, presented_key, client_ip, req).await?;
@@ -559,7 +558,12 @@ struct InvocationHook(hook::Model);
 /// every other route, with `guard_execute`'s per-key `can_execute` check still enforced by the
 /// handler afterwards. The target hook's `auth_mode` is **not consulted** for this caller: holding a
 /// valid, permitted key is always sufficient, regardless of what the hook additionally accepts from
-/// callers with none.
+/// callers with none. A failure to *authenticate* (unknown key, bad signature, stale timestamp) is
+/// reported through [`invocation_unauthorized`]'s single fixed body, same as the keyless path below
+/// — see that function's doc comment. A failure to *authorize* (a genuinely valid key lacking
+/// `can_execute`) is **not** folded in: `guard_execute` still answers its own `403` with its own
+/// message, exactly as on every other route, since that caller has already proven it holds a real
+/// credential and telling it "unauthenticated" would be false.
 ///
 /// **Keyless** (no header): the target hook is resolved from the request path, and its `auth_mode`
 /// decides what happens next —
@@ -571,18 +575,32 @@ struct InvocationHook(hook::Model);
 ///   over the raw body, verified against the hook's own [`hook::Model::hmac_secret`] — never a
 ///   key's. No timestamp, so **no anti-replay protection**; this is the GitHub/Forgejo/GitLab
 ///   third-party webhook shape.
-/// - `NoAuth`: accepted outright, but **only** when `REQUIRE_SIGNED_REQUESTS` is `false`. A
-///   deployment that opted into mandatory signing everywhere else must not have a hook silently
-///   exempted from it.
+/// - `NoAuth`: accepted outright, but **only** when `REQUIRE_SIGNED_REQUESTS` is `false`, **and**
+///   only when the request carries no signature material at all — see the next paragraph.
+///
+/// # Unexpected signature material is refused, not silently ignored
+///
+/// A keyless request against an `ApiKeyOnly` or `NoAuth` hook that nonetheless carries something
+/// that looks like a signature (`X-Signature-256`, or the hook's own configured
+/// `signature_header`) is refused outright by [`signature_material_present`], rather than accepted
+/// with the header quietly ignored. For `ApiKeyOnly` this changes nothing observable — that mode
+/// refuses every keyless caller regardless — but for `NoAuth` it closes a real gap: without this
+/// check, a caller sending a stale or garbage signature to an otherwise-open `NONE` hook would
+/// still succeed, which is "unexpected input silently accepted" exactly where this codebase's
+/// posture everywhere else is "fail loud".
 ///
 /// # Why lookup failures and mode mismatches are told apart from nothing
 ///
-/// A keyless caller that cannot proceed — no such hook, a hook requiring a key, or a `NoAuth` hook
-/// currently blocked by `REQUIRE_SIGNED_REQUESTS` — receives the **exact same** `401` a missing
-/// `X-API-Key` gets everywhere else in this API. Distinguishing any of these would let an
-/// unauthenticated caller enumerate which hook names exist, and which of those are configured for
-/// public access, by nothing more than probing paths — the same oracle `RBAC_MODEL.md` §4 and the
-/// authenticate-then-authorize ordering exist to close off elsewhere. The one place this daemon
+/// A keyless caller that cannot proceed — no such hook, a hook requiring a key, a `NoAuth` hook
+/// currently blocked by `REQUIRE_SIGNED_REQUESTS`, or unexpected signature material on a mode that
+/// does not use one — receives the **exact same** `401` a missing `X-API-Key` gets everywhere else
+/// in this API, and the exact same body a *keyed* caller's failed authentication gets too (see
+/// [`invocation_unauthorized`]). Distinguishing any of these would let a caller — with no
+/// credential, a guessed one, or a stolen one it cannot yet prove — enumerate which hook names
+/// exist, which are configured for public access, or whether a key string is real, by nothing more
+/// than probing responses. That is the same oracle `RBAC_MODEL.md` §4 and the
+/// authenticate-then-authorize ordering exist to close off elsewhere, extended here to the one
+/// surface that now accepts callers with no credential at all. The one place this daemon
 /// *does* distinguish is once a caller has presented signature material for an `HmacOnly` hook: a
 /// malformed or non-matching signature is reported as such, exactly as an invalid signature is on
 /// every keyed route — a caller that already knows to try signing something has proven it knows more
@@ -611,23 +629,38 @@ pub async fn invocation_auth_middleware(
                 req.extensions_mut().insert(InvocationHook(target));
             }
 
-            let (mut req, key_record) =
-                authenticate_bearer_key(&state, &headers, presented_key, client_ip, req).await?;
+            let (mut req, key_record) = authenticate_bearer_key(&state, &headers, presented_key, client_ip, req)
+                .await
+                .map_err(uniformize_keyed_auth_failure)?;
             req.extensions_mut().insert(ClientIp(client_ip));
             req.extensions_mut().insert(key_record);
             Ok(next.run(req).await)
         }
         None => {
-            let identifier = identifier.ok_or_else(missing_credentials_error)?;
+            let identifier = identifier.ok_or_else(invocation_unauthorized)?;
             let target = crate::api::support::resolve_hook(&state.db, identifier)
                 .await
-                .map_err(|_| missing_credentials_error())?;
+                .map_err(|_| invocation_unauthorized())?;
+
+            // Task 3 / defense in depth: a keyless caller presenting signature material against a
+            // mode that does not use one is a confused (or probing) request shape, refused outright
+            // rather than silently accepted with the material ignored. `CANONICAL_V1`/`ApiKeyOnly`
+            // are unaffected in practice — they are refused unconditionally below regardless — but
+            // `NoAuth` is: without this check, a stray signature header on an otherwise-open `NONE`
+            // hook would simply be ignored and the request would still succeed, which is "silently
+            // accepted" exactly where this codebase's posture elsewhere is "fail loud on the
+            // unexpected".
+            if matches!(target.auth_mode, AuthMode::ApiKeyOnly | AuthMode::NoAuth)
+                && signature_material_present(&headers, &target)
+            {
+                return Err(invocation_unauthorized());
+            }
 
             match target.auth_mode {
-                AuthMode::CanonicalV1 | AuthMode::ApiKeyOnly => Err(missing_credentials_error()),
+                AuthMode::CanonicalV1 | AuthMode::ApiKeyOnly => Err(invocation_unauthorized()),
                 AuthMode::NoAuth => {
                     if state.config.require_signed_requests {
-                        return Err(missing_credentials_error());
+                        return Err(invocation_unauthorized());
                     }
                     req.extensions_mut().insert(ClientIp(client_ip));
                     Ok(next.run(req).await)
@@ -643,7 +676,7 @@ pub async fn invocation_auth_middleware(
                     let provided = headers
                         .get(header_name)
                         .and_then(|h| h.to_str().ok())
-                        .ok_or_else(missing_credentials_error)?;
+                        .ok_or_else(invocation_unauthorized)?;
 
                     let secret = recover_hook_secret(&state, &target)?;
                     let (parts, body) = req.into_parts();
@@ -789,19 +822,19 @@ mod tests {
         }
     }
 
-    /// The pre-check is scoped to the shape of a `CANONICAL_V1` request, so it cannot reach into
-    /// `BODY_ONLY` traffic — whose senders `AGENT.MD` says we do not get to change, and whose stray
-    /// `X-Timestamp` is documented as ignored. A window enforced there would reject a webhook over
-    /// a header that is not part of its signed material.
+    /// The pre-check is scoped to requests carrying [`SIGNATURE_HEADER`], not merely a timestamp —
+    /// a stray `X-Timestamp` alongside an unrelated header is unsigned bearer traffic, and a window
+    /// enforced over it would reject an ordinary request for a value that is not part of any signed
+    /// material.
     #[test]
     fn a_stray_timestamp_without_a_canonical_signature_is_carried_not_judged() {
         let ancient = "1";
 
-        for shape in [None, Some(HUB_SIGNATURE_HEADER)] {
+        for shape in [None, Some("X-Some-Other-Header")] {
             let headers = headers_with(Some(ancient), shape);
             assert_eq!(
                 prevalidate_timestamp_header(&headers, 300)
-                    .expect("a body-only or unsigned request is not window-checked here"),
+                    .expect("an unsigned request is not window-checked here"),
                 Some(ancient.to_owned()),
                 "{shape:?}: the header is passed through untouched"
             );

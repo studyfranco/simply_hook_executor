@@ -515,15 +515,14 @@ async fn r4_only_master_grants_can_manage_keys_or_resource_creation() {
     }
 }
 
-/// **Service-specific hardening, layered on R4.** `can_manage_keys` requires `hmac_mode =
-/// CANONICAL_V1` — not part of `RBAC_MODEL.md` itself, but a policy this service adds on top of it:
-/// the scope that can administer every other credential must not be reachable over a signature mode
-/// with no replay window. Checked at both routes a key can end up holding the scope through, and
-/// confirmed harmless for the case R4 already permits.
+/// **Service-specific hardening, layered on R4.** `can_manage_keys` requires the standard
+/// `CANONICAL_V1` template — not part of `RBAC_MODEL.md` itself, but a policy this service adds on
+/// top of it: the scope that can administer every other credential must sign over the one canonical
+/// string this codebase's verification has actually been reviewed against, not one of its own
+/// choosing. Checked at both routes a key can end up holding the scope through, and confirmed
+/// harmless for the case R4 already permits.
 #[tokio::test]
-async fn service_policy_can_manage_keys_requires_canonical_v1() {
-    use simply_hook_executor::entities::api_key::HmacMode;
-
+async fn service_policy_can_manage_keys_requires_the_standard_canonical_template() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let (_master_id, master) = insert_key(&db, "cv1-master", "", KeyScopes::master()).await;
@@ -535,19 +534,23 @@ async fn service_policy_can_manage_keys_requires_canonical_v1() {
             "POST",
             "/api/keys",
             &master,
-            Some(json!({ "name": "risky", "can_manage_keys": true, "hmac_mode": "BODY_ONLY" })),
+            Some(json!({
+                "name": "risky",
+                "can_manage_keys": true,
+                "canonical_template": "{method}|{path}|{timestamp}|{body}"
+            })),
         ),
     )
     .await;
     assert_eq!(
         refused_create.status,
         StatusCode::BAD_REQUEST,
-        "can_manage_keys + BODY_ONLY must be refused at creation: {}",
+        "can_manage_keys + a custom canonical_template must be refused at creation: {}",
         refused_create.raw
     );
 
-    // Creation: permitted when can_manage_keys is requested without an explicit hmac_mode, since
-    // the default is CANONICAL_V1 — the guard must not refuse the common case.
+    // Creation: permitted when can_manage_keys is requested without a custom template, since the
+    // default is the standard one — the guard must not refuse the common case.
     let permitted_create = send(
         &app,
         json_request(
@@ -561,19 +564,26 @@ async fn service_policy_can_manage_keys_requires_canonical_v1() {
     assert_eq!(
         permitted_create.status,
         StatusCode::OK,
-        "can_manage_keys with the CANONICAL_V1 default must be permitted: {}",
+        "can_manage_keys with the standard default template must be permitted: {}",
         permitted_create.raw
     );
 
-    // Update: a BODY_ONLY key cannot be promoted to can_manage_keys later, either. hmac_mode is
-    // immutable, so this is the only remaining route by which the forbidden combination could arise
-    // after creation, and it must be closed the same way creation is.
-    let body_only = insert_key_with_mode(&db, "cv1-body-only", "", KeyScopes::plain(), HmacMode::BodyOnly).await;
+    // Update: a key with a custom template cannot be promoted to can_manage_keys later, either —
+    // this is the only remaining route by which the forbidden combination could arise after
+    // creation, and it must be closed the same way creation is.
+    let templated = insert_key_with_template(
+        &db,
+        "cv1-templated",
+        "",
+        KeyScopes::plain(),
+        "{method}|{path}|{timestamp}|{body}",
+    )
+    .await;
     let refused_promotion = send(
         &app,
         json_request(
             "PUT",
-            &format!("/api/keys/{}", body_only.id),
+            &format!("/api/keys/{}", templated.id),
             &master,
             Some(json!({ "can_manage_keys": true })),
         ),
@@ -582,36 +592,55 @@ async fn service_policy_can_manage_keys_requires_canonical_v1() {
     assert_eq!(
         refused_promotion.status,
         StatusCode::BAD_REQUEST,
-        "promoting a BODY_ONLY key to can_manage_keys must be refused: {}",
+        "promoting a templated key to can_manage_keys must be refused: {}",
         refused_promotion.raw
     );
 
     // And the refusal is real: the row was not partially updated.
-    let reloaded = ApiKey::find_by_id(body_only.id)
+    let reloaded = ApiKey::find_by_id(templated.id)
         .one(&db)
         .await
         .expect("query succeeds")
         .expect("the key still exists");
     assert!(!reloaded.can_manage_keys, "the refused promotion must not have taken effect");
 
-    // Update: an ordinary field change on that same BODY_ONLY key, not touching can_manage_keys,
+    // Update: an ordinary field change on that same templated key, not touching can_manage_keys,
     // still succeeds — the guard fires only when can_manage_keys is the *effective* outcome, not on
-    // every update to a BODY_ONLY key.
+    // every update to a templated key.
     let ordinary_update = send(
         &app,
         json_request(
             "PUT",
-            &format!("/api/keys/{}", body_only.id),
+            &format!("/api/keys/{}", templated.id),
             &master,
-            Some(json!({ "name": "renamed-body-only" })),
+            Some(json!({ "name": "renamed-templated" })),
         ),
     )
     .await;
     assert_eq!(
         ordinary_update.status,
         StatusCode::OK,
-        "an update that never touches can_manage_keys must still work on a BODY_ONLY key: {}",
+        "an update that never touches can_manage_keys must still work on a templated key: {}",
         ordinary_update.raw
+    );
+
+    // Clearing the template while promoting, in the same request, is permitted — the guard checks
+    // the *effective* template, and an explicit clear (`""`) makes that effective value `None`.
+    let promote_with_clear = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/keys/{}", templated.id),
+            &master,
+            Some(json!({ "can_manage_keys": true, "canonical_template": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        promote_with_clear.status,
+        StatusCode::OK,
+        "promoting while clearing the template in the same request must succeed: {}",
+        promote_with_clear.raw
     );
 }
 
@@ -974,6 +1003,7 @@ async fn s5_exactly_one_master_immutable_and_undeletable() {
         key_id: Set(Some(simply_hook_executor::api::generate_key_id())),
         signing_secret: Set(None),
         hmac_mode: Set(simply_hook_executor::entities::api_key::HmacMode::CanonicalV1),
+        canonical_template: Set(None),
         bound_ips: Set(Some(String::new())),
         max_concurrent_jobs: Set(10),
         is_master: Set(true),
@@ -1172,6 +1202,7 @@ async fn s7_every_required_index_and_constraint_exists() {
         key_id: Set(Some(simply_hook_executor::api::generate_key_id())),
         signing_secret: Set(None),
         hmac_mode: Set(simply_hook_executor::entities::api_key::HmacMode::CanonicalV1),
+        canonical_template: Set(None),
         bound_ips: Set(Some(String::new())),
         max_concurrent_jobs: Set(10),
         is_master: Set(false),
