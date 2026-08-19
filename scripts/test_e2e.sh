@@ -2046,6 +2046,82 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
 
     api_call PUT "/api/keys/$ADMIN_NO_TPL_ID" "$MASTER_KEY" '{"canonical_template":"{method}|{path}|{timestamp}|{body}"}'
     check "400" "setting a custom template on an existing can_manage_keys holder is refused"
+
+    # ── hooks.canonical_template, and its precedence over a key's own override ─────────────────
+    # A distinct customization surface from api_keys.canonical_template above — see AGENT.MD's
+    # 3-tier precedence note (hook template beats key template beats the service-wide default).
+    # Reuses $TPL_KEY/$TPL_SECRET, which already carries its own override
+    # (`{method}|{path}|{timestamp}|{body}`), to prove the hook's own template wins when both are
+    # set, not merely that a hook template works in isolation.
+    HOOK_TPL_SCRIPT=$(make_hook_script "hook_tpl.sh" 'echo hook-tpl-ok')
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"hook_templated\",\"script_path\":\"$HOOK_TPL_SCRIPT\",\"canonical_template\":\"{method}#{path}#{timestamp}#{body}\"}"
+    check "200" "create a hook with its own canonical_template"
+    HOOK_TPL_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    check_jq ".canonical_template" "{method}#{path}#{timestamp}#{body}" "the hook reports its own template"
+
+    api_call POST "/api/keys/$TPL_ID/permissions" "$MASTER_KEY" "{\"hook_id\":\"$HOOK_TPL_ID\",\"can_execute\":true,\"can_manage\":false}"
+    check "200" "grant the templated key rights on the templated hook"
+
+    HTPL_PATH="/api/hooks/$HOOK_TPL_ID/execute"
+    HTPL_TS=$(date +%s)
+    HTPL_BODY='{}'
+
+    # Signed against the hook's own template: verifies — it takes precedence over the key's own
+    # override, a different separator entirely (# vs |).
+    HTPL_SIG=$(printf 'POST#%s#%s#%s' "$HTPL_PATH" "$HTPL_TS" "$HTPL_BODY" | openssl dgst -sha256 -hmac "$TPL_SECRET" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $TPL_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $HTPL_TS" -H "X-Signature-256: sha256=$HTPL_SIG" \
+        -d "$HTPL_BODY" "$BASE_URL$HTPL_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "the hook's own template governs, taking precedence over the key's own override"
+
+    # Signed against the key's own template instead: refused — proving precedence is real, not that
+    # either template is accepted.
+    HTPL_KEY_SIG=$(printf 'POST|%s|%s|%s' "$HTPL_PATH" "$HTPL_TS" "$HTPL_BODY" | openssl dgst -sha256 -hmac "$TPL_SECRET" -r | cut -d' ' -f1)
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "X-API-Key: $TPL_KEY" -H "Content-Type: application/json" \
+        -H "X-Timestamp: $HTPL_TS" -H "X-Signature-256: sha256=$HTPL_KEY_SIG" \
+        -d "$HTPL_BODY" "$BASE_URL$HTPL_PATH")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "the key's own template is not consulted once the hook overrides it"
+
+    # ── HMAC_ONLY: custom signature_header and signature_prefix ────────────────────────────────
+    # §24 above only ever exercises the built-in defaults (X-Signature-256, sha256=); this is the
+    # customization surface those defaults exist to let an operator override, per-hook.
+    CUSTOM_HDR_SCRIPT=$(make_hook_script "custom_hdr.sh" 'echo custom-ok')
+    api_call POST "/api/hooks" "$MASTER_KEY" "{\"name\":\"custom_header_hook\",\"script_path\":\"$CUSTOM_HDR_SCRIPT\",\"auth_mode\":\"HMAC_ONLY\",\"hmac_secret\":\"custom-secret\",\"signature_header\":\"X-Custom-Sig\",\"signature_prefix\":\"hmac=\"}"
+    check "200" "create an HMAC_ONLY hook with a custom header and prefix"
+    check_jq ".signature_header" "X-Custom-Sig" "the hook reports its custom header"
+    check_jq ".signature_prefix" "hmac=" "the hook reports its custom prefix"
+
+    # An empty object: custom_header_hook declares no parameters, and any unrecognized key in the
+    # body is rejected by parameter resolution — a distinct, later failure from signature
+    # verification that would otherwise mask what this block is actually testing.
+    CH_BODY='{}'
+    CH_SIG=$(printf '%s' "$CH_BODY" | openssl dgst -sha256 -hmac "custom-secret" -r | cut -d' ' -f1)
+
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "X-Custom-Sig: hmac=$CH_SIG" -d "$CH_BODY" "$BASE_URL/webhook/custom_header_hook")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "a signature on the custom header with the custom prefix is accepted"
+
+    # Correct signature, but on the default header instead of the configured one: refused — the
+    # custom header is actually what is consulted, not tried as one of several candidates.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "X-Signature-256: hmac=$CH_SIG" -d "$CH_BODY" "$BASE_URL/webhook/custom_header_hook")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "the default header is not consulted once the hook has its own"
+
+    # Correct header and secret, but the built-in default prefix instead of the configured one:
+    # refused.
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "X-Custom-Sig: sha256=$CH_SIG" -d "$CH_BODY" "$BASE_URL/webhook/custom_header_hook")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "401" "the wrong prefix on the right header is refused"
 else
     skip "§24 key hmac_mode/canonical_template and hook-level HMAC_ONLY: openssl is not available to compute signatures."
 fi

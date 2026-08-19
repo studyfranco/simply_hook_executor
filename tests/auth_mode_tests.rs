@@ -177,6 +177,126 @@ async fn a_hook_with_no_template_override_still_signs_the_service_wide_default()
     assert_eq!(response.status, StatusCode::OK, "{}", response.raw);
 }
 
+/// When both a hook and the invoking key set their own `canonical_template`, the **hook's**
+/// template governs verification — the 3-tier precedence documented on
+/// `middleware::authenticate_bearer_key` (hook template, if the hook is `CANONICAL_V1` and sets
+/// one, beats the key's own template, which beats the service-wide default). A signature computed
+/// over the key's own override — real, and independently verified to work in
+/// `a_keys_own_canonical_template_override_governs_every_route_it_signs` — must still be refused
+/// once the hook it targets overrides it too.
+#[tokio::test]
+async fn a_hooks_canonical_template_takes_precedence_over_the_keys_own_template() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("precedence_hook.sh", "#!/bin/sh\necho ok\n");
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let hook_template = "{method}#{path}#{timestamp}#{body}";
+    let create = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "precedence_hook",
+                "script_path": script,
+                "canonical_template": hook_template
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(create.status, StatusCode::OK, "{}", create.raw);
+    let hook_id = create.string("id");
+
+    let key_template = "{method}|{path}|{timestamp}|{body}";
+    let caller =
+        insert_key_with_template(&db, "precedence-caller", "0.0.0.0/0", KeyScopes::plain(), key_template).await;
+    grant(&db, caller.id, uuid::Uuid::parse_str(&hook_id).unwrap(), true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+    let body = "{}";
+    let ts = now_timestamp();
+
+    // Signed against the hook's own template: verifies — it wins over the key's own override.
+    let hook_sig = sign_with_template(&caller.signing_secret, hook_template, "POST", &uri, &ts.to_string(), body);
+    let ok = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &hook_sig)).await;
+    assert_eq!(ok.status, StatusCode::OK, "the hook's own template must govern: {}", ok.raw);
+
+    // Signed against the key's own template instead: refused — proving the hook's override actually
+    // took precedence rather than either template being accepted.
+    let key_sig = sign_with_template(&caller.signing_secret, key_template, "POST", &uri, &ts.to_string(), body);
+    let refused = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &key_sig)).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNAUTHORIZED,
+        "the key's own template must not be consulted once the hook overrides it: {}",
+        refused.raw
+    );
+
+    // Signed against the service-wide default: refused too.
+    let default_sig = sign_request(&caller.signing_secret, "POST", &uri, ts, body);
+    let refused_default =
+        send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &default_sig)).await;
+    assert_eq!(refused_default.status, StatusCode::UNAUTHORIZED, "{}", refused_default.raw);
+}
+
+/// A canonical template that reduces to nothing but `{body}` — the exact shape `BODY_ONLY` used to
+/// be a distinct mode for — is now just an ordinary `CANONICAL_V1` template. Exercised against a
+/// genuinely empty body (not `"{}"`), the edge case a raw-body-only convention actually has to
+/// handle, and against a single stray space appended to that empty body, proving whitespace is
+/// signed material rather than something the verifier trims before comparing.
+#[tokio::test]
+async fn a_body_only_shaped_template_verifies_a_genuinely_empty_body() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("body_only_shaped_hook.sh", "#!/bin/sh\necho ok\n");
+    let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+
+    let template = "{body}";
+    let create = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "body_only_shaped_hook",
+                "script_path": script,
+                "canonical_template": template
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(create.status, StatusCode::OK, "{}", create.raw);
+    let hook_id = create.string("id");
+
+    let caller = insert_key_full(&db, "body-only-shaped-caller", "0.0.0.0/0", KeyScopes::plain()).await;
+    grant(&db, caller.id, uuid::Uuid::parse_str(&hook_id).unwrap(), true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+    let ts = now_timestamp();
+
+    // A genuinely empty body — not "{}" — since the hook takes no parameters and the execute
+    // endpoint reads its body as raw bytes (an empty body is a valid "no parameters" request).
+    let sig = sign_with_template(&caller.signing_secret, template, "POST", &uri, &ts.to_string(), "");
+    let response = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, "", &sig)).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "an empty body against a bare {{body}} template must verify: {}",
+        response.raw
+    );
+
+    // The identical signature, but a body with one trailing space: the material it was computed
+    // over no longer matches, so this must be refused, not silently trimmed into matching.
+    let with_space =
+        send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, " ", &sig)).await;
+    assert_eq!(with_space.status, StatusCode::UNAUTHORIZED, "{}", with_space.raw);
+}
+
 // ─────────────────────────────────────────────────────────────
 // 2. auth_mode does not exist on ApiKey; canonical_template does, but is admin-locked
 // ─────────────────────────────────────────────────────────────
@@ -395,6 +515,25 @@ async fn hmac_only_verifies_against_the_hooks_own_secret_header_and_prefix() {
         StatusCode::UNAUTHORIZED,
         "a signature on the wrong header must not be found: {}",
         refused_header.raw
+    );
+
+    // Correct header, correct secret, but the default prefix instead of the configured one — must
+    // not verify, proving the custom prefix is actually what is stripped rather than the built-in
+    // default being tried as a fallback.
+    let wrong_prefix = hmac_only_request(
+        "POST",
+        uri,
+        &body,
+        "X-Custom-Signature",
+        "sha256=",
+        "correct-horse-battery-staple",
+    );
+    let refused_prefix = send(&app, wrong_prefix).await;
+    assert_eq!(
+        refused_prefix.status,
+        StatusCode::UNAUTHORIZED,
+        "a signature with the wrong prefix must not verify: {}",
+        refused_prefix.raw
     );
 
     // No signature at all: identical refusal to a hook that simply requires a key — no oracle.

@@ -6644,3 +6644,73 @@ in `scripts/test_e2e.sh`, interpolated once well before §12's key-rotation step
 afterward, silently signed with a since-invalidated secret the first time §24's rewritten section
 tried to use it. Fixed by re-setting both explicitly immediately before use, rather than assuming a
 global set many hundred lines earlier was still current.
+
+---
+
+# 2026-08-19 (fourth pass) — QA/coverage-expansion audit: `API_KEY_ONLY` scoping and the HMAC template matrix
+
+A five-task request to expand coverage of key-management constraints, `API_KEY_ONLY` execution
+rights, and HMAC template variations. Before writing anything, checked each of the two "constraint"
+and "invocation" asks in Task 1 against what the third pass (above) had already built, since both
+sounded like they might already be satisfied.
+
+## What was already true (no new code needed)
+
+- **Task 1's "constraint test"** — `can_manage_keys=true` paired with a non-standard signing
+  configuration refused with `400` — was worded around a premise that no longer holds: `api_keys`
+  has no `API_KEY_ONLY` mode (that's a *hook's* `auth_mode`) and `hmac_mode` has had exactly one
+  variant since the third pass, so it can't be set to anything else via the API in the first place
+  (a bogus value is refused at `422` by deserialization, not `400`, and is already covered by
+  `hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical`). The real admin-lock surface is
+  `canonical_template`, and `service_policy_can_manage_keys_requires_the_standard_canonical_template`
+  (`tests/rbac_model_compliance.rs`) already exercises creation, promotion, the "effective template"
+  edge case, and the row-unchanged check on refusal — nothing to add.
+- **Task 1's "invocation test"** — an `API_KEY_ONLY` key with `can_execute` invoking its hook with no
+  signature headers — is already the second half of
+  `api_key_only_refuses_keyless_and_accepts_any_permitted_key_exactly_like_canonical_v1`
+  (`tests/auth_mode_tests.rs`).
+- Most of Task 2's matrix was likewise already covered: the default template path (implicitly, by
+  every ordinary signed test), key-level and hook-level custom templates in isolation
+  (`canonical_v1_custom_template_is_verified_against_and_the_default_is_refused`,
+  `a_keys_own_canonical_template_override_governs_every_route_it_signs`), and custom
+  `signature_header`/`signature_prefix` on `HMAC_ONLY` with wrong-header and no-signature refusal
+  (`hmac_only_verifies_against_the_hooks_own_secret_header_and_prefix`). Task 3's malformed-signature
+  matrix (tampered body, wrong key, wrong method/path/timestamp, missing/wrong prefix, non-hex,
+  empty, truncated digest) was already exhaustive in
+  `hook_executor_integration_tests.rs`'s `signed_request_...` suite.
+
+## What was actually missing, and added
+
+1. **Precedence**: no existing test set *both* a hook-level and a key-level `canonical_template`
+   (to different values) on the same invocation and confirmed the hook's wins. New
+   `a_hooks_canonical_template_takes_precedence_over_the_keys_own_template`
+   (`tests/auth_mode_tests.rs`) does exactly that — signs against the hook's template (accepted),
+   the key's own template (refused), and the service default (refused), on one hook/key pair.
+2. **Wrong `signature_prefix`**: the existing `HMAC_ONLY` custom-header/-prefix test asserted a wrong
+   *header* but never a wrong *prefix* on the right header — added as one more case inside the same
+   test.
+3. **`{body}`-only template against a genuinely empty body**: the shape `BODY_ONLY` used to own,
+   now just an ordinary `CANONICAL_V1` template. New
+   `a_body_only_shaped_template_verifies_a_genuinely_empty_body` signs an empty body (not `"{}"`)
+   against a bare `{body}` template and confirms a single trailing space flips it.
+4. **E2E gaps, both real**: §24 in `scripts/test_e2e.sh` exercised the *key-level* `canonical_template`
+   thoroughly but never a *hook-level* one, never the precedence between the two, and never a custom
+   `signature_header`/`signature_prefix` on `HMAC_ONLY` (only the built-in defaults). Added, inside
+   the same `HAVE_OPENSSL` guard: a hook-level-template creation/verification/default-now-refused
+   block, a precedence block reusing the already-templated key against a hook with a *different*
+   template, and an `HMAC_ONLY` block with a custom header and prefix (accepted on the right
+   header+prefix; refused on the default header; refused on the default prefix).
+
+One e2e authoring mistake caught by the first run, not by review: the new custom-header/-prefix hook
+declares no parameters, and the first draft posted `{"x":"1"}` as its body — an unrecognized
+parameter key, rejected by `resolve_parameters` at `400`, before the signature check's own 401/200
+distinction was ever reached. Fixed by posting `{}` instead, isolating the check to what it was
+actually meant to test.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**307 passed / 0 failed / 2 ignored** (`auth_mode_tests` grew from 12 to 14) ·
+`cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **971 passed / 0 failed** — up from
+960 before this pass · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence
+(pre-existing, unrelated), 0 drifted**.
