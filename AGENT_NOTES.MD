@@ -6853,3 +6853,115 @@ field's presence in the markup, and its wiring in `bindEvents()` — plus two li
 `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **1039 passed / 0 failed** — up from
 1030 before this pass · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence
 (pre-existing, unrelated), 0 drifted**.
+
+---
+
+# 2026-08-20 — WebUI feature-parity audit: full overhaul (`static/`), two small backend additions
+
+A six-task, full-autonomy request to bring the WebUI up to parity with what the backend already
+supports, "taking inspiration from `simply_ip_vault`" for structure and polish. The largest single
+pass on `static/` this project has had. Backend changes were kept deliberately small — this was a
+frontend task that turned up exactly two genuine backend gaps along the way, not a re-architecture.
+
+## The audit (Task 3), and what it actually found
+
+Read every `src/api/*.rs` handler and payload struct against what `static/app.js` sent and rendered.
+The concrete gaps, roughly in order of severity:
+
+1. **The Edit API Key form was silently broken.** It still sent `hmac_mode` on every `PUT
+   /api/keys/{id}`, but `UpdateApiKeyPayload` dropped that field entirely in the third pass (2026-08-19)
+   — `hmac_mode` is immutable after creation. `deny_unknown_fields` meant **every "Save Changes" click
+   on that modal has been returning 422 since that commit**, with the error swallowed by an empty
+   `catch` block after a toast. Not a cosmetic staleness issue; a live regression this task exists to
+   catch.
+2. **Both key forms still offered `BODY_ONLY`** in a "Signature Mode" dropdown — a value `HmacMode`
+   has not parsed since the same commit. Selecting it at creation would have 422'd; the edit form
+   never even reached the server with it, per (1).
+3. **No trash UI at all.** `POST /hooks/{id}/restore`, `POST /system/purge-hooks`, and
+   `?include_deleted=true` are all real, already well-tested backend endpoints (§20 of the e2e suite
+   covers all three) — but nothing in `static/` ever called any of them. A soft-deleted hook was
+   invisible and unmanageable from the dashboard.
+4. **No hook `auth_mode` control anywhere.** The create/edit hook forms had no field for it at all;
+   every hook was implicitly `CANONICAL_V1` from the UI's perspective regardless of what the API
+   actually allowed, and the `hmac_secret`/`signature_header`/`signature_prefix`/`canonical_template`
+   fields were entirely unreachable.
+5. **Hook parameters could be added and deleted, never edited** — `PUT
+   /hooks/{id}/parameters/{param_id}` (`update_hook_parameter`) had no caller in `app.js` at all.
+6. **`ApiKeySummary` had no `parent_key_id`.** Not a frontend gap — the field was never serialized in
+   the first place, so "display key lineage" (Task 5) was unimplementable without a backend change.
+7. **`AuditLogQuery` had no `client_ip`/`since`/`until`.** Task 2 asked for exactly these filters; the
+   backend only ever supported `action`. `audit.rs`'s own module doc had predicted this
+   ("will keep acquiring query surface... by target, by time range") — this pass is that prediction
+   landing.
+8. Two stale doc comments in `app.js` still described `BODY_ONLY` as a live key-level mode, from
+   before its retirement; fixed for accuracy, not behavior.
+
+Items 6 and 7 were the only backend changes: `parent_key_id: Option<Uuid>` added to `ApiKeySummary`
+(not `MinimalApiKeyView` — §4's shared-resource disclosure doesn't extend to lineage) in
+`src/api/keys.rs`, and `client_ip`/`since`/`until` added to `AuditLogQuery` in `src/api/audit.rs`
+(`since` inclusive, `until` strictly exclusive, both RFC 3339 parsed by a new `parse_instant` helper).
+
+## What was built (Tasks 1, 2, 4, 5, 6)
+
+- **Hook Auth Mode**: a dropdown presenting the four `auth_mode` values grouped into three headings
+  (`CANONICAL_V1`/`API_KEY_ONLY` under "Standard API Key Required", `HMAC_ONLY`, `NONE`), with
+  `syncHookAuthFields(prefix)` toggling the mode-dependent field groups and swapping in a one-line
+  hint from a static `AUTH_MODE_HINTS` map — the same pattern as vault's `syncWebhookAuthFields`/
+  `AUTH_MODE_HINTS`, adapted from vault's *outbound* dispatch config to this service's *inbound* hook
+  auth. `canonical_template` is gated on `CANONICAL_V1` specifically, not `API_KEY_ONLY` too — its own
+  doc comment says it is consulted only for the former.
+- **Side drawer**: new `.side-drawer`/`.drawer-backdrop` component (vault has no equivalent — this one
+  is new), opened by a "?" button next to either hook form's Auth Mode field, restating the §1 rule
+  (a valid key always bypasses `auth_mode`) plus the three keyless paths and example webhook headers
+  (`X-Hub-Signature-256`, `sha256=` prefix).
+- **Audit Logs**: split out of System Settings into its own tab, with the three new filters plus a
+  `<datalist>` of known action values rather than a `<select>` — `Column::Action.eq` is an exact
+  match, and the action namespace has no fixed enum to enumerate (`audit.rs`'s own "non-exhaustive"
+  note), so a dropdown could only ever offer what happened to load already. `PagedCache.loadFirstChunk`
+  already re-invokes `fetchChunk` (which reads the filter DOM values fresh), so filter changes reuse
+  the same reload path the execution-history filter already established — no new pagination mechanism.
+- **Trash UI**: a "Show deleted" checkbox (master-only, disabled otherwise) toggles `?include_deleted`
+  on the hooks list; a trashed row renders Restore/Purge in place of the normal action set; Settings
+  gained a "Purge Deleted Hooks Now" button and the previously-unrendered `deleted_hook_retention_days`.
+- **Parameter editing**: the existing add-parameter form now doubles as an edit form (a hidden
+  `param-edit-id` field selects POST vs PUT), with `param_key` disabled during edit since it is not
+  part of `UpdateParameterPayload`.
+- **JSON Payload Extractor**: paste a sample webhook body, get each top-level flat-valued key back as
+  a one-click "Add" (defaulted to the sample's own value); nested values are shown for context only.
+- **Keys tab**: `BODY_ONLY` removed from both dropdowns; replaced with a `canonical_template` input on
+  create, and a read-only mode display + editable `canonical_template` on edit (no `hmac_mode` field
+  sent at all, fixing the item-1 regression). New **Lineage** column reading `parent_key_id`.
+- **Identity pill**: `enforceRBACUI` now builds a `.identity-pill` (dot + name, high-contrast
+  `.identity-pill-master` variant) instead of setting `.textContent` to a sentence.
+
+## Verification beyond static analysis
+
+`AGENT.MD` forbids frontend dependencies, so this project's standing convention (§35, then §52) is to
+pin WebUI behavior by asserting on the served source rather than driving a browser — no headless
+browser is normally available in this environment. One **was** available here (`chromium`, confirmed
+present), so this pass used it for real, once: started the actual daemon, and drove an iframe-based
+harness (seed `localStorage` with the bootstrap master credentials on a same-origin scratch page,
+wait for `#dashboard-container` to lose `.hidden`, then script real `.click()`s) to screenshot the
+Hooks tab, the HMAC-mode field toggle, the side drawer, the Keys tab, and the Audit tab. All rendered
+correctly. One apparent bug — the Audit tab's nav button not showing as active — turned out to be the
+`.tab-panel.active` `fadeIn` animation caught mid-transition by too-early a screenshot; a diagnostic
+rerun with an extra 500 ms wait showed both the button and panel state were correct throughout, no
+code was wrong. The harness files (`static/_verify_harness.html`, `static/_seed_and_go.html`) were
+scratch-only and deleted before commit — never part of the shipped `static/` tree.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**307 passed / 0 failed / 2 ignored** (unchanged — no Rust test file was touched; the two backend
+changes are in handler/query-struct code with no dedicated unit tests of their own, covered instead by
+new e2e checks) · `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **1056 passed / 0
+failed**, stable across two consecutive runs — up from 1039 before this pass (new §18 coverage for
+`client_ip`/`since`/`until` audit filtering, plus `deleted_hook_retention_days` in §19) ·
+`./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing, unrelated), 0
+drifted**.
+
+One real e2e test bug, not a backend bug: the first `since`/`until` draft captured its time boundary
+with `date -u +%Y-%m-%dT%H:%M:%SZ` (whole-second precision) immediately after creating the "old" probe
+entry (microsecond precision) — when both landed in the same truncated second, the "old" entry's
+sub-second fraction decided whether `until`'s strict `<` included it, rather than actual chronological
+order. Fixed by sleeping a full second on *both* sides of the boundary capture, not just one.

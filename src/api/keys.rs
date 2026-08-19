@@ -392,6 +392,13 @@ pub struct ApiKeySummary {
     pub can_manage_keys: bool,
     /// Global hook-creation scope.
     pub can_manage_hooks: bool,
+    /// The key that created this one, for display only. `RBAC_MODEL.md` R3: "Rights are never
+    /// derived from key lineage" — this is shown so an operator can see the key tree, never
+    /// consulted by any guard. `None` for the bootstrap master and every key issued before lineage
+    /// was recorded. Deliberately absent from [`MinimalApiKeyView`]: §4's shared-resource scope
+    /// discloses only "id, name, and that key's rights on that resource alone", and lineage is not
+    /// on that list.
+    pub parent_key_id: Option<Uuid>,
     /// Creation timestamp.
     pub created_at: chrono::NaiveDateTime,
     /// Per-hook permissions held by this key.
@@ -481,6 +488,7 @@ pub(crate) async fn build_api_key_summary(
         is_master: model.is_master,
         can_manage_keys: model.can_manage_keys,
         can_manage_hooks: model.can_manage_hooks,
+        parent_key_id: model.parent_key_id,
         created_at: model.created_at,
         hook_permissions,
     })

@@ -1423,6 +1423,64 @@ else
     check_local "identical" "distinct" "pagination returns different entries per page"
 fi
 
+# client_ip: every prior entry in this run was recorded from a bare X-Forwarded-For-less call, so
+# the resolved client_ip is the TCP peer (127.0.0.1). A request carrying a distinctive forwarded
+# address, from a key TRUSTED_PROXIES actually recognises this daemon as sitting behind, produces a
+# distinguishably different recorded value to filter on.
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ECHO_SCRIPT" '{name:"audit_ip_probe_hook",script_path:$p}')" "203.0.113.44"
+check "200" "create a throwaway hook from a distinctive forwarded IP"
+AUDIT_IP_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/audit-logs?client_ip=203.0.113.44&limit=5" "$MASTER_KEY"
+check "200" "filter audit logs by client_ip"
+check_true '[.[] | select(.client_ip == "203.0.113.44")] | length >= 1' \
+    "the distinctively-forwarded entry is found by its client_ip"
+check_true '[.[] | select(.client_ip != "203.0.113.44")] | length == 0' \
+    "client_ip is a real filter, not decoration — no other address slips through"
+
+api_call GET "/api/audit-logs?client_ip=203.0.113.99&limit=5" "$MASTER_KEY"
+check "200" "filter by an address nothing was ever recorded under"
+check_true 'length == 0' "an unmatched client_ip returns no rows, not everything"
+
+# since / until: an RFC 3339 boundary captured *before* creating one more distinctive entry must
+# include that entry under `since` and exclude it under `until` — proving both ends of the range are
+# genuinely applied, not merely accepted and ignored.
+# `date` truncates to whole seconds but `audit_logs.timestamp` is microsecond-precision, so the
+# boundary needs a full second of clearance on *both* sides — otherwise the IP probe hook just
+# created above and this boundary can land in the same truncated second, and whichever sub-second
+# fraction the probe happened to land on decides the comparison rather than "before" meaning
+# anything.
+sleep 1
+AUDIT_BOUNDARY=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sleep 1
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ECHO_SCRIPT" '{name:"audit_time_probe_hook",script_path:$p}')"
+check "200" "create one more throwaway hook to anchor the time boundary"
+AUDIT_TIME_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/audit-logs?action=HOOK_CREATE&since=$AUDIT_BOUNDARY&limit=50" "$MASTER_KEY"
+check "200" "filter by since"
+check_true '[.[] | select(.target_resource == "audit_time_probe_hook")] | length == 1' \
+    "the entry created after the boundary is included under since"
+
+api_call GET "/api/audit-logs?action=HOOK_CREATE&until=$AUDIT_BOUNDARY&limit=50" "$MASTER_KEY"
+check "200" "filter by until"
+check_true '[.[] | select(.target_resource == "audit_time_probe_hook")] | length == 0' \
+    "the same entry is excluded under until — it is a strict boundary, not inclusive on both ends"
+check_true '[.[] | select(.target_resource == "audit_ip_probe_hook")] | length == 1' \
+    "an entry genuinely older than the boundary still comes back under until"
+
+api_call GET "/api/audit-logs?since=not-a-timestamp" "$MASTER_KEY"
+check "400" "a malformed since is refused rather than silently ignored"
+api_call GET "/api/audit-logs?until=2026-13-99" "$MASTER_KEY"
+check "400" "an out-of-range until is refused the same way"
+
+for AUDIT_PROBE_ID in "$AUDIT_IP_HOOK_ID" "$AUDIT_TIME_HOOK_ID"; do
+    api_call DELETE "/api/hooks/$AUDIT_PROBE_ID?hard=true" "$MASTER_KEY"
+    check "204" "clean up an audit-filter probe hook"
+done
+
 # ── 19. System settings ─────────────────────────────────────────────────────
 
 log_section "19. System Settings"
@@ -1431,6 +1489,7 @@ api_call GET "/api/settings" "$MASTER_KEY"
 check "200" "master reads the runtime configuration"
 check_jq ".allowed_env_vars | join(\",\")" "PATH" "the configured passthrough allowlist is reported"
 check_jq ".log_retention_days" "30" "the configured retention window is reported"
+check_true '.deleted_hook_retention_days >= 0' "the deleted-hook retention window is reported"
 
 # This endpoint reports the *effective configuration*, which is exactly the kind of surface that
 # grows a credential by accident: a future field echoing SIGNING_SECRET_KEY, or a bound key, would

@@ -36,9 +36,10 @@
                         <code>X-API-Key</code>, <code>X-Timestamp</code> and
                         <code>X-Signature-256</code>. Signing uses the browser's Web Crypto API over
                         <strong>HTTPS or on localhost</strong>, and an identical built-in fallback on
-                        a plain-HTTP LAN address, where Web Crypto is not exposed at all. Keys in
-                        <code>BODY_ONLY</code> mode are for third-party webhook senders and cannot
-                        drive this dashboard.
+                        a plain-HTTP LAN address, where Web Crypto is not exposed at all. Third-party
+                        webhook senders that cannot sign this way authenticate against a hook's own
+                        <code>HMAC_ONLY</code> mode instead, keyless — this dashboard always uses a
+                        real API key.
                     </span>
                 </div>
                 <div class="form-group">
@@ -65,7 +66,7 @@
                 <h1>Simply Hook Executor</h1>
             </div>
             <div class="header-actions">
-                <span id="identity-badge" class="badge badge-scope"></span>
+                <span id="identity-badge" class="identity-pill"></span>
                 <button id="refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
                 <button id="logout-btn" class="btn btn-logout">Logout</button>
             </div>
@@ -77,6 +78,7 @@
             <button class="tab-btn" data-tab="hooks" id="hooks-tab-btn" role="tab" aria-selected="false">Hooks Management</button>
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
             <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
+            <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
 
         <!-- ═══════════════════════════════════════════════ -->
@@ -221,12 +223,62 @@
                                 <textarea id="hook-description" class="input-field" rows="2" placeholder="What does this hook do?"></textarea>
                             </div>
                         </div>
+
+                        <!--
+                          A valid API key with can_execute always has execution authority on this
+                          hook, regardless of what is chosen below — auth_mode only ever adds a way
+                          in for a caller presenting no X-API-Key at all. See the "?" drawer.
+                        -->
+                        <div class="auth-mode-row mt-4">
+                            <div class="form-group">
+                                <label for="hook-auth-mode">Keyless Auth Mode <span>*</span>
+                                    <button type="button" class="btn-help-trigger" id="hook-auth-help-btn" title="Explain hook authentication" aria-label="Explain hook authentication">?</button>
+                                </label>
+                                <select id="hook-auth-mode" class="input-field select-field">
+                                    <optgroup label="Standard API Key Required">
+                                        <option value="CANONICAL_V1" selected>Signed (CANONICAL_V1) — key + HMAC signature</option>
+                                        <option value="API_KEY_ONLY">Bearer only (API_KEY_ONLY) — key header, no signature</option>
+                                    </optgroup>
+                                    <option value="HMAC_ONLY">External Webhook HMAC Signature (HMAC_ONLY)</option>
+                                    <option value="NONE">Public / No Auth Required (NONE)</option>
+                                </select>
+                            </div>
+                            <p class="auth-mode-hint field-hint" id="hook-auth-mode-hint" aria-live="polite"></p>
+                        </div>
+
+                        <div class="form-grid mt-2" id="hook-hmac-secret-group">
+                            <div class="form-group col-span-2">
+                                <label for="hook-hmac-secret">HMAC Secret <span>*</span></label>
+                                <input type="password" id="hook-hmac-secret" placeholder="Shared secret the sender signs with" class="input-field" autocomplete="off">
+                                <span class="text-muted text-sm">Encrypted at rest. Never shown again once saved — rotate by setting a new value.</span>
+                            </div>
+                        </div>
+                        <div class="form-grid mt-2" id="hook-hmac-transport-group">
+                            <div class="form-group">
+                                <label for="hook-signature-header">Signature Header</label>
+                                <input type="text" id="hook-signature-header" class="input-field font-mono" placeholder="X-Signature-256 (default)" autocomplete="off" spellcheck="false">
+                            </div>
+                            <div class="form-group">
+                                <label for="hook-signature-prefix">Signature Prefix</label>
+                                <input type="text" id="hook-signature-prefix" class="input-field font-mono" placeholder="sha256= (default)" autocomplete="off" spellcheck="false">
+                            </div>
+                        </div>
+                        <div class="form-group mt-2" id="hook-canonical-template-group">
+                            <label for="hook-canonical-template">Custom Canonical Template</label>
+                            <input type="text" id="hook-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
+                            <span class="text-muted text-sm">Overrides what a <em>keyed, signed</em> caller's signature is verified against for this hook alone. Leave blank for the service-wide default.</span>
+                        </div>
+
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create Hook</button>
                         </div>
                     </form>
 
                     <div class="batch-actions">
+                        <label class="checkbox-container mr-4">
+                            <input type="checkbox" id="hooks-show-deleted">
+                            <span class="checkmark"></span> Show deleted (trash)
+                        </label>
                         <button type="button" id="delete-selected-hooks" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
 
@@ -239,6 +291,7 @@
                                     <th>Script Path</th>
                                     <th>Runs As</th>
                                     <th>Timeout</th>
+                                    <th>Auth Mode</th>
                                     <th>Parameters</th>
                                     <th>Your Rights</th>
                                     <th>Actions</th>
@@ -246,7 +299,7 @@
                             </thead>
                             <tbody id="hooks-table-body">
                                 <tr>
-                                    <td colspan="8" class="text-center text-muted">No hooks loaded.</td>
+                                    <td colspan="9" class="text-center text-muted">No hooks loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -275,20 +328,20 @@
                                 <input type="number" id="apikey-max-jobs" value="10" min="1" max="1000" required class="input-field">
                             </div>
                             <div class="form-group col-span-2">
-                                <label for="apikey-hmac-mode">Signature Mode</label>
-                                <select id="apikey-hmac-mode" class="input-field select-field">
-                                    <option value="CANONICAL_V1" selected>CANONICAL_V1 — method + path + timestamp + body (anti-replay)</option>
-                                    <option value="BODY_ONLY">BODY_ONLY — body only, for GitHub/Forgejo/GitLab senders</option>
-                                </select>
-                                <span class="text-muted text-sm">
-                                    <code>BODY_ONLY</code> also accepts <code>X-Hub-Signature-256</code> and needs no
-                                    <code>X-Timestamp</code> — but it has <strong>no replay protection</strong>. Use it only for
-                                    third-party senders whose signature format you cannot change.
-                                </span>
-                            </div>
-                            <div class="form-group col-span-2">
                                 <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
                                 <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label for="apikey-canonical-template">Custom Canonical Template</label>
+                                <input type="text" id="apikey-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
+                                <span class="text-muted text-sm">
+                                    Every key signs <code>CANONICAL_V1</code> — the only signature scheme this service has
+                                    (<code>BODY_ONLY</code> was retired in favor of a hook's own <code>HMAC_ONLY</code> mode for
+                                    keyless third-party senders). This overrides the exact string <em>this key's own</em>
+                                    signatures are verified against; leave blank for the service-wide default. Refused if
+                                    <strong>Manage Keys</strong> is also checked below — an admin credential must sign over the
+                                    one template this codebase's verification has actually been reviewed against.
+                                </span>
                             </div>
                         </div>
 
@@ -335,6 +388,7 @@
                                 <tr>
                                     <th><input type="checkbox" id="select-all-keys" title="Select all"></th>
                                     <th>Name</th>
+                                    <th>Lineage</th>
                                     <th>Key ID</th>
                                     <th>Mode</th>
                                     <th>Bound IPs</th>
@@ -345,7 +399,7 @@
                             </thead>
                             <tbody id="apikeys-table-body">
                                 <tr>
-                                    <td colspan="8" class="text-center text-muted">No API keys loaded.</td>
+                                    <td colspan="9" class="text-center text-muted">No API keys loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -423,11 +477,63 @@
                             </div>
                         </form>
                     </div>
-                </section>
 
+                    <div class="mt-4 pt-4" style="border-top: 1px solid var(--border);">
+                        <h4>Empty Hook Trash</h4>
+                        <p class="subtitle text-sm">
+                            Deleting a hook only moves it to the trash — its parameters, permissions, and full execution
+                            history survive until the retention window above passes, or until purged here. This drops
+                            everything the sweep would eventually drop, immediately, for hooks already past that window.
+                        </p>
+                        <div class="form-actions">
+                            <button type="button" id="btn-purge-hooks" class="btn btn-danger">Purge Deleted Hooks Now</button>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Audit Logs                                 -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-audit" class="tab-panel">
+            <div class="admin-grid">
                 <section class="card admin-section">
                     <h2>Audit Logs</h2>
                     <p class="subtitle">Every mutating configuration change and execution request. Master keys only.</p>
+
+                    <div class="filters mb-4">
+                        <!-- Exact match server-side (audit_log::Column::Action.eq), so a free-text
+                             field with suggestions beats a dropdown: the action namespace has no
+                             fixed enum to enumerate (see audit.rs's own "non-exhaustive" note), and
+                             a dropdown could only ever offer what happens to have loaded already. -->
+                        <input type="text" id="audit-action-filter" class="input-field font-mono" list="audit-action-options" placeholder="Filter by action...">
+                        <datalist id="audit-action-options">
+                            <option value="HOOK_CREATE"></option>
+                            <option value="HOOK_UPDATE"></option>
+                            <option value="HOOK_DELETE"></option>
+                            <option value="HOOK_RESTORE"></option>
+                            <option value="HOOK_PURGE"></option>
+                            <option value="HOOK_PARAM_CREATE"></option>
+                            <option value="HOOK_PARAM_UPDATE"></option>
+                            <option value="HOOK_PARAM_DELETE"></option>
+                            <option value="HOOK_EXECUTE"></option>
+                            <option value="KEY_CREATE"></option>
+                            <option value="KEY_UPDATE"></option>
+                            <option value="KEY_DELETE"></option>
+                            <option value="KEY_ROTATE"></option>
+                            <option value="KEY_PERM_UPDATE"></option>
+                            <option value="KEY_PERM_REVOKE"></option>
+                            <option value="EXECUTION_DELETE"></option>
+                            <option value="EXECUTION_PURGE"></option>
+                        </datalist>
+                        <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
+                        <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
+                        <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+                        <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
+                        <button type="button" id="audit-clear-filters-btn" class="btn btn-secondary btn-sm">Clear</button>
+                    </div>
+
                     <div class="table-container">
                         <table class="data-table">
                             <thead>
@@ -476,6 +582,9 @@
 
             <form id="form-add-param" class="admin-form">
                 <input type="hidden" id="params-modal-hook-id">
+                <!-- Empty means "creating a new parameter"; set means "editing this one" — one form
+                     serves both, since the fields and validation are identical either way. -->
+                <input type="hidden" id="param-edit-id">
                 <div class="form-grid">
                     <div class="form-group">
                         <label for="param-key">Key <span>*</span></label>
@@ -497,7 +606,9 @@
                     </label>
                 </div>
                 <div class="form-actions">
-                    <button type="submit" class="btn btn-primary">Add Parameter</button>
+                    <button type="submit" id="param-submit-btn" class="btn btn-primary">Add Parameter</button>
+                    <button type="button" id="param-cancel-edit-btn" class="btn btn-secondary hidden">Cancel Edit</button>
+                    <button type="button" id="btn-open-json-extractor" class="btn btn-secondary">Extract from JSON…</button>
                 </div>
             </form>
 
@@ -516,34 +627,105 @@
         </div>
     </div>
 
+    <!--
+      JSON Payload Extractor: paste a sample webhook body, discover its top-level keys, and create
+      them as parameters for the hook currently open in the Parameters modal above — without typing
+      each param_key by hand or guessing what a real sender's payload looks like.
+    -->
+    <div id="json-extractor-modal" class="modal-overlay hidden">
+        <div class="modal-card modal-card-wide card">
+            <div class="modal-header">
+                <h3>Extract Parameters from a Sample Payload</h3>
+                <button type="button" id="json-extractor-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle">
+                Paste a sample webhook JSON body. Its top-level keys become candidate parameters — each maps to
+                <code>HOOK_PARAM_&lt;KEY&gt;</code>, exactly like one added by hand. Nested objects/arrays are shown
+                as read-only preview only: a parameter value must be a flat string, so pick a leaf field instead.
+            </p>
+            <div class="form-group">
+                <label for="json-extractor-input">Sample Payload</label>
+                <textarea id="json-extractor-input" class="input-field font-mono" rows="8" placeholder='{"ref": "refs/heads/main", "pusher": {"name": "octocat"}}' spellcheck="false"></textarea>
+            </div>
+            <div class="form-actions">
+                <button type="button" id="json-extractor-parse-btn" class="btn btn-secondary">Parse Payload</button>
+            </div>
+            <div id="json-extractor-error" class="message error hidden mt-2"></div>
+            <div id="json-extractor-results" class="mt-4"></div>
+        </div>
+    </div>
+
     <!-- Edit Hook Modal -->
     <div id="edit-hook-modal" class="modal-overlay hidden">
-        <div class="modal-card card">
+        <div class="modal-card modal-card-wide card">
             <h3>Edit Hook</h3>
             <form id="form-edit-hook">
                 <input type="hidden" id="edit-hook-id">
-                <div class="form-group">
-                    <label for="edit-hook-name">Hook Name <span>*</span></label>
-                    <input type="text" id="edit-hook-name" required class="input-field">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="edit-hook-name">Hook Name <span>*</span></label>
+                        <input type="text" id="edit-hook-name" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-hook-timeout">Timeout (seconds) <span>*</span></label>
+                        <input type="number" id="edit-hook-timeout" min="1" max="86400" required class="input-field">
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="edit-hook-script-path">Script Path <span>*</span></label>
+                        <input type="text" id="edit-hook-script-path" required class="input-field">
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="edit-hook-run-as-user">Run as User (sudo)</label>
+                        <input type="text" id="edit-hook-run-as-user" placeholder="empty = run as the daemon user" class="input-field">
+                        <span class="text-muted text-sm">Clear this field to drop elevation.</span>
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="edit-hook-description">Description</label>
+                        <textarea id="edit-hook-description" class="input-field" rows="2"></textarea>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label for="edit-hook-script-path">Script Path <span>*</span></label>
-                    <input type="text" id="edit-hook-script-path" required class="input-field">
+
+                <div class="auth-mode-row mt-4">
+                    <div class="form-group">
+                        <label for="edit-hook-auth-mode">Keyless Auth Mode <span>*</span>
+                            <button type="button" class="btn-help-trigger" id="edit-hook-auth-help-btn" title="Explain hook authentication" aria-label="Explain hook authentication">?</button>
+                        </label>
+                        <select id="edit-hook-auth-mode" class="input-field select-field">
+                            <optgroup label="Standard API Key Required">
+                                <option value="CANONICAL_V1">Signed (CANONICAL_V1) — key + HMAC signature</option>
+                                <option value="API_KEY_ONLY">Bearer only (API_KEY_ONLY) — key header, no signature</option>
+                            </optgroup>
+                            <option value="HMAC_ONLY">External Webhook HMAC Signature (HMAC_ONLY)</option>
+                            <option value="NONE">Public / No Auth Required (NONE)</option>
+                        </select>
+                    </div>
+                    <p class="auth-mode-hint field-hint" id="edit-hook-auth-mode-hint" aria-live="polite"></p>
                 </div>
-                <div class="form-group">
-                    <label for="edit-hook-timeout">Timeout (seconds) <span>*</span></label>
-                    <input type="number" id="edit-hook-timeout" min="1" max="86400" required class="input-field">
+
+                <div class="form-grid mt-2" id="edit-hook-hmac-secret-group">
+                    <div class="form-group col-span-2">
+                        <label for="edit-hook-hmac-secret">HMAC Secret</label>
+                        <input type="password" id="edit-hook-hmac-secret" placeholder="leave blank to keep the current secret" class="input-field" autocomplete="off">
+                        <span class="text-muted text-sm" id="edit-hook-hmac-secret-status"></span>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label for="edit-hook-run-as-user">Run as User (sudo)</label>
-                    <input type="text" id="edit-hook-run-as-user" placeholder="empty = run as the daemon user" class="input-field">
-                    <span class="text-muted text-sm">Clear this field to drop elevation.</span>
+                <div class="form-grid mt-2" id="edit-hook-hmac-transport-group">
+                    <div class="form-group">
+                        <label for="edit-hook-signature-header">Signature Header</label>
+                        <input type="text" id="edit-hook-signature-header" class="input-field font-mono" placeholder="X-Signature-256 (default)" autocomplete="off" spellcheck="false">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-hook-signature-prefix">Signature Prefix</label>
+                        <input type="text" id="edit-hook-signature-prefix" class="input-field font-mono" placeholder="sha256= (default)" autocomplete="off" spellcheck="false">
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label for="edit-hook-description">Description</label>
-                    <textarea id="edit-hook-description" class="input-field" rows="2"></textarea>
+                <div class="form-group mt-2" id="edit-hook-canonical-template-group">
+                    <label for="edit-hook-canonical-template">Custom Canonical Template</label>
+                    <input type="text" id="edit-hook-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
+                    <span class="text-muted text-sm">Leave blank for the service-wide default.</span>
                 </div>
-                <div class="form-actions">
+
+                <div class="form-actions mt-4">
                     <button type="submit" class="btn btn-primary">Save Changes</button>
                     <button type="button" id="edit-hook-cancel" class="btn btn-secondary">Cancel</button>
                 </div>
@@ -570,11 +752,14 @@
                     <input type="number" id="edit-key-max-jobs" min="1" max="1000" class="input-field">
                 </div>
                 <div class="form-group">
-                    <label for="edit-key-hmac-mode">Signature Mode</label>
-                    <select id="edit-key-hmac-mode" class="input-field select-field">
-                        <option value="CANONICAL_V1">CANONICAL_V1 (anti-replay)</option>
-                        <option value="BODY_ONLY">BODY_ONLY (no replay protection)</option>
-                    </select>
+                    <label>Signature Mode</label>
+                    <div id="edit-key-hmac-mode-display" class="font-mono text-sm"></div>
+                    <span class="text-muted text-sm"><code>hmac_mode</code> is fixed at creation and cannot be changed — every key signs <code>CANONICAL_V1</code>, the only scheme this service has.</span>
+                </div>
+                <div class="form-group">
+                    <label for="edit-key-canonical-template">Custom Canonical Template</label>
+                    <input type="text" id="edit-key-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
+                    <span class="text-muted text-sm">Send blank to reset to the service-wide default. Refused if <strong>Manage Keys</strong> is also set.</span>
                 </div>
                 <div class="permissions-grid mt-2 mb-4" id="edit-key-master-only-scopes">
                     <label class="checkbox-container">
@@ -649,6 +834,84 @@
             </div>
         </div>
     </div>
+
+    <!--
+      Auth-mode help drawer: a slide-out panel from the right, opened by the "?" button next to
+      either hook form's Auth Mode field (create and edit share this one instance). A backdrop
+      closes it on outside click, mirroring the confirm modal's own dismiss pattern.
+    -->
+    <div id="auth-help-backdrop" class="drawer-backdrop hidden"></div>
+    <aside id="auth-help-drawer" class="side-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="auth-help-title">
+        <div class="side-drawer-header">
+            <h3 id="auth-help-title">How Hook Authentication Works</h3>
+            <button type="button" id="auth-help-close" class="btn-modal-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="side-drawer-body">
+            <section class="help-section">
+                <h4>1. An API key is always the primary authority</h4>
+                <p>
+                    Any request that carries a valid <code>X-API-Key</code> naming a key with
+                    <code>can_execute=true</code> on the target hook may run it —
+                    <strong>regardless of that hook's own Auth Mode setting below</strong>. A hook's
+                    Auth Mode only ever adds a way in for a caller presenting <em>no</em> API key at
+                    all; it never removes, narrows, or overrides the always-available keyed path.
+                </p>
+                <p>
+                    Whether that keyed request must <em>also</em> carry an HMAC signature
+                    (<code>X-Timestamp</code> + <code>X-Signature-256</code>) depends on the
+                    <strong>key</strong>, not the hook: a key with <code>can_manage_keys</code> must
+                    always sign, and every deployment can additionally require it of every key via
+                    <code>REQUIRE_SIGNED_REQUESTS</code>. Otherwise, an unsigned bearer request — the
+                    header alone — is enough.
+                </p>
+            </section>
+
+            <section class="help-section">
+                <h4>2. The three ways a <em>keyless</em> caller can reach a hook</h4>
+                <dl class="help-mode-list">
+                    <dt><span class="badge badge-scope">Standard API Key Required</span> <code>CANONICAL_V1</code> / <code>API_KEY_ONLY</code></dt>
+                    <dd>
+                        The default. A caller with no <code>X-API-Key</code> is refused outright —
+                        this hook is reachable only through a real, permitted key, signed or not per
+                        the rule above. The two backend values differ only in what they document
+                        about a <em>keyed</em> caller's intent (whether it is expected to also sign a
+                        custom template); a keyless caller cannot tell them apart.
+                    </dd>
+                    <dt><span class="badge badge-timeout">External Webhook HMAC Signature</span> <code>HMAC_ONLY</code></dt>
+                    <dd>
+                        For third-party senders (GitHub, Forgejo, GitLab, …) whose signature format
+                        cannot be changed. A keyless request is accepted if it carries a valid
+                        HMAC-SHA256 signature over the <strong>raw request body alone</strong>, computed
+                        with this hook's own secret — no API key, no timestamp, and therefore
+                        <strong>no anti-replay protection</strong>: a captured request stays valid
+                        forever. A caller presenting a real API key still bypasses this entirely (see
+                        §1) — that key's own rules govern instead.
+                    </dd>
+                    <dt><span class="badge badge-success">Public / No Auth Required</span> <code>NONE</code></dt>
+                    <dd>
+                        A keyless, completely unauthenticated request is accepted outright — but only
+                        when this deployment's <code>REQUIRE_SIGNED_REQUESTS</code> is <code>false</code>.
+                        A deployment that has opted into mandatory signing everywhere else refuses this
+                        shape of request too, rather than leaving one open door.
+                    </dd>
+                </dl>
+            </section>
+
+            <section class="help-section">
+                <h4>3. External webhook header formats</h4>
+                <p>An <code>HMAC_ONLY</code> hook checks a header you configure — defaults shown:</p>
+                <pre class="font-mono text-sm help-code-block">X-Signature-256: sha256=&lt;hex-encoded HMAC-SHA256 of the raw body&gt;</pre>
+                <p>GitHub/Forgejo-style senders use a different header name by convention — set the
+                    <strong>Signature Header</strong> and <strong>Signature Prefix</strong> fields to
+                    match what the sender actually transmits, for example:</p>
+                <pre class="font-mono text-sm help-code-block">X-Hub-Signature-256: sha256=&lt;hex-encoded HMAC-SHA256 of the raw body&gt;</pre>
+                <p class="text-muted text-sm">
+                    The algorithm is always SHA-256; only the header name and the string prepended to
+                    the hex digest are configurable per hook.
+                </p>
+            </section>
+        </div>
+    </aside>
 
     <div id="toast-container" class="toast-container"></div>
     <script src="app.js"></script>

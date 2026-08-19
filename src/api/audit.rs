@@ -41,10 +41,34 @@ use super::DEFAULT_PAGE_LIMIT;
 pub struct AuditLogQuery {
     /// Filter by exact action type (e.g. `HOOK_EXECUTE`).
     pub action: Option<String>,
+    /// Filter by client IP, substring match — an operator narrowing down "everything from this
+    /// address" rarely has the exact recorded string at hand (a IPv6 address's zero-compression
+    /// form, in particular), so this behaves like the hook-name search filter elsewhere rather than
+    /// an exact match.
+    pub client_ip: Option<String>,
+    /// Only entries at or after this instant. RFC 3339 (`2026-08-19T00:00:00Z`), the shape
+    /// `Date.prototype.toISOString()` produces — the one JavaScript's own `<input
+    /// type="datetime-local">` needs a manual round trip through to get, so this exists to be filled
+    /// by client code rather than typed by hand.
+    pub since: Option<String>,
+    /// Only entries strictly before this instant. Same shape as `since`.
+    pub until: Option<String>,
     /// Pagination limit.
     pub limit: Option<u64>,
     /// Pagination offset.
     pub offset: Option<u64>,
+}
+
+/// Parses an RFC 3339 timestamp query parameter into the naive UTC shape `audit_logs.timestamp` is
+/// stored as. Named in the error so a malformed `since`/`until` is distinguishable from the other.
+fn parse_instant(field: &str, raw: &str) -> Result<chrono::NaiveDateTime, AppError> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.to_utc().naive_utc())
+        .map_err(|_| {
+            AppError::InvalidInput(format!(
+                "Invalid '{field}': expected an RFC 3339 timestamp, e.g. 2026-08-19T00:00:00Z"
+            ))
+        })
 }
 
 /// Handles `GET /api/audit-logs`.
@@ -68,6 +92,15 @@ pub async fn list_audit_logs(
     let mut q = AuditLog::find().order_by_desc(audit_log::Column::Timestamp);
     if let Some(action) = query.action.as_deref().filter(|a| !a.is_empty()) {
         q = q.filter(audit_log::Column::Action.eq(action));
+    }
+    if let Some(client_ip) = query.client_ip.as_deref().filter(|s| !s.is_empty()) {
+        q = q.filter(audit_log::Column::ClientIp.contains(client_ip));
+    }
+    if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
+        q = q.filter(audit_log::Column::Timestamp.gte(parse_instant("since", since)?));
+    }
+    if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
+        q = q.filter(audit_log::Column::Timestamp.lt(parse_instant("until", until)?));
     }
 
     let logs = q

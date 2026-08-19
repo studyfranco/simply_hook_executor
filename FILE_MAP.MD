@@ -478,7 +478,7 @@ Two ordering rules inside this file are load-bearing:
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,327 lines
+### `src/api/keys.rs` — 1,335 lines
 
 **Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
 **key-subtree** visibility.
@@ -514,6 +514,10 @@ replacement customization surface. `hmac_mode` stays immutable after creation ex
 a key that is not (and does not become) a `can_manage_keys` holder —
 `guards::guard_canonical_v1_for_key_management` refuses either direction (granting the scope to an
 already-templated key, or templating an already-scoped one) with `400`.
+
+`ApiKeySummary` also carries `parent_key_id`, for the WebUI's key-lineage column — display only, per
+`RBAC_MODEL.md` R3 ("rights are never derived from key lineage"), and deliberately absent from
+`MinimalApiKeyView`, whose §4 shared-resource disclosure does not extend to it.
 
 ### `src/api/hooks.rs` — 1,063 lines
 
@@ -569,11 +573,11 @@ authorized) and attributes the resulting audit log entry and execution record ac
 Note `delete_execution` is deliberately **stricter** than reading one — `can_view_execution` buys
 visibility, never destruction. An auditor is not a redactor.
 
-### `src/api/audit.rs` — 80 lines
+### `src/api/audit.rs` — 113 lines
 
 **Role & scope.** Master-only **reads** over `audit_logs`. Must **not** hold the writer.
 
-**Key exports.** `list_audit_logs`, `AuditLogQuery`.
+**Key exports.** `list_audit_logs`, `AuditLogQuery`, `parse_instant`.
 
 **Rationale.** This was the first half of `system.rs`, which grouped the audit log with the settings
 endpoint on the grounds that both are master-only. Audience is the weakest thing to organize by —
@@ -582,6 +586,11 @@ for change: this one reads a growing table and will keep acquiring query surface
 key, by target, by time range), while settings reports a struct fixed at startup. Splitting them
 also **removes the last naming divergence** from the peer service, which reached `api/audit.rs`
 independently.
+
+`AuditLogQuery` grew the predicted time-range and target surface: `client_ip` (substring match, for
+the WebUI's Audit Logs tab) and `since`/`until` (RFC 3339, parsed by `parse_instant` into the naive
+UTC shape `audit_logs.timestamp` is stored as — `since` is inclusive, `until` is strictly exclusive,
+matching the half-open range a paginated "next page starts here" UI expects).
 
 Writing an audit row is `api/support.rs::create_audit_log`, called from every mutating handler. That
 asymmetry is deliberate: this module is the *reader* of a table a dozen call sites write to.
