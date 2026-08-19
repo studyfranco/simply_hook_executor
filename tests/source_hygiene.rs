@@ -372,3 +372,42 @@ fn the_dashboard_never_sends_is_master_in_a_key_payload() {
         offending.join("\n  ")
     );
 }
+
+/// `sea-orm-migration`'s Cargo.toml features must include every backend `sea-orm` itself declares.
+///
+/// The two crates carry *independent* feature lists. `sea-orm-migration`'s `SchemaManager::has_index`
+/// (and `has_table`/`has_column`) compile a match arm per enabled backend feature and fall through to
+/// `DbErr::BackendNotSupported` for anything not compiled in — so if this crate's feature list ever
+/// drifts to list fewer backends than `sea-orm`'s, the drift is invisible to `cargo check` (everything
+/// still compiles; only the runtime match arms differ) and surfaces only when `src/master.rs`'s boot
+/// check for RBAC_MODEL.md §5's uniqueness index runs against the backend nobody remembered to enable.
+/// A string check on `Cargo.toml` catches the drift where a passing build cannot.
+#[test]
+fn sea_orm_migration_declares_every_backend_sea_orm_does() {
+    let cargo_toml = std::fs::read_to_string(repo_path("Cargo.toml"))
+        .expect("Cargo.toml is readable");
+
+    let sea_orm_line = cargo_toml
+        .lines()
+        .find(|line| line.starts_with("sea-orm ="))
+        .expect("a sea-orm dependency line exists");
+    let migration_line = cargo_toml
+        .lines()
+        .find(|line| line.starts_with("sea-orm-migration ="))
+        .expect("a sea-orm-migration dependency line exists");
+
+    for backend in ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite"] {
+        assert!(
+            sea_orm_line.contains(backend),
+            "test fixture assumption broken: the `sea-orm` line no longer declares {backend:?}, so \
+             this test can no longer tell drift from an intentional narrowing:\n  {sea_orm_line}"
+        );
+        assert!(
+            migration_line.contains(backend),
+            "sea-orm-migration is missing the {backend:?} feature that sea-orm itself declares. \
+             SchemaManager::has_index/has_table/has_column silently compile out that backend's match \
+             arm and fail at runtime with DbErr::BackendNotSupported instead of at build time:\n  \
+             {migration_line}"
+        );
+    }
+}

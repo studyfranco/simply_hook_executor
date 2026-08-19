@@ -6284,3 +6284,128 @@ rename · `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **95
 `./scripts/verify_convergence.sh` **18 converged, 1 known divergence, 0 drifted**, exit 0 ·
 `FILE_MAP.MD`'s three coverage commands all silent (file count unchanged — a rename, not an add or
 remove) · `git diff RBAC_MODEL.md` empty.
+
+---
+
+# 2026-08-19 — Security & architecture hardening: PG portability, `deny_unknown_fields` audit, SHE-1, `hmac_mode` immutability
+
+A five-task hardening brief: (1) fix a PostgreSQL portability bug in `SchemaManager::has_index`,
+(2) complete a `#[serde(deny_unknown_fields)]` audit across `src/api/`, (3) resolve SHE-1 —
+a dispatch-configuration ownership bypass, (4) lock `hmac_mode` immutable and make it
+`CANONICAL_V1`-mandatory for any `can_manage_keys` holder, with mandatory signing enforced in
+`auth_middleware`, and (5) this entry plus the other docs.
+
+## Task 1 — PostgreSQL portability (`Cargo.toml` only, no source change)
+
+`SchemaManager::has_index`/`has_table`/`has_column` compile one match arm per backend *feature
+enabled on the `sea-orm-migration` crate specifically* — a separate feature list from `sea-orm`'s.
+This crate's `sea-orm-migration` dependency carried only `sqlx-sqlite`, so calling `has_index` (which
+`src/master.rs` does on every boot, to verify RBAC_MODEL.md §5's uniqueness index) compiled fine
+everywhere and then hit `DbErr::BackendNotSupported` at runtime on Postgres or MySQL — a hole
+invisible to `cargo check`, since the code path differs only per backend match arm. Fixed by adding
+`sqlx-postgres`/`sqlx-mysql` to `sea-orm-migration`'s feature list, matching `sea-orm`'s. A new test,
+`sea_orm_migration_declares_every_backend_sea_orm_does` (`tests/source_hygiene.rs`), pins the two
+feature lists to each other so they cannot silently diverge again.
+
+## Task 2 — `deny_unknown_fields` audit
+
+All 14 request-DTO structs across `src/api/` (`hooks.rs` ×6, `executions.rs` ×2, `audit.rs` ×1,
+`keys.rs` ×5) now carry `#[serde(deny_unknown_fields)]`; none used `#[serde(flatten)]`, so there was
+no conflict to resolve. `keys.rs`'s `UpdateApiKeyPayload` additionally lost its `hmac_mode` field
+entirely rather than gaining the attribute over a field meant to stay mutable — see Task 4.
+
+## Task 3 — SHE-1: dispatch-configuration ownership bypass
+
+**The brief's own proposed fix was itself wrong, and was not implemented as written.** It said to
+check `can_manage_hooks` (a resource-*creation* right) or `owner_key_id` in `update_hook`'s
+`script_path`/`run_as_user` path. RBAC_MODEL.md R2 states the conjunction ("`can_manage_keys` AND a
+`can_manage = true` row") governs dispatch configuration *in full*, and §1 states creation rights and
+management rights "are never implied by" each other. Implementing the brief literally would have left
+the exact hole it was trying to close, just narrower: a Daughter holding `can_manage_hooks` (creation
+only, no `can_manage_keys`) or a bare owner with no `can_manage` row at all would still repoint a live
+hook's `script_path` — arbitrary code execution the moment the hook next executes.
+
+Implemented per R2's literal text instead: a new `guard_dispatch_configuration` (`src/api/guards.rs`)
+requires the full conjunction — `can_manage_keys` **and** a `can_manage = true` row on the specific
+hook — with no ownership exception, and `update_hook` (`src/api/hooks.rs`) calls it whenever the
+payload names `script_path` or `run_as_user`. `guard_manage`'s doc comment was corrected to state it
+authorizes general content only, not dispatch configuration, with a cross-reference. Master is exempt
+(as everywhere).
+
+Two new tests: `r2_owner_cannot_repoint_script_path_after_its_creation_right_is_revoked`
+(`tests/rbac_model_compliance.rs`) models the exact exploit chain — create as a Daughter, revoke
+`can_manage_hooks`, confirm the auto-provisioned ownership and `can_manage` row survive the
+revocation untouched, confirm a `script_path` repoint is still refused while a `description` edit
+still works — and `scripts/test_e2e.sh` §41 was corrected: it previously asserted the *old*,
+vulnerable behavior ("the owner may repoint its own hook's script_path without can_manage_keys",
+expecting `200`) and now asserts the fix (`403`, plus a follow-up `GET` proving the refusal is real
+and the original `script_path` survived).
+
+## Task 4 — `hmac_mode` immutability and mandatory `CANONICAL_V1` for key administrators
+
+Three parts, all in service of one policy: a key that can administer every other credential must not
+be reachable over a signature scheme with no replay window.
+
+1. **`hmac_mode` is fixed at creation.** `UpdateApiKeyPayload` no longer has the field at all — not
+   accepted-and-ignored, *absent* — so naming it in a `PUT`/`PATCH` is refused by
+   `deny_unknown_fields` before any handler runs (Axum's own `422`, not this service's JSON error
+   envelope). Rotation still mints a fresh signing secret; it does not touch the mode.
+2. **`can_manage_keys` requires `hmac_mode = CANONICAL_V1`.** A new guard,
+   `guard_canonical_v1_for_key_management` (`src/api/guards.rs`), is checked at both creation and
+   update — the two routes a key can end up holding the scope through — and is harmless for the
+   default case (an omitted `hmac_mode` defaults to `CANONICAL_V1` already).
+3. **`auth_middleware` requires a valid `CANONICAL_V1` signature, unconditionally, from any
+   non-master `can_manage_keys` holder** — overriding `REQUIRE_SIGNED_REQUESTS = false`:
+   `signature_required = state.config.require_signed_requests || (key_record.can_manage_keys &&
+   !key_record.is_master)`. Guard (2) guarantees such a key is always capable of producing that
+   signature, so this can never demand a scheme the key cannot present.
+
+**Master is deliberately excluded**, via `!key_record.is_master`, even though the bootstrap master
+row's `can_manage_keys` column also reads `true`. This is a judgment call made and flagged rather
+than a literal reading of the brief ("any request authenticated with a key holding
+`can_manage_keys == true`"): RBAC_MODEL.md §1's Tiers table names Master as a distinct, superior tier
+that "bypasses scoping" outright, not a Parent that happens to hold every scope, and that column's
+value on the master row is a bootstrap artifact rather than a meaningful grant. Including Master would
+have forced virtually the entire test suite — which uses Master as its default caller throughout — to
+start signing, a blast radius the rule's own stated target (credential administrators) does not call
+for. Master already carries independent, stronger hardening (immutable except `bound_ips`,
+unrotatable, undeletable).
+
+### Fallout: every test driving a `can_manage_keys` key unsigned had to be fixed
+
+The mandatory-signing change broke every existing test and e2e check that authenticated as a
+non-master `can_manage_keys` holder without signing — 33 in `tests/hook_executor_integration_tests.rs`,
+12 in `tests/rbac_model_compliance.rs`, and (before a separate fix, below) 156 checks in
+`scripts/test_e2e.sh`.
+
+- **Rust tests**: `tests/common/mod.rs` gained `signing_clock()`/`signed_send()` — a per-test
+  monotonic clock ticking backward from `now()+1`, since repeated signed calls with the same key
+  inside one test can otherwise land in the same wall-clock second and produce an identical
+  signature, which the anti-replay guard then (correctly) rejects as a genuine replay. Every affected
+  call site was converted from `send(&app, json_request(...))` to
+  `signed_send(&app, &mut clock, ...)`. `hmac_mode_toggle_takes_effect_immediately_without_a_restart`
+  was deleted outright (~100 lines) — its premise, that `hmac_mode` is live-togglable, is now false
+  by design — and replaced by
+  `hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical`, which asserts the `422` refusal
+  and that the mode survives unchanged (checked via the list endpoint, since no single-key `GET`
+  route exists).
+- **`scripts/test_e2e.sh`**: rather than hand-converting ~40 call sites across a 4,200-line script,
+  `api_call` now **auto-signs** whenever its API-key argument is a registered `can_manage_keys`
+  holder — a `KEY_SIGNING_SECRET` associative array, populated by `create_scoped_key`/`create_key_as`
+  (keyed off the literal `"can_manage_keys":true` in the request payload, since
+  `CreateApiKeyResponse` doesn't echo scope fields back) plus three manual `register_manager_key`
+  calls for keys minted outside those helpers or promoted after creation. This required no changes at
+  any of the ~150 individual call sites. Two bugs surfaced and were fixed during this: (a) the first
+  cut of the monotonic signing clock (`next_sign_ts`) was called as `sts=$(next_sign_ts)` — a command
+  substitution, which forks a subshell, so the clock's own advancement was invisible to the caller and
+  it silently did nothing; fixed by having the function set a global (`NEXT_SIGN_TS`) instead of
+  echoing. (b) two long-standing checks (a manual `hmac_mode` PUT-toggle round trip, and a
+  `hmac_mode":"BODY_ONLY"` entry in the master-immutability refusal loop) asserted the pre-Task-4
+  behavior and were updated to match — the same `422`-before-`403` pattern as the Rust-side fix.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**289 passed / 0 failed / 2 ignored** across all 9 binaries · `cargo test -- --ignored` **2 passed** ·
+`./scripts/test_e2e.sh` **958 passed / 0 failed** · `./scripts/verify_convergence.sh` **18 converged,
+1 known divergence (pre-existing, unrelated), 0 drifted**, exit 0.

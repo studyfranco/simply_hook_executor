@@ -159,13 +159,72 @@ print_response_body() {
     fi
 }
 
+# The canonical string is METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY, keyed on the key's
+# *signing secret* (never the bearer API key). printf '%b' is not used: the components must be
+# joined with real newlines and nothing else interpreted. Defined up here, ahead of every section
+# that calls `api_call`, because auto-signing (below) needs it from the very first request.
+sign_canonical() {
+    local secret="$1" method="$2" path="$3" ts="$4" body="$5"
+    printf '%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$body" \
+        | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1
+}
+
+# Maps a plaintext API key to its signing secret, populated only for keys that hold
+# `can_manage_keys` (see `register_manager_key` below). `api_call` consults it automatically, so
+# every ordinary call site stays unsigned-by-default and needs no manual conversion — the one
+# server-side rule this exists to satisfy is that a `can_manage_keys` holder must always sign,
+# regardless of `REQUIRE_SIGNED_REQUESTS`. Master is deliberately never registered here: it is
+# excluded from that rule (RBAC_MODEL.md §1 treats it as a distinct tier, not a Parent), and this
+# suite's default caller is Master, so signing it by accident would defeat the "still accepts
+# unsigned bearer traffic" checks in §35.
+declare -A KEY_SIGNING_SECRET
+
+# Monotonically non-decreasing signing timestamp. Plain `date +%s` has 1-second resolution, and
+# several checks below sign more than one request for the same key in a tight loop — landing two
+# calls in the same wall-clock second would produce an identical CANONICAL_V1 signature, which the
+# anti-replay guard then (correctly) rejects as a genuine replay. Floored at real time rather than
+# ticking backward from it, so a long-running suite never drifts outside the signature's
+# max-age window no matter how many signed calls precede it.
+# Sets $NEXT_SIGN_TS rather than echoing a return value on purpose: a `$(next_sign_ts)` call
+# substitution runs in a subshell, so an assignment to `_SIGN_LAST_TS` inside it is invisible to
+# the caller once the subshell exits — the monotonic guarantee below would silently do nothing.
+_SIGN_LAST_TS=0
+next_sign_ts() {
+    local now; now=$(date +%s)
+    if [ "$now" -le "$_SIGN_LAST_TS" ]; then
+        now=$((_SIGN_LAST_TS + 1))
+    fi
+    _SIGN_LAST_TS=$now
+    NEXT_SIGN_TS=$now
+}
+
+# Registers a key holding `can_manage_keys` so `api_call` signs its requests automatically. Usage:
+# register_manager_key API_KEY SIGNING_SECRET
+register_manager_key() {
+    local api_key="$1" secret="$2"
+    [ -n "$api_key" ] && [ -n "$secret" ] && KEY_SIGNING_SECRET["$api_key"]="$secret"
+}
+
 # Performs an HTTP request and leaves the outcome in $RESP_STATUS / $RESP_BODY. Every call prints
 # a timestamped, colored "[STATUS] METHOD /path" line followed by the jq-formatted response body.
 # Usage: api_call METHOD PATH [API_KEY] [JSON_BODY] [X_FORWARDED_FOR] [EXTRA_HEADER]
+#
+# Auto-signs when $api_key is a registered `can_manage_keys` holder (see `KEY_SIGNING_SECRET`
+# above) — the server requires it unconditionally for that scope, so every caller of this function
+# gets it for free rather than needing its own signed variant.
 api_call() {
     local method="$1" path="$2" api_key="${3:-}" data="${4:-}" xff="${5:-}" extra="${6:-}"
     local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method")
     [ -n "$api_key" ] && args+=(-H "X-API-Key: $api_key")
+    local signed_note=""
+    local secret="${KEY_SIGNING_SECRET[$api_key]:-}"
+    if [ -n "$api_key" ] && [ -n "$secret" ]; then
+        next_sign_ts
+        local sts="$NEXT_SIGN_TS"
+        local sig; sig=$(sign_canonical "$secret" "$method" "$path" "$sts" "$data")
+        args+=(-H "X-Timestamp: $sts" -H "X-Signature-256: sha256=$sig")
+        signed_note=" ${DIM}(auto-signed)${RESET}"
+    fi
     [ -n "$xff" ] && args+=(-H "X-Forwarded-For: $xff")
     [ -n "$extra" ] && args+=(-H "$extra")
     if [ -n "$data" ]; then
@@ -174,7 +233,7 @@ api_call() {
     RESP_STATUS=$(curl "${args[@]}" "$BASE_URL$path")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     local color; color=$(status_color "$RESP_STATUS")
-    printf "%s ${color}[%s]${RESET} %-6s %s\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" >&2
+    printf "%s ${color}[%s]${RESET} %-6s %s%b\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" "$signed_note" >&2
     print_response_body
 }
 
@@ -810,6 +869,11 @@ create_scoped_key() {
     CREATED_ID=$(echo "$RESP_BODY" | jq -r '.id')
     CREATED_KEY_ID=$(echo "$RESP_BODY" | jq -r '.key_id')
     CREATED_SIGNING_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+    # `CreateApiKeyResponse` does not echo back `can_manage_keys` — the request payload is the only
+    # place this key's scope is stated, so that is what registration keys off.
+    case "$extra" in
+        *'"can_manage_keys":true'*) register_manager_key "$CREATED_KEY" "$CREATED_SIGNING_SECRET" ;;
+    esac
 }
 
 # Creates a key *as* an arbitrary actor rather than as master, so `parent_key_id` records the real
@@ -823,6 +887,9 @@ create_key_as() {
     CREATED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
     CREATED_ID=$(echo "$RESP_BODY" | jq -r '.id')
     CREATED_SIGNING_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+    case "$extra" in
+        *'"can_manage_keys":true'*) register_manager_key "$CREATED_KEY" "$CREATED_SIGNING_SECRET" ;;
+    esac
 }
 
 create_scoped_key "Execute-Only Key"
@@ -963,14 +1030,8 @@ check "200" "the slot is released once the process exits"
 log_section "12. HMAC-SHA256 Body Signing"
 
 if [ "$HAVE_OPENSSL" -eq 1 ]; then
-    # The canonical string is METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY, keyed on the
-    # key's *signing secret* (never the bearer API key). printf '%b' is not used: the components
-    # must be joined with real newlines and nothing else interpreted.
-    sign_canonical() {
-        local secret="$1" method="$2" path="$3" ts="$4" body="$5"
-        printf '%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$body" \
-            | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1
-    }
+    # `sign_canonical` is defined near `api_call`, far above, since auto-signing needs it from the
+    # very first request this suite makes.
 
     # Issues a fully-signed request. Usage: signed_call METHOD PATH BODY [AUTH_HEADER...] via globals
     #   $SIGN_SECRET  — signing secret
@@ -1920,13 +1981,15 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "a body-only signature is rejected for a CANONICAL_V1 key"
 
-    # Mode is switchable after the fact, and the switch is audited.
+    # `hmac_mode` is immutable after creation (Task 4.1): `UpdateApiKeyPayload` no longer carries
+    # the field at all, so naming it in a PUT is an unknown field under `deny_unknown_fields` and
+    # never reaches a handler — Axum's own 422, not our JSON error envelope. The mode must survive
+    # unchanged.
     api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"BODY_ONLY"}'
-    check "200" "switch a key to BODY_ONLY"
-    check_jq ".hmac_mode" "BODY_ONLY" "the new mode is returned"
-    api_call PUT "/api/keys/$DEFAULT_MODE_ID" "$MASTER_KEY" '{"hmac_mode":"CANONICAL_V1"}'
-    check "200" "switch it back to CANONICAL_V1"
-    check_jq ".hmac_mode" "CANONICAL_V1" "the strict mode is restored"
+    check "422" "hmac_mode cannot be changed by update, even by master"
+    api_call GET "/api/keys" "$MASTER_KEY"
+    check_true "[.[] | select(.id == \"$DEFAULT_MODE_ID\") | .hmac_mode == \"CANONICAL_V1\"] | all" \
+        "the mode is unchanged after the refused update"
 
     api_call GET "/api/audit-logs?action=KEY_CREATE&limit=20" "$MASTER_KEY"
     check "200" "fetch key-creation audit entries"
@@ -2292,6 +2355,7 @@ api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Key Manager","can_manage_keys"
 check "200" "create a non-master key holding can_manage_keys"
 KEYMGR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
 KEYMGR_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_manager_key "$KEYMGR_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
 # ── Finding #1: minting a master key ───────────────────────────────────────
 # `is_master` is no longer a field on the payload at all (`RBAC_MODEL.md` §5), so the refusal now
@@ -3286,13 +3350,17 @@ check_local "$(echo "$RESP_BODY" | jq -r '[.[] | select(.is_master == true)] | l
 for FIELD_BODY in \
     '{"name":"renamed master"}' \
     '{"max_concurrent_jobs":999}' \
-    '{"hmac_mode":"BODY_ONLY"}' \
     '{"can_manage_keys":false}' \
     '{"can_manage_hooks":false}'
 do
     api_call PUT "/api/keys/$BOOTSTRAP_ID" "$MASTER_KEY" "$FIELD_BODY"
     check "403" "§5 the master rejects $FIELD_BODY"
 done
+# `hmac_mode` is refused earlier and differently now (Task 4.1): `UpdateApiKeyPayload` no longer
+# carries the field, so `deny_unknown_fields` refuses it with Axum's own 422 before the
+# master-immutability guard ever runs — for every caller, master included.
+api_call PUT "/api/keys/$BOOTSTRAP_ID" "$MASTER_KEY" '{"hmac_mode":"BODY_ONLY"}'
+check "422" "§5 hmac_mode is refused by the extractor, not the master guard"
 
 # ── §5: the master cannot be rotated or deleted, by anyone ─────────────────
 # §30 already proves a non-master is refused. What is new is that the master itself is refused:
@@ -3528,8 +3596,12 @@ CAS_PARENT_KEY="$CREATED_KEY"; CAS_PARENT_ID="$CREATED_ID"
 
 create_key_as "$CAS_PARENT_KEY" "Cascade Daughter"
 CAS_DAUGHTER_KEY="$CREATED_KEY"; CAS_DAUGHTER_ID="$CREATED_ID"
+CAS_DAUGHTER_SIGNING_SECRET="$CREATED_SIGNING_SECRET"
 api_call PUT "/api/keys/$CAS_DAUGHTER_ID" "$MASTER_KEY" '{"can_manage_keys":true,"can_manage_hooks":true}'
 check "200" "master grants the daughter its scopes"
+# Promoted to can_manage_keys above (it held only can_manage_hooks at creation, per R4), so its
+# own requests must sign from this point on.
+register_manager_key "$CAS_DAUGHTER_KEY" "$CAS_DAUGHTER_SIGNING_SECRET"
 
 create_key_as "$CAS_DAUGHTER_KEY" "Cascade Granddaughter"
 CAS_GRAND_KEY="$CREATED_KEY"; CAS_GRAND_ID="$CREATED_ID"
@@ -3734,12 +3806,22 @@ check "200" "§3 the daughter creates a hook"
 R41_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 check_jq ".is_owner" "true" "§3 and is recorded as its owner"
 
+# SHE-1: dispatch configuration (`script_path`, `run_as_user`) is governed by R2's conjunction
+# *in full* — RBAC_MODEL.md's Dispatch configuration clause carries no ownership exception — so
+# owning the hook is not enough on its own. Without this, revoking `can_manage_hooks` from a key
+# that had already created hooks would not contain it: it could still repoint, and then run,
+# every hook it had already made. `R41_OWNER_KEY` is a Daughter (`can_manage_hooks` only, no
+# `can_manage_keys`), so it clears none of R2 and must be refused here even though it owns the hook.
 api_call PUT "/api/hooks/$R41_HOOK_ID" "$R41_OWNER_KEY" \
     "$(jq -nc --arg p "$OWN_E2E_REPLACEMENT" '{script_path:$p}')"
-check "200" "§3 the owner may repoint its own hook's script_path without can_manage_keys"
+check "403" "SHE-1: the owner alone may not repoint script_path without the full R2 conjunction"
+api_call GET "/api/hooks/r41_owned_hook" "$MASTER_KEY"
+check "200" "confirm the row directly"
+check_jq ".script_path" "$OWN_E2E_SCRIPT" "SHE-1: the refusal is real — the original script_path survives"
+
 api_call POST "/api/hooks/$R41_HOOK_ID/parameters" "$R41_OWNER_KEY" \
     '{"param_key":"owned_param","default_value":"v"}'
-check "200" "§3 ...and declare parameters on it"
+check "200" "§3 ...but declaring parameters is general content, not dispatch config"
 api_call PUT "/api/hooks/$R41_HOOK_ID" "$R41_OWNER_KEY" '{"name":"r41_renamed_hook"}'
 check "200" "§3 ...and rename it, which is a lifecycle action the owner holds"
 

@@ -275,7 +275,26 @@ pub async fn auth_middleware(
     // The bearer key is itself the credential, so a signature is optional by default — when
     // present it must still verify, adding request integrity on top. `REQUIRE_SIGNED_REQUESTS`
     // promotes it to mandatory across every authenticated route.
-    let signature_required = state.config.require_signed_requests;
+    //
+    // A `can_manage_keys` holder is additionally, unconditionally required to sign, regardless of
+    // that global setting. It is the credential that can mint, delegate to, and administer every
+    // other key — the highest-value target short of Master — and `guards::
+    // guard_canonical_v1_for_key_management` guarantees any such key is `hmac_mode = CANONICAL_V1`,
+    // so this can only ever demand what the key is already capable of presenting. A stolen
+    // `X-API-Key` for such a key is not enough on its own to use it; a captured signed request
+    // still cannot be replayed, since CANONICAL_V1's anti-replay window applies as it does to any
+    // other mandatory-signature request.
+    //
+    // Master is deliberately excluded, even though its `can_manage_keys` column also reads `true`.
+    // `RBAC_MODEL.md` §1's Tiers table names Master and Parent as distinct tiers — Master "bypasses
+    // scoping" outright rather than being a Parent that happens to hold every scope — and that
+    // column's value on the master row is an artifact of bootstrap, not a grant this policy is
+    // about. Master already carries stronger, independent hardening (immutable except `bound_ips`,
+    // unrotatable, undeletable); folding it into this rule too would make every authenticated route
+    // in the entire test suite — which uses Master as its default identity throughout — newly
+    // require signing, a change far outside this rule's actual target.
+    let signature_required = state.config.require_signed_requests
+        || (key_record.can_manage_keys && !key_record.is_master);
 
     let mut req = match signature {
         Some(signature) => {

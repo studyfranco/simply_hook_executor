@@ -154,7 +154,7 @@ would be one forgotten call site away from worthless — including every call si
 someone who never read this file. Handlers keep reading `key.is_master` and are automatically
 correct, because the principal they receive is the *effective* one.
 
-### `src/middleware.rs` — 543 lines
+### `src/middleware.rs` — 562 lines
 
 **Role & scope.** Authentication only — establishing *who* is calling. Bearer key lookup, HMAC
 signature verification, timestamp freshness, replay rejection, and bound-IP enforcement. Must **not**
@@ -391,7 +391,7 @@ The credential primitives are `pub` because `tests/common/mod.rs` mints keys dir
 database, hashing a plaintext exactly as the service would — the only way to seed a key whose secret
 the test already knows.
 
-### `src/api/guards.rs` — 932 lines
+### `src/api/guards.rs` — 1,029 lines
 
 **Role & scope.** Every **cross-domain** authorization decision in the API layer. **Must not write
 anything.** A guard answers "may this caller do this", returns `Result<_, AppError>`, and mutates no
@@ -403,7 +403,9 @@ state. §4's *key-subtree* visibility is the one exception and lives in `api/key
 | :--- | :--- |
 | R2 conjunction (single evaluation point) | `guard_hook_manage_conjunction` |
 | R2, master/owner short-circuit in front of it | `guard_manage` |
+| R2 in full for dispatch config, no ownership exception (SHE-1) | `guard_dispatch_configuration` |
 | R2 pre-payload standing | `has_permission_admin_standing`, `manages_any_hook` |
+| Service policy: `can_manage_keys` ⇒ `hmac_mode = CANONICAL_V1` | `guard_canonical_v1_for_key_management` |
 | R1 delegation bound | `guard_delegated_hook_grant` |
 | R6 revocation classification | `is_permission_reduction` |
 | R4 scope elevation | `guard_master_to_grant_scopes`, `guard_master_to_administer` |
@@ -440,7 +442,7 @@ Two ordering rules inside this file are load-bearing:
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,274 lines
+### `src/api/keys.rs` — 1,290 lines
 
 **Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
 **key-subtree** visibility.
@@ -469,7 +471,7 @@ returning `Result<_, AppError>`, writing nothing, and preserving §4 oracle disc
 `None`/`404` must be indistinguishable from a nonexistent id and is propagated rather than converted
 to a `403`.
 
-### `src/api/hooks.rs` — 892 lines
+### `src/api/hooks.rs` — 928 lines
 
 **Role & scope.** What a hook *is* — its definition, dispatch configuration, parameter contract, and
 trash lifecycle. Must **not** hold execution: that is `executions.rs`.
@@ -485,7 +487,7 @@ not by a bare permission row. Parameter CRUD sits in the same file and behind th
 parameter is argv for whatever `script_path` names: a defaulted parameter on a hook running `/bin/sh`
 supplies `-c` and a command string without the caller ever touching `script_path`.
 
-### `src/api/executions.rs` — 446 lines
+### `src/api/executions.rs` — 449 lines
 
 **Role & scope.** Triggering hooks and reading the records that result.
 
@@ -506,7 +508,7 @@ than fifty visible rows and hides the rest behind an offset that never advances 
 Note `delete_execution` is deliberately **stricter** than reading one — `can_view_execution` buys
 visibility, never destruction. An auditor is not a redactor.
 
-### `src/api/audit.rs` — 78 lines
+### `src/api/audit.rs` — 80 lines
 
 **Role & scope.** Master-only **reads** over `audit_logs`. Must **not** hold the writer.
 

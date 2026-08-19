@@ -104,8 +104,9 @@ pub(crate) async fn guard_execute(
     }
 }
 
-/// Authorizes editing the *content* of an existing hook — its definition, its dispatch
-/// configuration, its parameter contract, and its execution records.
+/// Authorizes editing the *general content* of an existing hook — its description, timeout, and
+/// parameter contract. **Not** its dispatch configuration; see [`guard_dispatch_configuration`] for
+/// why `script_path` and `run_as_user` are gated separately and more strictly.
 ///
 /// Three routes in, and they are not interchangeable:
 ///
@@ -114,7 +115,7 @@ pub(crate) async fn guard_execute(
 /// 3. **R2 in full** — global `can_manage_keys` *and* a `can_manage = true` row on this hook —
 ///    for everyone else, via [`guard_hook_manage_conjunction`].
 ///
-/// # Why ownership is sufficient on its own
+/// # Why ownership is sufficient on its own, for these fields
 ///
 /// §3 makes the owner "the key answerable for this hook", and the only non-Master identity that may
 /// delete or rename it. A model in which you may destroy a resource outright but may not edit its
@@ -127,6 +128,12 @@ pub(crate) async fn guard_execute(
 /// it again — not even the hook it had just written, whose `owner_key_id` names it. Ownership as a
 /// third route makes creation coherent: you may maintain what you are answerable for.
 ///
+/// This reasoning stops at the boundary `RBAC_MODEL.md`'s *Dispatch configuration* clause draws.
+/// Ownership is a route this codebase adds on top of R2, not one R2 itself provides — and that
+/// clause states dispatch-config edits are governed by R2 **in full**, with no such addition. See
+/// [`guard_dispatch_configuration`] for the guard that enforces the narrower rule on those two
+/// fields specifically.
+///
 /// # What ownership is *not* sufficient for
 ///
 /// **Delegation.** Granting or revoking another key's rights on this hook is not reachable through
@@ -134,6 +141,8 @@ pub(crate) async fn guard_execute(
 /// still require R2 in full. Owning a hook makes you answerable for it; it does not make you an
 /// administrator of credentials, which is what handing out verbs on it amounts to. A Daughter owner
 /// can therefore edit its own hook and cannot widen anyone's access to it, including its own.
+///
+/// **Dispatch configuration** — see above and [`guard_dispatch_configuration`].
 ///
 /// # Why the owner check runs before the conjunction
 ///
@@ -159,7 +168,8 @@ pub(crate) async fn guard_execute(
 /// about "a `can_manage = true` row for that specific resource" and a resource that does not yet
 /// exist can have no row. Creation rights and management rights remain separate powers — but a
 /// creator is recorded as `owner_key_id`, so route 2 above is what lets it keep maintaining its own
-/// work without also being made a Parent.
+/// *general content* without also being made a Parent. It does not let it keep maintaining dispatch
+/// configuration past that scope being revoked; see [`guard_dispatch_configuration`].
 pub(crate) async fn guard_manage(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
@@ -169,6 +179,49 @@ pub(crate) async fn guard_manage(
         return Ok(());
     }
     if hook.owner_key_id == Some(key.id) {
+        return Ok(());
+    }
+    guard_hook_manage_conjunction(db, key, hook.id).await?;
+    Ok(())
+}
+
+/// **§3's "Dispatch configuration" clause — R2 in full, with no ownership exception.**
+///
+/// `RBAC_MODEL.md` names `script_path` and `run_as_user` this service's dispatch configuration —
+/// "what the service executes or where it dispatches" — and states plainly that editing it "is a
+/// management action on that resource and is governed by R2 in full." Ownership is not part of R2's
+/// conjunction (`can_manage_keys` *and* a `can_manage = true` row); it is a **third route**
+/// [`guard_manage`] adds on top of R2 for every other field. This guard is what keeps that addition
+/// from reaching the two fields the specification explicitly carves out of it.
+///
+/// # Why this exists: revocation must be containment
+///
+/// Before this guard, `update_hook` called only [`guard_manage`], whose ownership route requires
+/// nothing beyond `hooks.owner_key_id == key.id`. Walk the sequence that enabled:
+///
+/// 1. Master grants a Daughter `can_manage_hooks` (legitimate — R4).
+/// 2. The Daughter creates a hook. `owner_key_id` is set to itself, and creation auto-provisions a
+///    `can_manage = true` permission row on the hook it just made.
+/// 3. Master **revokes** `can_manage_hooks` — the containment action, taken because the Daughter
+///    should no longer be trusted to define what runs on this host.
+/// 4. The row from step 2 and the ownership column from step 2 are both untouched by step 3.
+///    `guard_manage`'s ownership route asks for neither `can_manage_hooks` nor `can_manage_keys`, so
+///    the Daughter can still `PUT` a new `script_path` — pointing the hook at an arbitrary
+///    absolute, traversal-free path (`ALLOWED_SCRIPT_ROOTS` is empty by default) — and then execute
+///    it with the `can_execute` half of the same still-live permission row.
+///
+/// Revoking a scope that does not revoke the holder's ability to redefine what code runs is not
+/// containment; it is bookkeeping. This guard closes exactly that gap, and only for the two fields
+/// the specification names: master and a caller currently holding R2's full conjunction on this
+/// specific hook both still pass. Every other field — description, timeout, the parameter contract —
+/// stays governed by [`guard_manage`]'s wider ownership route, since `RBAC_MODEL.md` draws the
+/// stricter line at dispatch configuration specifically, not at hook editing in general.
+pub(crate) async fn guard_dispatch_configuration(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    hook: &hook::Model,
+) -> Result<(), AppError> {
+    if key.is_master {
         return Ok(());
     }
     guard_hook_manage_conjunction(db, key, hook.id).await?;
@@ -405,6 +458,47 @@ pub(crate) fn guard_master_to_grant_scopes(
     )))
 }
 
+/// **Mandatory `CANONICAL_V1` for `can_manage_keys`.** Refuses granting the global key-management
+/// scope to a key whose signature verification mode is `BODY_ONLY`.
+///
+/// `can_manage_keys` is the scope that lets a key mint, delegate to, and administer every other
+/// credential in the deployment (R4) — it is the highest-value target in the system short of
+/// `is_master` itself. `BODY_ONLY` carries no timestamp and therefore no replay window: a captured
+/// request against a `BODY_ONLY` key is replayable indefinitely. Pairing the two is not a
+/// hypothetical risk to note and move past; it is the one combination this function exists to make
+/// unreachable.
+///
+/// # Why this is checked at grant time rather than left as documentation
+///
+/// `hmac_mode` is immutable after creation (`CreateApiKeyPayload`'s field doc; `UpdateApiKeyPayload`
+/// carries no `hmac_mode` field at all). That immutability is what makes a *creation-time-only*
+/// check sufficient and correct: a key that passes this guard when `can_manage_keys` is granted
+/// cannot later have its `hmac_mode` weakened out from under that grant, because nothing can change
+/// it at all. Without the immutability this guard would only be checking a snapshot; with it, the
+/// combination it refuses can never arise later either.
+///
+/// # Where this is called
+///
+/// Both `create_api_key` and `update_api_key`, immediately after [`guard_master_to_grant_scopes`] —
+/// R4 (who may grant `can_manage_keys` at all) is checked first, and this is the narrower rule about
+/// *what else must be true* for that grant to be safe. At update time the caller passes the target's
+/// **current** `hmac_mode`, not a payload value — there is no payload value to pass, by the
+/// immutability guarantee above.
+pub(crate) fn guard_canonical_v1_for_key_management(
+    can_manage_keys: bool,
+    hmac_mode: api_key::HmacMode,
+) -> Result<(), AppError> {
+    if can_manage_keys && hmac_mode != api_key::HmacMode::CanonicalV1 {
+        return Err(AppError::InvalidInput(
+            "can_manage_keys requires hmac_mode = CANONICAL_V1: a key that can administer other \
+             credentials must not opt out of replay protection. Create or promote it as a \
+             CANONICAL_V1 key, or leave can_manage_keys unset."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Rejects a non-master caller acting on a key that is itself master.
 ///
 /// Rotation returns the new plaintext secret in its response, so "rotate the master key" was a
@@ -473,10 +567,11 @@ pub(crate) fn refuse_master_lifecycle_action(target: &api_key::Model, action: &s
 /// from moves — and it is the one field that can only ever *reduce* the credential's usefulness to
 /// an attacker who lacks the operator's network position.
 ///
-/// Every other field fails that test. `name` rewrites what the audit log calls the root of trust;
-/// `max_concurrent_jobs` is a resource lever; `hmac_mode` could downgrade the master to
-/// `BODY_ONLY`, which carries no replay protection at all. None of them has a reason to be
-/// reachable, so none of them is.
+/// Every other reachable field fails that test. `name` rewrites what the audit log calls the root
+/// of trust; `max_concurrent_jobs` is a resource lever. `hmac_mode` no longer needs a guard here at
+/// all — it is not a field on `UpdateApiKeyPayload` for *any* key, master included, so a downgrade
+/// to `BODY_ONLY` (no replay protection) cannot be requested through this route in the first place.
+/// None of the remaining fields has a reason to be reachable, so none of them is.
 ///
 /// The `key.id != target.id` arm is unreachable while exactly one master row exists, and is
 /// written anyway: it is the assertion that keeps §5's "which it alone may edit" true by
@@ -496,10 +591,12 @@ pub(crate) fn guard_master_self_edit_is_bound_ips_only(
         ));
     }
 
-    let other_fields: [(&str, bool); 4] = [
+    // `hmac_mode` is absent from this list on purpose, not by oversight: it is no longer a field
+    // on `UpdateApiKeyPayload` at all (immutable after creation, for every key), so there is nothing
+    // here to check — `deny_unknown_fields` refuses the attempt before this function ever runs.
+    let other_fields: [(&str, bool); 3] = [
         ("name", payload.name.is_some()),
         ("max_concurrent_jobs", payload.max_concurrent_jobs.is_some()),
-        ("hmac_mode", payload.hmac_mode.is_some()),
         ("can_manage_keys", payload.can_manage_keys.is_some()),
     ];
     let requested = other_fields

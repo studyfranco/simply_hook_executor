@@ -337,6 +337,43 @@ pub fn signed_request_at(
     .expect("request builds")
 }
 
+/// A per-test monotonic clock for [`signed_send`], seeded at "now" and ticking backwards one
+/// second per call. `HashMap<Uuid, Digest>`-based replay protection rejects a *second* use of an
+/// identical signature, and repeated calls with the same key against the same route inside one test
+/// can otherwise land in the same wall-clock second — a real collision, not a test artifact, since
+/// two genuinely different actions producing the same signature is exactly what CANONICAL_V1 is
+/// supposed to make impossible. Ticking backwards rather than forwards keeps every timestamp inside
+/// the signature max-age window for the whole test, however many calls it makes.
+pub fn signing_clock() -> i64 {
+    now_timestamp() + 1
+}
+
+/// Sends a request signed as `key`, consuming one tick of `clock`.
+///
+/// Exists because hardening added in this codebase's history requires every `can_manage_keys`
+/// holder to sign — `guard_canonical_v1_for_key_management` guarantees such a key is always
+/// `CANONICAL_V1`, and `auth_middleware` makes signing mandatory for it regardless of
+/// `REQUIRE_SIGNED_REQUESTS`. A Parent-tier test identity can therefore no longer authenticate with
+/// a bare bearer key the way an ordinary Daughter still can; this is the signed equivalent of
+/// `json_request` for exactly that identity.
+///
+/// Declare one `clock` with [`signing_clock`] per test and thread it through every call that needs
+/// one — including calls to *different* keys, since the clock's only job is producing distinct
+/// timestamps, not modelling wall-clock time for any one key.
+pub async fn signed_send(
+    app: &axum::Router,
+    clock: &mut i64,
+    method: &str,
+    uri: &str,
+    key: &SeededKey,
+    body: Option<serde_json::Value>,
+) -> TestResponse {
+    *clock -= 1;
+    let body_str = body.map(|v| v.to_string()).unwrap_or_default();
+    let req = signed_request_at(method, uri, &key.plaintext, &key.signing_secret, &body_str, *clock);
+    send(app, req).await
+}
+
 /// Computes a BODY_ONLY signature: HMAC over the raw body alone, with no canonical prefix.
 pub fn sign_body_only(signing_secret: &str, body: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};

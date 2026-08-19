@@ -242,6 +242,7 @@ pub async fn test_hook(
 
 /// Query parameters for the execution history listing.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionQuery {
     /// Restrict to a single hook, by UUID or name.
     pub hook: Option<String>,
@@ -387,6 +388,7 @@ pub async fn delete_execution(
 
 /// Query parameters for the manual history purge.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PurgeQuery {
     /// Age threshold in days. Defaults to the configured `LOG_RETENTION_DAYS`.
     ///

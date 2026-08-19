@@ -45,8 +45,9 @@ use crate::state::AppState;
 
 
 use super::guards::{
-    guard_delegated_hook_grant, has_permission_admin_standing, hook_permission,
-    is_permission_reduction, refuse_master_lifecycle_action, guard_hook_manage_conjunction,
+    guard_canonical_v1_for_key_management, guard_delegated_hook_grant,
+    has_permission_admin_standing, hook_permission, is_permission_reduction,
+    refuse_master_lifecycle_action, guard_hook_manage_conjunction,
     guard_master_for_privileged_hook, guard_master_self_edit_is_bound_ips_only,
     guard_master_to_administer, guard_master_to_grant_scopes,
 };
@@ -320,6 +321,12 @@ pub struct CreateApiKeyPayload {
     pub max_concurrent_jobs: Option<i32>,
     /// Signature verification mode. Defaults to `CANONICAL_V1`; `BODY_ONLY` opts out of replay
     /// protection for third-party webhook senders whose format cannot be changed.
+    ///
+    /// **Fixed for the key's entire life.** Set here or never; `UpdateApiKeyPayload` carries no
+    /// `hmac_mode` field at all, so there is no request that can change it later. A security level a
+    /// key can downgrade itself into (or be downgraded into) after the fact is not a fixed level —
+    /// this is the guarantee `can_manage_keys` below leans on: once granted to a `CANONICAL_V1` key,
+    /// it cannot be left holding that scope while quietly weakened to `BODY_ONLY`.
     pub hmac_mode: Option<HmacMode>,
     /// Global key-management scope.
     pub can_manage_keys: Option<bool>,
@@ -484,6 +491,12 @@ pub async fn create_api_key(
     // some unrelated field in the same payload.
     guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
+    // Computed here, ahead of the other field validation below, so the mandatory-CANONICAL_V1
+    // guard can run in the same "authorization before validation" position as the guard above —
+    // and so it is set exactly once, since `hmac_mode` is immutable from here on.
+    let hmac_mode = payload.hmac_mode.unwrap_or_default();
+    guard_canonical_v1_for_key_management(payload.can_manage_keys.unwrap_or(false), hmac_mode)?;
+
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
     }
@@ -494,7 +507,6 @@ pub async fn create_api_key(
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     let (key_id, signing_secret, sealed_secret) = mint_signing_pair(&state.cipher)?;
-    let hmac_mode = payload.hmac_mode.unwrap_or_default();
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
@@ -615,8 +627,11 @@ pub struct UpdateApiKeyPayload {
     pub bound_ips: Option<String>,
     /// New concurrency budget.
     pub max_concurrent_jobs: Option<i32>,
-    /// New signature verification mode.
-    pub hmac_mode: Option<HmacMode>,
+    // No `hmac_mode`, deliberately. It is fixed at creation and immutable for the rest of the key's
+    // life — see the module note on `CreateApiKeyPayload`'s `hmac_mode` field for why. Removed from
+    // the payload type rather than accepted-and-ignored, for the same reason `is_master` is absent:
+    // `deny_unknown_fields` above is what turns an attempt to change it into a `400` naming the
+    // field, instead of a silently no-op `200` that leaves the caller believing it took effect.
     /// New key-management scope.
     pub can_manage_keys: Option<bool>,
     /// New hook-creation scope.
@@ -646,15 +661,20 @@ pub async fn update_api_key(
     // through this route regardless; the other two global scopes still need the gate.
     guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
+    // The *effective* can_manage_keys after this update, against the target's current — and, since
+    // `hmac_mode` is immutable, permanent — signature mode. An omitted `can_manage_keys` in the
+    // payload means "leave it as it is", so the target's own current value is the fallback rather
+    // than `false`; using `false` here would let this guard be bypassed by simply not mentioning
+    // the field on a key that already (illegitimately) held both.
+    let effective_can_manage_keys = payload.can_manage_keys.unwrap_or(target.can_manage_keys);
+    guard_canonical_v1_for_key_management(effective_can_manage_keys, target.hmac_mode)?;
+
     if let Some(bound_ips) = &payload.bound_ips {
         validate_bound_ips(bound_ips)?;
     }
     if let Some(jobs) = payload.max_concurrent_jobs {
         validate_concurrency(jobs)?;
     }
-
-    // Captured before `payload` is consumed field-by-field below.
-    let payload_hmac_mode = payload.hmac_mode;
 
     let mut active: api_key::ActiveModel = target.into();
     if let Some(name) = payload.name {
@@ -665,9 +685,6 @@ pub async fn update_api_key(
     }
     if let Some(jobs) = payload.max_concurrent_jobs {
         active.max_concurrent_jobs = Set(jobs);
-    }
-    if let Some(mode) = payload.hmac_mode {
-        active.hmac_mode = Set(mode);
     }
     if let Some(v) = payload.can_manage_keys {
         active.can_manage_keys = Set(v);
@@ -687,10 +704,7 @@ pub async fn update_api_key(
         client_ip.0,
         "KEY_UPDATE",
         Some(updated.name.clone()),
-        Some(match payload_hmac_mode {
-            Some(mode) => format!("Updated key {reference} ({})", describe_hmac_mode(mode)),
-            None => format!("Updated key {reference}"),
-        }),
+        Some(format!("Updated key {reference}")),
     )
     .await?;
 
@@ -1045,6 +1059,7 @@ pub async fn rotate_api_key(
 
 /// Input for granting a key rights over a hook.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookPermInput {
     /// Target hook, by UUID *or* name (a plain string, so a name here never trips Axum's
     /// deserialization). Provide this or `hook_name`, not both.

@@ -37,6 +37,7 @@ use super::DEFAULT_PAGE_LIMIT;
 
 /// Query parameters for the audit log listing.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditLogQuery {
     /// Filter by exact action type (e.g. `HOOK_EXECUTE`).
     pub action: Option<String>,

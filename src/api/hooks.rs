@@ -29,9 +29,9 @@ use crate::executor;
 
 use super::executions::PurgeQuery;
 use super::guards::{
-    guard_lifecycle_authority, guard_manage, guard_master_for_deleted_view,
-    hook_permission, normalize_run_as_user, guard_master_for_privileged_hook,
-    guard_visibility, visible_hook_ids,
+    guard_dispatch_configuration, guard_lifecycle_authority, guard_manage,
+    guard_master_for_deleted_view, hook_permission, normalize_run_as_user,
+    guard_master_for_privileged_hook, guard_visibility, visible_hook_ids,
 };
 use super::support::{
     create_audit_log, describe_privilege, format_reference, load_parameters,
@@ -44,6 +44,7 @@ use super::support::{
 
 /// A hook parameter declaration, as accepted on hook creation.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParameterInput {
     /// Variable name; must match `[A-Za-z_][A-Za-z0-9_]*`.
     pub param_key: String,
@@ -57,6 +58,7 @@ pub struct ParameterInput {
 
 /// Payload for creating a hook.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateHookPayload {
     /// Unique hook name.
     pub name: String,
@@ -76,6 +78,7 @@ pub struct CreateHookPayload {
 
 /// Payload for updating a hook. Every field is optional; omitted fields are left untouched.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateHookPayload {
     /// New name.
     pub name: Option<String>,
@@ -343,6 +346,7 @@ pub async fn create_hook(
 
 /// Query parameters for the hook listing.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListHooksQuery {
     /// Include soft-deleted hooks — the master's trash view. Defaults to `false`.
     pub include_deleted: Option<bool>,
@@ -412,6 +416,14 @@ pub async fn update_hook(
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
     guard_manage(&state.db, &key, &model).await?;
+    // RBAC_MODEL.md's Dispatch configuration clause governs `script_path` and `run_as_user` by R2
+    // *in full*, with no ownership exception — a narrower rule than `guard_manage`'s own, which
+    // lets the owner through on ownership alone. Checked as its own step, before validation, so an
+    // owner whose `can_manage_hooks` was revoked is refused here rather than by a guard further
+    // down that happens to also catch it for an unrelated reason.
+    if payload.script_path.is_some() || payload.run_as_user.is_some() {
+        guard_dispatch_configuration(&state.db, &key, &model).await?;
+    }
     // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
     // elevate. `script_path`, the timeout, and the name all decide what executes with the borrowed
     // privileges, so guarding one field while leaving the rest writable protected nothing.
@@ -529,6 +541,7 @@ pub async fn update_hook(
 
 /// Query parameters for `DELETE /api/hooks/{identifier}`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteHookQuery {
     /// Drop the row outright instead of moving it to the trash. Master-only.
     pub hard: Option<bool>,
@@ -742,6 +755,7 @@ pub async fn purge_deleted_hooks(
 
 /// Payload for updating an existing parameter declaration.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateParameterPayload {
     /// New description.
     pub description: Option<String>,
