@@ -6409,3 +6409,136 @@ non-master `can_manage_keys` holder without signing — 33 in `tests/hook_execut
 **289 passed / 0 failed / 2 ignored** across all 9 binaries · `cargo test -- --ignored` **2 passed** ·
 `./scripts/test_e2e.sh` **958 passed / 0 failed** · `./scripts/verify_convergence.sh` **18 converged,
 1 known divergence (pre-existing, unrelated), 0 drifted**, exit 0.
+
+---
+
+# 2026-08-19 (second pass) — Per-hook inbound authentication modes (`Hook.auth_mode`)
+
+A brief asked to bring `simply_ip_vault`'s `AuthMode` enum (`CANONICAL_V1`/`HMAC_ONLY`/
+`API_KEY_ONLY`/`NONE`) to this service, framed as "aligning inbound webhook authentication modes with
+`simply_ip_vault` outbound dispatch modes." The premise was checked before implementing, per this
+session's established pattern.
+
+## What was verified
+
+`simply_ip_vault` genuinely has this exact four-variant `AuthMode` — but on `WebhookConfig`, governing
+how the **vault itself signs outbound dispatches it originates**. This service has no outbound
+dispatch concept at all; it receives inbound requests to run local scripts. Bringing the *shape* of
+that enum here to govern *inbound* authentication of hook-invocation requests is a coherent, legitimate
+feature — but it is not a structural port of an existing capability, and unlike earlier "harmonize"
+briefs this session, it required real new design work rather than correction of a false premise.
+
+Given the scale (new migration, two entities' worth of design questions, a middleware
+architecture change, and a change that — done carelessly — would add an unauthenticated
+arbitrary-script-execution surface to a security-hardened codebase) three questions were put to the
+user via `AskUserQuestion` before writing any code:
+
+1. **Does `auth_mode` replace `ApiKey.hmac_mode`, or is it hook-only?** `NONE`/`API_KEY_ONLY` are
+   incoherent as properties of a credential object (authenticated by what?). **Answered: hook-only.**
+   `ApiKey.hmac_mode` (`CANONICAL_V1`/`BodyOnly`) is completely unchanged by this feature.
+2. **Should setting a hook to `NONE`/`HMAC_ONLY` require Master?** **Answered: no** — any key with
+   ordinary hook-management authority (`guard_manage`: master, owner, or the full R2 conjunction) may
+   set it, with the deployment's own `REQUIRE_SIGNED_REQUESTS` flag as the system-wide safety rail: a
+   hook set to `NONE` still refuses keyless access wherever `REQUIRE_SIGNED_REQUESTS=true`.
+3. **Route scope?** **Answered: the three hook-invocation routes only** —
+   `POST /api/hooks/{id}/execute`, `POST /api/hooks/{id}/test`, `POST /webhook/{identifier}`. Every
+   other `/api/*` route (key CRUD, hook CRUD, audit logs, settings) keeps today's unconditional
+   `X-API-Key` requirement, unchanged.
+
+The user's answer to (1) also specified the exact dual-path authorization model implemented below,
+in enough detail that no further design questions were asked; one genuine gap in that design — what a
+hook's own `canonical_template` should mean, given a keyed caller bypasses `auth_mode` entirely — was
+resolved by inference rather than a fourth round-trip: it overrides the canonical string a *keyed*
+`CANONICAL_V1` caller's signature is verified against, scoped to hooks whose own `auth_mode` stays
+`CANONICAL_V1`, which is the one reading that makes the field load-bearing rather than accepted, and
+never reached.
+
+## What was built
+
+**Schema** (`m20260819_120414_add_hook_auth_mode`): `hooks.auth_mode` (`NOT NULL DEFAULT
+'CANONICAL_V1'`) plus four nullable refinements — `hmac_secret` (encrypted at rest, same mechanism as
+`api_keys.signing_secret`), `signature_header`, `signature_prefix`, `canonical_template`.
+`entities/hook.rs` gained the `AuthMode` enum; the Rust variant for `NONE` is spelled `NoAuth` (with
+an explicit `#[serde(rename = "NONE")]`) to avoid colliding with `Option::None` in every match arm
+that touches both — the DB/wire spelling is `NONE`.
+
+**Middleware** (`src/middleware.rs`, restructured): the former single `auth_middleware` function's
+body — key lookup, signature verification, `bound_ips` — was extracted into `authenticate_bearer_key`,
+shared by two callers. `auth_middleware` (unchanged behavior) covers every administrative route.
+`invocation_auth_middleware` (new) covers the three invocation routes: `X-API-Key` present delegates
+straight to `authenticate_bearer_key`, exactly as before; absent, it resolves the target hook from the
+request path (`hook_identifier_from_path`, a pure function over the already-nest-stripped path) and
+authorizes per its `auth_mode`, per the table in `AGENT.MD`'s new "Per-Hook Keyless Authentication"
+section. `src/lib.rs`'s router now splits `admin_routes` (unchanged middleware) from
+`hook_invocation_routes` (new middleware), merged before the `/api` nest; `webhook_routes` moved to
+the same new middleware.
+
+**Handlers**: `execute_hook_endpoint`, `test_hook`, `webhook_execute` now take
+`Option<Extension<api_key::Model>>`. `run_hook_request`/`test_hook` skip `guard_execute` entirely for
+`None` — there is no permission row to check, and the hook's `auth_mode` already authorized the
+request. `executor::execute_hook` takes `Option<&api_key::Model>`; a keyless invocation skips
+per-key `max_concurrent_jobs` throttling (nothing to throttle against) but is otherwise unexempted —
+`ensure_runnable`, script-root confinement, the body ceiling, and the process timeout all still apply.
+A new `create_audit_log_anonymous` (`api/support.rs`) writes a fixed sentinel attribution
+(`"(keyless: <hook>)"` / `"(none)"`) rather than relaxing the audit log's `NOT NULL` attribution
+columns — distinguishable from a deleted key's trail, which keeps that key's real name.
+
+**`hooks.rs` DTOs**: `CreateHookPayload`/`UpdateHookPayload` gained the five fields.
+`validate_and_seal_hmac_secret` refuses landing a hook in `HMAC_ONLY` with no secret configured,
+checked against the *effective* mode/secret (payload's, else the row's existing one) so both "create
+as HMAC_ONLY with none" and "switch an existing hook to HMAC_ONLY that never had one" are caught.
+`auth_mode`/`canonical_template`/etc. are edited via ordinary `guard_manage` (general content), not
+`guard_dispatch_configuration` — `RBAC_MODEL.md`'s Terminology section names only `script_path`/
+`run_as_user` as dispatch configuration, so this required no reinterpretation of that section and
+needed no change to `RBAC_MODEL.md` itself (read-only, untouched).
+
+**`crypto.rs`**: `verify_signature` generalized into `verify_signature_with_prefix` (the original
+becomes a thin wrapper over the fixed `SIGNATURE_PREFIX`), for `hooks.signature_prefix`.
+`render_canonical_template` substitutes `{method}`/`{path}`/`{timestamp}`/`{body}` textually; `{body}`
+is UTF-8-decoded lossily since a template is necessarily a `String` — a documented limitation for
+hooks using a custom template against non-UTF-8 bodies, not a bug in the default (byte-exact) path.
+
+## A real bug caught by the new tests, not by review
+
+`AuthMode::NoAuth` initially had only `#[sea_orm(string_value = "NONE")]` — the *database* spelling.
+Serde's `rename_all = "SCREAMING_SNAKE_CASE"` on the enum derives the *wire* spelling from the Rust
+identifier by default, so without an explicit `#[serde(rename = "NONE")]` the JSON API accepted/emitted
+`NO_AUTH` instead of `NONE`. `none_mode_is_keyless_reachable_only_when_signing_is_not_globally_mandatory`
+(`tests/auth_mode_tests.rs`) failed on first run with exactly that mismatch in the error body; fixed by
+adding the explicit rename.
+
+## A structural mistake caught by `verify_convergence.sh`, not by review
+
+The new `hook_identifier_from_path` function's unit tests were placed in their own `#[cfg(test)] mod`
+immediately after the function, mid-file — everywhere else in this crate, a file's tests live in one
+trailing `mod tests` block at the end. `scripts/verify_convergence.sh`'s `production_source` helper
+(`awk '/^#\[cfg\(test\)\]/ { exit }'`) assumes exactly that convention: it stops scanning at the
+**first** `#[cfg(test)]` line, so the mid-file block silently hid every function defined after it —
+including the real `OriginalUri` usage — from every later drift check in the script, flagging a false
+`[DRIFT]` on "Canonicalization reads the original URI". Fixed by moving the new tests into the
+existing trailing `mod tests` block, restoring the one-test-module-per-file convention rather than
+patching the script — the convention is what every other file in this crate already follows, and the
+script's assumption is a reasonable one to keep.
+
+## Tests
+
+`tests/auth_mode_tests.rs` (new, 8 tests): custom `canonical_template` verified and its absence
+falling back to the default; `auth_mode`/`canonical_template` rejected as unknown fields on `ApiKey`
+payloads (`deny_unknown_fields` — confirming the hook-only design holds at the wire level, not just in
+the Rust types); a `can_manage_keys` holder still forced to sign on an invocation route
+(`authenticate_bearer_key` sharing confirmed under the new dual-path middleware); `NONE` gated
+correctly by `REQUIRE_SIGNED_REQUESTS` in both directions, with the blocked case proven
+indistinguishable from "no such hook"; `HMAC_ONLY` verified against a hook-level secret, custom
+header, and custom prefix, with wrong-secret/wrong-header/no-signature all separately refused;
+`HMAC_ONLY` refused at both creation and update without a secret; `API_KEY_ONLY` proven to refuse a
+keyless caller identically to `CANONICAL_V1` while accepting any permitted key exactly as
+`CANONICAL_V1` does.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**300 passed / 0 failed / 2 ignored** across all binaries (`auth_mode_tests` is the new one, 8
+passing) · `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **958 passed / 0 failed** — the pre-existing suite,
+entirely unaffected, plus the new `auth_mode`/`hmac_secret_configured`/etc. fields now visible in every
+hook response · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing,
+unrelated), 0 drifted** after the mid-file-test-module fix above.

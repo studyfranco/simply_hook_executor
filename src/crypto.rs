@@ -172,12 +172,25 @@ pub fn verify_signature(
     payload: &[u8],
     provided: &str,
 ) -> Result<Vec<u8>, SignatureRejection> {
+    verify_signature_with_prefix(secret, payload, provided, SIGNATURE_PREFIX)
+}
+
+/// [`verify_signature`], generalized to a caller-supplied prefix.
+///
+/// Exists for `hooks.signature_prefix`: an `HMAC_ONLY` hook may configure a prefix other than
+/// [`SIGNATURE_PREFIX`] (a third-party sender's own convention), while every other caller in this
+/// crate keeps using the fixed one through [`verify_signature`] above. The stripping, decoding and
+/// constant-time comparison are otherwise identical — see [`verify_signature`]'s doc comment for why
+/// each step is shaped the way it is.
+pub fn verify_signature_with_prefix(
+    secret: &str,
+    payload: &[u8],
+    provided: &str,
+    prefix: &str,
+) -> Result<Vec<u8>, SignatureRejection> {
     // The prefix is required, not merely tolerated: a `None` here ends verification rather than
     // falling back to treating the whole value as hex.
-    let hex_digest = provided
-        .trim()
-        .strip_prefix(SIGNATURE_PREFIX)
-        .ok_or(SignatureRejection::MissingPrefix)?;
+    let hex_digest = provided.trim().strip_prefix(prefix).ok_or(SignatureRejection::MissingPrefix)?;
     let provided_bytes =
         hex::decode(hex_digest.trim()).map_err(|_| SignatureRejection::MalformedHex)?;
 
@@ -188,6 +201,40 @@ pub fn verify_signature(
         .map_err(|_| SignatureRejection::Mismatch)?;
 
     Ok(provided_bytes)
+}
+
+/// The `canonical_template` used when a `CANONICAL_V1` hook leaves the column `NULL`, spelled out
+/// as a template string in the same shape [`canonical_v1_payload`] builds directly. The two must
+/// stay equivalent: this constant is what [`hooks.canonical_template`] documents itself against, and
+/// [`canonical_v1_payload`] is what every route with no hook-level override actually signs.
+pub const DEFAULT_CANONICAL_TEMPLATE: &str = "{method}\n{path}\n{timestamp}\n{body}";
+
+/// Renders a hook's custom canonical template, substituting `{method}`, `{path}`, `{timestamp}` and
+/// `{body}`.
+///
+/// Substitution is purely textual — `body` is decoded as UTF-8 on a best-effort basis (invalid bytes
+/// become the Unicode replacement character) since a template is necessarily a `String`, and an
+/// unrecognized `{placeholder}` is left in the output verbatim rather than rejected. A template is
+/// data the hook's operator supplies and is responsible for; this function does not validate its
+/// shape beyond performing the substitution, matching [`hooks.canonical_template`]'s documented
+/// contract.
+///
+/// Returns bytes, not `String`, for the same reason [`canonical_v1_payload`] does: the result is
+/// HMAC key material, not text to be displayed.
+pub fn render_canonical_template(
+    template: &str,
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    body: &[u8],
+) -> Vec<u8> {
+    let body_text = String::from_utf8_lossy(body);
+    template
+        .replace("{method}", method)
+        .replace("{path}", path)
+        .replace("{timestamp}", timestamp)
+        .replace("{body}", &body_text)
+        .into_bytes()
 }
 
 // ─────────────────────────────────────────────────────────────

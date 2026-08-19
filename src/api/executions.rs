@@ -34,7 +34,8 @@ use super::guards::{
     guard_visibility,
 };
 use super::support::{
-    create_audit_log, extract_parameter_map, format_reference, load_parameters, resolve_hook,
+    create_audit_log, create_audit_log_anonymous, extract_parameter_map, format_reference,
+    load_parameters, resolve_hook,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -94,15 +95,23 @@ impl ExecutionView {
 }
 
 /// Shared implementation behind `POST /api/hooks/{id}/execute` and `POST /webhook/{id}`.
+///
+/// `key` is `None` exactly when [`crate::middleware::invocation_auth_middleware`] authorized the
+/// caller through the target hook's own `auth_mode` (`HMAC_ONLY` or `NONE`) rather than through a
+/// bearer key — see that middleware's doc comment. In that case `guard_execute`'s per-key
+/// `can_execute` check is skipped entirely: there is no key to hold a permission row, and the
+/// hook's `auth_mode` is itself the authorization for a keyless caller.
 pub(crate) async fn run_hook_request(
     state: AppState,
-    key: api_key::Model,
+    key: Option<api_key::Model>,
     client_ip: std::net::IpAddr,
     identifier: &str,
     body: &[u8],
 ) -> Result<axum::response::Response, AppError> {
     let hook_model = resolve_hook(&state.db, identifier).await?;
-    guard_execute(&state.db, &key, hook_model.id).await?;
+    if let Some(key) = &key {
+        guard_execute(&state.db, key, hook_model.id).await?;
+    }
 
     let supplied = extract_parameter_map(body)?;
     let declared = load_parameters(&state.db, hook_model.id).await?;
@@ -115,22 +124,38 @@ pub(crate) async fn run_hook_request(
         )));
     }
 
-    let record = executor::execute_hook(&state, &hook_model, &key, &resolved).await?;
+    let record = executor::execute_hook(&state, &hook_model, key.as_ref(), &resolved).await?;
 
-    create_audit_log(
-        &state.db,
-        &key,
-        client_ip,
-        "HOOK_EXECUTE",
-        Some(hook_model.name.clone()),
-        Some(format!(
-            "Executed hook {} -> {:?} in {}ms",
-            format_reference(&hook_model.name, hook_model.id),
-            record.status,
-            record.duration_ms
-        )),
-    )
-    .await?;
+    let details = Some(format!(
+        "Executed hook {} -> {:?} in {}ms",
+        format_reference(&hook_model.name, hook_model.id),
+        record.status,
+        record.duration_ms
+    ));
+    match &key {
+        Some(key) => {
+            create_audit_log(
+                &state.db,
+                key,
+                client_ip,
+                "HOOK_EXECUTE",
+                Some(hook_model.name.clone()),
+                details,
+            )
+            .await?;
+        }
+        None => {
+            create_audit_log_anonymous(
+                &state.db,
+                &hook_model.name,
+                client_ip,
+                "HOOK_EXECUTE",
+                Some(hook_model.name.clone()),
+                details,
+            )
+            .await?;
+        }
+    }
 
     // `200 OK` reports that the *request* was carried out; whether the script itself succeeded is
     // the `status`/`exit_code` in the body. A non-zero script exit is a legitimate, fully-recorded
@@ -143,26 +168,30 @@ pub(crate) async fn run_hook_request(
 /// The body is taken as raw [`axum::body::Bytes`] rather than a typed `Json<T>` so the two
 /// accepted payload shapes (see [`extract_parameter_map`]) both work, and so an empty body is a
 /// valid "no parameters" request instead of a deserialization error.
+///
+/// `key` is `Option` rather than mandatory — see [`run_hook_request`] — because this is one of the
+/// two `/api/hooks/{id}` routes (with `test`) that [`crate::middleware::invocation_auth_middleware`]
+/// may authorize without one.
 pub async fn execute_hook_endpoint(
     State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
+    key: Option<Extension<api_key::Model>>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key, client_ip.0, &identifier, &body).await
+    run_hook_request(state, key.map(|Extension(k)| k), client_ip.0, &identifier, &body).await
 }
 
 /// Handles `POST /webhook/{identifier}` — the webhook-facing alias of the execute endpoint, for
 /// third-party senders that post their own flat JSON document to a fixed URL.
 pub async fn webhook_execute(
     State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
+    key: Option<Extension<api_key::Model>>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key, client_ip.0, &identifier, &body).await
+    run_hook_request(state, key.map(|Extension(k)| k), client_ip.0, &identifier, &body).await
 }
 
 /// Dry-run preview returned by `POST /api/hooks/{id}/test`.
@@ -189,16 +218,23 @@ pub struct TestHookResponse {
 
 /// Handles `POST /api/hooks/{identifier}/test` — resolves parameters and renders the exact command
 /// that *would* run, without spawning anything.
+///
+/// `key` is `Option`, like [`execute_hook_endpoint`]: [`crate::middleware::invocation_auth_middleware`]
+/// may authorize a keyless caller through the target hook's `auth_mode`.
 pub async fn test_hook(
     State(state): State<AppState>,
-    Extension(key): Extension<api_key::Model>,
+    key: Option<Extension<api_key::Model>>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
     let hook_model = resolve_hook(&state.db, &identifier).await?;
     // `can_execute`, not merely visibility: a dry run reveals the fully-resolved command line and
     // the child's environment, which is execution-shaped knowledge even though nothing is spawned.
-    guard_execute(&state.db, &key, hook_model.id).await?;
+    // Skipped for a keyless caller, exactly as in `run_hook_request`: there is no key to hold a
+    // permission row, and the hook's own `auth_mode` is what authorized this request.
+    if let Some(Extension(key)) = &key {
+        guard_execute(&state.db, key, hook_model.id).await?;
+    }
 
     let supplied = extract_parameter_map(&body)?;
     let declared = load_parameters(&state.db, hook_model.id).await?;

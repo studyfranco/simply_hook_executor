@@ -3,6 +3,59 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// How a request that invokes this hook (`execute`, `test`, or the `/webhook/{identifier}` alias)
+/// must authenticate, for a caller presenting **no** `X-API-Key`.
+///
+/// A caller that *does* present a valid `X-API-Key` with `can_execute` on the hook is authenticated
+/// and authorized by the key itself — the key's own `hmac_mode` governs whether its signature is
+/// required, exactly as for every other route — and this field is not consulted at all for that
+/// caller. `auth_mode` only ever *adds* a way in for a keyless caller; it never removes the
+/// always-available keyed path.
+///
+/// Stored as a plain string rather than a native database enum, matching [`super::api_key::HmacMode`],
+/// so the schema stays portable across SQLite/PostgreSQL/MySQL without vendor-specific DDL.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumIter, DeriveActiveEnum, Serialize, Deserialize,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthMode {
+    /// **The default.** A keyless request is refused with `401`; only a caller presenting a valid,
+    /// permitted `X-API-Key` may invoke this hook.
+    ///
+    /// If [`Model::canonical_template`] is set, a *keyed* `CANONICAL_V1` caller's signature is
+    /// verified against that custom template instead of the service-wide default — scoping a
+    /// non-standard canonical string to this one hook rather than requiring every key in the
+    /// deployment to sign the same way.
+    #[default]
+    #[sea_orm(string_value = "CANONICAL_V1")]
+    CanonicalV1,
+    /// A keyless request is refused with `401`, identically to [`Self::CanonicalV1`] from a keyless
+    /// caller's perspective. The two modes exist to record different operator intent about what a
+    /// *keyed* caller is expected to present — `ApiKeyOnly` documents "a bearer key alone is
+    /// sufficient for this integration, it need not also sign" — but neither mode changes how a
+    /// keyed request is actually verified, which is governed entirely by the presenting key's own
+    /// `hmac_mode` and the deployment's `REQUIRE_SIGNED_REQUESTS` setting.
+    #[sea_orm(string_value = "API_KEY_ONLY")]
+    ApiKeyOnly,
+    /// A keyless request is accepted if it carries a valid signature over the raw body, verified
+    /// against [`Model::hmac_secret`] — this hook's own secret, never a key's. No `X-API-Key` and no
+    /// timestamp are involved, so there is **no anti-replay protection**: an intercepted request
+    /// stays valid forever. This is the GitHub/Forgejo/GitLab third-party webhook shape, and exists
+    /// solely to accept senders whose signature format cannot be changed.
+    #[sea_orm(string_value = "HMAC_ONLY")]
+    HmacOnly,
+    /// A keyless, unsigned request is accepted outright — **no authentication of any kind** — but
+    /// only when the deployment's `REQUIRE_SIGNED_REQUESTS` is `false`. A deployment that has opted
+    /// into mandatory signing globally is refusing exactly this shape of request everywhere else in
+    /// the API, and a hook set to `NONE` must not become the one door that setting does not cover.
+    /// Rust's `None` is deliberately not this variant's name — `Option::None` is spelled identically
+    /// and the collision would be a standing hazard in every match arm that touches both.
+    #[sea_orm(string_value = "NONE")]
+    #[serde(rename = "NONE")]
+    NoAuth,
+}
+
 /// A single hook: a named, permission-guarded pointer to a local executable.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "hooks")]
@@ -57,6 +110,34 @@ pub struct Model {
     pub created_at: DateTime,
     /// Hook last-update timestamp.
     pub updated_at: DateTime,
+    /// How a keyless caller must authenticate to invoke this hook. See [`AuthMode`].
+    pub auth_mode: AuthMode,
+    /// `HMAC_ONLY`'s signing secret, encrypted at rest through the same [`super::api_key::Model`]
+    /// mechanism as `signing_secret` — recomputing an HMAC needs the plaintext back, so it cannot be
+    /// hashed. `None` for every other [`AuthMode`]. **Never serialized**: unlike a key's plaintext,
+    /// which is shown once at creation and never again, this value is meant to be referenced (and
+    /// updated) repeatedly by whoever configures the hook, but it must still never leave the server
+    /// in a `GET` response — `hook::Model` is serialized directly to API clients, with no separate
+    /// safe-view type standing between the entity and the wire, so the field itself carries the
+    /// omission.
+    #[serde(skip_serializing)]
+    pub hmac_secret: Option<String>,
+    /// Header an `HMAC_ONLY` sender's signature arrives on. `None` means the built-in default,
+    /// `X-Signature-256` — apply the default at the point of use
+    /// ([`crate::middleware::HMAC_ONLY_DEFAULT_HEADER`]), not by writing the literal into every row,
+    /// so changing the default later does not require a data migration.
+    pub signature_header: Option<String>,
+    /// Prefix stripped from an `HMAC_ONLY` signature before hex-decoding it. `None` means the
+    /// built-in default, `sha256=` ([`crate::crypto::SIGNATURE_PREFIX`]).
+    pub signature_prefix: Option<String>,
+    /// Override of the `CANONICAL_V1` canonical string template, consulted only when a *keyed*
+    /// caller invokes a hook whose [`AuthMode`] is [`AuthMode::CanonicalV1`]. `None` means the
+    /// service-wide default, `{method}\n{path}\n{timestamp}\n{body}`
+    /// ([`crate::crypto::canonical_v1_payload`]). Recognized placeholders: `{method}`, `{path}`,
+    /// `{timestamp}`, `{body}`; substitution is textual, so an unrecognized `{...}` is left in the
+    /// signed material verbatim rather than rejected — a template is data the operator controls, not
+    /// something this service validates the shape of beyond that.
+    pub canonical_template: Option<String>,
 }
 
 /// Relations from `hooks` to other entities.

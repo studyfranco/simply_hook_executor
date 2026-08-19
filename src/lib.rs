@@ -63,12 +63,16 @@ use state::AppState;
 
 /// Builds the complete Axum router.
 ///
-/// Both the `/api/*` tree and the `/webhook/*` entry point sit behind
-/// [`middleware::auth_middleware`]. The public surface is exactly three things: the static SPA
-/// served from `static/`, and the `/health` and `/ready` probes — see [`api::health`] for why those
-/// two must not require a credential.
+/// Every `/api/*` route sits behind [`middleware::auth_middleware`] — a valid `X-API-Key` is always
+/// mandatory — **except** the three hook-invocation routes (`POST /api/hooks/{id}/execute`,
+/// `POST /api/hooks/{id}/test`, and `POST /webhook/{identifier}`), which sit behind
+/// [`middleware::invocation_auth_middleware`] instead: the only routes in this daemon that may
+/// authorize a caller presenting no key at all, governed per-hook by `hook::AuthMode`. The public
+/// surface beyond that is exactly three things: the static SPA served from `static/`, and the
+/// `/health` and `/ready` probes — see [`api::health`] for why those two must not require a
+/// credential.
 pub fn create_app(state: AppState) -> Router {
-    let api_routes = Router::new()
+    let admin_routes = Router::new()
         .route("/auth/me", get(api::get_me))
         // Hooks
         .route("/hooks", post(api::create_hook))
@@ -81,8 +85,6 @@ pub fn create_app(state: AppState) -> Router {
         .route("/hooks/{identifier}", delete(api::delete_hook))
         // Trash management. Both are master-only; see the handlers.
         .route("/hooks/{identifier}/restore", post(api::restore_hook))
-        .route("/hooks/{identifier}/execute", post(api::execute_hook_endpoint))
-        .route("/hooks/{identifier}/test", post(api::test_hook))
         // Hook parameters
         .route("/hooks/{identifier}/parameters", get(api::list_hook_parameters))
         .route("/hooks/{identifier}/parameters", post(api::create_hook_parameter))
@@ -114,13 +116,28 @@ pub fn create_app(state: AppState) -> Router {
             middleware::auth_middleware,
         ));
 
+    // The two routes that actually run a hook, split from `admin_routes` because they alone may
+    // accept a caller presenting no `X-API-Key` at all — see [`middleware::invocation_auth_middleware`].
+    // Every other `/api/*` route stays behind the always-mandatory-bearer-key `auth_middleware`
+    // above.
+    let hook_invocation_routes = Router::new()
+        .route("/hooks/{identifier}/execute", post(api::execute_hook_endpoint))
+        .route("/hooks/{identifier}/test", post(api::test_hook))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::invocation_auth_middleware,
+        ));
+
+    let api_routes = admin_routes.merge(hook_invocation_routes);
+
     // Webhook-facing alias of the execute endpoint, for third-party senders posting their own
-    // flat JSON to a fixed URL. Authenticated by the same middleware as `/api/*`.
+    // flat JSON to a fixed URL. Behind the same dual-path middleware as the two routes above, for
+    // the same reason: a third-party sender is exactly the caller `HMAC_ONLY` and `NONE` exist for.
     let webhook_routes = Router::new()
         .route("/{identifier}", post(api::webhook_execute))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            middleware::auth_middleware,
+            middleware::invocation_auth_middleware,
         ));
 
     // Monitoring probes, mounted on the root router *outside* both nests so no `from_fn_with_state`

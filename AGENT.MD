@@ -297,6 +297,65 @@ Rules the implementation MUST hold to:
   - `TRUSTED_PROXIES` defaults to **empty** (trust nothing). Honouring these headers unconditionally lets any client pick its own apparent source address, which defeats `bound_ips` outright and forges `audit_logs.client_ip` at the same time.
   - **A syntactically invalid entry is fatal.** An entry that parses as neither an IP, nor a CIDR range, nor even a plausible hostname aborts startup with `FATAL: TRUSTED_PROXIES entry '<entry>' is not a valid IP address, CIDR range, or hostname (<reason>). Refusing to start with an ambiguous trust boundary.` — the one exception to this module's otherwise lenient parsing, because it is the one override with no safe substitute. Dropping it with a warning (as the daemon previously did) leaves the operator believing a proxy is trusted while it is not, so requests through it are authorized against the *proxy's* address rather than the client's: a security boundary configured one way and enforced another. One bad entry condemns the whole list — a partially-applied trust boundary is exactly the ambiguity being refused — and the check runs **before** the database is opened, so a refused boot applies no migrations and mints no bootstrap master key. This is *typo versus timing*: contrast the unresolvable-hostname case above, which is well-formed, already fail-closed, self-correcting, and therefore never fatal.
 
+#### Per-Hook Keyless Authentication (`hooks.auth_mode`)
+
+Three routes — `POST /api/hooks/{id}/execute`, `POST /api/hooks/{id}/test`, and
+`POST /webhook/{identifier}` — are the **only** routes in this daemon that may authorize a caller
+presenting **no** `X-API-Key` at all, and they sit behind `middleware::invocation_auth_middleware`
+rather than `middleware::auth_middleware`. Every other route, including every other `/api/*` route,
+is unaffected: `X-API-Key` remains unconditionally mandatory there, exactly as before this feature
+existed.
+
+**Two paths, chosen by whether `X-API-Key` is present:**
+
+- **Keyed.** Identical to every other route: the key is resolved and authenticated exactly as
+  `auth_middleware` would, its own `hmac_mode` and the `can_manage_keys`/`REQUIRE_SIGNED_REQUESTS`
+  signing rules apply unchanged, and the handler's `guard_execute` checks the key's own `can_execute`
+  row. **The target hook's `auth_mode` is not consulted for this caller at all** — a valid, permitted
+  key is always sufficient, regardless of what the hook additionally accepts from callers with none.
+  The one exception: if the hook's own `auth_mode` is `CANONICAL_V1` and it has set a
+  `canonical_template`, a keyed `CANONICAL_V1` caller's signature is verified against that template
+  instead of the service-wide default — a per-hook override of the *signed material's shape*, not of
+  whether a key is required.
+- **Keyless.** The target hook is resolved from the request path and its `auth_mode` decides:
+
+  | `auth_mode` | Keyless caller |
+  | :--- | :--- |
+  | `CANONICAL_V1` *(default)* | Refused — a key is required |
+  | `API_KEY_ONLY` | Refused, identically to `CANONICAL_V1` — the two exist to record different operator intent about a *keyed* caller (see `entities/hook.rs::AuthMode`), not to open a keyless path |
+  | `HMAC_ONLY` | Accepted with a valid HMAC-SHA256 signature over the raw body, verified against `hooks.hmac_secret` (**never** a key's secret) on `hooks.signature_header`/`signature_prefix` or their defaults (`X-Signature-256` / `sha256=`). **No anti-replay protection** — no timestamp is involved, matching the GitHub/Forgejo/GitLab third-party webhook convention this mode exists for |
+  | `NONE` | Accepted outright — no authentication of any kind — but **only** when `REQUIRE_SIGNED_REQUESTS` is `false`. A deployment that opted into mandatory signing everywhere else must not have one hook silently exempted from it |
+
+**Oracle discipline extends to the keyless path.** Every refusal a keyless caller can receive — no
+such hook, a hook whose `auth_mode` requires a key, or a `NONE` hook currently blocked by
+`REQUIRE_SIGNED_REQUESTS` — returns the **exact same** `401` a missing `X-API-Key` produces on every
+other route. Distinguishing any of these would let an unauthenticated caller enumerate hook names,
+and which of those are configured for public access, purely by probing paths — the same class of
+oracle `RBAC_MODEL.md` §4 and the authenticate-then-authorize ordering close off for authenticated
+callers, extended here to the one surface that now accepts none at all. The single place this
+distinction is *not* made is once a caller has presented signature material for an `HMAC_ONLY` hook:
+a malformed or non-matching signature is reported specifically, exactly as an invalid signature is on
+every keyed route — a caller that already knows to try signing something has proven it knows more
+than a bare prober does.
+
+**`auth_mode` is not "dispatch configuration".** `RBAC_MODEL.md`'s Terminology section names only
+`script_path` and `run_as_user` as this service's dispatch configuration, governed by R2 in full with
+no ownership exception (SHE-1). `auth_mode` and its four supporting fields are edited through the
+ordinary `guard_manage` path instead — master, the hook's owner, or the full R2 conjunction — the
+same authority that already edits a hook's description or timeout. Setting a hook to `NONE` (public,
+zero-authentication script execution) is therefore reachable by anyone who may otherwise manage that
+hook, gated globally by the operator's own `REQUIRE_SIGNED_REQUESTS` setting rather than by a
+per-request scope check — a deliberate choice: modifying a hook is itself an authenticated
+administrative act, and an operator managing a specific integration is trusted to choose its
+authentication requirements the same way it is already trusted to choose `script_path`.
+
+**Keyless execution is not exempt from the rest of the pipeline.** `ensure_runnable`, script-root
+confinement, the request body ceiling, and the process timeout all still apply; the only thing a
+keyless invocation forgoes is per-key `max_concurrent_jobs` throttling, since there is no key to
+throttle against. Its execution record carries `api_key_id = NULL` and its audit log entry is
+attributed via a fixed sentinel (`create_audit_log_anonymous`) distinguishable from a deleted key's
+trail, which also carries `NULL` but keeps that key's real, point-in-time name.
+
 ### 2. Granular Multi-Tenant RBAC (M:N)
 
 - **Global Rights:** An `ApiKey` can be `is_master` (bypasses all checks) or hold global booleans (`can_manage_keys`, `can_manage_hooks`).
@@ -321,8 +380,8 @@ Rules the implementation MUST hold to:
 
 | Operation | Required |
 | :--- | :--- |
-| `POST /api/hooks/{id}/execute`, `POST /webhook/{id}` | `can_execute` |
-| `POST /api/hooks/{id}/test` (dry run) | `can_execute` — the preview reveals the fully-resolved command line and child environment, which is execution-shaped knowledge even though nothing is spawned |
+| `POST /api/hooks/{id}/execute`, `POST /webhook/{id}` | **A keyed caller**: `can_execute`. **A keyless caller**: authorized entirely by the target hook's `auth_mode` instead — see the Per-Hook Keyless Authentication section below. These are the only three routes (with `/test` below) where a request may reach a handler with no `api_key` row at all |
+| `POST /api/hooks/{id}/test` (dry run) | Same split as `/execute` — `can_execute` when keyed, `auth_mode` when not. The preview reveals the fully-resolved command line and child environment, which is execution-shaped knowledge even though nothing is spawned |
 | `GET /api/hooks`, `GET /api/hooks/{id}`, `GET .../parameters` | derived read: ownership, **or** any of `can_execute` / `can_manage` / `can_view_execution`. `can_view_execution` is included because history is unreadable without being able to name the hook that produced it; ownership is included because otherwise a hook could be editable by a key that cannot list it |
 | `GET /api/executions`, `GET /api/executions/{id}` | **Creator-private, four routes in** (§4 scope 3): `is_master`, **or** the acting key (`executions.api_key_id`), **or** the hook's `owner_key_id`, **or** a row on that hook carrying `can_view_execution` **or** `can_manage`. Anything else is `404`, byte-identical to a record that never existed. The listing expresses the same disjunction as an indexed `WHERE` rather than filtering after `LIMIT`, which would page wrongly — a limit applied before a visibility filter returns fewer than *n* visible rows and hides the rest behind an offset that never advances past them |
 | `PUT`/`PATCH`/`DELETE /api/hooks/{id}`, parameter CRUD, `DELETE /api/executions/{id}` — **general content** (`description`, timeout, parameter contract) | `is_master`, **or** the hook's `owner_key_id`, **or** global `can_manage_keys` **AND** a `can_manage = true` row on that hook. A bare row does not suffice: the Tiers matrix says a Daughter never manages resources. Note `DELETE /api/executions/{id}` is deliberately *stricter* than reading one: `can_view_execution` buys visibility of a record, never the right to destroy it — an auditor is not a redactor. §4 decides the status: no row and no ownership is `404` (invisible), a row short of a conjunct is `403` |

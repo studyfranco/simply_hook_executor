@@ -114,6 +114,15 @@ pub(crate) fn format_reference(name: &str, id: Uuid) -> String {
 /// An entity with no name of its own — an execution record — takes the name of the entity it hangs
 /// from, and puts its own id in `details`. Identifiers belong in `details`, formatted with
 /// [`format_reference`] so a name and a truncated id appear together.
+/// Who an audit log entry is attributed to — either a real key, or the keyless sentinel
+/// [`create_audit_log_anonymous`] writes. Bundled into one type so [`create_audit_log_inner`] stays
+/// under the arity clippy enforces, rather than growing a parameter per attribution column.
+struct Attribution<'a> {
+    api_key_id: Option<Uuid>,
+    api_key_name: &'a str,
+    api_key_prefix: &'a str,
+}
+
 pub(crate) async fn create_audit_log(
     db: &sea_orm::DatabaseConnection,
     key: &api_key::Model,
@@ -122,11 +131,53 @@ pub(crate) async fn create_audit_log(
     target_resource: Option<String>,
     details: Option<String>,
 ) -> Result<(), AppError> {
+    let attribution = Attribution {
+        api_key_id: Some(key.id),
+        api_key_name: &key.name,
+        api_key_prefix: &key.prefix,
+    };
+    create_audit_log_inner(db, attribution, client_ip, action, target_resource, details).await
+}
+
+/// [`create_audit_log`]'s counterpart for a keyless invocation — a hook whose `auth_mode` is
+/// `HMAC_ONLY` or `NONE`, authorized entirely by `middleware::invocation_auth_middleware` with no
+/// `api_key` row involved at all.
+///
+/// The three attribution columns stay `NOT NULL` (see [`create_audit_log`]'s doc comment on why that
+/// is load-bearing) by writing a fixed sentinel rather than relaxing the constraint. The sentinel is
+/// chosen to stay distinguishable from a *deleted* key's audit trail, which also carries `api_key_id
+/// = NULL` but keeps that key's real, point-in-time name and prefix — a reader filtering on this
+/// exact `api_key_prefix` value is asking "which invocations had no credential at all", a genuinely
+/// different question from "which invocations were made by a key since deleted".
+pub(crate) async fn create_audit_log_anonymous(
+    db: &sea_orm::DatabaseConnection,
+    hook_name: &str,
+    client_ip: std::net::IpAddr,
+    action: &str,
+    target_resource: Option<String>,
+    details: Option<String>,
+) -> Result<(), AppError> {
+    let attribution = Attribution {
+        api_key_id: None,
+        api_key_name: &format!("(keyless: {hook_name})"),
+        api_key_prefix: "(none)",
+    };
+    create_audit_log_inner(db, attribution, client_ip, action, target_resource, details).await
+}
+
+async fn create_audit_log_inner(
+    db: &sea_orm::DatabaseConnection,
+    attribution: Attribution<'_>,
+    client_ip: std::net::IpAddr,
+    action: &str,
+    target_resource: Option<String>,
+    details: Option<String>,
+) -> Result<(), AppError> {
     let log = audit_log::ActiveModel {
         id: Set(Uuid::new_v4()),
-        api_key_id: Set(Some(key.id)),
-        api_key_name: Set(key.name.clone()),
-        api_key_prefix: Set(key.prefix.clone()),
+        api_key_id: Set(attribution.api_key_id),
+        api_key_name: Set(attribution.api_key_name.to_owned()),
+        api_key_prefix: Set(attribution.api_key_prefix.to_owned()),
         client_ip: Set(client_ip.to_string()),
         action: Set(action.to_owned()),
         target_resource: Set(target_resource),

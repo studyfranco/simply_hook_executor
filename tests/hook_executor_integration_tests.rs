@@ -1866,6 +1866,11 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         deleted_by: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
+        auth_mode: Set(hook::AuthMode::CanonicalV1),
+        hmac_secret: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
+        canonical_template: Set(None),
     }
     .insert(&db)
     .await

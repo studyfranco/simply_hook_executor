@@ -13,8 +13,12 @@ use crate::config::resolve_client_ip;
 // The HMAC itself lives in `crate::crypto`, beside the secret it consumes and the cipher that
 // protects that secret at rest. This module decides *when* a signature is required and what a
 // caller is told when one fails; it no longer implements the primitive.
-use crate::crypto::{SignatureRejection, canonical_v1_payload, verify_signature};
+use crate::crypto::{
+    SIGNATURE_PREFIX, SignatureRejection, canonical_v1_payload, render_canonical_template,
+    verify_signature, verify_signature_with_prefix,
+};
 use crate::entities::api_key::HmacMode;
+use crate::entities::hook::{self, AuthMode};
 use crate::entities::prelude::ApiKey;
 use crate::error::AppError;
 use crate::state::AppState;
@@ -29,6 +33,9 @@ const SIGNATURE_HEADER: &str = "X-Signature-256";
 const HUB_SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
 /// Header carrying the Unix-seconds timestamp a signature was computed at.
 const TIMESTAMP_HEADER: &str = "X-Timestamp";
+/// Default signature header for a hook whose `auth_mode` is [`AuthMode::HmacOnly`] and which has
+/// not overridden [`crate::entities::hook::Model::signature_header`].
+pub const HMAC_ONLY_DEFAULT_HEADER: &str = "X-Signature-256";
 /// Largest request body that will be buffered in order to verify a signature. Signed payloads are
 /// small JSON documents; the bound stops an attacker from forcing unbounded buffering just by
 /// attaching a signature header.
@@ -182,62 +189,75 @@ fn recover_signing_secret(
     })
 }
 
-/// Enforces API key authentication, CIDR binding, and (when present) body signing for every
-/// `/api/*` and `/webhook/*` route.
+/// Recovers an `HMAC_ONLY` hook's own signing secret, the [`hook::Model`] counterpart of
+/// [`recover_signing_secret`]. An `HmacOnly` hook is guaranteed a secret by
+/// `validate_and_seal_hmac_secret` (`api/hooks.rs`) at write time, so the missing-secret case here
+/// is unreachable in practice; it is still reported as `AppError::Internal` rather than unwrapped,
+/// matching this crate's rule against panicking on a path an attacker can reach.
+fn recover_hook_secret(state: &AppState, target: &hook::Model) -> Result<String, AppError> {
+    let stored = target.hmac_secret.as_deref().ok_or_else(|| {
+        tracing::error!(hook = %target.name, "HMAC_ONLY hook has no hmac_secret");
+        AppError::Internal
+    })?;
+
+    state.cipher.open(stored).map_err(|e| {
+        tracing::error!(hook = %target.name, "Failed to decrypt a stored hook hmac_secret: {e}");
+        AppError::Internal
+    })
+}
+
+/// Extracts a hook identifier from a request path already stripped of its router-nest prefix
+/// (`Router::nest` strips `/api` or `/webhook` before an inner layer's middleware observes the URI —
+/// see [`authenticate_bearer_key`]'s `OriginalUri` comment for the general mechanism). Recognizes
+/// exactly the shapes the two invocation-route groups produce:
 ///
-/// # Ordering: cheapest first, then authenticate, then authorize
+/// - `/hooks/{identifier}/execute` or `/hooks/{identifier}/test` (from the `/api` nest)
+/// - `/{identifier}` (from the `/webhook` nest)
 ///
-/// 1. Resolve the client IP — no I/O beyond a possibly-cached DNS lookup.
-/// 2. Require an `X-API-Key` header to exist. No query yet; this is a header read.
-/// 3. **Validate `X-Timestamp` on a signed request.** Self-contained, so a stale or malformed
-///    timestamp is refused before it can cost a database round-trip.
-/// 4. Look up the key by `key_hash` — the first query, and the first step an unauthenticated caller
-///    can make us pay for.
-/// 5. Verify the HMAC (`CANONICAL_V1` also requires that step 3 found a header).
-/// 6. Reject a signature already used inside the window.
-/// 7. **Only then** check `bound_ips`.
+/// Anything else — including every administrative `/api/*` route, which never reaches this
+/// middleware — returns `None`.
+fn hook_identifier_from_path(path: &str) -> Option<&str> {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        [identifier] if !identifier.is_empty() => Some(identifier),
+        ["hooks", identifier, "execute" | "test"] => Some(identifier),
+        _ => None,
+    }
+}
+
+/// The message every keyless caller of an invocation route is told when it is not eligible to
+/// proceed without an `X-API-Key` — whether that is because none was sent, the hook does not exist,
+/// or the hook exists but its `auth_mode` demands a key. See [`invocation_auth_middleware`]'s doc
+/// comment for why these three cases are deliberately not told apart.
+fn missing_credentials_error() -> AppError {
+    AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header"))
+}
+
+/// Authenticates a presented `X-API-Key`, verifying its signature (when one is required or
+/// presented) and its `bound_ips` binding.
 ///
-/// Steps 3 and 7 are both load-bearing and neither may drift. Moving step 3 back after the lookup
-/// hands an unauthenticated caller a free query per request. Moving step 7 forward lets a caller
-/// holding nothing but a leaked `X-API-Key` distinguish `403 Client IP not allowed` from `401`, and
-/// so learn whether a key it merely found is bound to networks excluding it — a map of the
-/// deployment's topology handed to someone who has proven nothing. Both failures must look identical
-/// until the caller has proven it holds the signing secret.
+/// This is the whole of what [`auth_middleware`] does after resolving the client IP and confirming
+/// an `X-API-Key` header exists — pulled out so [`invocation_auth_middleware`]'s keyed branch can
+/// share it exactly, rather than keeping a second copy that could drift. See `auth_middleware`'s doc
+/// comment for the full step-by-step rationale (timestamp-before-lookup, network-check-last); this
+/// function performs the same steps in the same order.
 ///
-/// On success the authenticated [`crate::entities::api_key::Model`] and the resolved [`ClientIp`]
-/// are placed in the request's extensions for handlers to consume.
-pub async fn auth_middleware(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+/// Returns the request with its body restored (rebuilt, if a signature required buffering it) and
+/// the authenticated, master-pin-resolved [`crate::entities::api_key::Model`] — both **not yet**
+/// inserted into extensions, so the caller decides how to expose them.
+async fn authenticate_bearer_key(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    presented_key: &str,
+    client_ip: std::net::IpAddr,
     req: Request<Body>,
-    next: Next,
-) -> Result<Response, AppError> {
-    // Forwarding headers are consulted only when the TCP peer is a configured trusted proxy;
-    // otherwise the peer address itself is authoritative. See [`crate::config::resolve_client_ip`].
-    //
-    // `resolved()` is what turns a hostname entry into addresses. It is awaited per request so a
-    // container that moved is picked up within the DNS reuse window rather than at the next
-    // restart; with no hostnames configured it is a refcount bump and touches neither lock nor
-    // resolver.
-    let trusted_proxies = state.config.trusted_proxies.resolved().await;
-    let client_ip = resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
-
-    // One canonical way to name yourself: the bearer API key. It is hashed and matched against
-    // `api_keys.key_hash`, which is the only key lookup path in the system.
-    let presented_key = headers
-        .get(API_KEY_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header"))
-        })?;
-
+) -> Result<(Request<Body>, crate::entities::api_key::Model), AppError> {
     // Freshness before the database. A stale or malformed timestamp on a signed request is refused
     // here rather than after a query an unauthenticated caller provoked — see
     // [`prevalidate_timestamp_header`]. Its *absence* cannot be judged yet: that depends on the
     // key's `hmac_mode`, which is what the lookup below is for.
     let presented_timestamp =
-        prevalidate_timestamp_header(&headers, state.config.signature_max_age_seconds)?;
+        prevalidate_timestamp_header(headers, state.config.signature_max_age_seconds)?;
 
     let mut hasher = Sha256::new();
     hasher.update(presented_key.as_bytes());
@@ -296,7 +316,7 @@ pub async fn auth_middleware(
     let signature_required = state.config.require_signed_requests
         || (key_record.can_manage_keys && !key_record.is_master);
 
-    let mut req = match signature {
+    let req = match signature {
         Some(signature) => {
             // CANONICAL_V1 binds the timestamp into the signed material and enforces the replay
             // window. BODY_ONLY signs the body alone, which is what GitHub-style senders produce —
@@ -320,12 +340,25 @@ pub async fn auth_middleware(
                 HmacMode::BodyOnly => None,
             };
 
-            let secret = recover_signing_secret(&state, &key_record)?;
+            let secret = recover_signing_secret(state, &key_record)?;
 
             let (parts, body) = req.into_parts();
             let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
                 .await
                 .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
+
+            // A hook whose own `auth_mode` is `CANONICAL_V1` and which has set a
+            // `canonical_template` overrides the canonical string this *keyed* signature is
+            // verified against — see `AuthMode::CanonicalV1`'s doc comment. Every other route
+            // (every non-invocation route, and every invocation route whose target hook keeps the
+            // default template or is not itself `CANONICAL_V1`) is unaffected and keeps signing the
+            // service-wide default exactly as before this feature existed.
+            let template = match &parts.extensions.get::<InvocationHook>() {
+                Some(InvocationHook(hook)) if hook.auth_mode == AuthMode::CanonicalV1 => {
+                    hook.canonical_template.as_deref()
+                }
+                _ => None,
+            };
 
             let base = match &timestamp {
                 Some(timestamp) => {
@@ -347,7 +380,21 @@ pub async fn auth_middleware(
                         .path_and_query()
                         .map(|pq| pq.as_str())
                         .unwrap_or_else(|| original_uri.path());
-                    canonical_v1_payload(parts.method.as_str(), path_and_query, timestamp, &bytes)
+                    match template {
+                        Some(template) => render_canonical_template(
+                            template,
+                            parts.method.as_str(),
+                            path_and_query,
+                            timestamp,
+                            &bytes,
+                        ),
+                        None => canonical_v1_payload(
+                            parts.method.as_str(),
+                            path_and_query,
+                            timestamp,
+                            &bytes,
+                        ),
+                    }
                 }
                 None => bytes.to_vec(),
             };
@@ -434,15 +481,221 @@ pub async fn auth_middleware(
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
 
+    Ok((req, key_record))
+}
+
+/// Enforces API key authentication, CIDR binding, and (when present) body signing for every
+/// administrative `/api/*` route — everything except the three hook-invocation routes, which sit
+/// behind [`invocation_auth_middleware`] instead.
+///
+/// # Ordering: cheapest first, then authenticate, then authorize
+///
+/// 1. Resolve the client IP — no I/O beyond a possibly-cached DNS lookup.
+/// 2. Require an `X-API-Key` header to exist. No query yet; this is a header read.
+/// 3. **Validate `X-Timestamp` on a signed request.** Self-contained, so a stale or malformed
+///    timestamp is refused before it can cost a database round-trip.
+/// 4. Look up the key by `key_hash` — the first query, and the first step an unauthenticated caller
+///    can make us pay for.
+/// 5. Verify the HMAC (`CANONICAL_V1` also requires that step 3 found a header).
+/// 6. Reject a signature already used inside the window.
+/// 7. **Only then** check `bound_ips`.
+///
+/// Steps 3 and 7 are both load-bearing and neither may drift. Moving step 3 back after the lookup
+/// hands an unauthenticated caller a free query per request. Moving step 7 forward lets a caller
+/// holding nothing but a leaked `X-API-Key` distinguish `403 Client IP not allowed` from `401`, and
+/// so learn whether a key it merely found is bound to networks excluding it — a map of the
+/// deployment's topology handed to someone who has proven nothing. Both failures must look identical
+/// until the caller has proven it holds the signing secret. Steps 3-7 live in
+/// [`authenticate_bearer_key`], shared with [`invocation_auth_middleware`]'s keyed branch.
+///
+/// On success the authenticated [`crate::entities::api_key::Model`] and the resolved [`ClientIp`]
+/// are placed in the request's extensions for handlers to consume.
+pub async fn auth_middleware(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    // Forwarding headers are consulted only when the TCP peer is a configured trusted proxy;
+    // otherwise the peer address itself is authoritative. See [`crate::config::resolve_client_ip`].
+    //
+    // `resolved()` is what turns a hostname entry into addresses. It is awaited per request so a
+    // container that moved is picked up within the DNS reuse window rather than at the next
+    // restart; with no hostnames configured it is a refcount bump and touches neither lock nor
+    // resolver.
+    let trusted_proxies = state.config.trusted_proxies.resolved().await;
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
+
+    // One canonical way to name yourself: the bearer API key. It is hashed and matched against
+    // `api_keys.key_hash`, which is the only key lookup path in the system.
+    let presented_key =
+        headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok()).ok_or_else(missing_credentials_error)?;
+
+    let (mut req, key_record) =
+        authenticate_bearer_key(&state, &headers, presented_key, client_ip, req).await?;
+
     req.extensions_mut().insert(ClientIp(client_ip));
     req.extensions_mut().insert(key_record);
 
     Ok(next.run(req).await)
 }
 
+/// Carries the target hook into request extensions when [`invocation_auth_middleware`] has already
+/// resolved it (either to serve a keyless request, or to make it available to
+/// [`authenticate_bearer_key`]'s `canonical_template` override) — so the handler at the end of the
+/// chain, and the keyed-signature branch above, are not left re-querying it.
+#[derive(Clone)]
+struct InvocationHook(hook::Model);
+
+/// Enforces authentication for the three hook-invocation routes — `POST /api/hooks/{id}/execute`,
+/// `POST /api/hooks/{id}/test`, and `POST /webhook/{identifier}` — which alone, among every route
+/// this daemon exposes, may accept a caller presenting **no** `X-API-Key` at all.
+///
+/// # Two paths, chosen by whether `X-API-Key` is present
+///
+/// **Keyed** (the header is present): identical to [`auth_middleware`] — delegates to
+/// [`authenticate_bearer_key`], so a real credential authenticates and is authorized exactly as on
+/// every other route, with `guard_execute`'s per-key `can_execute` check still enforced by the
+/// handler afterwards. The target hook's `auth_mode` is **not consulted** for this caller: holding a
+/// valid, permitted key is always sufficient, regardless of what the hook additionally accepts from
+/// callers with none.
+///
+/// **Keyless** (no header): the target hook is resolved from the request path, and its `auth_mode`
+/// decides what happens next —
+///
+/// - `CANONICAL_V1` or `ApiKeyOnly`: refused, identically to a missing key on any other route. Both
+///   modes mean "a key is required here"; they exist to record different operator intent about what
+///   a *keyed* caller is expected to present (see [`AuthMode`]), not to open a keyless path.
+/// - `HmacOnly`: accepted if the configured signature header carries a valid HMAC-SHA256 signature
+///   over the raw body, verified against the hook's own [`hook::Model::hmac_secret`] — never a
+///   key's. No timestamp, so **no anti-replay protection**; this is the GitHub/Forgejo/GitLab
+///   third-party webhook shape.
+/// - `NoAuth`: accepted outright, but **only** when `REQUIRE_SIGNED_REQUESTS` is `false`. A
+///   deployment that opted into mandatory signing everywhere else must not have a hook silently
+///   exempted from it.
+///
+/// # Why lookup failures and mode mismatches are told apart from nothing
+///
+/// A keyless caller that cannot proceed — no such hook, a hook requiring a key, or a `NoAuth` hook
+/// currently blocked by `REQUIRE_SIGNED_REQUESTS` — receives the **exact same** `401` a missing
+/// `X-API-Key` gets everywhere else in this API. Distinguishing any of these would let an
+/// unauthenticated caller enumerate which hook names exist, and which of those are configured for
+/// public access, by nothing more than probing paths — the same oracle `RBAC_MODEL.md` §4 and the
+/// authenticate-then-authorize ordering exist to close off elsewhere. The one place this daemon
+/// *does* distinguish is once a caller has presented signature material for an `HmacOnly` hook: a
+/// malformed or non-matching signature is reported as such, exactly as an invalid signature is on
+/// every keyed route — a caller that already knows to try signing something has proven it knows more
+/// than a bare prober does.
+pub async fn invocation_auth_middleware(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    let trusted_proxies = state.config.trusted_proxies.resolved().await;
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
+
+    let identifier = hook_identifier_from_path(req.uri().path());
+
+    match headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok()) {
+        Some(presented_key) => {
+            // The keyed path consults the target hook too, but only for the `canonical_template`
+            // override — never to decide *whether* to authenticate, which a valid key always does
+            // on its own. Resolution failures here are silently ignored rather than propagated: an
+            // unresolvable hook is the handler's `404` to report, not this middleware's.
+            if let Some(identifier) = identifier
+                && let Ok(target) = crate::api::support::resolve_hook(&state.db, identifier).await
+            {
+                req.extensions_mut().insert(InvocationHook(target));
+            }
+
+            let (mut req, key_record) =
+                authenticate_bearer_key(&state, &headers, presented_key, client_ip, req).await?;
+            req.extensions_mut().insert(ClientIp(client_ip));
+            req.extensions_mut().insert(key_record);
+            Ok(next.run(req).await)
+        }
+        None => {
+            let identifier = identifier.ok_or_else(missing_credentials_error)?;
+            let target = crate::api::support::resolve_hook(&state.db, identifier)
+                .await
+                .map_err(|_| missing_credentials_error())?;
+
+            match target.auth_mode {
+                AuthMode::CanonicalV1 | AuthMode::ApiKeyOnly => Err(missing_credentials_error()),
+                AuthMode::NoAuth => {
+                    if state.config.require_signed_requests {
+                        return Err(missing_credentials_error());
+                    }
+                    req.extensions_mut().insert(ClientIp(client_ip));
+                    Ok(next.run(req).await)
+                }
+                AuthMode::HmacOnly => {
+                    let header_name =
+                        target.signature_header.as_deref().unwrap_or(HMAC_ONLY_DEFAULT_HEADER);
+                    let prefix = target.signature_prefix.as_deref().unwrap_or(SIGNATURE_PREFIX);
+                    // Absence of the configured header looks identical to a missing `X-API-Key`
+                    // everywhere else — see this function's doc comment on oracle discipline. Only
+                    // once *some* signature material is presented do format/mismatch errors start
+                    // being reported specifically.
+                    let provided = headers
+                        .get(header_name)
+                        .and_then(|h| h.to_str().ok())
+                        .ok_or_else(missing_credentials_error)?;
+
+                    let secret = recover_hook_secret(&state, &target)?;
+                    let (parts, body) = req.into_parts();
+                    let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES).await.map_err(
+                        |_| AppError::InvalidInput("Request body too large to verify".to_owned()),
+                    )?;
+                    verify_signature_with_prefix(&secret, &bytes, provided, prefix)
+                        .map_err(|rejection| reject_signature(rejection, &target.name))?;
+
+                    let mut req = Request::from_parts(parts, Body::from(bytes));
+                    req.extensions_mut().insert(ClientIp(client_ip));
+                    Ok(next.run(req).await)
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_every_shape_the_invocation_routes_actually_produce() {
+        assert_eq!(hook_identifier_from_path("/hooks/echo_hook/execute"), Some("echo_hook"));
+        assert_eq!(hook_identifier_from_path("/hooks/echo_hook/test"), Some("echo_hook"));
+        assert_eq!(hook_identifier_from_path("/echo_hook"), Some("echo_hook"));
+        assert_eq!(
+            hook_identifier_from_path("/hooks/9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d/execute"),
+            Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
+        );
+    }
+
+    #[test]
+    fn refuses_shapes_no_invocation_route_produces() {
+        assert_eq!(hook_identifier_from_path("/"), None);
+        assert_eq!(hook_identifier_from_path(""), None);
+        assert_eq!(hook_identifier_from_path("/hooks/x/parameters"), None);
+        assert_eq!(hook_identifier_from_path("/hooks/x/execute/extra"), None);
+    }
+
+    /// A bare single segment (`/keys`, `/executions`, ...) is indistinguishable, by shape alone,
+    /// from a webhook-nest hook identifier (`/webhook/{identifier}` strips to exactly this). That
+    /// is not a real ambiguity: this function is only ever called from within
+    /// `invocation_auth_middleware`, which is mounted on nothing but the `/webhook` nest and the two
+    /// `/hooks/{id}/execute|test` routes — a request for `/api/keys` never reaches this middleware
+    /// at all, since `/api/keys` sits behind `auth_middleware` on a wholly separate `Router`. A hook
+    /// legitimately named `keys` is exactly as reachable through the webhook alias as any other name.
+    #[test]
+    fn a_bare_segment_is_read_as_a_webhook_alias_not_an_admin_route() {
+        assert_eq!(hook_identifier_from_path("/keys"), Some("keys"));
+    }
 
     #[test]
     fn timestamps_inside_the_window_are_accepted() {

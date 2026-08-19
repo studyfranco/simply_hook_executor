@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{
-    api_key, api_key_hook_permission, hook, hook_parameter, prelude::*,
+    api_key, api_key_hook_permission, hook, hook::AuthMode, hook_parameter, prelude::*,
 };
 use crate::error::AppError;
 use crate::extract::{StrictJson, StrictPath, StrictQuery};
@@ -74,6 +74,21 @@ pub struct CreateHookPayload {
     /// Optional parameter contract, declared inline so a hook and its parameters can be created
     /// in one request instead of N+1.
     pub parameters: Option<Vec<ParameterInput>>,
+    /// How a keyless caller must authenticate to invoke this hook. Defaults to
+    /// [`AuthMode::CanonicalV1`] — every hook keeps requiring a valid `X-API-Key` unless an
+    /// operator explicitly opts it into something looser.
+    pub auth_mode: Option<AuthMode>,
+    /// `HMAC_ONLY`'s signing secret, in plaintext. Required if `auth_mode` is `HMAC_ONLY`; ignored
+    /// (but accepted) for any other mode, so a hook can be pre-provisioned with a secret before it
+    /// is switched over.
+    pub hmac_secret: Option<String>,
+    /// Header an `HMAC_ONLY` sender's signature arrives on. Defaults to `X-Signature-256`.
+    pub signature_header: Option<String>,
+    /// Prefix stripped from an `HMAC_ONLY` signature before hex-decoding it. Defaults to `sha256=`.
+    pub signature_prefix: Option<String>,
+    /// Override of the `CANONICAL_V1` canonical string template for this hook. Defaults to the
+    /// service-wide `{method}\n{path}\n{timestamp}\n{body}`.
+    pub canonical_template: Option<String>,
 }
 
 /// Payload for updating a hook. Every field is optional; omitted fields are left untouched.
@@ -99,6 +114,23 @@ pub struct UpdateHookPayload {
     /// an arbitrary key would let it walk away from a resource rather than resolve it, which is the
     /// step §6 exists to make impossible.
     pub owner_key_id: Option<Uuid>,
+    /// New `auth_mode`. Omitting the field leaves the current mode untouched. Governed by the same
+    /// rights as any other content edit — `RBAC_MODEL.md`'s Terminology section names only
+    /// `script_path` and `run_as_user` as this service's dispatch configuration, so `auth_mode` and
+    /// its supporting fields below are not subject to `guard_dispatch_configuration`.
+    pub auth_mode: Option<AuthMode>,
+    /// New `HMAC_ONLY` secret. Send `""` to clear it; omitting the field leaves the current secret
+    /// untouched.
+    pub hmac_secret: Option<String>,
+    /// New signature header for `HMAC_ONLY`. Send `""` to reset to the built-in default
+    /// (`X-Signature-256`); omitting the field leaves the current value untouched.
+    pub signature_header: Option<String>,
+    /// New signature prefix for `HMAC_ONLY`. Send `""` to reset to the built-in default (`sha256=`);
+    /// omitting the field leaves the current value untouched.
+    pub signature_prefix: Option<String>,
+    /// New `CANONICAL_V1` template override. Send `""` to reset to the service-wide default;
+    /// omitting the field leaves the current value untouched.
+    pub canonical_template: Option<String>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -138,6 +170,17 @@ pub struct HookDetail {
     pub created_at: chrono::NaiveDateTime,
     /// Last-update timestamp.
     pub updated_at: chrono::NaiveDateTime,
+    /// How a keyless caller must authenticate to invoke this hook.
+    pub auth_mode: AuthMode,
+    /// Whether an `HMAC_ONLY` secret has been set. The secret itself is never returned — it left
+    /// the server once, when it was supplied, and no listing hands it back.
+    pub hmac_secret_configured: bool,
+    /// Configured signature header for `HMAC_ONLY`, or `None` for the built-in default.
+    pub signature_header: Option<String>,
+    /// Configured signature prefix for `HMAC_ONLY`, or `None` for the built-in default.
+    pub signature_prefix: Option<String>,
+    /// Configured `CANONICAL_V1` template override, or `None` for the service-wide default.
+    pub canonical_template: Option<String>,
 }
 
 /// Assembles the [`HookDetail`] view for one hook as seen by one key.
@@ -176,7 +219,52 @@ pub(crate) async fn build_hook_detail(
         can_manage,
         created_at: model.created_at,
         updated_at: model.updated_at,
+        auth_mode: model.auth_mode,
+        hmac_secret_configured: model.hmac_secret.is_some(),
+        signature_header: model.signature_header,
+        signature_prefix: model.signature_prefix,
+        canonical_template: model.canonical_template,
     })
+}
+
+/// Validates and seals a hook's `HMAC_ONLY` secret for storage, and rejects an `HMAC_ONLY` mode
+/// left without one.
+///
+/// `effective_mode` and `effective_secret` are the values that will actually be on the row once
+/// this write lands — the payload's, if it supplied one, otherwise whatever the row already has —
+/// so this catches both "create as `HMAC_ONLY` with no secret" and "switch an existing hook to
+/// `HMAC_ONLY` without ever having set one", not only the first.
+fn validate_and_seal_hmac_secret(
+    cipher: &crate::crypto::SecretCipher,
+    effective_mode: AuthMode,
+    payload_secret: Option<&str>,
+    existing_sealed: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    match payload_secret {
+        Some("") => {
+            if effective_mode == AuthMode::HmacOnly {
+                return Err(AppError::InvalidInput(
+                    "hmac_secret cannot be cleared while auth_mode is HMAC_ONLY".to_owned(),
+                ));
+            }
+            Ok(None)
+        }
+        Some(raw) => cipher
+            .seal(raw)
+            .map(Some)
+            .map_err(|e| {
+                tracing::error!("Failed to seal a hook's hmac_secret: {e}");
+                AppError::Internal
+            }),
+        None => {
+            if effective_mode == AuthMode::HmacOnly && existing_sealed.is_none() {
+                return Err(AppError::InvalidInput(
+                    "hmac_secret is required when auth_mode is HMAC_ONLY".to_owned(),
+                ));
+            }
+            Ok(existing_sealed.map(str::to_owned))
+        }
+    }
 }
 
 /// Grants a key full rights over a hook, ignoring a pre-existing identical grant.
@@ -260,6 +348,17 @@ pub async fn create_hook(
         }
     }
 
+    let auth_mode = payload.auth_mode.unwrap_or_default();
+    let sealed_hmac_secret = validate_and_seal_hmac_secret(
+        &state.cipher,
+        auth_mode,
+        payload.hmac_secret.as_deref(),
+        None,
+    )?;
+    let signature_header = payload.signature_header.filter(|s| !s.is_empty());
+    let signature_prefix = payload.signature_prefix.filter(|s| !s.is_empty());
+    let canonical_template = payload.canonical_template.filter(|s| !s.is_empty());
+
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
     let model = hook::ActiveModel {
@@ -277,6 +376,11 @@ pub async fn create_hook(
         deleted_by: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
+        auth_mode: Set(auth_mode),
+        hmac_secret: Set(sealed_hmac_secret),
+        signature_header: Set(signature_header),
+        signature_prefix: Set(signature_prefix),
+        canonical_template: Set(canonical_template),
     };
 
     if let Err(err) = Hook::insert(model).exec(&state.db).await {
@@ -476,6 +580,14 @@ pub async fn update_hook(
         validate_timeout(timeout)?;
     }
 
+    let effective_auth_mode = payload.auth_mode.unwrap_or(model.auth_mode);
+    let sealed_hmac_secret = validate_and_seal_hmac_secret(
+        &state.cipher,
+        effective_auth_mode,
+        payload.hmac_secret.as_deref(),
+        model.hmac_secret.as_deref(),
+    )?;
+
     let hook_id = model.id;
     let mut changes: Vec<String> = Vec::new();
     let mut active: hook::ActiveModel = model.into();
@@ -509,6 +621,29 @@ pub async fn update_hook(
         // absent, which leaves the current setting alone.
         changes.push(describe_privilege(normalized.as_deref()));
         active.run_as_user = Set(normalized);
+    }
+    if let Some(mode) = payload.auth_mode {
+        changes.push(format!("auth_mode={mode:?}"));
+        active.auth_mode = Set(mode);
+    }
+    // `hmac_secret` always resolves to a value above (the payload's, the existing one, or `None`
+    // after an explicit clear) — but only recorded as *changed* when the payload actually named it,
+    // so an untouched secret does not show up in every unrelated edit's audit trail.
+    if payload.hmac_secret.is_some() {
+        changes.push("hmac_secret".to_owned());
+    }
+    active.hmac_secret = Set(sealed_hmac_secret);
+    if let Some(header) = payload.signature_header {
+        changes.push(format!("signature_header={header}"));
+        active.signature_header = Set(if header.is_empty() { None } else { Some(header) });
+    }
+    if let Some(prefix) = payload.signature_prefix {
+        changes.push(format!("signature_prefix={prefix}"));
+        active.signature_prefix = Set(if prefix.is_empty() { None } else { Some(prefix) });
+    }
+    if let Some(template) = payload.canonical_template {
+        changes.push("canonical_template".to_owned());
+        active.canonical_template = Set(if template.is_empty() { None } else { Some(template) });
     }
     active.updated_at = Set(Utc::now().naive_utc());
 

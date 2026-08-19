@@ -487,6 +487,11 @@ pub async fn insert_hook_full(
         deleted_by: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
+        auth_mode: Set(hook::AuthMode::CanonicalV1),
+        hmac_secret: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
+        canonical_template: Set(None),
     }
     .insert(db)
     .await
@@ -524,6 +529,11 @@ pub async fn insert_hook_deleted_days_ago(
         deleted_by: Set(Some(deleted_by.to_string())),
         created_at: Set(now),
         updated_at: Set(deleted_at),
+        auth_mode: Set(hook::AuthMode::CanonicalV1),
+        hmac_secret: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
+        canonical_template: Set(None),
     }
     .insert(db)
     .await

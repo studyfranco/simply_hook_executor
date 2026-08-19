@@ -149,6 +149,22 @@ Defines executable script definitions and execution constraints.
 | `owner_key_id` | UUID / String | NULLABLE, INDEXED (`idx_hooks_owner_key_id`) | The key answerable for this hook: with master, the **only** identity that may delete or rename it (`RBAC_MODEL.md` §3). Deliberately not derivable from `api_key_hook_permissions` — a creator receives an ordinary `can_manage` row there, byte-identical to a delegated one, so "holds `can_manage`" says nothing about authorship. `NULL` for hooks predating ownership, which leaves lifecycle authority with master alone. |
 | `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
 | `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
+| `auth_mode` | String | NOT NULL, DEFAULT `'CANONICAL_V1'` | How a request presenting **no** `X-API-Key` may invoke this hook: `CANONICAL_V1`, `API_KEY_ONLY`, `HMAC_ONLY`, or `NONE`. See the enumeration section below. Added in `m20260819_120414`. Irrelevant to a caller presenting a valid, permitted key — that path is authorized by the key alone, exactly as before this column existed. |
+| `hmac_secret` | Text | NULLABLE | `HMAC_ONLY`'s signing secret, encrypted at rest through the same mechanism as `api_keys.signing_secret` (verifying an HMAC means recomputing it, so it cannot be hashed). `NULL` for every other `auth_mode`. Never returned by any `GET` — `#[serde(skip_serializing)]` on the entity field is defense in depth; the public `HookDetail` view returns only `hmac_secret_configured: bool`. |
+| `signature_header` | String | NULLABLE | Header an `HMAC_ONLY` sender's signature arrives on. `NULL` means the built-in default, `X-Signature-256`. |
+| `signature_prefix` | String | NULLABLE | Prefix stripped from an `HMAC_ONLY` signature before hex-decoding it. `NULL` means the built-in default, `sha256=`. |
+| `canonical_template` | Text | NULLABLE | Override of the `CANONICAL_V1` canonical string, consulted only when a **keyed** `CANONICAL_V1` caller invokes a hook whose own `auth_mode` is `CANONICAL_V1`. `NULL` means the service-wide default, `{method}\n{path}\n{timestamp}\n{body}`. Recognized placeholders: `{method}`, `{path}`, `{timestamp}`, `{body}`; substitution is purely textual. |
+
+#### `auth_mode` is orthogonal to `api_keys.hmac_mode`
+
+Two different questions, deliberately kept on two different tables. `api_keys.hmac_mode`
+(`CANONICAL_V1`/`BODY_ONLY`) governs how a **specific credential's own** signature verifies, and is
+unchanged by this column. `hooks.auth_mode` governs what a request targeting **this endpoint** may
+present when it has **no credential at all** — a question a key cannot answer about itself, since
+`NONE`/`HMAC_ONLY` describe the *absence* of a key. A caller presenting a valid `X-API-Key` is always
+authorized by the key (per its own `hmac_mode` and the service's `REQUIRE_SIGNED_REQUESTS` setting,
+per `AGENT.MD`'s HMAC Signature Protocol section) regardless of the target hook's `auth_mode`; the
+column exists purely to widen what a *keyless* caller may do, never to narrow what a keyed one may.
 
 #### Soft delete
 
@@ -236,7 +252,7 @@ Stores complete execution history, output logs, and performance metrics.
 | :--- | :--- | :--- | :--- |
 | `id` | UUID / String | PRIMARY KEY | Unique identifier for the execution job. |
 | `hook_id` | UUID / String | NOT NULL, FOREIGN KEY (`hooks.id` ON DELETE CASCADE) | Executed hook. |
-| `api_key_id` | UUID / String | NULLABLE, FOREIGN KEY (`api_keys.id` ON DELETE SET NULL) | Key that requested execution. |
+| `api_key_id` | UUID / String | NULLABLE, FOREIGN KEY (`api_keys.id` ON DELETE SET NULL) | Key that requested execution. `NULL` for two distinct reasons: the acting key was since deleted (the FK's `ON DELETE SET NULL`), or the invocation was **keyless** — authorized by the target hook's `auth_mode` (`HMAC_ONLY`/`NONE`) rather than by any key. `audit_logs.api_key_name`/`api_key_prefix` disambiguate the two: a deleted key keeps its real, point-in-time name; a keyless invocation carries `create_audit_log_anonymous`'s fixed sentinel. |
 | `status` | Enum (`ExecutionStatus`) | NOT NULL | Outcome: `SUCCESS`, `FAILED`, `TIMEOUT`. |
 | `exit_code` | Integer | NULLABLE | Sub-process exit code (e.g., `0`, `1`, `137`). |
 | `stdout` | Text | NOT NULL, DEFAULT `''` | Captured standard output. |
@@ -316,8 +332,37 @@ Stored as a plain string (portable across SQLite/PostgreSQL/MySQL), selected **p
   enforced, not advisory.
 - The column defaults to `CANONICAL_V1`, including for rows backfilled by the migration that adds
   it: an upgrade must never silently strip replay protection from an existing key.
-- Selecting `BODY_ONLY` at creation or switching to it later is recorded in the audit trail,
-  explicitly labelled as removing replay protection.
+- **Immutable after creation.** `UpdateApiKeyPayload` does not carry the field at all — not
+  accepted-and-ignored, *absent* — so naming it in an update is a `422` from `deny_unknown_fields`
+  before any handler runs. A mutable mode would be a downgrade lever: a key minted `CANONICAL_V1`
+  that could later be flipped to `BODY_ONLY` would have its replay protection removable by whoever
+  can already reach the update route. Selecting `BODY_ONLY` **at creation** is still recorded in the
+  audit trail, explicitly labelled as removing replay protection.
+- A key holding `can_manage_keys = true` **must** be `CANONICAL_V1`, enforced at both creation and
+  update by `guard_canonical_v1_for_key_management` — the scope that can administer every other
+  credential must not be reachable over a scheme with no replay window.
+
+### `AuthMode` (`hooks.auth_mode`)
+
+Stored as a plain string, selected **per hook** — see `SCHEMA.MD`'s `hooks` table above for the
+column and `AGENT.MD`'s HMAC Signature Protocol section for the full authorization rationale.
+Governs only what a **keyless** caller of that hook may do; a caller presenting a valid, permitted
+`X-API-Key` is authorized by the key alone, per its own `HmacMode` above, regardless of this column.
+
+| Value | Keyless caller | Notes |
+| :--- | :--- | :--- |
+| `CANONICAL_V1` *(default)* | refused (`401`, identical to a missing key everywhere else) | A keyed caller's signature is verified against `canonical_template` when the hook sets one, else the service-wide default |
+| `API_KEY_ONLY` | refused, identically to `CANONICAL_V1` | Records operator intent — "a bearer key alone suffices for this integration" — without changing verification, which is entirely the presenting key's own `HmacMode` |
+| `HMAC_ONLY` | accepted with a valid signature over the raw body, verified against `hooks.hmac_secret` (never a key's) on `signature_header`/`signature_prefix` (or their defaults) | **No anti-replay protection** — no timestamp is involved. The GitHub/Forgejo/GitLab third-party webhook shape |
+| `NONE` | accepted outright — **no authentication at all** | **Only** when the deployment's `REQUIRE_SIGNED_REQUESTS` is `false`. A deployment that opted into mandatory signing everywhere else must not have one hook silently exempted |
+
+`CANONICAL_V1` and `API_KEY_ONLY` refuse a keyless caller **identically** — same status, same
+body — so an unauthenticated prober cannot tell "this hook requires a key" apart from "no such hook
+exists" apart from "this hook is `NONE` but currently blocked by `REQUIRE_SIGNED_REQUESTS`". All
+three collapse to the one `401` every other missing-key request already produces
+(`middleware::invocation_auth_middleware`'s `missing_credentials_error`), preserving the oracle
+discipline `RBAC_MODEL.md` §4 requires for authenticated callers on the one surface that now accepts
+none at all.
 
 ---
 

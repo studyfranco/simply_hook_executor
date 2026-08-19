@@ -975,16 +975,18 @@ fn elapsed_ms(started: Instant) -> i32 {
 pub async fn execute_hook(
     state: &AppState,
     hook: &hook::Model,
-    key: &api_key::Model,
+    key: Option<&api_key::Model>,
     resolved: &ResolvedParameters,
 ) -> Result<execution::Model, AppError> {
+    let key_prefix = key.map(|k| k.prefix.as_str()).unwrap_or("(keyless)");
+
     if let Err(diagnosis) = ensure_runnable(hook, &state.config) {
         // Logged at WARN with the classification attached, so a misconfigured or tampered-with
         // hook is greppable in journald (`rejection=PermissionDenied`) and not merely a 400 that
         // only the caller ever sees.
         tracing::warn!(
             hook = %hook.name,
-            key = %key.prefix,
+            key = %key_prefix,
             script = %hook.script_path,
             rejection = ?diagnosis.rejection,
             "Refusing to execute hook: {}",
@@ -993,7 +995,14 @@ pub async fn execute_hook(
         return Err(diagnosis.into());
     }
 
-    let _permit = state.limiter.try_acquire(key)?;
+    // A keyless invocation (`HMAC_ONLY`/`NONE` `auth_mode`) has no `api_keys.max_concurrent_jobs`
+    // to throttle against — there is no key. It is not exempt from every limit: `ensure_runnable`,
+    // `MAX_REQUEST_BODY_BYTES`, and the process timeout all still apply, and the operator who opted
+    // the hook into keyless access accepted the absence of this one specifically.
+    let _permit = match key {
+        Some(key) => Some(state.limiter.try_acquire(key)?),
+        None => None,
+    };
 
     let plan = build_command_plan(hook, resolved, &state.config);
     let timeout = state.config.timeout_for(hook.default_timeout_seconds);
@@ -1003,7 +1012,7 @@ pub async fn execute_hook(
     // should be able to find it in journald without cross-referencing the hooks table.
     tracing::info!(
         hook = %hook.name,
-        key = %key.prefix,
+        key = %key_prefix,
         timeout_s = timeout.as_secs(),
         run_as_user = plan.run_as_user.as_deref().unwrap_or("-"),
         "Executing hook"
@@ -1022,7 +1031,7 @@ pub async fn execute_hook(
     let record = execution::ActiveModel {
         id: Set(Uuid::new_v4()),
         hook_id: Set(hook.id),
-        api_key_id: Set(Some(key.id)),
+        api_key_id: Set(key.map(|k| k.id)),
         status: Set(outcome.status),
         exit_code: Set(outcome.exit_code),
         stdout: Set(outcome.stdout),
@@ -1153,6 +1162,11 @@ mod tests {
             deleted_by: None,
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
+            auth_mode: hook::AuthMode::CanonicalV1,
+            hmac_secret: None,
+            signature_header: None,
+            signature_prefix: None,
+            canonical_template: None,
         }
     }
 

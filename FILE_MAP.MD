@@ -17,18 +17,18 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 
 ## Coverage
 
-**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-11.
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-19.
 
 | Group | Files | Where documented here |
 | :--- | :--- | :--- |
 | Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 10 | Table under **`src/migration/`** (9 migrations + `mod.rs`) |
-| **Total** | **40** | — |
+| Migrations (`src/migration/*.rs`) | 11 | Table under **`src/migration/`** (10 migrations + `mod.rs`) |
+| **Total** | **41** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
-(verified passing 2026-08-11, all three silent against `4865a82`):
+(verified passing 2026-08-19, all three silent):
 
 ```bash
 # 1. Crate-root and API modules, documented as `### `src/…`` headings
@@ -90,7 +90,7 @@ src/
 
 ## Top level
 
-### `src/lib.rs` — 163 lines
+### `src/lib.rs` — 186 lines
 
 **Role & scope.** Declares the module tree, assembles the Axum router, and spawns the retention
 worker. Holds no business logic and no authorization: it is the wiring diagram.
@@ -101,6 +101,14 @@ worker. Holds no business logic and no authorization: it is the wiring diagram.
 — which route is public, which is nested behind `auth_middleware`, and in what order layers apply.
 Carries `#![warn(missing_docs)]`, which is what makes the rustdoc requirement in `AGENT.MD`
 enforceable rather than aspirational.
+
+`api_routes` is `admin_routes.merge(hook_invocation_routes)` rather than one flat router: the two
+hook-invocation routes (`POST /hooks/{id}/execute`, `POST /hooks/{id}/test`) are the only `/api/*`
+routes that may authorize a keyless caller, so they sit behind `middleware::invocation_auth_middleware`
+on their own sub-router while every other `/api/*` route stays behind the always-mandatory-bearer-key
+`middleware::auth_middleware`. `webhook_routes` (`/webhook/{identifier}`) shares the same dual-path
+middleware, for the same reason a third-party sender is exactly the caller `HMAC_ONLY`/`NONE` exist
+for.
 
 > **Note:** `create_app` refers to handlers unqualified as `api::create_hook`. That works because
 > `api/mod.rs` re-exports every handler, and it is why the `src/api.rs` → `src/api/` split left this
@@ -154,13 +162,15 @@ would be one forgotten call site away from worthless — including every call si
 someone who never read this file. Handlers keep reading `key.is_master` and are automatically
 correct, because the principal they receive is the *effective* one.
 
-### `src/middleware.rs` — 562 lines
+### `src/middleware.rs` — 815 lines
 
 **Role & scope.** Authentication only — establishing *who* is calling. Bearer key lookup, HMAC
 signature verification, timestamp freshness, replay rejection, and bound-IP enforcement. Must **not**
 make per-resource authorization decisions.
 
-**Key exports.** `auth_middleware`, `ClientIp`.
+**Key exports.** `auth_middleware` (every administrative `/api/*` route — bearer key always
+mandatory), `invocation_auth_middleware` (the three hook-invocation routes — may authorize a keyless
+caller per the target hook's `AuthMode`), `ClientIp`, `HMAC_ONLY_DEFAULT_HEADER`.
 
 **Rationale.** Ordering inside this file is a security property, not a style choice:
 **authenticate, then authorize.** Checking the source network before the signature let a caller
@@ -170,6 +180,19 @@ unauthenticated garbage never buys an indexed query.
 
 This is also where `MasterPin::authenticate` runs, which is why a tampered `is_master` never reaches
 a handler.
+
+**Two middleware functions, one shared authentication core.** `auth_middleware` and
+`invocation_auth_middleware` both delegate their keyed path to `authenticate_bearer_key` — the whole
+of what the pre-existing single function did (steps 3-7 of the ordering above), pulled out so the two
+callers cannot drift into two copies of the same security-critical sequence. `invocation_auth_middleware`
+additionally branches on whether `X-API-Key` is present at all: absent, it resolves the target hook
+from the request path (`hook_identifier_from_path`, a pure function — the router-nest prefix is
+already stripped by the time this middleware runs, matching the `OriginalUri` note above) and
+authorizes per its `AuthMode`. Every keyless refusal — no such hook, a hook requiring a key, or a
+`NONE` hook currently blocked by `REQUIRE_SIGNED_REQUESTS` — returns the **identical** `401` a missing
+key gets everywhere else, so an unauthenticated caller cannot enumerate hook names or which are
+configured for public access by probing paths — the same oracle discipline `RBAC_MODEL.md` §4
+enforces for authenticated callers, extended to the one surface that now accepts none at all.
 
 ### `src/config.rs` — 1,642 lines
 
@@ -185,15 +208,17 @@ X-Forwarded-For chain walk is one of the three behaviours `scripts/verify_conver
 against the peer service; keeping it in a named function in a predictable file is what makes that
 check possible.
 
-### `src/crypto.rs` — 781 lines
+### `src/crypto.rs` — 828 lines
 
 **Role & scope.** Every cryptographic primitive in the service: HMAC request signing, and encryption
 of `api_keys.signing_secret` at rest. Must **not** decide *when* a signature is required, or what a
 caller is told when one fails — that is `middleware.rs`.
 
 **Key exports.** Signing: `generate_signing_secret`, `canonical_v1_payload`, `compute_signature`,
-`verify_signature`, `SignatureRejection`, `SIGNATURE_PREFIX`. At rest: `SecretCipher` (`from_env`,
-`seal`, `open`, `is_encrypting`), `CryptoError`.
+`verify_signature`, `verify_signature_with_prefix` (generalized to a caller-supplied prefix, for
+`hooks.signature_prefix`), `render_canonical_template`, `DEFAULT_CANONICAL_TEMPLATE`,
+`SignatureRejection`, `SIGNATURE_PREFIX`. At rest: `SecretCipher` (`from_env`, `seal`, `open`,
+`is_encrypting`), `CryptoError`.
 
 **Rationale.** Both halves protect the same column, from opposite directions: the signing half is
 what `api_keys.signing_secret` is *for*, and `SecretCipher` is how it survives being written down.
@@ -226,7 +251,7 @@ recording unverified signatures would let anyone who merely observed a request b
 legitimate copy arrived, turning the control into a denial-of-service primitive aimed at the client
 it protects.
 
-### `src/executor.rs` — 1,389 lines
+### `src/executor.rs` — 1,403 lines
 
 **Role & scope.** Everything about running a child process safely: argv construction, environment
 isolation, `run_as_user` handling, script-path containment, timeouts, and process-group kill. Must
@@ -368,14 +393,16 @@ blast radius nobody can review. The constants sit here rather than in `support.r
 policy numbers rather than plumbing, read by both the validators that enforce them and the handlers
 that document them.
 
-### `src/api/support.rs` — 352 lines
+### `src/api/support.rs` — 403 lines
 
 **Role & scope.** Shared plumbing used by three or more handler domains. **Must not decide
 anything.** Nothing here returns a refusal that depends on *who* is calling — a helper that starts
 doing so belongs in `guards.rs`. The strict JSON extractors used to live here and now sit in
 `src/extract.rs`; they were the one thing in this file that decided something.
 
-**Key exports.** `create_audit_log`; `resolve_hook`,
+**Key exports.** `create_audit_log`, `create_audit_log_anonymous` (the keyless-invocation
+counterpart — see `hook.rs`/`middleware.rs` above; writes a fixed, `NOT NULL`-satisfying sentinel
+rather than relaxing the attribution columns); `resolve_hook`,
 `resolve_hook_including_deleted`; `load_parameters`; `format_reference`; `generate_random_key`,
 `hash_key`, `generate_key_id`, `generate_signing_secret`, `mint_signing_pair`; `validate_timeout`,
 `validate_bound_ips`, `validate_concurrency`; `extract_parameter_map`; `describe_hmac_mode`,
@@ -471,7 +498,7 @@ returning `Result<_, AppError>`, writing nothing, and preserving §4 oracle disc
 `None`/`404` must be indistinguishable from a nonexistent id and is propagated rather than converted
 to a `403`.
 
-### `src/api/hooks.rs` — 928 lines
+### `src/api/hooks.rs` — 1,063 lines
 
 **Role & scope.** What a hook *is* — its definition, dispatch configuration, parameter contract, and
 trash lifecycle. Must **not** hold execution: that is `executions.rs`.
@@ -487,7 +514,16 @@ not by a bare permission row. Parameter CRUD sits in the same file and behind th
 parameter is argv for whatever `script_path` names: a defaulted parameter on a hook running `/bin/sh`
 supplies `-c` and a command string without the caller ever touching `script_path`.
 
-### `src/api/executions.rs` — 449 lines
+`auth_mode` and its four supporting fields (`hmac_secret`, `signature_header`, `signature_prefix`,
+`canonical_template`) are **not** dispatch configuration under `RBAC_MODEL.md`'s Terminology section —
+only `script_path`/`run_as_user` are named there — so they are editable via ordinary `guard_manage`
+(ownership included), not `guard_dispatch_configuration`. `validate_and_seal_hmac_secret` is the one
+piece of non-trivial validation: it refuses landing a hook in `HMAC_ONLY` with no secret configured,
+checked against the *effective* mode and secret (payload's, else the row's existing one) so both
+"create as HMAC_ONLY with none" and "switch an existing hook to HMAC_ONLY that never had one" are
+caught, not only the first.
+
+### `src/api/executions.rs` — 485 lines
 
 **Role & scope.** Triggering hooks and reading the records that result.
 
@@ -504,6 +540,14 @@ to a record that never existed.
 The listing expresses that disjunction as a single indexed `WHERE` rather than filtering after
 fetching, which would page wrongly: a `LIMIT 50` applied before a visibility filter returns fewer
 than fifty visible rows and hides the rest behind an offset that never advances past them.
+
+`key` is `Option<Extension<api_key::Model>>` on all three trigger handlers, not the mandatory
+`Extension` every other handler in this crate takes — `middleware::invocation_auth_middleware` may
+authorize a keyless caller through the target hook's `AuthMode`, in which case there is no key row to
+extract. `run_hook_request` skips `guard_execute` entirely when `key` is `None` (there is no
+permission row to check against; the hook's own `auth_mode` already decided the request was
+authorized) and attributes the resulting audit log entry and execution record accordingly
+(`api_key_id = NULL`, `create_audit_log_anonymous`'s sentinel name/prefix).
 
 Note `delete_execution` is deliberately **stricter** than reading one — `can_view_execution` buys
 visibility, never destruction. An auditor is not a redactor.
@@ -575,8 +619,8 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 
 | File | Table | Note |
 | :--- | :--- | :--- |
-| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` |
-| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns |
+| `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` — a key's **own** signature mode, unrelated to `hook.rs`'s `AuthMode` below |
+| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*, deliberately kept off `ApiKey`: `NONE`/`HMAC_ONLY` describe a keyless caller, which is incoherent as a property of a credential object. See `middleware.rs` below |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
 | `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus` |
@@ -601,6 +645,7 @@ one that has shipped.
 | `m20230107_090000_key_lineage_and_resource_ownership` | `parent_key_id`, `owner_key_id` (on both `api_keys` and `hooks`), and §7's indexes |
 | `m20260809_090000_add_can_view_execution` | The third permission verb |
 | `m20260810_090000_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
+| `m20260819_120414_add_hook_auth_mode` | `hooks.auth_mode` (`NOT NULL DEFAULT 'CANONICAL_V1'`), `hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template` (all nullable) — per-hook inbound authentication, see `entities/hook.rs` above |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the
