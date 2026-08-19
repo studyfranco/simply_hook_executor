@@ -6776,3 +6776,80 @@ collision isolation. Before writing anything, checked which asks were genuinely 
 and the random-byte UTF-8 check were each specifically re-verified for flakiness) ·
 `./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing, unrelated), 0
 drifted**.
+
+---
+
+# 2026-08-19 (sixth pass) — WebUI: subpath-agnostic API resolution behind a reverse proxy
+
+`static/app.js` hardcoded `this.apiBase = '/api'`, so a deployment behind a reverse proxy mounted
+under a subpath (Traefik `PathPrefix('/hook_executor')`) sent every request straight at the domain
+root — `GET /api/auth/me`, never `GET /hook_executor/api/auth/me` — and 404'd before the proxy's own
+routing rule could ever match it. `example/simply_ip_vault`'s `static/app.js` (its `FirewallClient`
+class) already solves the identical problem for `PathPrefix('/ip_vault')`, so this pass ported its
+mechanism rather than inventing a new one.
+
+## The two-base split, and why one base cannot do this job
+
+The fix is not "make the base relative" — a single relative base breaks the *signature*, not the
+routing. Read first: `src/middleware.rs`'s `authenticate_bearer_key` canonicalizes against
+`OriginalUri`, documented there as undoing Axum's own internal `Router::nest` prefix-stripping —
+it has **no visibility into a reverse proxy in front of the process at all**. A proxy that strips its
+mount prefix before forwarding (the standard Traefik `PathPrefix` + `StripPrefix` pairing) means the
+daemon only ever sees `/api/...`, never `/hook_executor/api/...`, regardless of what the browser's
+address bar shows. So two genuinely different strings are needed:
+
+- `requestBase` — where `fetch()` sends the request. Must include whatever prefix the proxy expects,
+  so the request reaches it at all. Derived from `window.location.pathname` (`deriveRequestBase()`),
+  which needs no configuration because it is exactly the directory this page was itself loaded from.
+- `signingBase` — what the canonical string is built from. Must be the path the *daemon* receives
+  post-strip, which the browser has no way to discover — hence `setApiBaseOverride()`, a login-screen
+  field (`login-api-base`) persisted to `localStorage` independent of the credentials, defaulting to
+  `/api` (the direct-access case, where the two bases are identical and behavior is byte-for-byte
+  unchanged from before this pass).
+
+Signing `requestBase` instead — the naive "just make it relative" fix — would work at the domain root
+and break the moment a proxy strips a prefix: the daemon would verify `/api/auth/me` against a
+signature computed over `/hook_executor/api/auth/me`, a `401` with no debugging signal beyond "the
+signature is wrong."
+
+## The "with or without a trailing slash" requirement, and why it cannot be solved in `app.js`
+
+`deriveRequestBase()`'s directory computation (`path.slice(0, path.lastIndexOf('/') + 1)`) is the
+same RFC 3986 §5.3 rule the browser already applies to resolve this page's own `<script src="app.js">`
+and `<link href="style.css">` — both plain relative hrefs, unchanged by this pass. Verified by hand
+(no `node` available in this environment) against every combination the task named: root, root with
+`index.html` named explicitly, `/hook_executor/`, `/hook_executor/index.html`, and the two-segment
+`/direct/hook_executor/` all resolve correctly. The one case that does not — a bare prefix with **no**
+trailing slash (`/hook_executor`, not `/hook_executor/`) — resolves the *same* way for `app.js`
+itself: the browser would already be fetching `/app.js` at the domain root before any code in this
+file ever ran, on every browser, by the same RFC 3986 merge rule. A JS fix cannot repair a page that
+never finished loading its own script. This is a pre-existing constraint of using relative asset
+paths at all (`style.css`/`app.js` already had it), not a new one, and it is resolved the same way it
+already had to be: the proxy redirects the bare prefix to its trailing-slash form before serving the
+page, which is standard behavior for path-prefix-mounted static apps and outside what a served JS
+file can influence. Documented as a comment on `deriveRequestBase()` rather than left implicit.
+
+## No backend changes
+
+Every change is confined to `static/app.js` and `static/index.html` — no route, response schema, or
+signature-verification logic in `src/` was touched, matching the task's explicit "no breaking changes
+to existing backend routes" constraint. `cargo check`/`clippy`/`test` are unaffected by construction;
+run anyway per the gate list, unchanged.
+
+## E2E coverage added (§52)
+
+Consistent with §35's established precedent (`AGENT.MD` forbids frontend dependencies, so there is no
+JS runtime or headless browser anywhere in this suite — WebUI behavior is pinned by asserting on the
+served source, not by driving it): a new section greps `static/app.js`/`static/index.html` for the
+hardcoded base's absence, the two derivation functions' presence, `requestBase`/`signingBase` actually
+being used at their respective call sites (never the same variable doing both jobs), the override
+field's presence in the markup, and its wiring in `bindEvents()` — plus two liveness checks (`GET /`,
+`GET /app.js`) confirming the daemon still serves the modified files without incident.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**307 passed / 0 failed / 2 ignored** (unchanged — no Rust source or test file was touched) ·
+`cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **1039 passed / 0 failed** — up from
+1030 before this pass · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence
+(pre-existing, unrelated), 0 drifted**.

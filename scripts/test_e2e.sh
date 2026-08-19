@@ -4667,6 +4667,72 @@ check_stdout_contains "PARAM_PATH:[not-a-real-path]" \
 check_stdout_contains "PARAM_IFS:[X]" \
     "the IFS parameter's value reaches the script as HOOK_PARAM_IFS, not as IFS"
 
+# ── 52. WebUI subpath-agnostic API resolution ───────────────────────────────
+
+log_section "52. WebUI Subpath-Agnostic API Resolution"
+
+# Same constraint as §35: no JS runtime and no headless browser here, so a reverse-proxy subpath
+# deployment (Traefik `PathPrefix('/hook_executor')`, with or without a trailing slash, with or
+# without the prefix stripped before forwarding upstream) cannot be driven end to end. What can be
+# pinned is that the SPA has exactly one way of computing each of two genuinely different paths —
+# where a request is *sent* (browser-relative, so it reaches this page's own proxy mount) and what
+# gets *signed* (the daemon's own view of its path, which a prefix-stripping proxy makes different)
+# — rather than the single hardcoded `/api` this section exists because of.
+
+# The old failure mode: a fixed absolute base that ignores wherever the page itself was loaded from,
+# and escapes any subpath a reverse proxy put it under.
+if grep -qF "this.apiBase = '/api'" "$SPA_JS"; then
+    check_local "hardcoded" "derived" "static/app.js no longer hardcodes a fixed /api base"
+else
+    check_local "derived" "derived" "static/app.js no longer hardcodes a fixed /api base"
+fi
+
+# requestBase: derived from window.location.pathname, so it inherits whatever prefix the browser
+# actually loaded this page under, with no configuration.
+if grep -qF 'window.location.pathname' "$SPA_JS" && grep -qF 'static deriveRequestBase()' "$SPA_JS"; then
+    check_local "present" "present" "requestBase is derived from the page's own location"
+else
+    check_local "missing" "present" "requestBase is derived from the page's own location"
+fi
+
+# signingBase: independently overridable, because a prefix-stripping proxy makes it genuinely
+# different from requestBase and no amount of browser-side introspection can discover it.
+if grep -qF 'static normalizeBasePath(raw)' "$SPA_JS" && grep -qF 'setApiBaseOverride(raw)' "$SPA_JS"; then
+    check_local "present" "present" "signingBase has its own override, independent of requestBase"
+else
+    check_local "missing" "present" "signingBase has its own override, independent of requestBase"
+fi
+
+# The two must actually be used where it matters: fetch() sent to requestBase, the signature
+# computed over signingBase — never the reverse, and never the same variable doing both jobs.
+if grep -qF 'fetch(requestPath' "$SPA_JS" && grep -qF 'this.signer.headers(method, signedPath' "$SPA_JS"; then
+    check_local "split" "split" "the request target and the signed path are built from different bases"
+else
+    check_local "unified" "split" "the request target and the signed path are built from different bases"
+fi
+
+# The login form carries the override control, and app.js actually reads it before the very first
+# (already-signed) request a session makes.
+if grep -qF 'id="login-api-base"' "$SPA_HTML"; then
+    check_local "present" "present" "index.html carries the API base path override field"
+else
+    check_local "missing" "present" "index.html carries the API base path override field"
+fi
+if grep -qF "this.setApiBaseOverride(document.getElementById('login-api-base').value)" "$SPA_JS"; then
+    check_local "wired" "wired" "the override is applied before login()'s first signed request"
+else
+    check_local "unwired" "wired" "the override is applied before login()'s first signed request"
+fi
+
+# And the daemon itself still serves the (now-modified) static files without incident — the fix is
+# purely client-side, so this pins that nothing on the serving path regressed alongside it.
+api_call GET "/"
+check "200" "the index page still serves"
+api_call GET "/app.js"
+check "200" "the modified app.js still serves"
+check_not_contains "this.apiBase = '/api'" \
+    "the served app.js response is the fixed file, not a stale cached copy of the old hardcoded base"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

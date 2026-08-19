@@ -457,7 +457,26 @@ class HookExecutorClient {
     constructor() {
         this.apiKey = localStorage.getItem('simply_hook_executor_key') || '';
         this.signer = new RequestSigner(localStorage.getItem('simply_hook_executor_signing_secret') || '');
-        this.apiBase = '/api';
+
+        // Two distinct bases, because behind a reverse proxy they are genuinely different paths:
+        //
+        //   requestBase — where to SEND. Derived from where this page is served, so a dashboard
+        //                 mounted at /hook_executor/ fetches /hook_executor/api/hooks without any
+        //                 configuration at all.
+        //   signingBase — what to SIGN. The path this daemon's own HTTP layer sees after a
+        //                 prefix-stripping reverse proxy is done rewriting, which no amount of
+        //                 introspection in the browser can discover — hence the override. Defaults
+        //                 to '/api', the direct-access case where the two are identical.
+        //
+        // Signing the browser's own URL instead would break the moment a proxy strips a prefix:
+        // the daemon would verify '/api/hooks' against a signature computed over
+        // '/hook_executor/api/hooks'. (`OriginalUri` in src/middleware.rs only undoes Axum's own
+        // internal `Router::nest` prefix-stripping — it has no visibility into a reverse proxy in
+        // front of the process at all, so it cannot paper over this on the server side.)
+        this.requestBase = HookExecutorClient.deriveRequestBase();
+        this.signingBase = HookExecutorClient.normalizeBasePath(
+            localStorage.getItem('simply_hook_executor_api_base') || ''
+        );
         this.state = {
             profile: null,
             hooks: [],
@@ -530,13 +549,75 @@ class HookExecutorClient {
     }
 
     // ───────────────────────────────────────────────────────
+    // Proxy-aware base paths
+    // ───────────────────────────────────────────────────────
+
+    /**
+     * Cleans up a user-typed base path: trims it, guarantees exactly one leading slash, drops any
+     * trailing one, and falls back to '/api' when blank. Idempotent, so re-normalizing a stored
+     * value is harmless.
+     */
+    static normalizeBasePath(raw) {
+        const trimmed = (raw || '').trim();
+        if (!trimmed) return '/api';
+        return `/${trimmed.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+    }
+
+    /**
+     * The prefix every request is sent to, derived from the directory this page is served from.
+     *
+     * Served at `/` this yields `/api` — byte-identical to the previous hardcoded value, so direct
+     * (non-proxied) deployments behave exactly as before. Served at `/hook_executor/` it yields
+     * `/hook_executor/api`, which is what makes a sub-path mount work with no configuration at all.
+     *
+     * This is the same directory-of-the-current-URL rule (RFC 3986 §5.3) the browser itself already
+     * applies to resolve this page's own `<script src="app.js">` and `<link href="style.css">` —
+     * both plain relative hrefs. That equivalence is what makes the "with or without a trailing
+     * slash" requirement fall out for free rather than needing special-casing here: a bare-prefix
+     * URL with no trailing slash (`/hook_executor`, not `/hook_executor/`) resolves a *relative*
+     * script tag to `/app.js` at the domain root under the identical rule, so this function would
+     * never even run — the page's own assets fail to load first, on every browser, independent of
+     * anything in this file. A deployment that must support the bare-prefix form redirects it to the
+     * trailing-slash form (a one-line Traefik rule, or any reverse proxy's default directory
+     * behavior) before the page is ever served, exactly as it must already do for `style.css`.
+     */
+    static deriveRequestBase() {
+        const path = window.location.pathname;
+        // Everything up to and including the last '/': '/hook_executor/index.html' → '/hook_executor/',
+        // '/' → '/'.
+        const dir = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+        return `${dir}api`.replace(/\/{2,}/g, '/');
+    }
+
+    /**
+     * Persists the API base path override and applies it to this session.
+     *
+     * Only signing is affected — where requests are *sent* stays derived from the page location.
+     * The two are independent precisely because a prefix-stripping proxy makes them differ.
+     */
+    setApiBaseOverride(raw) {
+        const normalized = HookExecutorClient.normalizeBasePath(raw);
+        this.signingBase = normalized;
+        if (normalized === '/api') {
+            localStorage.removeItem('simply_hook_executor_api_base');
+        } else {
+            localStorage.setItem('simply_hook_executor_api_base', normalized);
+        }
+    }
+
+    // ───────────────────────────────────────────────────────
     // Fetch Wrapper (Global 401 interceptor)
     // ───────────────────────────────────────────────────────
     async apiFetch(endpoint, options = {}) {
         const method = (options.method || 'GET').toUpperCase();
-        // The signature covers the path the server actually receives, including the /api prefix
-        // and any query string — so it must be built from the full request target, not `endpoint`.
-        const pathAndQuery = `${this.apiBase}${endpoint}`;
+        // Two distinct targets built from the same endpoint: where the request is actually sent
+        // (browser-relative, so it reaches this page's own reverse-proxy path) and what the
+        // signature covers (the daemon's own view of its path — see the constructor for why a
+        // prefix-stripping proxy makes these different). Signing must use `signingBase`, never
+        // `requestBase`: the server canonicalizes against the request target *it* receives, which
+        // has already had any reverse-proxy prefix stripped away.
+        const requestPath = `${this.requestBase}${endpoint}`;
+        const signedPath = `${this.signingBase}${endpoint}`;
         // `body` is signed byte-for-byte as sent; an absent body signs as the empty string, which
         // is what the backend uses for GET/DELETE without a payload.
         const body = options.body ?? '';
@@ -549,10 +630,10 @@ class HookExecutorClient {
                 'Content-Type': 'application/json',
                 ...(options.headers || {}),
                 'X-API-Key': this.apiKey,
-                ...(await this.signer.headers(method, pathAndQuery, body))
+                ...(await this.signer.headers(method, signedPath, body))
             };
 
-            const res = await fetch(pathAndQuery, { ...options, headers });
+            const res = await fetch(requestPath, { ...options, headers });
 
             // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
             // out. 403 means the key IS valid but lacks permission for this one action; it must
@@ -2028,8 +2109,15 @@ class HookExecutorClient {
     // Event Binding
     // ───────────────────────────────────────────────────────
     bindEvents() {
+        // Prefill the override from storage so a proxied deployment doesn't ask for it again on
+        // every logout.
+        document.getElementById('login-api-base').value =
+            localStorage.getItem('simply_hook_executor_api_base') || '';
+
         document.getElementById('login-form').addEventListener('submit', (e) => {
             e.preventDefault();
+            // Applied before login(), since verifyAuth()'s very first request is already signed.
+            this.setApiBaseOverride(document.getElementById('login-api-base').value);
             // Both trimmed: a trailing newline from a paste is invisible in a password field and
             // would otherwise become part of the key lookup or the HMAC key material.
             this.login(
