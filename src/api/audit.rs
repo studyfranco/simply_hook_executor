@@ -34,18 +34,26 @@ use crate::extract::{StrictQuery};
 use crate::state::AppState;
 
 use super::DEFAULT_PAGE_LIMIT;
+use super::executions::resolve_api_key_filter;
+use super::support::parse_instant;
 
 /// Query parameters for the audit log listing.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditLogQuery {
-    /// Filter by exact action type (e.g. `HOOK_EXECUTE`).
+    /// Filter by exact action type (e.g. `HOOK_CREATE`).
     pub action: Option<String>,
     /// Filter by client IP, substring match — an operator narrowing down "everything from this
     /// address" rarely has the exact recorded string at hand (a IPv6 address's zero-compression
     /// form, in particular), so this behaves like the hook-name search filter elsewhere rather than
     /// an exact match.
     pub client_ip: Option<String>,
+    /// Restrict to a single acting key, by UUID (exact) or name (substring, case-insensitive) — see
+    /// [`resolve_api_key_filter`]. Matched against `audit_logs.api_key_id`, so a key deleted since
+    /// the entry was written can only be found by UUID (its name is no longer in `api_keys` to
+    /// search), never by the point-in-time `api_key_name` snapshot on the row itself — that
+    /// snapshot is for display, not for this filter to also index.
+    pub api_key: Option<String>,
     /// Only entries at or after this instant. RFC 3339 (`2026-08-19T00:00:00Z`), the shape
     /// `Date.prototype.toISOString()` produces — the one JavaScript's own `<input
     /// type="datetime-local">` needs a manual round trip through to get, so this exists to be filled
@@ -57,18 +65,6 @@ pub struct AuditLogQuery {
     pub limit: Option<u64>,
     /// Pagination offset.
     pub offset: Option<u64>,
-}
-
-/// Parses an RFC 3339 timestamp query parameter into the naive UTC shape `audit_logs.timestamp` is
-/// stored as. Named in the error so a malformed `since`/`until` is distinguishable from the other.
-fn parse_instant(field: &str, raw: &str) -> Result<chrono::NaiveDateTime, AppError> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.to_utc().naive_utc())
-        .map_err(|_| {
-            AppError::InvalidInput(format!(
-                "Invalid '{field}': expected an RFC 3339 timestamp, e.g. 2026-08-19T00:00:00Z"
-            ))
-        })
 }
 
 /// Handles `GET /api/audit-logs`.
@@ -95,6 +91,10 @@ pub async fn list_audit_logs(
     }
     if let Some(client_ip) = query.client_ip.as_deref().filter(|s| !s.is_empty()) {
         q = q.filter(audit_log::Column::ClientIp.contains(client_ip));
+    }
+    if let Some(api_key_filter) = query.api_key.as_deref().filter(|s| !s.is_empty()) {
+        let ids = resolve_api_key_filter(&state.db, api_key_filter).await?;
+        q = q.filter(audit_log::Column::ApiKeyId.is_in(ids));
     }
     if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
         q = q.filter(audit_log::Column::Timestamp.gte(parse_instant("since", since)?));

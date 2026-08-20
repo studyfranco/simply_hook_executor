@@ -1907,6 +1907,7 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         signature_header: Set(None),
         signature_prefix: Set(None),
         canonical_template: Set(None),
+        sample_payload_json: Set(None),
     }
     .insert(&db)
     .await
@@ -3053,7 +3054,8 @@ async fn audit_trail_records_mutations_and_is_master_only() {
     .await;
     let hook_id = created.string("id");
     grant(&db, scoped_id, Uuid::parse_str(&hook_id).expect("valid uuid"), true, false).await;
-    send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &scoped, None)).await;
+    let executed = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &scoped, None)).await;
+    assert_eq!(executed.status, StatusCode::OK, "{}", executed.raw);
 
     // Scoped keys cannot read the trail at all.
     assert_eq!(send(&app, json_request("GET", "/api/audit-logs", &scoped, None)).await.status, StatusCode::FORBIDDEN);
@@ -3065,15 +3067,17 @@ async fn audit_trail_records_mutations_and_is_master_only() {
     assert_eq!(rows[0]["client_ip"], json!("127.0.0.1"));
     assert_eq!(rows[0]["target_resource"], json!("audited"));
 
+    // `audit_logs` is the administrative/mutation trail; running a hook is neither, and already has
+    // its own purpose-built, RBAC-scoped record in `executions`. Asserted two ways: no `HOOK_EXECUTE`
+    // action was ever written, and the trail's total row count is exactly the one mutation above —
+    // the execution did not sneak in under some other action name either.
     let executes = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_EXECUTE", &master, None)).await;
     let rows = executes.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["api_key_name"], json!("Scoped"));
-    assert!(
-        rows[0]["details"].as_str().unwrap_or_default().contains("audited"),
-        "details name the hook: {}",
-        rows[0]["details"]
-    );
+    assert_eq!(rows.len(), 0, "hook execution must never write an audit_logs entry");
+
+    let all = send(&app, json_request("GET", "/api/audit-logs?limit=50", &master, None)).await;
+    let rows = all.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "the only audit entry in this test is the HOOK_CREATE above: {:?}", rows);
 }
 
 #[tokio::test]
@@ -7240,4 +7244,389 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
         StatusCode::OK,
         "master may delegate on the same hook"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Independent key/secret regeneration
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn regenerate_key_replaces_only_the_bearer_credential() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let target = insert_key_full(&db, "Target", "0.0.0.0/0", KeyScopes::plain()).await;
+
+    let res = send(&app, json_request("POST", &format!("/api/keys/{}/regenerate-key", target.id), &master, None)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
+    let new_key = res.string("plaintext_key");
+    assert!(res.json.get("key_id").is_none(), "regenerate-key does not echo the (unchanged) key_id");
+    assert!(res.json.get("signing_secret").is_none(), "nor the (unchanged) signing secret");
+
+    // The old bearer key is dead.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &target.plaintext, None)).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the old X-API-Key must stop working immediately"
+    );
+    // The new one works.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &new_key, None)).await.status,
+        StatusCode::OK,
+        "the new X-API-Key must work immediately"
+    );
+    // The signing secret is untouched: a request signed with the *original* secret, presented with
+    // the *new* bearer key, still verifies.
+    let signed = signed_request("GET", "/api/auth/me", &new_key, &target.signing_secret, "");
+    assert_eq!(send(&app, signed).await.status, StatusCode::OK, "the original signing secret still verifies");
+}
+
+#[tokio::test]
+async fn regenerate_secret_replaces_only_the_signing_pair() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let target = insert_key_full(&db, "Target", "0.0.0.0/0", KeyScopes::plain()).await;
+
+    let res = send(&app, json_request("POST", &format!("/api/keys/{}/regenerate-secret", target.id), &master, None)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
+    let new_secret = res.string("signing_secret");
+    assert_ne!(new_secret, target.signing_secret, "a genuinely new secret is minted");
+    assert!(res.json.get("plaintext_key").is_none(), "regenerate-secret does not echo the (unchanged) bearer key");
+
+    // The bearer key is untouched: it still authenticates unsigned.
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &target.plaintext, None)).await.status,
+        StatusCode::OK,
+        "the unchanged bearer key still works"
+    );
+    // The old secret no longer verifies; the new one does.
+    let old_sig = signed_request("GET", "/api/auth/me", &target.plaintext, &target.signing_secret, "");
+    assert_eq!(send(&app, old_sig).await.status, StatusCode::UNAUTHORIZED, "the old signing secret is dead");
+    let new_sig = signed_request("GET", "/api/auth/me", &target.plaintext, &new_secret, "");
+    assert_eq!(send(&app, new_sig).await.status, StatusCode::OK, "the new signing secret verifies");
+}
+
+#[tokio::test]
+async fn regenerate_endpoints_require_key_management_and_refuse_the_master() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (master_id, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let plain = insert_key_full(&db, "Plain", "0.0.0.0/0", KeyScopes::plain()).await;
+    let target = insert_key_full(&db, "Target", "0.0.0.0/0", KeyScopes::plain()).await;
+
+    for path_suffix in ["regenerate-key", "regenerate-secret"] {
+        let denied = send(
+            &app,
+            json_request("POST", &format!("/api/keys/{}/{path_suffix}", target.id), &plain.plaintext, None),
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "a plain key cannot {path_suffix}: {}", denied.raw);
+
+        let on_master = send(&app, json_request("POST", &format!("/api/keys/{master_id}/{path_suffix}"), &master, None)).await;
+        assert_eq!(on_master.status, StatusCode::FORBIDDEN, "{path_suffix} refuses the master key itself: {}", on_master.raw);
+    }
+}
+
+#[tokio::test]
+async fn a_key_can_be_created_with_no_signing_secret_and_can_manage_keys_forbids_it() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    let bearer_only = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "bearer_only", "bound_ips": "0.0.0.0/0", "generate_signing_secret": false })),
+        ),
+    )
+    .await;
+    assert_eq!(bearer_only.status, StatusCode::OK, "{}", bearer_only.raw);
+    assert_eq!(bearer_only.json.get("key_id"), Some(&json!(null)), "no key_id is minted");
+    assert_eq!(bearer_only.json.get("signing_secret"), Some(&json!(null)), "no signing secret is minted");
+    let plaintext = bearer_only.string("plaintext_key");
+    assert_eq!(
+        send(&app, json_request("GET", "/api/auth/me", &plaintext, None)).await.status,
+        StatusCode::OK,
+        "the bearer-only key still authenticates unsigned"
+    );
+    let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
+    let rows = listed.json.as_array().cloned().unwrap_or_default();
+    let row = rows.iter().find(|k| k["name"] == json!("bearer_only")).expect("listed");
+    assert_eq!(row["key_id"], json!(null));
+    assert_eq!(row["has_signing_secret"], json!(false));
+
+    let refused = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({
+                "name": "admin_no_secret",
+                "bound_ips": "0.0.0.0/0",
+                "can_manage_keys": true,
+                "generate_signing_secret": false
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "can_manage_keys requires a signing secret: {}", refused.raw);
+}
+
+// ─────────────────────────────────────────────────────────────
+// hooks.sample_payload_json
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sample_payload_json_is_validated_against_declared_parameters() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("sample_hook.sh", "#!/bin/sh\necho ok\n");
+
+    // Malformed JSON is refused outright.
+    let bad_json = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "bad_json_hook", "script_path": script, "sample_payload_json": "{not json" })),
+        ),
+    )
+    .await;
+    assert_eq!(bad_json.status, StatusCode::BAD_REQUEST, "{}", bad_json.raw);
+
+    // A JSON array (not an object) is refused too.
+    let not_object = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "array_sample_hook", "script_path": script, "sample_payload_json": "[1,2,3]" })),
+        ),
+    )
+    .await;
+    assert_eq!(not_object.status, StatusCode::BAD_REQUEST, "{}", not_object.raw);
+
+    // A declared parameter absent from the sample is refused, naming the missing key.
+    let missing_key = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "missing_key_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "target_ip", "is_required": true}],
+                "sample_payload_json": "{\"other_field\": \"x\"}"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(missing_key.status, StatusCode::BAD_REQUEST, "{}", missing_key.raw);
+    assert!(missing_key.raw.contains("target_ip"), "the error names the missing key: {}", missing_key.raw);
+
+    // A sample that names every declared parameter is accepted.
+    let ok = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "matching_sample_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "target_ip", "is_required": true}],
+                "sample_payload_json": "{\"target_ip\": \"203.0.113.5\"}"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.raw);
+    assert_eq!(ok.field("sample_payload_json").as_str(), Some("{\"target_ip\": \"203.0.113.5\"}"));
+    let hook_id = ok.string("id");
+
+    // A hook with no parameters at all needs no cross-check, only well-formed JSON.
+    let no_params = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "no_params_hook", "script_path": script, "sample_payload_json": "{\"anything\": 1}" })),
+        ),
+    )
+    .await;
+    assert_eq!(no_params.status, StatusCode::OK, "{}", no_params.raw);
+
+    // Updating the sample re-validates against the hook's *current* declared parameters.
+    let update_refused = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "sample_payload_json": "{\"wrong_field\": \"x\"}" })),
+        ),
+    )
+    .await;
+    assert_eq!(update_refused.status, StatusCode::BAD_REQUEST, "{}", update_refused.raw);
+
+    // Clearing it with "" is always permitted, regardless of the parameter contract.
+    let cleared = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "sample_payload_json": "" }))),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
+    assert_eq!(cleared.field("sample_payload_json"), &json!(null));
+}
+
+// ─────────────────────────────────────────────────────────────
+// System settings: keyless_hooks_allowed
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn settings_expose_whether_keyless_hooks_are_globally_allowed() {
+    let db = setup_test_db().await;
+    // One master, reused against both app instances below — a second `insert_key(..., master())`
+    // against the same database would collide on the `master_marker` uniqueness constraint (§5).
+    let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    let permissive = create_app(test_state(&db));
+    let res = send(&permissive, json_request("GET", "/api/settings", &master.plaintext, None)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
+    assert_eq!(res.field("require_signed_requests"), &json!(false));
+    assert_eq!(res.field("keyless_hooks_allowed"), &json!(true), "the negation of require_signed_requests: {}", res.raw);
+
+    let strict = create_app(test_state_requiring_signatures(&db));
+    let signed = signed_request("GET", "/api/settings", &master.plaintext, &master.signing_secret, "");
+    let res = send(&strict, signed).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
+    assert_eq!(res.field("require_signed_requests"), &json!(true));
+    assert_eq!(res.field("keyless_hooks_allowed"), &json!(false));
+}
+
+// ─────────────────────────────────────────────────────────────
+// Execution & audit-log filter parity: api_key, since, until
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn execution_history_reports_and_filters_by_acting_key() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("filter_hook.sh", "#!/bin/sh\necho ok\n");
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let alice = insert_key_full(&db, "Alice", "0.0.0.0/0", KeyScopes::plain()).await;
+    let bob = insert_key_full(&db, "Bob", "0.0.0.0/0", KeyScopes::plain()).await;
+
+    let hook_id = insert_hook(&db, "filter_hook", &script, 30).await;
+    grant(&db, alice.id, hook_id, true, false).await;
+    grant(&db, bob.id, hook_id, true, false).await;
+
+    let ran_alice = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &alice.plaintext, None)).await;
+    assert_eq!(ran_alice.status, StatusCode::OK, "{}", ran_alice.raw);
+    assert_eq!(ran_alice.field("api_key_name").as_str(), Some("Alice"), "the acting key's name is reported");
+
+    let ran_bob = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &bob.plaintext, None)).await;
+    assert_eq!(ran_bob.status, StatusCode::OK, "{}", ran_bob.raw);
+
+    // By name.
+    let by_name = send(&app, json_request("GET", "/api/executions?api_key=Alice", &master, None)).await;
+    let rows = by_name.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0]["api_key_name"], json!("Alice"));
+
+    // By UUID.
+    let by_id = send(&app, json_request("GET", &format!("/api/executions?api_key={}", bob.id), &master, None)).await;
+    let rows = by_id.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0]["api_key_name"], json!("Bob"));
+}
+
+#[tokio::test]
+async fn execution_and_audit_history_filter_by_time_range() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("time_hook.sh", "#!/bin/sh\necho ok\n");
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    // Created through the API, not `insert_hook` (a raw DB seed with no audit trail), since the
+    // audit-log half of this test needs a real HOOK_CREATE entry to filter against.
+    let created = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "time_hook", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+
+    let boundary = chrono::Utc::now();
+    // `to_rfc3339()` renders a UTC offset as "+00:00", and an unescaped "+" in a query string is
+    // form-decoded as a space, which breaks `parse_instant`'s RFC 3339 parse before this test's own
+    // assertion is ever reached. `use_z: true` renders "Z" instead, which contains nothing a query
+    // string reinterprets.
+    let boundary_str = boundary.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    let ran = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None)).await;
+    assert_eq!(ran.status, StatusCode::OK, "{}", ran.raw);
+
+    // Executions: the run happened after the captured boundary.
+    let since = send(&app, json_request("GET", &format!("/api/executions?since={boundary_str}"), &master, None)).await;
+    assert_eq!(since.json.as_array().map(Vec::len).unwrap_or(0), 1, "{}", since.raw);
+    let until = send(&app, json_request("GET", &format!("/api/executions?until={boundary_str}"), &master, None)).await;
+    assert_eq!(until.json.as_array().map(Vec::len).unwrap_or(0), 0, "{}", until.raw);
+
+    // Audit logs: the hook's own HOOK_CREATE entry happened before the boundary.
+    let audit_since = send(&app, json_request("GET", &format!("/api/audit-logs?action=HOOK_CREATE&since={boundary_str}"), &master, None)).await;
+    assert_eq!(audit_since.json.as_array().map(Vec::len).unwrap_or(0), 0, "{}", audit_since.raw);
+    let audit_until = send(&app, json_request("GET", &format!("/api/audit-logs?action=HOOK_CREATE&until={boundary_str}"), &master, None)).await;
+    assert_eq!(audit_until.json.as_array().map(Vec::len).unwrap_or(0), 1, "{}", audit_until.raw);
+
+    // A malformed timestamp is refused, not silently ignored.
+    let malformed = send(&app, json_request("GET", "/api/executions?since=not-a-timestamp", &master, None)).await;
+    assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+    let malformed_audit = send(&app, json_request("GET", "/api/audit-logs?until=not-a-timestamp", &master, None)).await;
+    assert_eq!(malformed_audit.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn audit_logs_filter_by_acting_key() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let parent = insert_key_full(
+        &db,
+        "Parent",
+        "0.0.0.0/0",
+        KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() },
+    )
+    .await;
+
+    // A can_manage_keys holder must always sign, regardless of REQUIRE_SIGNED_REQUESTS.
+    let body = json!({ "name": "child", "bound_ips": "0.0.0.0/0" }).to_string();
+    let created = send(
+        &app,
+        signed_request("POST", "/api/keys", &parent.plaintext, &parent.signing_secret, &body),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+
+    let by_name = send(&app, json_request("GET", "/api/audit-logs?api_key=Parent", &master, None)).await;
+    let rows = by_name.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0]["action"], json!("KEY_CREATE"));
+
+    let none_match = send(&app, json_request("GET", "/api/audit-logs?api_key=NoSuchKeyNameAtAll", &master, None)).await;
+    assert_eq!(none_match.json.as_array().map(Vec::len).unwrap_or(0), 0);
 }

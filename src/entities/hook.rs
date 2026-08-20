@@ -138,6 +138,12 @@ pub struct Model {
     /// signed material verbatim rather than rejected — a template is data the operator controls, not
     /// something this service validates the shape of beyond that.
     pub canonical_template: Option<String>,
+    /// An example of the JSON body a real caller sends this hook — free-form, not schema-validated
+    /// beyond being well-formed JSON. Drives the WebUI's live command preview and JSON Payload
+    /// Extractor, and — only when both this and at least one declared parameter exist — is checked
+    /// at creation/update time (`api::hooks::validate_sample_payload_matches_parameters`) so a
+    /// parameter contract cannot silently drift from the shape callers actually send.
+    pub sample_payload_json: Option<String>,
 }
 
 /// Relations from `hooks` to other entities.

@@ -149,7 +149,7 @@ async fn deleting_a_key_cascades_grants_but_only_nulls_execution_and_audit_attri
     grant(&db, doomed_key, hook_id, true, false).await;
     grant(&db, other_key, hook_id, true, false).await;
     let execution_id = insert_execution_by(&db, hook_id, doomed_key).await;
-    let audit_id = insert_audit_by(&db, doomed_key, "HOOK_EXECUTE").await;
+    let audit_id = insert_audit_by(&db, doomed_key, "HOOK_UPDATE").await;
 
     assert_eq!(count_perms_for_key(&db, doomed_key).await, 1);
 

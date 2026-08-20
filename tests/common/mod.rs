@@ -502,6 +502,7 @@ pub async fn insert_hook_full(
         signature_header: Set(None),
         signature_prefix: Set(None),
         canonical_template: Set(None),
+        sample_payload_json: Set(None),
     }
     .insert(db)
     .await
@@ -544,6 +545,7 @@ pub async fn insert_hook_deleted_days_ago(
         signature_header: Set(None),
         signature_prefix: Set(None),
         canonical_template: Set(None),
+        sample_payload_json: Set(None),
     }
     .insert(db)
     .await

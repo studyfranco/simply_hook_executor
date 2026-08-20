@@ -248,6 +248,12 @@ pub struct MeResponse {
     pub can_manage_hooks: bool,
     /// Granular per-hook permissions.
     pub hook_permissions: Vec<HookPermissionView>,
+    /// Whether this deployment can actually reach a hook set to `auth_mode = NONE` keylessly — see
+    /// `system::SettingsResponse::keyless_hooks_allowed`, which this mirrors. Surfaced here too
+    /// (not only in `GET /api/settings`, master-only) because a non-master `can_manage_hooks`
+    /// holder still needs this fact to decide whether offering `NONE` in the hook-creation form
+    /// means anything on this deployment.
+    pub keyless_hooks_allowed: bool,
 }
 
 /// Builds the per-hook permission views for one key.
@@ -295,6 +301,7 @@ pub async fn get_me(
         can_manage_keys: key.can_manage_keys,
         can_manage_hooks: key.can_manage_hooks,
         hook_permissions,
+        keyless_hooks_allowed: !state.config.require_signed_requests,
     }))
 }
 
@@ -341,6 +348,15 @@ pub struct CreateApiKeyPayload {
     pub can_manage_keys: Option<bool>,
     /// Global hook-creation scope.
     pub can_manage_hooks: Option<bool>,
+    /// Whether to mint a `key_id` + `signing_secret` pair for this key at all. Defaults to `true`
+    /// (every key minted this way until now). Set `false` for a plain `X-API-Key`-only credential
+    /// that never signs — the standard-API-key-only mode `key_id`'s own doc comment already
+    /// anticipated ("`None` only for keys issued before signing secrets existed"): this is simply
+    /// the create-time path back to that shape, rather than something reachable only by predating a
+    /// feature. **Refused (`400`) together with `can_manage_keys = true`**: such a key must always
+    /// sign (`middleware::authenticate_bearer_key`), so it cannot be minted with nothing to sign
+    /// with.
+    pub generate_signing_secret: Option<bool>,
 }
 
 /// Response after creating an API key — the only time the secrets are ever available.
@@ -352,10 +368,13 @@ pub struct CreateApiKeyResponse {
     pub plaintext_key: String,
     /// Public key identifier, for display and log correlation. Not a secret, and not a credential:
     /// it stays retrievable from `GET /api/keys` afterwards and is never sent as an auth header.
-    pub key_id: String,
+    /// `None` when `generate_signing_secret: false` was requested — a plain bearer-only key.
+    pub key_id: Option<String>,
     /// The HMAC signing secret. Shown **once**; only its encrypted form is stored, and no endpoint
-    /// will ever return it again. Rotating the key is the only way to obtain a new one.
-    pub signing_secret: String,
+    /// will ever return it again. `POST /api/keys/{id}/regenerate-secret` is the only way to obtain
+    /// a new one — including a bearer-only key's *first* one, minted after the fact. `None` for the
+    /// same reason as `key_id`.
+    pub signing_secret: Option<String>,
     /// Key name.
     pub name: String,
     /// Bound CIDRs.
@@ -511,6 +530,18 @@ pub async fn create_api_key(
     // some unrelated field in the same payload.
     guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
 
+    // A `can_manage_keys` holder must always sign (`middleware::authenticate_bearer_key`), so it
+    // cannot be minted with nothing to sign with. Checked ahead of the other field validation,
+    // alongside the guard above, for the same "authorization-shaped refusals surface first" reason.
+    let wants_signing_pair = payload.generate_signing_secret.unwrap_or(true);
+    if payload.can_manage_keys.unwrap_or(false) && !wants_signing_pair {
+        return Err(AppError::InvalidInput(
+            "can_manage_keys requires a signing secret: generate_signing_secret cannot be false \
+             for a key that manages other keys, since such a key must always sign."
+                .to_owned(),
+        ));
+    }
+
     // Computed here, ahead of the other field validation below, so the mandatory-CANONICAL_V1
     // guard can run in the same "authorization before validation" position as the guard above —
     // and so it is set exactly once, since `hmac_mode` is immutable from here on.
@@ -531,7 +562,11 @@ pub async fn create_api_key(
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
-    let (key_id, signing_secret, sealed_secret) = mint_signing_pair(&state.cipher)?;
+    // `None` all around for a bearer-only key — the same shape `key_id`'s doc comment already
+    // describes for "keys issued before signing secrets existed", now reachable by request instead
+    // of only by predating the feature.
+    let (key_id, signing_secret, sealed_secret) =
+        if wants_signing_pair { mint_signing_pair(&state.cipher).map(|(a, b, c)| (Some(a), Some(b), Some(c)))? } else { (None, None, None) };
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
@@ -540,8 +575,8 @@ pub async fn create_api_key(
         key_hash: Set(key_hash),
         name: Set(payload.name.clone()),
         prefix: Set(prefix),
-        key_id: Set(Some(key_id.clone())),
-        signing_secret: Set(Some(sealed_secret)),
+        key_id: Set(key_id.clone()),
+        signing_secret: Set(sealed_secret),
         hmac_mode: Set(hmac_mode),
         canonical_template: Set(canonical_template),
         bound_ips: Set(payload.bound_ips.clone()),
@@ -569,7 +604,7 @@ pub async fn create_api_key(
         Some(format!(
             "Created key {} ({})",
             format_reference(&payload.name, id),
-            describe_hmac_mode(hmac_mode)
+            if wants_signing_pair { describe_hmac_mode(hmac_mode).to_owned() } else { "bearer-only, no signing secret".to_owned() }
         )),
     )
     .await?;
@@ -1100,6 +1135,129 @@ pub async fn rotate_api_key(
         key_id,
         signing_secret,
     }))
+}
+
+/// Response after regenerating only an API key's bearer credential.
+#[derive(Serialize)]
+pub struct RegenerateKeyResponse {
+    /// Internal UUID.
+    pub id: Uuid,
+    /// The new plaintext `X-API-Key`. Shown only once — only its hash is stored.
+    pub plaintext_key: String,
+}
+
+/// Handles `POST /api/keys/{id}/regenerate-key` — issues a new bearer `X-API-Key`, leaving the
+/// signing pair (`key_id` + `signing_secret`) untouched.
+///
+/// Distinct from [`rotate_api_key`] (`POST /api/keys/{id}/rotate`), which replaces *both* halves at
+/// once, and from [`regenerate_secret`] below, its narrower counterpart on the other half. A caller
+/// signing with the old secret keeps working immediately after this — only the header value
+/// changes — which is the point of splitting it out: "this specific credential string leaked" and
+/// "this key may be compromised, replace everything" are different incidents with different blast
+/// radii, and forcing the wider one every time either happens means re-provisioning every
+/// integration that relies on the (unaffected) signing secret for no reason.
+pub async fn regenerate_key(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = load_administrable_key(&state.db, &key, id).await?;
+    // Same rationale as `rotate_api_key`: the response hands back a working plaintext credential,
+    // so doing this to someone else's master key is credential theft with a lockout attached.
+    guard_master_to_administer(&key, &target, "regenerate")?;
+    refuse_master_lifecycle_action(&target, "regenerate")?;
+    let reference = format_reference(&target.name, id);
+    let name = target.name.clone();
+
+    let plaintext_key = generate_random_key();
+    let key_hash = hash_key(&plaintext_key);
+    let prefix = plaintext_key.chars().take(8).collect::<String>();
+
+    let mut active: api_key::ActiveModel = target.into();
+    active.key_hash = Set(key_hash);
+    active.prefix = Set(prefix);
+    active.updated_at = Set(Utc::now().naive_utc());
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "KEY_REGENERATE_KEY",
+        Some(name),
+        Some(format!(
+            "Regenerated the bearer API key for {reference}; its signing secret is unchanged"
+        )),
+    )
+    .await?;
+
+    Ok(Json(RegenerateKeyResponse { id, plaintext_key }))
+}
+
+/// Response after regenerating only an API key's HMAC signing pair.
+#[derive(Serialize)]
+pub struct RegenerateSecretResponse {
+    /// Internal UUID.
+    pub id: Uuid,
+    /// The new public key identifier.
+    pub key_id: String,
+    /// The new HMAC signing secret. Shown only once.
+    pub signing_secret: String,
+}
+
+/// Handles `POST /api/keys/{id}/regenerate-secret` — issues a new `key_id` + `signing_secret` pair,
+/// leaving the bearer `X-API-Key` untouched.
+///
+/// [`regenerate_key`]'s mirror image, and [`rotate_api_key`]'s other narrower counterpart. A caller
+/// presenting the existing `X-API-Key` unsigned (or signed with the *new* secret once it has it)
+/// keeps working; only a caller still signing with the old secret is cut over. `key_id` is
+/// regenerated alongside the secret rather than held fixed, matching how the pair is minted
+/// everywhere else (creation, full rotation) — the two have shared a lifecycle since
+/// [`crate::api::support::mint_signing_pair`] was introduced, and giving this one endpoint a
+/// different rule would be a special case with no benefit: `key_id` is a display identifier, not a
+/// credential, so nothing depends on it surviving a secret regeneration.
+pub async fn regenerate_secret(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = load_administrable_key(&state.db, &key, id).await?;
+    guard_master_to_administer(&key, &target, "regenerate")?;
+    refuse_master_lifecycle_action(&target, "regenerate")?;
+    let reference = format_reference(&target.name, id);
+    let name = target.name.clone();
+
+    let (key_id, signing_secret, sealed_secret) = mint_signing_pair(&state.cipher)?;
+
+    let mut active: api_key::ActiveModel = target.into();
+    active.key_id = Set(Some(key_id.clone()));
+    active.signing_secret = Set(Some(sealed_secret));
+    active.updated_at = Set(Utc::now().naive_utc());
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "KEY_REGENERATE_SECRET",
+        Some(name),
+        Some(format!(
+            "Regenerated the signing secret for {reference}; its bearer API key is unchanged"
+        )),
+    )
+    .await?;
+
+    Ok(Json(RegenerateSecretResponse { id, key_id, signing_secret }))
 }
 
 /// Input for granting a key rights over a hook.

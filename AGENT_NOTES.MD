@@ -6965,3 +6965,114 @@ with `date -u +%Y-%m-%dT%H:%M:%SZ` (whole-second precision) immediately after cr
 entry (microsecond precision) — when both landed in the same truncated second, the "old" entry's
 sub-second fraction decided whether `until`'s strict `<` included it, rather than actual chronological
 order. Fixed by sleeping a full second on *both* sides of the boundary capture, not just one.
+
+---
+
+# 2026-08-20 (second pass) — Execution model correction, key regeneration split, sample payloads
+
+A second same-day pass, a six-task brief pointing at genuine architectural misunderstandings the
+prior pass's audit had not gone looking for: hook execution events were still landing in
+`audit_logs` alongside admin mutations, key rotation had only one all-or-nothing shape, and the
+WebUI's hook forms had no way to preview or test the exact command a hook would run before granting
+it real permissions.
+
+## Backend
+
+- **Hook execution — keyed or keyless — no longer writes to `audit_logs` at all.** `run_hook_request`
+  dropped its `create_audit_log`/`create_audit_log_anonymous` calls entirely (and the now-unused
+  `client_ip` parameter along with them); `executions` is the sole, §4-scoped operational record.
+  `create_audit_log_anonymous` and the `Attribution` split it was built on were deleted from
+  `api/support.rs` — there is no longer any keyless *mutation* left for them to attribute, since a
+  keyless execution was never a mutation to begin with. `audit.rs`'s own module doc already named
+  this as the intended boundary; this pass is that boundary actually being enforced.
+- **Independent `regenerate-key` / `regenerate-secret` endpoints**, alongside the existing
+  both-halves `rotate`. Each replaces exactly one half of a key's credential pair and leaves the
+  other untouched — for an operator who wants to rotate a leaked bearer key without also forcing
+  every signature-verifying integration onto a new secret, or the reverse. Proven in both the Rust
+  integration suite and a new e2e block by which half of the pair still authenticates after each call.
+- **Standard API Key Only Mode restored**: `generate_signing_secret: Option<bool>` (default `true`)
+  on `CreateApiKeyPayload` mints a plain bearer-only credential with no `key_id`/`signing_secret` at
+  all when `false` — refused with `400` together with `can_manage_keys: true`, since that scope
+  requires a signing secret to exist unconditionally. `regenerate_secret` deliberately still works
+  on such a key afterward, minting its *first* pair rather than only ever replacing an existing one.
+- **`keyless_hooks_allowed: bool`** added to both `SettingsResponse` (master-only) and `MeResponse`
+  (every session) — the latter so a `can_manage_hooks` holder who is not master, and therefore never
+  calls `GET /api/settings`, can still learn whether a hook's `auth_mode: NONE` is globally reachable.
+- **`hooks.sample_payload_json`** (new migration, `m20260820_090000_add_hook_sample_payload`): a
+  nullable `TEXT` column, purely a WebUI convenience — never consulted by `executor::build_command_plan`
+  — validated at create/update time (`validate_sample_payload_matches_parameters`) against the hook's
+  *currently* declared parameters: must parse as JSON, be a top-level object, and name every declared
+  `param_key`. `update_hook` checks the *effective* value (payload's if named, else the row's
+  existing one) against `load_parameters`'s current result, loaded before the model is consumed.
+- `ExecutionQuery` grew `api_key` (via a new `resolve_api_key_filter`, shared with `audit.rs`),
+  `since`, `until`; `AuditLogQuery` grew the matching `api_key` filter. `parse_instant` moved from
+  `audit.rs` to `support.rs` once both domains needed it.
+
+## WebUI
+
+- **Live Command Preview**: both hook forms now carry a `sample_payload_json` textarea plus a
+  read-only preview recomputed on every relevant keystroke and after every parameter edit
+  (`renderCommandPreview` / `renderParamsModalPreview`). `computeCommandPreview` deliberately mirrors
+  `executor::build_command_plan`'s *actual* shape — bare positional args in declaration order,
+  `HOOK_PARAM_<KEY>` env vars, a `sudo -n -u <user> --` prefix when elevated — rather than the task
+  brief's own illustrative `--flag value` example, which implies CLI syntax this codebase does not
+  implement. A preview showing fabricated syntax would mislead the operator reading it before
+  granting a hook real permissions, so the brief's literal example was overridden for accuracy.
+- **"Run a Hook" now auto-fills a live JSON payload editor** from the selected hook's
+  `sample_payload_json`, replacing the old one-input-per-parameter form. Both Dry Run and Execute
+  parse the *edited* textarea and send it as `{"parameters": ...}`; malformed or non-object JSON
+  blocks the request with an inline error rather than reaching the server. Verified with a real
+  headless-Chromium run against the live daemon: selecting a hook correctly auto-filled the sample,
+  editing the payload before clicking Dry Run correctly changed the resolved `argv[1]` in the result
+  panel — proving the live edit, not just the auto-fill, is what the request actually carries.
+- **Independent Regenerate Key / Regenerate Secret** buttons per key row, matching the backend split;
+  `revealCredentials` renders its modal fields conditionally since either response carries only one
+  half. **Standard API Key Only Mode** exposed via a `generate_signing_secret` checkbox
+  (`syncApiKeySigningFields` locks it on whenever `can_manage_keys` is also checked).
+- **Key Lineage moved from an inline table column to a side drawer** — a crowded per-row cell does
+  not scale past a couple of ancestors. Built entirely client-side from `parent_key_id` on the
+  already-visibility-scoped `state.apiKeys`, per R3 ("rights are never derived from lineage"); no new
+  endpoint.
+- **`applyKeylessHooksGuard`** greys out the `NONE` auth-mode option in both hook forms when
+  `keyless_hooks_allowed` is `false`, with a tooltip naming `REQUIRE_SIGNED_REQUESTS` as the reason.
+- **Global table rule finished**: every batch-delete button across Hooks/Keys/Executions now hides
+  (`classList.toggle('hidden', ...)`) rather than merely disabling when the selection is empty,
+  matching `simply_ip_vault`'s own established pattern — confirmed by a direct screenshot of vault's
+  equivalent control before changing anything here.
+- **Checkbox layout: confirmed correct, not fixed.** A screenshot of this project's own
+  `.checkbox-container` form-grid rows looked like a misalignment bug at first glance; a direct
+  screenshot of vault's own analogous row showed the identical pattern, confirming it was intentional
+  and matched byte-for-byte already. The brief's "checkbox on the right of the label" instruction was
+  re-scoped to apply only to the new standalone "Show deleted (trash)" toolbar toggle — a different
+  UI context (an inline switch, not a vertical form field) — via a new `.checkbox-toggle` modifier,
+  leaving the vault-matching default untouched everywhere else.
+- Execution History's filter row now mirrors Audit Logs': hook, acting API key, status, `since`/
+  `until`. The table names the acting key per row; the detail modal gained an API Key field.
+
+## Verification
+
+Two servers were run side-by-side for this pass — this project's own daemon and a compiled
+`simply_ip_vault` instance — specifically so WebUI changes could be checked by screenshot against a
+live reference rather than by reading its CSS/JS in isolation, per an explicit mid-session
+instruction to do exactly that. The scratch harness files
+(`static/_seed_and_go.html`, `static/_verify_harness.html`) touched both projects' `static/`
+directories temporarily and were deleted from both before this commit — never part of either
+shipped tree.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**140 + 25 + 6 + 9 passed / 0 failed / 2 ignored** (new tests: independent regeneration, bearer-only
+key creation, `sample_payload_json` validation, `keyless_hooks_allowed` exposure, execution/audit
+`api_key` and time-range filtering, and a rewritten audit-trail test proving hook execution writes
+zero `audit_logs` rows) · `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **1102
+passed / 0 failed / 0 skipped** — up from 1056 before this pass (new §53, plus a rewritten §18
+`HOOK_EXECUTE` assertion that now expects zero rows instead of one, and the `keyless_hooks_allowed`
+checks folded into the existing §19).
+
+Two e2e-script bugs were found and fixed while writing the new coverage, neither a backend bug: a
+nonexistent `can_execute` field on `CreateApiKeyPayload` (real hook-execution rights are per-hook
+grants, not a key-level flag) caused a `422` the strict JSON extractor was correctly raising; and the
+master key's own self-regeneration refusal is `403` (`AppError::Forbidden`), not the `404` a
+non-master caller gets when the target key is opaque to it — two different oracle rules for two
+different callers, both correct, and the test's expectation was wrong on the first draft.

@@ -1398,9 +1398,12 @@ check "200" "fetch the most recent HOOK_CREATE entry"
 check_jq ".[0].api_key_name" "System Master" "the acting key's name is denormalized into the entry"
 check_jq ".[0].client_ip" "127.0.0.1" "the resolved client IP is recorded"
 
-api_call GET "/api/audit-logs?action=HOOK_EXECUTE&limit=1" "$MASTER_KEY"
-check "200" "fetch the most recent HOOK_EXECUTE entry"
-check_true '.[0].details | contains("Executed hook")' "execution requests are audited"
+# Hook execution is deliberately excluded from audit_logs — it lives only in `executions` — so a
+# HOOK_EXECUTE filter must come back empty even though many hooks have already run by this point in
+# the script.
+api_call GET "/api/audit-logs?action=HOOK_EXECUTE&limit=50" "$MASTER_KEY"
+check "200" "querying audit logs by the (nonexistent) HOOK_EXECUTE action still succeeds"
+check_true 'length == 0' "hook execution never writes an audit_logs entry, keyed or keyless"
 
 api_call GET "/api/audit-logs?action=KEY_ROTATE&limit=1" "$MASTER_KEY"
 check "200" "fetch the most recent KEY_ROTATE entry"
@@ -1511,6 +1514,11 @@ check_jq ".trusted_proxies | join(\",\")" "$BIND_HOST/32,localhost" \
     "both proxy spellings are reported as configured, the hostname unresolved"
 check_true '.hook_count >= 8' "the hook counter reflects everything created above"
 check_true '.execution_count >= 1' "the execution counter is populated"
+check_jq ".keyless_hooks_allowed" "true" "this instance boots with REQUIRE_SIGNED_REQUESTS unset, so keyless hooks are globally allowed"
+
+api_call GET "/api/auth/me" "$MASTER_KEY"
+check "200" "auth/me still works"
+check_jq ".keyless_hooks_allowed" "true" "the same fact is mirrored onto /api/auth/me for non-master, non-settings callers"
 
 # ── 20. Hook deletion cascade ───────────────────────────────────────────────
 
@@ -4791,6 +4799,139 @@ api_call GET "/app.js"
 check "200" "the modified app.js still serves"
 check_not_contains "this.apiBase = '/api'" \
     "the served app.js response is the fixed file, not a stale cached copy of the old hardcoded base"
+
+# ── 53. Global settings, bearer-only keys, independent regeneration & sample payloads ──────
+
+log_section "53. Bearer-Only Keys, Independent Regenerate-Key/Secret & Sample Payloads"
+
+# --- Standard API Key Only Mode: a key can be created with no signing secret at all ---
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Bearer Only Key","generate_signing_secret":false}'
+check "200" "a key can be created with generate_signing_secret:false"
+check_jq ".key_id" "null" "no key_id is minted for a bearer-only key"
+check_jq ".signing_secret" "null" "no signing secret is minted for a bearer-only key"
+BEARER_ONLY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+BEARER_ONLY_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+api_call GET "/api/auth/me" "$BEARER_ONLY_KEY"
+check "200" "the bearer-only key authenticates with no signature at all"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Escalated Bearer Only","can_manage_keys":true,"generate_signing_secret":false}'
+check "400" "can_manage_keys always requires a signing secret — generate_signing_secret:false is refused for it"
+
+# --- Independent regenerate-key / regenerate-secret endpoints (distinct from the existing
+# both-halves /rotate) — target holds can_manage_keys so every request against it is mandatorily
+# signed, which lets each regeneration be proven by which half of the credential pair still works ---
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Regen Target","can_manage_keys":true}'
+check "200" "create a can_manage_keys target key for the regeneration endpoints"
+REGEN_ID=$(echo "$RESP_BODY" | jq -r '.id')
+REGEN_BEARER=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+REGEN_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+register_manager_key "$REGEN_BEARER" "$REGEN_SECRET"
+
+api_call GET "/api/auth/me" "$REGEN_BEARER"
+check "200" "the original bearer+secret pair authenticates before any regeneration"
+
+api_call POST "/api/keys/$REGEN_ID/regenerate-key" "$MASTER_KEY"
+check "200" "regenerate-key succeeds"
+check_true '(.plaintext_key | length) > 10' "a new plaintext bearer key is returned"
+NEW_BEARER=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+api_call GET "/api/auth/me" "$REGEN_BEARER"
+check "401" "the old bearer key no longer authenticates once its bearer half is regenerated"
+
+register_manager_key "$NEW_BEARER" "$REGEN_SECRET"
+api_call GET "/api/auth/me" "$NEW_BEARER"
+check "200" "the new bearer key, signed with the UNTOUCHED original secret, authenticates — regenerate-key leaves the signing pair alone"
+
+api_call POST "/api/keys/$REGEN_ID/regenerate-secret" "$MASTER_KEY"
+check "200" "regenerate-secret succeeds"
+check_true '(.signing_secret | length) > 10' "a new signing secret is returned"
+NEW_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+
+next_sign_ts
+OLD_SIG=$(sign_canonical "$REGEN_SECRET" "GET" "/api/auth/me" "$NEXT_SIGN_TS" "")
+OLD_SECRET_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "X-API-Key: $NEW_BEARER" -H "X-Timestamp: $NEXT_SIGN_TS" -H "X-Signature-256: sha256=$OLD_SIG" \
+    "$BASE_URL/api/auth/me")
+check_local "$OLD_SECRET_STATUS" "401" "the old signing secret no longer authenticates once regenerate-secret runs"
+
+register_manager_key "$NEW_BEARER" "$NEW_SECRET"
+api_call GET "/api/auth/me" "$NEW_BEARER"
+check "200" "the UNCHANGED bearer key, now signed with the newly regenerated secret, authenticates — regenerate-secret leaves the bearer half alone"
+
+api_call GET "/api/auth/me" "$MASTER_KEY"
+MASTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/keys/$MASTER_ID/regenerate-key" "$MASTER_KEY"
+check "403" "the master key itself refuses regenerate-key (lifecycle-protected, same as rotate/delete)"
+api_call POST "/api/keys/$MASTER_ID/regenerate-secret" "$MASTER_KEY"
+check "403" "the master key itself refuses regenerate-secret too"
+
+# --- Hook sample_payload_json: validated against the hook's own declared parameters ---
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ECHO_SCRIPT" '{name:"sample_payload_hook",script_path:$p,parameters:[{param_key:"target",is_required:true}],sample_payload_json:"{\"target\":\"1.2.3.4\"}"}')"
+check "200" "a sample payload naming every declared parameter is accepted"
+SAMPLE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+check_jq ".sample_payload_json" '{"target":"1.2.3.4"}' "the sample payload is stored and returned verbatim"
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ECHO_SCRIPT" '{name:"sample_payload_malformed",script_path:$p,parameters:[{param_key:"target",is_required:true}],sample_payload_json:"{not json"}')"
+check "400" "malformed JSON in sample_payload_json is rejected at creation time"
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ECHO_SCRIPT" '{name:"sample_payload_missing_key",script_path:$p,parameters:[{param_key:"target",is_required:true}],sample_payload_json:"{\"wrong_key\":\"nope\"}"}')"
+check "400" "a sample payload missing a declared parameter key is rejected"
+check_true '.error | contains("target")' "the error names the missing declared parameter"
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$ECHO_SCRIPT" '{name:"sample_payload_array",script_path:$p,sample_payload_json:"[1,2,3]"}')"
+check "400" "a non-object top-level sample payload is rejected"
+
+api_call PUT "/api/hooks/$SAMPLE_HOOK_ID" "$MASTER_KEY" '{"sample_payload_json":"{\"still_wrong\":\"x\"}"}'
+check "400" "updating a hook to a sample payload that no longer names its declared parameters is rejected the same way"
+
+# --- Execution history: acting API key is named, and the new api_key/since/until filters work ---
+api_call POST "/api/hooks/$SAMPLE_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"target":"filter-probe"}}'
+check "200" "run the sample-payload hook once, as Master, to anchor the new execution filters"
+
+api_call GET "/api/executions?hook=sample_payload_hook&limit=5" "$MASTER_KEY"
+check "200" "list executions for the sample-payload hook"
+check_jq ".[0].api_key_name" "System Master" "the acting key's name is denormalized onto the execution record"
+
+api_call GET "/api/executions?api_key=System+Master&hook=sample_payload_hook&limit=5" "$MASTER_KEY"
+check "200" "filter execution history by acting API key name"
+check_true 'length >= 1' "the Master-run execution is found by its acting key's name"
+
+api_call GET "/api/executions?api_key=no-such-key-anywhere&limit=5" "$MASTER_KEY"
+check "200" "an unmatched api_key filter is accepted"
+check_true 'length == 0' "...and returns no rows, not everything"
+
+EXEC_SINCE_BOUNDARY=$(date -u -d '1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)
+api_call GET "/api/executions?since=$EXEC_SINCE_BOUNDARY&limit=5" "$MASTER_KEY"
+check "200" "an execution-history since filter one hour in the future is accepted"
+check_true 'length == 0' "...and correctly excludes everything that already happened"
+
+api_call GET "/api/executions?until=$EXEC_SINCE_BOUNDARY&hook=sample_payload_hook&limit=5" "$MASTER_KEY"
+check "200" "the same boundary as until instead includes the already-run execution"
+check_true 'length >= 1' "the probe execution is found under until"
+
+api_call GET "/api/executions?since=not-a-timestamp" "$MASTER_KEY"
+check "400" "a malformed since on execution history is refused rather than silently ignored"
+
+# --- Audit logs: the new api_key filter ---
+api_call GET "/api/audit-logs?api_key=System+Master&action=HOOK_CREATE&limit=50" "$MASTER_KEY"
+check "200" "filter audit logs by the acting API key's name"
+check_true 'length >= 1' "Master's own HOOK_CREATE entries are found by acting key name"
+
+api_call GET "/api/audit-logs?api_key=no-such-key-anywhere&limit=5" "$MASTER_KEY"
+check "200" "an unmatched audit-log api_key filter is accepted"
+check_true 'length == 0' "...and returns no rows"
+
+api_call DELETE "/api/hooks/$SAMPLE_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "clean up the sample-payload probe hook"
+api_call DELETE "/api/keys/$REGEN_ID" "$MASTER_KEY"
+check "204" "clean up the regen-target key"
+api_call DELETE "/api/keys/$BEARER_ONLY_ID" "$MASTER_KEY"
+check "204" "clean up the bearer-only key"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

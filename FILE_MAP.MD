@@ -17,18 +17,18 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 
 ## Coverage
 
-**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-19.
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-20.
 
 | Group | Files | Where documented here |
 | :--- | :--- | :--- |
 | Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 12 | Table under **`src/migration/`** (11 migrations + `mod.rs`) |
-| **Total** | **42** | — |
+| Migrations (`src/migration/*.rs`) | 13 | Table under **`src/migration/`** (12 migrations + `mod.rs`) |
+| **Total** | **43** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
-(verified passing 2026-08-19, all three silent):
+(verified passing 2026-08-20, all three silent):
 
 ```bash
 # 1. Crate-root and API modules, documented as `### `src/…`` headings
@@ -402,20 +402,27 @@ blast radius nobody can review. The constants sit here rather than in `support.r
 policy numbers rather than plumbing, read by both the validators that enforce them and the handlers
 that document them.
 
-### `src/api/support.rs` — 401 lines
+### `src/api/support.rs` — 372 lines
 
 **Role & scope.** Shared plumbing used by three or more handler domains. **Must not decide
 anything.** Nothing here returns a refusal that depends on *who* is calling — a helper that starts
 doing so belongs in `guards.rs`. The strict JSON extractors used to live here and now sit in
 `src/extract.rs`; they were the one thing in this file that decided something.
 
-**Key exports.** `create_audit_log`, `create_audit_log_anonymous` (the keyless-invocation
-counterpart — see `hook.rs`/`middleware.rs` above; writes a fixed, `NOT NULL`-satisfying sentinel
-rather than relaxing the attribution columns); `resolve_hook`,
+**Key exports.** `create_audit_log`; `resolve_hook`,
 `resolve_hook_including_deleted`; `load_parameters`; `format_reference`; `generate_random_key`,
 `hash_key`, `generate_key_id`, `generate_signing_secret`, `mint_signing_pair`; `validate_timeout`,
-`validate_bound_ips`, `validate_concurrency`; `extract_parameter_map`; `describe_hmac_mode`,
-`describe_privilege`.
+`validate_bound_ips`, `validate_concurrency`; `extract_parameter_map`; `parse_instant`;
+`describe_hmac_mode`, `describe_privilege`.
+
+`create_audit_log_anonymous` and the `Attribution` split it was built on were removed once hook
+execution stopped writing to `audit_logs` at all (see `api/executions.rs` below) — there was no
+longer any keyless *mutation* left to attribute, since a keyless execution is not a mutation.
+`create_audit_log` now builds its `ActiveModel` directly from the acting key, unconditionally.
+
+`parse_instant` (RFC 3339 → the naive UTC shape every timestamp column is stored as) moved here from
+`audit.rs` once `executions.rs` grew its own `since`/`until` filters and needed the same parser —
+two domains sharing one function is exactly what this module exists for.
 
 **Rationale.** This module exists because of a measurement: `create_audit_log` and `resolve_hook` are
 each used by five domains, `format_reference` by four, `load_parameters` by three — and none of them
@@ -478,13 +485,14 @@ Two ordering rules inside this file are load-bearing:
   hook visible (`403` for a missing conjunct), no row makes it invisible (`404`). Filtering on
   `can_manage` first would `404` a hook the caller can demonstrably see via `GET /api/auth/me`.
 
-### `src/api/keys.rs` — 1,335 lines
+### `src/api/keys.rs` — 1,493 lines
 
 **Role & scope.** API key lifecycle, caller identity, per-hook grants, the §6 cascade, and §4
 **key-subtree** visibility.
 
 **Key exports.** `get_me`, `create_api_key`, `list_api_keys`, `update_api_key`, `delete_api_key`,
-`rotate_api_key`, `update_key_hook_permissions`, `revoke_key_hook_permission`; `HookPermissionView`,
+`rotate_api_key`, `regenerate_key`, `regenerate_secret`, `update_key_hook_permissions`,
+`revoke_key_hook_permission`; `HookPermissionView`,
 `MeResponse`, `ApiKeySummary`, `MinimalApiKeyView`, `collect_subtree_inventory`.
 
 **Module-private** (deliberately not exported): `KeyVisibility`, `descendant_key_ids`,
@@ -519,7 +527,27 @@ already-templated key, or templating an already-scoped one) with `400`.
 `RBAC_MODEL.md` R3 ("rights are never derived from key lineage"), and deliberately absent from
 `MinimalApiKeyView`, whose §4 shared-resource disclosure does not extend to it.
 
-### `src/api/hooks.rs` — 1,063 lines
+`regenerate_key` and `regenerate_secret` are narrower, independent counterparts to `rotate_api_key`:
+`rotate_api_key` replaces the bearer key **and** the signing pair together, while these two each
+replace exactly one half, leaving the other untouched — for an operator rotating a leaked bearer key
+who does not want to also invalidate every signature-verifying integration still using the old
+secret, or vice versa. Both reuse the same two guards as `rotate_api_key`
+(`guard_master_to_administer`, `refuse_master_lifecycle_action`) and the same audit trail, under
+their own actions (`KEY_REGENERATE_KEY`, `KEY_REGENERATE_SECRET`).
+
+`create_api_key` also accepts `generate_signing_secret: Option<bool>` (default `true`), the
+"Standard API Key Only Mode" path back to a plain bearer-only credential with no `key_id`/signing
+secret minted at all — refused with `400` together with `can_manage_keys: true`, since that scope
+requires a signing secret to exist unconditionally (`middleware::authenticate_bearer_key`).
+`regenerate_secret` is deliberately still usable on such a key afterward: it mints the *first*
+signing pair a bearer-only key ever had, not just a replacement for an existing one.
+
+`MeResponse` carries `keyless_hooks_allowed` (mirroring `system::SettingsResponse`'s field of the
+same name) so a `can_manage_hooks` holder who is not master — and therefore never calls the
+master-only `GET /api/settings` — can still learn whether the WebUI's `PUBLIC_UNAUTHENTICATED` hook
+auth mode is globally reachable.
+
+### `src/api/hooks.rs` — 1,142 lines
 
 **Role & scope.** What a hook *is* — its definition, dispatch configuration, parameter contract, and
 trash lifecycle. Must **not** hold execution: that is `executions.rs`.
@@ -544,7 +572,14 @@ checked against the *effective* mode and secret (payload's, else the row's exist
 "create as HMAC_ONLY with none" and "switch an existing hook to HMAC_ONLY that never had one" are
 caught, not only the first.
 
-### `src/api/executions.rs` — 485 lines
+`sample_payload_json` gets the same effective-value treatment via `validate_sample_payload_matches_parameters`, checked against the *effective* declared parameter set — the payload's own `parameters`
+on create, `load_parameters`'s current result on update (loaded before `model.into()` consumes the
+row) — so renaming a parameter without also updating a hook's stale sample payload is caught rather
+than silently left inconsistent. It is pure WebUI convenience (`build_command_plan` never reads it)
+and is therefore validated only for shape and parameter-name coverage, never for the *values*'
+types.
+
+### `src/api/executions.rs` — 518 lines
 
 **Role & scope.** Triggering hooks and reading the records that result.
 
@@ -567,8 +602,26 @@ than fifty visible rows and hides the rest behind an offset that never advances 
 authorize a keyless caller through the target hook's `AuthMode`, in which case there is no key row to
 extract. `run_hook_request` skips `guard_execute` entirely when `key` is `None` (there is no
 permission row to check against; the hook's own `auth_mode` already decided the request was
-authorized) and attributes the resulting audit log entry and execution record accordingly
-(`api_key_id = NULL`, `create_audit_log_anonymous`'s sentinel name/prefix).
+authorized) and records `api_key_id = NULL` on the resulting execution record.
+
+**Hook execution — keyed or keyless — never writes to `audit_logs`.** `run_hook_request` calls
+`create_audit_log` for nothing; `executions` is this domain's own, purpose-built, §4-scoped
+operational record, and `audit_logs` is reserved for administrative *mutations* (key/hook CRUD,
+permission grants) elsewhere in the API. A hook run changes no configuration, so it has nothing to
+belong in that trail for. This is also why `create_audit_log_anonymous` no longer exists (see
+`api/support.rs` above) — it existed solely to attribute a keyless *execution's* audit entry, and
+there is no longer any such entry to attribute.
+
+`ExecutionView` carries `api_key_name: Option<String>` (the acting key's current name, looked up by
+`run_hook_request`/`list_executions`/`get_execution` at read time — not denormalized onto the row —
+so a later key rename is reflected retroactively, unlike `audit_logs.api_key_name`'s deliberate
+snapshot). `ExecutionQuery` grew `api_key` (name/prefix/UUID match, via the shared
+`resolve_api_key_filter`), `since`, and `until` (RFC 3339, via `support::parse_instant`), mirroring
+`AuditLogQuery`'s equivalent filters for WebUI parity between the two history views.
+
+`resolve_api_key_filter` (an exact UUID match, else a substring match on `api_keys.name`) is `pub(crate)`
+here rather than in `support.rs` because `executions.rs` is where it originated; `audit.rs` imports
+it directly rather than duplicating the same two-branch lookup for its own `api_key` filter.
 
 Note `delete_execution` is deliberately **stricter** than reading one — `can_view_execution` buys
 visibility, never destruction. An auditor is not a redactor.
@@ -588,14 +641,21 @@ also **removes the last naming divergence** from the peer service, which reached
 independently.
 
 `AuditLogQuery` grew the predicted time-range and target surface: `client_ip` (substring match, for
-the WebUI's Audit Logs tab) and `since`/`until` (RFC 3339, parsed by `parse_instant` into the naive
-UTC shape `audit_logs.timestamp` is stored as — `since` is inclusive, `until` is strictly exclusive,
-matching the half-open range a paginated "next page starts here" UI expects).
+the WebUI's Audit Logs tab), `since`/`until` (RFC 3339, parsed by `parse_instant` — now shared from
+`api/support.rs` rather than owned here — into the naive UTC shape `audit_logs.timestamp` is stored
+as; `since` is inclusive, `until` is strictly exclusive, matching the half-open range a paginated
+"next page starts here" UI expects), and `api_key` (acting-key name/prefix/UUID, via
+`executions::resolve_api_key_filter` — imported rather than duplicated, since `executions.rs`
+already needed the identical lookup for its own equivalent filter).
+
+Hook execution is out of scope for this reader entirely: it never reaches `audit_logs` in the first
+place (see `api/executions.rs` above), so there is no `HOOK_EXECUTE` action for any of these filters
+to ever match.
 
 Writing an audit row is `api/support.rs::create_audit_log`, called from every mutating handler. That
 asymmetry is deliberate: this module is the *reader* of a table a dozen call sites write to.
 
-### `src/api/system.rs` — 101 lines
+### `src/api/system.rs` — 109 lines
 
 **Role & scope.** The effective runtime configuration and instance counters. Master-only.
 
@@ -606,6 +666,12 @@ inherits, which is exactly what an attacker probing for an escape would want. `t
 surfaced because "is my proxy actually trusted?" is otherwise answerable only by reading the
 daemon's environment, and getting it wrong silently changes which address every `bound_ips` check is
 evaluated against.
+
+`SettingsResponse` also carries `keyless_hooks_allowed: bool` (`!config.require_signed_requests`) —
+whether a hook's `auth_mode: NONE` is reachable by anyone at all, service-wide, independent of what
+any individual hook declares. The WebUI greys out that option in its auth-mode dropdown when this is
+`false`. Duplicated onto `keys::MeResponse` under the same name for the master-only-endpoint reason
+described in `api/keys.rs` above.
 
 ### `src/api/health.rs` — 131 lines
 
@@ -646,7 +712,7 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 | File | Table | Note |
 | :--- | :--- | :--- |
 | `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` — a key's **own** signature mode, unrelated to `hook.rs`'s `AuthMode` below. `HmacMode` now has **one** variant (`CANONICAL_V1`) — `BODY_ONLY` was retired in `m20260819_141730`, superseded by hook-level `HMAC_ONLY`. `canonical_template` (added the same migration) is the per-key customization surface that replaced it |
-| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. See `middleware.rs` below |
+| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. Also carries `sample_payload_json` (nullable, `m20260820_090000`) — a WebUI convenience only, never read by `executor::build_command_plan`. See `middleware.rs` below |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
 | `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus` |
@@ -673,6 +739,7 @@ one that has shipped.
 | `m20260810_090000_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
 | `m20260819_120414_add_hook_auth_mode` | `hooks.auth_mode` (`NOT NULL DEFAULT 'CANONICAL_V1'`), `hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template` (all nullable) — per-hook inbound authentication, see `entities/hook.rs` above |
 | `m20260819_141730_consolidate_hmac_modes` | **Retires** `api_keys.hmac_mode = BODY_ONLY` (rewrites any stored row to `CANONICAL_V1` via a typed `sea_query::Query::update`, not raw SQL) and **adds** `api_keys.canonical_template` — see `entities/api_key.rs` above |
+| `m20260820_090000_add_hook_sample_payload` | `hooks.sample_payload_json` (nullable `TEXT`) — the WebUI's Live Command Preview / "Run a Hook" auto-fill source, see `entities/hook.rs` and `api/hooks.rs` above |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the

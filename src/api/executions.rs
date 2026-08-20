@@ -33,10 +33,7 @@ use super::guards::{
     execution_visible_hook_ids, may_read_execution, guard_execute, guard_manage,
     guard_visibility,
 };
-use super::support::{
-    create_audit_log, create_audit_log_anonymous, extract_parameter_map, format_reference,
-    load_parameters, resolve_hook,
-};
+use super::support::{create_audit_log, extract_parameter_map, format_reference, load_parameters, resolve_hook};
 
 // ─────────────────────────────────────────────────────────────
 // Execution
@@ -53,6 +50,12 @@ pub struct ExecutionView {
     pub hook_name: String,
     /// Requesting key's ID, if it still exists.
     pub api_key_id: Option<Uuid>,
+    /// Requesting key's name, resolved for display at read time (not denormalized onto the row).
+    /// `None` for a keyless invocation, or one whose key has since been deleted — the two are
+    /// distinguished from `api_key_id`, which is `None` in both cases too; a reader wanting to tell
+    /// them apart already has to consult `stdout`/the audited hook, since neither table stores that
+    /// distinction for executions the way `audit_logs` does with its keyless sentinel.
+    pub api_key_name: Option<String>,
     /// Outcome: `SUCCESS`, `FAILED`, or `TIMEOUT`.
     pub status: ExecutionStatus,
     /// Sub-process exit code (`128 + signum` for a signalled process).
@@ -70,8 +73,8 @@ pub struct ExecutionView {
 }
 
 impl ExecutionView {
-    /// Combines an execution row with its hook's name.
-    fn new(model: execution::Model, hook_name: String) -> Self {
+    /// Combines an execution row with its hook's name and (if any) its acting key's current name.
+    fn new(model: execution::Model, hook_name: String, api_key_name: Option<String>) -> Self {
         // Stored as text; rendered back as real JSON so clients don't have to double-parse. A row
         // that somehow holds unparseable text degrades to a JSON string rather than failing the
         // whole response.
@@ -83,6 +86,7 @@ impl ExecutionView {
             hook_id: model.hook_id,
             hook_name,
             api_key_id: model.api_key_id,
+            api_key_name,
             status: model.status,
             exit_code: model.exit_code,
             stdout: model.stdout,
@@ -101,10 +105,18 @@ impl ExecutionView {
 /// bearer key — see that middleware's doc comment. In that case `guard_execute`'s per-key
 /// `can_execute` check is skipped entirely: there is no key to hold a permission row, and the
 /// hook's `auth_mode` is itself the authorization for a keyless caller.
+///
+/// Deliberately writes no `audit_logs` entry. `audit_logs` is the administrative/mutation trail
+/// (key and hook CRUD, permission grants) — an execution is neither, and already has its own
+/// purpose-built, RBAC-scoped record in `executions` (see [`ExecutionView`] and
+/// [`super::guards::may_read_execution`]). Writing both would duplicate every run in two tables
+/// under two different visibility rules for no reader either table's own design doesn't already
+/// serve, and audit.rs's own module doc predicted exactly this scope: "filter by acting key, by
+/// target, by time range" is what `executions` already offers, not a second thing `audit_logs`
+/// needs to grow to match.
 pub(crate) async fn run_hook_request(
     state: AppState,
     key: Option<api_key::Model>,
-    client_ip: std::net::IpAddr,
     identifier: &str,
     body: &[u8],
 ) -> Result<axum::response::Response, AppError> {
@@ -125,42 +137,12 @@ pub(crate) async fn run_hook_request(
     }
 
     let record = executor::execute_hook(&state, &hook_model, key.as_ref(), &resolved).await?;
-
-    let details = Some(format!(
-        "Executed hook {} -> {:?} in {}ms",
-        format_reference(&hook_model.name, hook_model.id),
-        record.status,
-        record.duration_ms
-    ));
-    match &key {
-        Some(key) => {
-            create_audit_log(
-                &state.db,
-                key,
-                client_ip,
-                "HOOK_EXECUTE",
-                Some(hook_model.name.clone()),
-                details,
-            )
-            .await?;
-        }
-        None => {
-            create_audit_log_anonymous(
-                &state.db,
-                &hook_model.name,
-                client_ip,
-                "HOOK_EXECUTE",
-                Some(hook_model.name.clone()),
-                details,
-            )
-            .await?;
-        }
-    }
+    let api_key_name = key.as_ref().map(|k| k.name.clone());
 
     // `200 OK` reports that the *request* was carried out; whether the script itself succeeded is
     // the `status`/`exit_code` in the body. A non-zero script exit is a legitimate, fully-recorded
     // outcome, not an HTTP-level failure.
-    Ok(Json(ExecutionView::new(record, hook_model.name)).into_response())
+    Ok(Json(ExecutionView::new(record, hook_model.name, api_key_name)).into_response())
 }
 
 /// Handles `POST /api/hooks/{identifier}/execute` — runs a hook and returns its recorded outcome.
@@ -175,11 +157,10 @@ pub(crate) async fn run_hook_request(
 pub async fn execute_hook_endpoint(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
-    Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key.map(|Extension(k)| k), client_ip.0, &identifier, &body).await
+    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body).await
 }
 
 /// Handles `POST /webhook/{identifier}` — the webhook-facing alias of the execute endpoint, for
@@ -187,11 +168,10 @@ pub async fn execute_hook_endpoint(
 pub async fn webhook_execute(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
-    Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key.map(|Extension(k)| k), client_ip.0, &identifier, &body).await
+    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body).await
 }
 
 /// Dry-run preview returned by `POST /api/hooks/{id}/test`.
@@ -284,6 +264,14 @@ pub struct ExecutionQuery {
     pub hook: Option<String>,
     /// Restrict to a single status (`SUCCESS`, `FAILED`, `TIMEOUT`).
     pub status: Option<String>,
+    /// Restrict to a single acting key, by UUID (exact) or name (substring, case-insensitive) —
+    /// mirrors `hook`'s own "UUID or name" convention. A keyless execution never matches this
+    /// filter, since it has no key to match against.
+    pub api_key: Option<String>,
+    /// Only executions at or after this instant. RFC 3339, matching `audit::AuditLogQuery::since`.
+    pub since: Option<String>,
+    /// Only executions strictly before this instant. RFC 3339, matching `audit::AuditLogQuery::until`.
+    pub until: Option<String>,
     /// Pagination limit.
     pub limit: Option<u64>,
     /// Pagination offset.
@@ -300,6 +288,21 @@ pub(crate) fn parse_status(raw: &str) -> Result<ExecutionStatus, AppError> {
             "Invalid status filter '{other}': expected SUCCESS, FAILED, or TIMEOUT"
         ))),
     }
+}
+
+/// Resolves an `api_key` filter value to the set of key ids it names: an exact UUID match, or a
+/// case-insensitive substring match against `api_keys.name`. Shared with [`super::audit`]'s own
+/// `api_key` filter, which resolves the same way for the same reason — a caller narrowing an audit
+/// or execution list by key rarely has the exact id at hand.
+pub(crate) async fn resolve_api_key_filter(
+    db: &sea_orm::DatabaseConnection,
+    raw: &str,
+) -> Result<Vec<Uuid>, AppError> {
+    if let Ok(id) = Uuid::parse_str(raw) {
+        return Ok(vec![id]);
+    }
+    let matches = ApiKey::find().filter(api_key::Column::Name.contains(raw)).all(db).await?;
+    Ok(matches.into_iter().map(|k| k.id).collect())
 }
 
 /// Handles `GET /api/executions` — newest-first history, scoped to the caller's hooks.
@@ -336,6 +339,16 @@ pub async fn list_executions(
     if let Some(status) = query.status.as_deref().filter(|s| !s.is_empty()) {
         q = q.filter(execution::Column::Status.eq(parse_status(status)?));
     }
+    if let Some(api_key_filter) = query.api_key.as_deref().filter(|s| !s.is_empty()) {
+        let ids = resolve_api_key_filter(&state.db, api_key_filter).await?;
+        q = q.filter(execution::Column::ApiKeyId.is_in(ids));
+    }
+    if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
+        q = q.filter(execution::Column::Timestamp.gte(crate::api::support::parse_instant("since", since)?));
+    }
+    if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
+        q = q.filter(execution::Column::Timestamp.lt(crate::api::support::parse_instant("until", until)?));
+    }
 
     let rows = q
         .find_also_related(Hook)
@@ -344,11 +357,27 @@ pub async fn list_executions(
         .all(&state.db)
         .await?;
 
+    // One batch lookup for every acting key named across this page, rather than one query per row —
+    // the same shape `guards::execution_visible_hook_ids` already uses for its own IN-list.
+    let key_ids: Vec<Uuid> = rows.iter().filter_map(|(model, _)| model.api_key_id).collect();
+    let key_names: std::collections::HashMap<Uuid, String> = if key_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        ApiKey::find()
+            .filter(api_key::Column::Id.is_in(key_ids))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|k| (k.id, k.name))
+            .collect()
+    };
+
     let views = rows
         .into_iter()
         .map(|(model, hook_model)| {
-            let name = hook_model.map(|h| h.name).unwrap_or_else(|| "(deleted)".to_owned());
-            ExecutionView::new(model, name)
+            let hook_name = hook_model.map(|h| h.name).unwrap_or_else(|| "(deleted)".to_owned());
+            let api_key_name = model.api_key_id.and_then(|id| key_names.get(&id).cloned());
+            ExecutionView::new(model, hook_name, api_key_name)
         })
         .collect::<Vec<_>>();
 
@@ -374,8 +403,12 @@ pub async fn get_execution(
         .await?
         .map(|h| h.name)
         .unwrap_or_else(|| "(deleted)".to_owned());
+    let api_key_name = match model.api_key_id {
+        Some(id) => ApiKey::find_by_id(id).one(&state.db).await?.map(|k| k.name),
+        None => None,
+    };
 
-    Ok(Json(ExecutionView::new(model, hook_name)))
+    Ok(Json(ExecutionView::new(model, hook_name, api_key_name)))
 }
 
 /// Handles `DELETE /api/executions/{id}` — removes a single history entry.

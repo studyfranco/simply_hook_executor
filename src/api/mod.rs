@@ -68,8 +68,8 @@ pub use hooks::{
     update_hook_parameter,
 };
 pub use keys::{
-    create_api_key, delete_api_key, get_me, list_api_keys, revoke_key_hook_permission,
-    rotate_api_key, update_api_key, update_key_hook_permissions,
+    create_api_key, delete_api_key, get_me, list_api_keys, regenerate_key, regenerate_secret,
+    revoke_key_hook_permission, rotate_api_key, update_api_key, update_key_hook_permissions,
 };
 pub use audit::list_audit_logs;
 pub use health::{health_check, readiness_check};

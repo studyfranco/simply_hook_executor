@@ -329,6 +329,23 @@ body {
     color: var(--text-main);
 }
 
+/* Modal "Cancel"/"Close": a distinct bluish-slate outline theme rather than the generic dark grey
+   of .btn-secondary, so the safe escape hatch reads as its own affordance next to a solid-red
+   confirm/delete button instead of blending into the card background. Matches simply_ip_vault's
+   .btn-cancel. */
+.btn-cancel {
+    background-color: #1e293b;
+    color: #60a5fa;
+    border-color: #60a5fa;
+    font-weight: 600;
+}
+
+.btn-cancel:hover:not(:disabled) {
+    background-color: #2563eb;
+    color: #ffffff;
+    border-color: #2563eb;
+}
+
 .btn-logout {
     background-color: rgba(231, 76, 60, 0.1);
     color: var(--danger);
@@ -965,6 +982,21 @@ body {
     width: 0;
 }
 
+/* A standalone toggle sitting inline in a toolbar row (e.g. "Show deleted" beside "Delete
+   Selected") reads better checkbox-after-label, like a settings switch, than the checkbox-first
+   convention every *form* checkbox above keeps (that one matches simply_ip_vault's own
+   `.checkbox-container` exactly and stays as-is). Same box, same tight spacing — only the side it
+   sits on and which edge carries the padding are mirrored. */
+.checkbox-container.checkbox-toggle {
+    padding-left: 0;
+    padding-right: 26px;
+}
+
+.checkbox-container.checkbox-toggle .checkmark {
+    left: auto;
+    right: 0;
+}
+
 .checkmark {
     position: absolute;
     top: 50%;
@@ -1086,6 +1118,16 @@ body {
     display: flex;
     justify-content: space-between;
     gap: 0.75rem;
+}
+
+/* Ordinary modal forms (edit hook, edit key, parameters, JSON extractor) are not a single
+   irreversible confirmation — `.modal-actions`'s space-between reasoning above does not apply here
+   — so they pack to the trailing edge instead, matching simply_ip_vault's `.modal-card-form
+   .form-actions`. DOM order still carries the meaning: Cancel/Close comes first in the markup (and
+   therefore appears left of Save/Delete once packed), the same left-to-right reading order
+   `.modal-actions` uses for its own pair. */
+.modal-card .form-actions {
+    justify-content: flex-end;
 }
 
 /* ─── Batch Selection Actions ──────────────────────────────── */
@@ -1244,6 +1286,19 @@ input[type="checkbox"]:indeterminate::after {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+}
+
+.param-info-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.param-info-row:last-child {
+    border-bottom: none;
 }
 
 .result-header {
@@ -1600,4 +1655,34 @@ input[type="checkbox"]:indeterminate::after {
 
 .row-deleted:hover {
     opacity: 0.9;
+}
+
+/* ─── Key Lineage Drawer ────────────────────────────────── */
+
+.side-drawer-body h4 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.5rem;
+}
+
+.lineage-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0;
+    font-size: 0.88rem;
+    color: var(--text-main);
+    border-bottom: 1px solid var(--border);
+}
+
+.lineage-connector {
+    color: var(--text-muted);
+}
+
+.lineage-current {
+    font-weight: 700;
+    color: var(--accent);
 }

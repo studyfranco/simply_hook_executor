@@ -48,6 +48,13 @@ pub struct SettingsResponse {
     pub signature_max_age_seconds: i64,
     /// Whether every authenticated request must carry a valid signature.
     pub require_signed_requests: bool,
+    /// Whether a hook may be set to `auth_mode = NONE` (public, zero-authentication execution) and
+    /// actually be reachable that way. `hook::AuthMode::NoAuth`'s own doc comment is the source of
+    /// truth this mirrors: a keyless, unsigned request against a `NONE` hook is accepted only when
+    /// `require_signed_requests` is `false`, so this is exactly that flag's negation, surfaced under
+    /// the name the question is actually asked in — "can this deployment run public hooks at all" —
+    /// rather than making every caller re-derive it from a signing-requirement flag.
+    pub keyless_hooks_allowed: bool,
     /// Whether signing secrets are encrypted at rest (i.e. `SIGNING_SECRET_KEY` is configured).
     pub signing_secrets_encrypted: bool,
     /// Total hooks defined.
@@ -93,6 +100,7 @@ pub async fn get_settings(
         max_output_bytes: state.config.max_output_bytes,
         signature_max_age_seconds: state.config.signature_max_age_seconds,
         require_signed_requests: state.config.require_signed_requests,
+        keyless_hooks_allowed: !state.config.require_signed_requests,
         signing_secrets_encrypted: state.cipher.is_encrypting(),
         hook_count: Hook::find().count(&state.db).await?,
         api_key_count: ApiKey::find().count(&state.db).await?,

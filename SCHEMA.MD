@@ -155,6 +155,7 @@ Defines executable script definitions and execution constraints.
 | `signature_header` | String | NULLABLE | Header an `HMAC_ONLY` sender's signature arrives on. `NULL` means the built-in default, `X-Signature-256`. |
 | `signature_prefix` | String | NULLABLE | Prefix stripped from an `HMAC_ONLY` signature before hex-decoding it. `NULL` means the built-in default, `sha256=`. |
 | `canonical_template` | Text | NULLABLE | Override of the `CANONICAL_V1` canonical string, consulted only when a **keyed** `CANONICAL_V1` caller invokes a hook whose own `auth_mode` is `CANONICAL_V1`. `NULL` means the service-wide default, `{method}\n{path}\n{timestamp}\n{body}`. Recognized placeholders: `{method}`, `{path}`, `{timestamp}`, `{body}`; substitution is purely textual. |
+| `sample_payload_json` | Text | NULLABLE | An example JSON body for the WebUI's "Run a Hook" panel and Live Command Preview to auto-fill from — purely a UI convenience, never consulted by `executor::build_command_plan` or any execute/test route. Added in `m20260820_090000_add_hook_sample_payload`. Validated at both create and update time by `validate_sample_payload_matches_parameters`: when set (and non-empty), it must parse as JSON, be a top-level object, and name every one of the hook's *currently* declared `hook_parameters.param_key` values as a top-level key — a `400` otherwise. `NULL`/empty is always accepted regardless of declared parameters (the field is optional). |
 
 #### `auth_mode` is orthogonal to `api_keys.hmac_mode` and `api_keys.canonical_template`
 

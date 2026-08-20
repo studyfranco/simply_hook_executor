@@ -99,6 +99,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys/{id}", axum::routing::patch(api::update_api_key))
         .route("/keys/{id}", delete(api::delete_api_key))
         .route("/keys/{id}/rotate", post(api::rotate_api_key))
+        .route("/keys/{id}/regenerate-key", post(api::regenerate_key))
+        .route("/keys/{id}/regenerate-secret", post(api::regenerate_secret))
         .route("/keys/{id}/permissions", post(api::update_key_hook_permissions))
         .route("/keys/{id}/permissions/{hook_identifier}", delete(api::revoke_key_hook_permission))
         // Execution history

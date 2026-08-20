@@ -89,6 +89,10 @@ pub struct CreateHookPayload {
     /// Override of the `CANONICAL_V1` canonical string template for this hook. Defaults to the
     /// service-wide `{method}\n{path}\n{timestamp}\n{body}`.
     pub canonical_template: Option<String>,
+    /// An example of the JSON body a real caller sends this hook. When set alongside at least one
+    /// declared parameter, every parameter's key must appear as a top-level field of the sample —
+    /// see `validate_sample_payload_matches_parameters`.
+    pub sample_payload_json: Option<String>,
 }
 
 /// Payload for updating a hook. Every field is optional; omitted fields are left untouched.
@@ -131,6 +135,10 @@ pub struct UpdateHookPayload {
     /// New `CANONICAL_V1` template override. Send `""` to reset to the service-wide default;
     /// omitting the field leaves the current value untouched.
     pub canonical_template: Option<String>,
+    /// New sample payload. Send `""` to clear it; omitting the field leaves the current value
+    /// untouched. Re-validated against this hook's *current* declared parameters whenever it
+    /// changes — see `validate_sample_payload_matches_parameters`.
+    pub sample_payload_json: Option<String>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -181,6 +189,8 @@ pub struct HookDetail {
     pub signature_prefix: Option<String>,
     /// Configured `CANONICAL_V1` template override, or `None` for the service-wide default.
     pub canonical_template: Option<String>,
+    /// Example JSON body a real caller sends this hook, or `None` if never set.
+    pub sample_payload_json: Option<String>,
 }
 
 /// Assembles the [`HookDetail`] view for one hook as seen by one key.
@@ -224,6 +234,7 @@ pub(crate) async fn build_hook_detail(
         signature_header: model.signature_header,
         signature_prefix: model.signature_prefix,
         canonical_template: model.canonical_template,
+        sample_payload_json: model.sample_payload_json,
     })
 }
 
@@ -265,6 +276,52 @@ fn validate_and_seal_hmac_secret(
             Ok(existing_sealed.map(str::to_owned))
         }
     }
+}
+
+/// Validates that a hook's `sample_payload_json`, if set, is well-formed and — when the hook also
+/// declares at least one parameter — that every declared `param_key` names a top-level field the
+/// sample actually contains.
+///
+/// Scope is deliberately narrow: this runs only from [`create_hook`] and [`update_hook`], on
+/// whatever the *effective* sample and parameter set will be once the write lands — never from the
+/// separate parameter-CRUD endpoints (`create_hook_parameter`/`update_hook_parameter`), which have
+/// their own, independent contract. A hook that later grows a parameter naming a field absent from
+/// an already-set sample is not caught until its next own update; re-validating on every parameter
+/// change would make one hook's sample a cross-cutting constraint on four other endpoints for a
+/// consistency check that is advisory (it drives a UI preview), not load-bearing.
+///
+/// Checked against the parameter *keys* only — `is_required`, `default_value`, and every other facet
+/// of the contract are untouched by this. A sample is a shape example, not a second copy of the
+/// contract to keep in sync in full.
+fn validate_sample_payload_matches_parameters(
+    sample_payload_json: Option<&str>,
+    param_keys: &[String],
+) -> Result<(), AppError> {
+    let Some(raw) = sample_payload_json.filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        AppError::InvalidInput(format!("sample_payload_json is not valid JSON: {e}"))
+    })?;
+    let serde_json::Value::Object(object) = parsed else {
+        return Err(AppError::InvalidInput(
+            "sample_payload_json must be a JSON object at the top level".to_owned(),
+        ));
+    };
+
+    let missing: Vec<&str> = param_keys
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !object.contains_key(*key))
+        .collect();
+    if !missing.is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "sample_payload_json is missing the declared parameter(s): {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Grants a key full rights over a hook, ignoring a pre-existing identical grant.
@@ -358,6 +415,9 @@ pub async fn create_hook(
     let signature_header = payload.signature_header.filter(|s| !s.is_empty());
     let signature_prefix = payload.signature_prefix.filter(|s| !s.is_empty());
     let canonical_template = payload.canonical_template.filter(|s| !s.is_empty());
+    let sample_payload_json = payload.sample_payload_json.filter(|s| !s.is_empty());
+    let declared_keys: Vec<String> = declared.iter().map(|p| p.param_key.clone()).collect();
+    validate_sample_payload_matches_parameters(sample_payload_json.as_deref(), &declared_keys)?;
 
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
@@ -381,6 +441,7 @@ pub async fn create_hook(
         signature_header: Set(signature_header),
         signature_prefix: Set(signature_prefix),
         canonical_template: Set(canonical_template),
+        sample_payload_json: Set(sample_payload_json),
     };
 
     if let Err(err) = Hook::insert(model).exec(&state.db).await {
@@ -588,6 +649,20 @@ pub async fn update_hook(
         model.hmac_secret.as_deref(),
     )?;
 
+    // The *effective* sample, mirroring `effective_auth_mode` above — the payload's, if it named
+    // the field (`""` clears it), otherwise whatever the row already has — checked against the
+    // hook's current parameter contract, which `UpdateHookPayload` never carries directly (see
+    // `validate_sample_payload_matches_parameters`'s doc comment on why this is not re-checked from
+    // the separate parameter-CRUD endpoints).
+    let effective_sample_payload_json = match &payload.sample_payload_json {
+        Some(raw) if raw.is_empty() => None,
+        Some(raw) => Some(raw.clone()),
+        None => model.sample_payload_json.clone(),
+    };
+    let declared_keys: Vec<String> =
+        load_parameters(&state.db, model.id).await?.into_iter().map(|p| p.param_key).collect();
+    validate_sample_payload_matches_parameters(effective_sample_payload_json.as_deref(), &declared_keys)?;
+
     let hook_id = model.id;
     let mut changes: Vec<String> = Vec::new();
     let mut active: hook::ActiveModel = model.into();
@@ -644,6 +719,10 @@ pub async fn update_hook(
     if let Some(template) = payload.canonical_template {
         changes.push("canonical_template".to_owned());
         active.canonical_template = Set(if template.is_empty() { None } else { Some(template) });
+    }
+    if payload.sample_payload_json.is_some() {
+        changes.push("sample_payload_json".to_owned());
+        active.sample_payload_json = Set(effective_sample_payload_json);
     }
     active.updated_at = Set(Utc::now().naive_utc());
 

@@ -1167,6 +1167,7 @@ mod tests {
             signature_header: None,
             signature_prefix: None,
             canonical_template: None,
+            sample_payload_json: None,
         }
     }
 

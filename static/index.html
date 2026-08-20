@@ -129,6 +129,13 @@
                             <p class="text-muted text-sm">Select a hook to see its parameters.</p>
                         </div>
 
+                        <div class="form-group hidden" id="run-hook-payload-group">
+                            <label for="run-hook-payload-json">Payload (JSON) <span>*</span></label>
+                            <textarea id="run-hook-payload-json" class="input-field font-mono" rows="8" spellcheck="false"></textarea>
+                            <span class="text-muted text-sm">Auto-filled from the hook's sample payload. Edit freely before running — declared parameters are resolved from matching top-level keys.</span>
+                            <div id="run-hook-payload-error" class="message error hidden mt-2"></div>
+                        </div>
+
                         <div class="form-actions">
                             <button type="button" id="btn-test-hook" class="btn btn-secondary" disabled>Dry Run</button>
                             <button type="submit" id="btn-execute-hook" class="btn btn-primary" disabled>Execute</button>
@@ -146,18 +153,22 @@
                                 <input type="text" id="exec-hook-filter" placeholder="Filter by hook..." class="input-field combobox-input" autocomplete="off">
                                 <div class="combobox-menu hidden"></div>
                             </div>
+                            <input type="text" id="exec-key-filter" class="input-field" placeholder="Filter by API key (name or id)...">
                             <select id="exec-status-filter" class="input-field select-field">
                                 <option value="">All Statuses</option>
                                 <option value="SUCCESS">Success</option>
                                 <option value="FAILED">Failed</option>
                                 <option value="TIMEOUT">Timeout</option>
                             </select>
+                            <input type="datetime-local" id="exec-since-filter" class="input-field" title="Since (inclusive)">
+                            <input type="datetime-local" id="exec-until-filter" class="input-field" title="Until (exclusive)">
                             <button type="button" id="exec-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
+                            <button type="button" id="exec-clear-filters-btn" class="btn btn-secondary btn-sm">Clear</button>
                         </div>
                     </div>
 
                     <div class="batch-actions">
-                        <button type="button" id="delete-selected-executions" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                        <button type="button" id="delete-selected-executions" class="btn btn-batch-delete hidden">Delete Selected</button>
                     </div>
 
                     <div class="table-container">
@@ -167,6 +178,7 @@
                                     <th><input type="checkbox" id="select-all-executions" title="Select all"></th>
                                     <th>Time</th>
                                     <th>Hook</th>
+                                    <th>API Key</th>
                                     <th>Status</th>
                                     <th>Exit</th>
                                     <th>Duration</th>
@@ -175,7 +187,7 @@
                             </thead>
                             <tbody id="executions-table-body">
                                 <tr>
-                                    <td colspan="7" class="text-center text-muted">Loading data...</td>
+                                    <td colspan="8" class="text-center text-muted">Loading data...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -269,17 +281,36 @@
                             <span class="text-muted text-sm">Overrides what a <em>keyed, signed</em> caller's signature is verified against for this hook alone. Leave blank for the service-wide default.</span>
                         </div>
 
+                        <div class="form-group mt-2">
+                            <label for="hook-sample-payload">Sample JSON Payload</label>
+                            <textarea id="hook-sample-payload" class="input-field font-mono" rows="4" placeholder='{"target_ip": "203.0.113.5", "reason": "abuse"}' spellcheck="false"></textarea>
+                            <span class="text-muted text-sm">
+                                An example body a real caller sends. Drives the Live Command Preview below and the JSON
+                                Payload Extractor in the Parameters modal. If this hook already has declared parameters,
+                                every one of their keys must appear here as a top-level field.
+                            </span>
+                        </div>
+                        <div class="form-group mt-2" id="hook-command-preview-group">
+                            <label>Live Command Preview</label>
+                            <pre id="hook-command-preview" class="help-code-block font-mono text-sm"></pre>
+                            <span class="text-muted text-sm">
+                                Computed client-side from the script path, elevation, and sample payload above — advisory
+                                only, not what the daemon actually validates at execution time.
+                            </span>
+                        </div>
+
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create Hook</button>
                         </div>
                     </form>
 
-                    <div class="batch-actions">
-                        <label class="checkbox-container mr-4">
+                    <div class="batch-actions mt-4">
+                        <label class="checkbox-container checkbox-toggle mr-4">
+                            Show deleted (trash)
                             <input type="checkbox" id="hooks-show-deleted">
-                            <span class="checkmark"></span> Show deleted (trash)
+                            <span class="checkmark"></span>
                         </label>
-                        <button type="button" id="delete-selected-hooks" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                        <button type="button" id="delete-selected-hooks" class="btn btn-batch-delete hidden">Delete Selected</button>
                     </div>
 
                     <div class="table-container mt-4">
@@ -332,6 +363,20 @@
                                 <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
                             </div>
                             <div class="form-group col-span-2">
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="apikey-generate-signing-secret" checked>
+                                    <span class="checkmark"></span>
+                                    Generate a signing secret (HMAC)
+                                </label>
+                                <span class="text-muted text-sm">
+                                    Uncheck for a plain <strong>Standard API Key</strong>: authenticates with the
+                                    <code>X-API-Key</code> header alone, no signature ever required or possible. Restores the
+                                    key shape from before signing secrets existed — same field, same meaning
+                                    (<code>key_id</code>/<code>signing_secret</code> both stay <code>null</code>). Cannot be
+                                    unchecked together with <strong>Manage Keys</strong>: that scope must always sign.
+                                </span>
+                            </div>
+                            <div class="form-group col-span-2" id="apikey-canonical-template-group">
                                 <label for="apikey-canonical-template">Custom Canonical Template</label>
                                 <input type="text" id="apikey-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
                                 <span class="text-muted text-sm">
@@ -377,9 +422,8 @@
                         </div>
                     </form>
 
-
-                    <div class="batch-actions">
-                        <button type="button" id="delete-selected-keys" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                    <div class="batch-actions mt-4">
+                        <button type="button" id="delete-selected-keys" class="btn btn-batch-delete hidden">Delete Selected</button>
                     </div>
 
                     <div class="table-container mt-4">
@@ -388,8 +432,6 @@
                                 <tr>
                                     <th><input type="checkbox" id="select-all-keys" title="Select all"></th>
                                     <th>Name</th>
-                                    <th>Lineage</th>
-                                    <th>Key ID</th>
                                     <th>Mode</th>
                                     <th>Bound IPs</th>
                                     <th>Jobs</th>
@@ -399,7 +441,7 @@
                             </thead>
                             <tbody id="apikeys-table-body">
                                 <tr>
-                                    <td colspan="9" class="text-center text-muted">No API keys loaded.</td>
+                                    <td colspan="7" class="text-center text-muted">No API keys loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -500,7 +542,7 @@
             <div class="admin-grid">
                 <section class="card admin-section">
                     <h2>Audit Logs</h2>
-                    <p class="subtitle">Every mutating configuration change and execution request. Master keys only.</p>
+                    <p class="subtitle">Every mutating configuration change — key and hook CRUD, permission grants. Hook execution has its own history on the Executions tab, not here. Master keys only.</p>
 
                     <div class="filters mb-4">
                         <!-- Exact match server-side (audit_log::Column::Action.eq), so a free-text
@@ -528,6 +570,7 @@
                             <option value="EXECUTION_PURGE"></option>
                         </datalist>
                         <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
+                        <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name or id)...">
                         <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
                         <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
                         <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
@@ -606,9 +649,9 @@
                     </label>
                 </div>
                 <div class="form-actions">
-                    <button type="submit" id="param-submit-btn" class="btn btn-primary">Add Parameter</button>
-                    <button type="button" id="param-cancel-edit-btn" class="btn btn-secondary hidden">Cancel Edit</button>
+                    <button type="button" id="param-cancel-edit-btn" class="btn btn-cancel hidden">Cancel Edit</button>
                     <button type="button" id="btn-open-json-extractor" class="btn btn-secondary">Extract from JSON…</button>
+                    <button type="submit" id="param-submit-btn" class="btn btn-primary">Add Parameter</button>
                 </div>
             </form>
 
@@ -619,6 +662,15 @@
                     </thead>
                     <tbody id="params-table-body"></tbody>
                 </table>
+            </div>
+
+            <div class="form-group mt-4">
+                <label>Live Command Preview</label>
+                <pre id="params-modal-command-preview" class="help-code-block font-mono text-sm"></pre>
+                <span class="text-muted text-sm">
+                    Using this hook's own sample payload where set, falling back to each parameter's default, or a
+                    <code>&lt;key&gt;</code> placeholder for neither. Advisory only.
+                </span>
             </div>
 
             <div class="form-actions mt-4">
@@ -725,9 +777,23 @@
                     <span class="text-muted text-sm">Leave blank for the service-wide default.</span>
                 </div>
 
+                <div class="form-group mt-2">
+                    <label for="edit-hook-sample-payload">Sample JSON Payload</label>
+                    <textarea id="edit-hook-sample-payload" class="input-field font-mono" rows="4" placeholder='{"target_ip": "203.0.113.5", "reason": "abuse"}' spellcheck="false"></textarea>
+                    <span class="text-muted text-sm">
+                        Every declared parameter's key must appear here as a top-level field. Clear it (empty) to remove
+                        the sample entirely.
+                    </span>
+                </div>
+                <div class="form-group mt-2" id="edit-hook-command-preview-group">
+                    <label>Live Command Preview</label>
+                    <pre id="edit-hook-command-preview" class="help-code-block font-mono text-sm"></pre>
+                    <span class="text-muted text-sm">Advisory only — computed client-side, not what the daemon validates at execution time.</span>
+                </div>
+
                 <div class="form-actions mt-4">
+                    <button type="button" id="edit-hook-cancel" class="btn btn-cancel">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save Changes</button>
-                    <button type="button" id="edit-hook-cancel" class="btn btn-secondary">Cancel</button>
                 </div>
             </form>
         </div>
@@ -779,8 +845,8 @@
                 -->
                 <p class="text-muted text-sm mt-2 mb-4 hidden" id="edit-key-scopes-locked-note"></p>
                 <div class="form-actions">
+                    <button type="button" id="edit-key-cancel" class="btn btn-cancel">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save Changes</button>
-                    <button type="button" id="edit-key-cancel" class="btn btn-secondary">Cancel</button>
                 </div>
             </form>
         </div>
@@ -829,18 +895,23 @@
             <h3 id="confirm-modal-title">Are you sure?</h3>
             <p id="confirm-modal-message" class="subtitle"></p>
             <div class="modal-actions mt-4">
-                <button type="button" id="confirm-modal-cancel" class="btn btn-secondary">Cancel</button>
+                <button type="button" id="confirm-modal-cancel" class="btn btn-cancel">Cancel</button>
                 <button type="button" id="confirm-modal-confirm" class="btn btn-danger">Confirm</button>
             </div>
         </div>
     </div>
 
     <!--
-      Auth-mode help drawer: a slide-out panel from the right, opened by the "?" button next to
-      either hook form's Auth Mode field (create and edit share this one instance). A backdrop
-      closes it on outside click, mirroring the confirm modal's own dismiss pattern.
+      Shared backdrop for every side drawer (auth-mode help, key lineage) — only one drawer is ever
+      open at a time, so one backdrop element closes whichever it is on outside click, mirroring the
+      confirm modal's own dismiss pattern.
     -->
-    <div id="auth-help-backdrop" class="drawer-backdrop hidden"></div>
+    <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+
+    <!--
+      Auth-mode help drawer: a slide-out panel from the right, opened by the "?" button next to
+      either hook form's Auth Mode field (create and edit share this one instance).
+    -->
     <aside id="auth-help-drawer" class="side-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="auth-help-title">
         <div class="side-drawer-header">
             <h3 id="auth-help-title">How Hook Authentication Works</h3>
@@ -910,6 +981,26 @@
                     the hex digest are configurable per hook.
                 </p>
             </section>
+        </div>
+    </aside>
+
+    <!--
+      Key lineage drawer: opened from a key row's "Lineage" button. Replaces the previous crowded
+      inline "Lineage" table column with a proper hierarchical view — ancestors, the key itself, and
+      its direct children.
+    -->
+    <aside id="key-lineage-drawer" class="side-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="key-lineage-title">
+        <div class="side-drawer-header">
+            <h3 id="key-lineage-title">Lineage</h3>
+            <button type="button" id="key-lineage-close" class="btn-modal-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="side-drawer-body">
+            <p class="text-muted text-sm">
+                Lineage records who created a key, for cascading deletion and visibility only
+                (<code>RBAC_MODEL.md</code> R3) — it confers no rights. A daughter of the Master key
+                is an ordinary daughter key with no elevated standing.
+            </p>
+            <div id="key-lineage-body"></div>
         </div>
     </aside>
 
