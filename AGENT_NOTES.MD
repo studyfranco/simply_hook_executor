@@ -7076,3 +7076,133 @@ grants, not a key-level flag) caused a `422` the strict JSON extractor was corre
 master key's own self-regeneration refusal is `403` (`AppError::Forbidden`), not the `404` a
 non-master caller gets when the target key is opaque to it — two different oracle rules for two
 different callers, both correct, and the test's expectation was wrong on the first draft.
+
+---
+
+# 2026-08-21 — WebUI UX polish, templated argument vectors (`args_template`), Hooks & Runner merge
+
+A follow-up feedback pass on the previous day's WebUI overhaul: four concrete visual/UX complaints
+(modal footer alignment, a conflated Hook Auth Mode dropdown, a static Live Command Preview, cramped
+fixed-width layout), which turned into one confirmed backend feature (real argument-vector
+templating, not just a preview fix) plus a live-collaborative UI simplification pass conducted
+mid-session via direct user feedback rather than a written spec.
+
+## Task 3 turned out to need a real backend decision, not just a CSS/JS fix
+
+The brief's own example — typing `/usr/sbin/ipset bad_ip $target_ip` into the *Script Path* field —
+revealed a mismatch with this codebase's actual model: `script_path` is a literal path to one
+executable, never shell-interpreted, with parameters passed separately as positional args + env
+vars. Asked the user directly which was wanted: a cosmetic, preview-only substitution, or a real
+execution-time feature. They chose the latter, with an explicit design: `script_path` stays a bare
+path; a new `args_template` field is tokenized on whitespace and substituted with parameter values
+at execution time; forbidden shell metacharacters are rejected in substituted values as
+defense-in-depth even though nothing here is ever shell-interpreted; execution stays
+`Command::new(script_path).args(argv)`, never a shell.
+
+**What was built:**
+- New nullable `hooks.args_template` column (`m20260821_090000_add_hook_args_template`).
+- `executor::build_command_plan` now returns `Result<CommandPlan, ScriptError>` (a new
+  `ScriptRejection::ArgsTemplateSubstitution` variant) instead of being infallible — the only new
+  failure mode is `args_template` resolution, gated entirely behind `Some(template)`; the no-template
+  path is unchanged and still cannot fail. `extract_template_variable_names` (shared parsing) and
+  `resolve_args_template`/`substitute_token` handle both `$var` and `${var}` syntax.
+  `TestHookResponse.command` became `Option<CommandPlan>` — `null` exactly when a template couldn't
+  resolve, with `blocking_reason` naming why; `execute_hook` (the real path) simply propagates the
+  `ScriptError` as a `400`, no execution record, mirroring `ensure_runnable`'s own early-return shape.
+- `api::hooks::validate_args_template_matches_parameters` — the mirror image of
+  `validate_sample_payload_matches_parameters`: a template must *reference* only declared parameter
+  keys (never the other direction), same 400-at-definition-time discipline, same effective-value
+  pattern on update.
+- `args_template` is gated by `guard_dispatch_configuration` in `update_hook`, alongside
+  `script_path`/`run_as_user` — a deliberate, more-conservative-than-required reading, since
+  `RBAC_MODEL.md`'s Terminology section predates this column and names only the original two; nothing
+  in that normative document was edited to justify this, the code simply extends the same protection
+  on its own authority.
+- WebUI: `computeCommandPreview` gained an `argsTemplate` parameter mirroring the backend's
+  substitution (unresolved references degrade to a `<var>` placeholder instead of blocking, since the
+  box is advisory only); a new "Arguments Template" field sits in the (now-unified, see below) hook
+  config modal.
+- Tests: 5 new `#[test]`s in `executor.rs` (extraction, both substitution syntaxes, unresolved
+  variable, each forbidden character), 5 new `#[tokio::test]`s in the integration suite (creation
+  validation, dispatch-configuration gating, dry-run/execute substitution against the real API,
+  unresolved-variable blocking, forbidden-character blocking), plus a dedicated test — added on
+  explicit request — driving a **real Python `argparse` script** end to end
+  (`args_template_drives_a_real_python_argparse_script`) to prove flag-style tokens (`--target`,
+  `--port`) survive untouched alongside substituted values, not just `/bin/sh`'s bare `$1`/`$2`. New
+  e2e §54 mirrors all of this at the HTTP/bash level, plus its own python3-gated argparse check
+  (skipped, not failed, on a host without it — the same treatment §19 gives an absent `openssl`).
+
+## The WebUI simplification: three rounds of live feedback, not a spec
+
+Separately from Task 3, the user raised — one message at a time, mid-session — a chain of UX
+observations that compounded into a real restructuring:
+
+1. "Is the standalone 'Run a Hook' box even useful if the table already lists every hook?" — a fair
+   question: the table's row actions already redirected to that panel whenever a hook needed input
+   the row couldn't supply blind, so the panel's own hook-search combobox was a second way to reach
+   navigation the table already offered.
+2. "Remove it to get more space" — a direct instruction. The panel came out entirely.
+3. "In the hook row, `Launch` should show a checkbox-revealed JSON payload (pre-filled with the
+   example) plus Test/Launch/Cancel" — read as: fold the panel's review-before-running behavior into
+   a modal opened per-row, since the removed panel's whole value *was* that review step.
+4. "The row-level 'Test' becomes useless once that exists" — correct, and already implied by (3):
+   collapsed the row's two buttons (`Test`, `Launch`) into one (`Run`), which opens the new
+   `#run-hook-modal` (payload editor pre-filled from `sample_payload_json`, Cancel/Test/Launch
+   grouped bottom-right per the modal-footer fix) rather than firing blind.
+
+Net effect: `hookNeedsInput`/`sendToRunPanel`/`testHookFromTable`/`launchHookFromTable`,
+`showHookResultModal`, and the standalone `#hook-result-modal` all became genuinely dead code and
+were deleted outright rather than left as unused cruft. The Hooks & Runner tab is now a single
+full-width table; a real, pre-existing CSS bug this surfaced (below) was fixed as a direct
+consequence of that width change.
+
+## Other fixes from the same feedback chain
+
+- **Task 1 (modal footer alignment):** `.modal-actions`'s `justify-content: space-between` — a
+  previous session's deliberate mis-click defense for the destructive confirm-modal — was reversed to
+  `flex-end` on explicit instruction, matching every other modal's `.modal-card .form-actions`. The
+  two rules are now identical and could be merged, but were left distinct in case the defense is
+  wanted back for that one modal specifically.
+- **Task 2 (Hook Auth Mode):** `API_KEY_ONLY` removed from the offered dropdown (down to exactly
+  three options, relabelled "Hook Auth Mode"), but not from the backend `AuthMode` enum — a hook
+  already in that mode keeps working, and `applyLegacyAuthModeOption` injects a fourth "legacy"
+  option into the `<select>` only when the hook currently open is actually in it, so an existing
+  hook's real setting is never silently misrepresented or migrated on save.
+- **Task 4 (fluid layout):** `.container`'s `max-width` went from a fixed `1280px` to `1800px` with
+  `clamp()`-based side padding. This **surfaced a real, previously-latent bug**: `.grid-layout`'s
+  `1fr` column had no `min-width: 0`, so a wide child (the Hooks table, 5 action buttons deep at the
+  time) could inflate the whole grid track — and the page — past the viewport, found via a
+  `getBoundingClientRect()`-based headless diagnostic (`bodyScrollWidth` vs `viewport`) after a
+  visible page-level horizontal scrollbar kept appearing in screenshots regardless of window width.
+  Fixed with the standard `min-width: 0` grid-item reset; the table's own `.table-container
+  { overflow-x: auto }` now correctly absorbs the excess internally instead.
+- A real client-side null-pointer bug was caught *while answering an unrelated user question* about
+  row-button redundancy: `TestHookResponse.command` becoming `Option` (from the `args_template` work
+  above) meant `testHookFromTable`/`launchHookFromTable`/`testHook` all read `res.command.env`
+  unconditionally, which would throw once a hook's template legitimately failed to resolve against a
+  blind, no-payload run. Fixed by null-checking `res.command` everywhere it's read, before those three
+  functions were themselves deleted in the Hooks & Runner simplification above.
+
+## Verification
+
+Headless-Chromium screenshot verification (this project's established technique for WebUI changes)
+hit a new failure mode this session: `--virtual-time-budget` fast-forwards JS timers without
+necessarily producing the real animation frames a CSS `transition` needs to actually *start* — a
+freshly-unhidden modal could be screenshotted mid-(never-triggered)-fade regardless of how much
+virtual time elapsed, independent of budget size (tested up to 10 s). Root-caused via a `dbg()`
+overlay technique (careful about `position: fixed` stacking order — two overlapping debug elements at
+identical coordinates silently hid each other) that confirmed the modal's `hidden` class really was
+removed and its DOM really was correct; the screenshot was simply stale. Fixed, verification-only,
+by injecting `* { transition: none !important; animation: none !important; }` into the iframe before
+driving any action — never touches `style.css`.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**146 passed / 0 failed / 2 ignored** (up from 140 — the 5 `args_template` unit tests in `executor.rs`,
+5 integration tests, and the dedicated Python `argparse` test) · `cargo test -- --ignored` **2
+passed** · `./scripts/test_e2e.sh` **1133 passed / 0 failed / 0 skipped** (skip count only reaches 0
+because python3 was present on this host; §54's argparse check degrades to a counted skip otherwise)
+— up from 1102 at session start · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence
+(pre-existing, unrelated), 0 drifted** — "Hooks are never spawned through a shell" still holds with
+`args_template` in place, confirming the new substitution path never introduces one.

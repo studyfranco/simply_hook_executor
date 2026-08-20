@@ -93,6 +93,11 @@ pub struct CreateHookPayload {
     /// declared parameter, every parameter's key must appear as a top-level field of the sample —
     /// see `validate_sample_payload_matches_parameters`.
     pub sample_payload_json: Option<String>,
+    /// An optional argument-vector template (e.g. `add bad_ip ${target_ip}`). Every `$var`/`${var}`
+    /// it references must name one of `parameters`' declared keys — see
+    /// `validate_args_template_matches_parameters`. `None`/absent keeps the pre-existing behavior:
+    /// every resolved parameter appended positionally, in declaration order.
+    pub args_template: Option<String>,
 }
 
 /// Payload for updating a hook. Every field is optional; omitted fields are left untouched.
@@ -139,6 +144,16 @@ pub struct UpdateHookPayload {
     /// untouched. Re-validated against this hook's *current* declared parameters whenever it
     /// changes — see `validate_sample_payload_matches_parameters`.
     pub sample_payload_json: Option<String>,
+    /// New argument-vector template. Send `""` to clear it (reverting to plain positional
+    /// arguments); omitting the field leaves the current value untouched. Re-validated against this
+    /// hook's *current* declared parameters whenever it changes — see
+    /// `validate_args_template_matches_parameters`. Treated as dispatch configuration alongside
+    /// `script_path`/`run_as_user` (`guard_dispatch_configuration`): it decides what the process
+    /// actually receives as `argv` just as directly as those two fields do, even though
+    /// `RBAC_MODEL.md`'s Terminology section predates this column and does not name it — extending
+    /// the same protection here is a strictly more conservative reading of that section's intent,
+    /// never a narrower one.
+    pub args_template: Option<String>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -191,6 +206,8 @@ pub struct HookDetail {
     pub canonical_template: Option<String>,
     /// Example JSON body a real caller sends this hook, or `None` if never set.
     pub sample_payload_json: Option<String>,
+    /// Argument-vector template, or `None` if never set (plain positional arguments).
+    pub args_template: Option<String>,
 }
 
 /// Assembles the [`HookDetail`] view for one hook as seen by one key.
@@ -235,6 +252,7 @@ pub(crate) async fn build_hook_detail(
         signature_prefix: model.signature_prefix,
         canonical_template: model.canonical_template,
         sample_payload_json: model.sample_payload_json,
+        args_template: model.args_template,
     })
 }
 
@@ -319,6 +337,40 @@ fn validate_sample_payload_matches_parameters(
         return Err(AppError::InvalidInput(format!(
             "sample_payload_json is missing the declared parameter(s): {}",
             missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Validates that an `args_template`, if set, references only currently-declared parameters.
+///
+/// Mirrors [`validate_sample_payload_matches_parameters`]'s shape and scope exactly — same
+/// effective-value pattern from [`create_hook`]/[`update_hook`], same "not re-checked from the
+/// separate parameter-CRUD endpoints" boundary — but the direction of the check is reversed: a
+/// sample payload must *contain* every declared key, while a template must *reference* only
+/// declared keys. An `args_template` is exactly as much an allowlist boundary as a hook's
+/// parameter contract itself: a template naming an undeclared `$var` would otherwise let a hook's
+/// definition silently depend on a value the caller was never told it needed to supply, and that
+/// would only surface as an opaque `args_template references ... which has no resolved value`
+/// failure at execution time instead of a clear `400` at definition time.
+fn validate_args_template_matches_parameters(
+    args_template: Option<&str>,
+    param_keys: &[String],
+) -> Result<(), AppError> {
+    let Some(template) = args_template.filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+
+    let mut undeclared: Vec<String> = crate::executor::extract_template_variable_names(template)
+        .into_iter()
+        .filter(|name| !param_keys.iter().any(|k| k == name))
+        .collect();
+    if !undeclared.is_empty() {
+        undeclared.sort_unstable();
+        undeclared.dedup();
+        return Err(AppError::InvalidInput(format!(
+            "args_template references undeclared parameter(s): {}",
+            undeclared.join(", ")
         )));
     }
     Ok(())
@@ -416,8 +468,10 @@ pub async fn create_hook(
     let signature_prefix = payload.signature_prefix.filter(|s| !s.is_empty());
     let canonical_template = payload.canonical_template.filter(|s| !s.is_empty());
     let sample_payload_json = payload.sample_payload_json.filter(|s| !s.is_empty());
+    let args_template = payload.args_template.filter(|s| !s.is_empty());
     let declared_keys: Vec<String> = declared.iter().map(|p| p.param_key.clone()).collect();
     validate_sample_payload_matches_parameters(sample_payload_json.as_deref(), &declared_keys)?;
+    validate_args_template_matches_parameters(args_template.as_deref(), &declared_keys)?;
 
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
@@ -442,6 +496,7 @@ pub async fn create_hook(
         signature_prefix: Set(signature_prefix),
         canonical_template: Set(canonical_template),
         sample_payload_json: Set(sample_payload_json),
+        args_template: Set(args_template),
     };
 
     if let Err(err) = Hook::insert(model).exec(&state.db).await {
@@ -586,7 +641,11 @@ pub async fn update_hook(
     // lets the owner through on ownership alone. Checked as its own step, before validation, so an
     // owner whose `can_manage_hooks` was revoked is refused here rather than by a guard further
     // down that happens to also catch it for an unrelated reason.
-    if payload.script_path.is_some() || payload.run_as_user.is_some() {
+    // `args_template` decides what the process actually receives as `argv` exactly as directly as
+    // `script_path`/`run_as_user` do, so it is gated identically even though `RBAC_MODEL.md`'s
+    // Terminology section predates this column and does not name it — see `UpdateHookPayload`'s own
+    // doc comment on why this is the more conservative reading, not a narrower one.
+    if payload.script_path.is_some() || payload.run_as_user.is_some() || payload.args_template.is_some() {
         guard_dispatch_configuration(&state.db, &key, &model).await?;
     }
     // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
@@ -659,9 +718,18 @@ pub async fn update_hook(
         Some(raw) => Some(raw.clone()),
         None => model.sample_payload_json.clone(),
     };
+    // Same effective-value pattern as `effective_sample_payload_json` immediately above, for the
+    // same reason: `UpdateHookPayload` never carries the hook's current declared parameters, so
+    // this checks the *would-be* stored value against `load_parameters`'s live result.
+    let effective_args_template = match &payload.args_template {
+        Some(raw) if raw.is_empty() => None,
+        Some(raw) => Some(raw.clone()),
+        None => model.args_template.clone(),
+    };
     let declared_keys: Vec<String> =
         load_parameters(&state.db, model.id).await?.into_iter().map(|p| p.param_key).collect();
     validate_sample_payload_matches_parameters(effective_sample_payload_json.as_deref(), &declared_keys)?;
+    validate_args_template_matches_parameters(effective_args_template.as_deref(), &declared_keys)?;
 
     let hook_id = model.id;
     let mut changes: Vec<String> = Vec::new();
@@ -723,6 +791,10 @@ pub async fn update_hook(
     if payload.sample_payload_json.is_some() {
         changes.push("sample_payload_json".to_owned());
         active.sample_payload_json = Set(effective_sample_payload_json);
+    }
+    if payload.args_template.is_some() {
+        changes.push("args_template".to_owned());
+        active.args_template = Set(effective_args_template);
     }
     active.updated_at = Set(Utc::now().naive_utc());
 

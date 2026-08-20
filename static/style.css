@@ -52,10 +52,16 @@ body {
 
 /* ─── Layout ────────────────────────────────────────────── */
 
+/* Fluid up to a generous cap rather than a fixed 1280px: on anything narrower than the cap the
+   container simply fills the viewport (minus the clamped side padding below), so a 1440px/1920px
+   display is not left with hundreds of pixels of dead margin either side. The cap itself (1800px)
+   stops content over-stretching into unreadable full-bleed rows on a truly ultra-wide (3440px+)
+   display — fluid does not mean unbounded. */
 .container {
-    max-width: 1280px;
+    max-width: 1800px;
+    width: 100%;
     margin: 0 auto;
-    padding: 2rem;
+    padding: 2rem clamp(1rem, 3vw, 4rem);
     transition: opacity var(--transition-slow), transform var(--transition-slow);
 }
 
@@ -167,6 +173,15 @@ body {
     grid-template-columns: 380px 1fr;
     gap: 1.5rem;
     align-items: start;
+}
+
+/* A grid item's default min-width is `auto` — sized to its content's intrinsic minimum, not the
+   track it was assigned. The Hooks list card's table (checkboxes, a 5-button Actions column) has a
+   wide min-content width; without this, that width wins and inflates the whole `1fr` track (and
+   therefore the page) past the viewport, rather than the table's own `.table-container` handling
+   the overflow internally via its `overflow-x: auto`, which is the entire point of that wrapper. */
+.grid-layout > * {
+    min-width: 0;
 }
 
 @media (max-width: 1100px) {
@@ -1093,7 +1108,7 @@ body {
 
 .modal-card {
     width: 100%;
-    max-width: 460px;
+    max-width: min(460px, 92vw);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1108,24 +1123,16 @@ body {
     margin-top: 0.5rem;
 }
 
-/*
- * `space-between` is deliberate and should not be "tidied" to `flex-end`. It drives Cancel and the
- * destructive Confirm to opposite edges of the card, which is the cheapest possible defence against
- * a mis-click on an action that cannot be undone. Grouping them into an adjacent pair puts two
- * buttons a few pixels apart where one deletes data and the other does not.
- */
+/* Every modal footer packs to the bottom-right, Cancel immediately beside the primary/destructive
+   action (`[ Cancel ] [ Delete ]` / `[ Cancel ] [ Save ]`) — grouped, not split to opposite edges.
+   DOM order still carries the meaning: Cancel/Close comes first in the markup and therefore appears
+   left of Confirm/Save/Delete once packed. */
 .modal-actions {
     display: flex;
-    justify-content: space-between;
+    justify-content: flex-end;
     gap: 0.75rem;
 }
 
-/* Ordinary modal forms (edit hook, edit key, parameters, JSON extractor) are not a single
-   irreversible confirmation — `.modal-actions`'s space-between reasoning above does not apply here
-   — so they pack to the trailing edge instead, matching simply_ip_vault's `.modal-card-form
-   .form-actions`. DOM order still carries the meaning: Cancel/Close comes first in the markup (and
-   therefore appears left of Save/Delete once packed), the same left-to-right reading order
-   `.modal-actions` uses for its own pair. */
 .modal-card .form-actions {
     justify-content: flex-end;
 }
@@ -1375,7 +1382,7 @@ input[type="checkbox"]:indeterminate::after {
 /* ─── Wide Modals (execution detail, parameter editor) ──── */
 
 .modal-card-wide {
-    max-width: 780px;
+    max-width: min(960px, 92vw);
     max-height: 88vh;
     overflow-y: auto;
 }
@@ -1388,6 +1395,13 @@ input[type="checkbox"]:indeterminate::after {
 
 .mr-4 {
     margin-right: 1rem;
+}
+
+/* Pushes itself (and every sibling after it) to the right edge of a flex row — used in
+   `.batch-actions` to separate a leading primary action (e.g. "Create Hook") from a trailing
+   group of secondary controls (a view toggle, a batch-delete button) without a second wrapper. */
+.push-right {
+    margin-left: auto;
 }
 
 /* ─── Identity Pill (header) ────────────────────────────── */

@@ -17,18 +17,18 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 
 ## Coverage
 
-**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-20.
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-21.
 
 | Group | Files | Where documented here |
 | :--- | :--- | :--- |
 | Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 13 | Table under **`src/migration/`** (12 migrations + `mod.rs`) |
-| **Total** | **43** | — |
+| Migrations (`src/migration/*.rs`) | 14 | Table under **`src/migration/`** (13 migrations + `mod.rs`) |
+| **Total** | **44** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
-(verified passing 2026-08-20, all three silent):
+(verified passing 2026-08-21, all three silent):
 
 ```bash
 # 1. Crate-root and API modules, documented as `### `src/…`` headings
@@ -260,7 +260,7 @@ recording unverified signatures would let anyone who merely observed a request b
 legitimate copy arrived, turning the control into a denial-of-service primitive aimed at the client
 it protects.
 
-### `src/executor.rs` — 1,403 lines
+### `src/executor.rs` — 1,638 lines
 
 **Role & scope.** Everything about running a child process safely: argv construction, environment
 isolation, `run_as_user` handling, script-path containment, timeouts, and process-group kill. Must
@@ -547,7 +547,7 @@ same name) so a `can_manage_hooks` holder who is not master — and therefore ne
 master-only `GET /api/settings` — can still learn whether the WebUI's `PUBLIC_UNAUTHENTICATED` hook
 auth mode is globally reachable.
 
-### `src/api/hooks.rs` — 1,142 lines
+### `src/api/hooks.rs` — 1,214 lines
 
 **Role & scope.** What a hook *is* — its definition, dispatch configuration, parameter contract, and
 trash lifecycle. Must **not** hold execution: that is `executions.rs`.
@@ -579,7 +579,7 @@ than silently left inconsistent. It is pure WebUI convenience (`build_command_pl
 and is therefore validated only for shape and parameter-name coverage, never for the *values*'
 types.
 
-### `src/api/executions.rs` — 518 lines
+### `src/api/executions.rs` — 531 lines
 
 **Role & scope.** Triggering hooks and reading the records that result.
 
@@ -712,7 +712,7 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 | File | Table | Note |
 | :--- | :--- | :--- |
 | `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` — a key's **own** signature mode, unrelated to `hook.rs`'s `AuthMode` below. `HmacMode` now has **one** variant (`CANONICAL_V1`) — `BODY_ONLY` was retired in `m20260819_141730`, superseded by hook-level `HMAC_ONLY`. `canonical_template` (added the same migration) is the per-key customization surface that replaced it |
-| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. Also carries `sample_payload_json` (nullable, `m20260820_090000`) — a WebUI convenience only, never read by `executor::build_command_plan`. See `middleware.rs` below |
+| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. Also carries `sample_payload_json` (nullable, `m20260820_090000`) — a WebUI convenience only, never read by `executor::build_command_plan` — and `args_template` (nullable, `m20260821_090000`), which *is* read by it: an optional whitespace-tokenized argument-vector template with `$var`/`${var}` substitution, the templated alternative to appending every resolved parameter as a bare positional argument. See `middleware.rs` below |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
 | `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus` |
@@ -739,7 +739,8 @@ one that has shipped.
 | `m20260810_090000_drop_api_key_owner_key_id` | **Removes** `api_keys.owner_key_id` and its index — dormant since `m20230107`, read by nothing |
 | `m20260819_120414_add_hook_auth_mode` | `hooks.auth_mode` (`NOT NULL DEFAULT 'CANONICAL_V1'`), `hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template` (all nullable) — per-hook inbound authentication, see `entities/hook.rs` above |
 | `m20260819_141730_consolidate_hmac_modes` | **Retires** `api_keys.hmac_mode = BODY_ONLY` (rewrites any stored row to `CANONICAL_V1` via a typed `sea_query::Query::update`, not raw SQL) and **adds** `api_keys.canonical_template` — see `entities/api_key.rs` above |
-| `m20260820_090000_add_hook_sample_payload` | `hooks.sample_payload_json` (nullable `TEXT`) — the WebUI's Live Command Preview / "Run a Hook" auto-fill source, see `entities/hook.rs` and `api/hooks.rs` above |
+| `m20260820_090000_add_hook_sample_payload` | `hooks.sample_payload_json` (nullable `TEXT`) — the WebUI's Live Command Preview / Run Hook launcher auto-fill source, see `entities/hook.rs` and `api/hooks.rs` above |
+| `m20260821_090000_add_hook_args_template` | `hooks.args_template` (nullable `TEXT`) — the templated alternative to plain positional arguments, substituted by `executor::build_command_plan`, see `entities/hook.rs` and `executor.rs` above |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the

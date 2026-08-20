@@ -517,13 +517,6 @@ class HookExecutorClient {
         this.execCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchExecutionsChunk(offset, limit) });
         this.auditCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchAuditLogsChunk(offset, limit) });
 
-        this.runHookCombobox = new SearchableSelect({
-            rootId: 'run-hook-combobox',
-            searchId: 'run-hook-search',
-            valueId: 'run-hook-id',
-            emptyText: 'No matching hooks',
-            onSelect: (hookId) => this.onRunHookSelected(hookId)
-        });
         this.execHookFilterCombobox = new SearchableSelect({
             rootId: 'exec-hook-filter-combobox',
             searchId: 'exec-hook-filter',
@@ -768,11 +761,11 @@ class HookExecutorClient {
             ? `<span class="identity-pill-dot"></span> MASTER <span class="identity-pill-name">${escapeHtml(p.name)}</span>`
             : `<span class="identity-pill-dot"></span> ${escapeHtml(p.name)} <span class="identity-pill-prefix">${escapeHtml(p.prefix)}...</span>`;
 
-        // Hooks Management: anyone who can create hooks, or manage at least one existing hook.
+        // Hooks & Runner: anyone who can create hooks, or manage at least one existing hook.
         document.getElementById('hooks-tab-btn').style.display = canManageAnyHook ? 'inline-block' : 'none';
-        // The create form specifically needs the global creation scope.
-        document.getElementById('form-create-hook').style.display =
-            (p.is_master || p.can_manage_hooks) ? 'block' : 'none';
+        // The "Create Hook" button specifically needs the global creation scope.
+        document.getElementById('btn-open-create-hook-modal').style.display =
+            (p.is_master || p.can_manage_hooks) ? 'inline-block' : 'none';
 
         document.getElementById('keys-tab-btn').style.display =
             (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
@@ -794,10 +787,6 @@ class HookExecutorClient {
                 this.loadHooks();
             }
         }
-
-        // A key with no executable hook has nothing to run.
-        const canExecuteAny = p.is_master || (p.hook_permissions || []).some(h => h.can_execute);
-        document.getElementById('run-hook-section').style.display = canExecuteAny ? 'block' : 'none';
 
         // Hooks Management is also reachable by a key that *owns* a hook: §3 ownership confers the
         // right to edit and delete it, and that is independent of holding a `can_manage` row. Owned
@@ -867,10 +856,10 @@ class HookExecutorClient {
         document.getElementById('apikey-canonical-template-group').classList.toggle('hidden', !secretCheckbox.checked);
     }
 
-    // Disables the run_as_user inputs for non-master keys, matching the backend's 403.
+    // Disables the run_as_user input for non-master keys, matching the backend's 403.
     applyRunAsUserGuard() {
         const isMaster = Boolean(this.state.profile?.is_master);
-        ['hook-run-as-user', 'edit-hook-run-as-user'].forEach(id => {
+        ['edit-hook-run-as-user'].forEach(id => {
             const input = document.getElementById(id);
             if (!input) return;
             input.disabled = !isMaster;
@@ -887,11 +876,10 @@ class HookExecutorClient {
         });
     }
 
-    // Shows/hides the mode-dependent field groups on a hook's create or edit form and swaps in
-    // that mode's one-line hint (`AUTH_MODE_HINTS`). `prefix` is `'hook'` for the create form or
-    // `'edit-hook'` for the modal — every id below follows `${prefix}-auth-mode`,
-    // `${prefix}-hmac-secret-group`, etc., so one function drives both without duplicating the
-    // toggle logic.
+    // Shows/hides the mode-dependent field groups on the hook config modal (Create and Edit share
+    // one instance, hence one call site — `prefix` is always `'edit-hook'`) and swaps in that
+    // mode's one-line hint (`AUTH_MODE_HINTS`). Every id below follows `${prefix}-auth-mode`,
+    // `${prefix}-hmac-secret-group`, etc.
     //
     // `canonical_template` is deliberately gated on CANONICAL_V1 alone, not API_KEY_ONLY too: the
     // field's own doc comment (`hook::Model::canonical_template`) is explicit that it is "consulted
@@ -913,9 +901,11 @@ class HookExecutorClient {
         toggle(`${prefix}-canonical-template-group`, needsTemplate);
 
         const secretInput = document.getElementById(`${prefix}-hmac-secret`);
-        // Only the create form's secret is ever mandatory — the edit form's blank means "keep the
-        // current one" (see `submitEditHook`), so it is never `required`.
-        if (secretInput) secretInput.required = needsSecret && prefix === 'hook';
+        // Only in Create mode (no `edit-hook-id` yet) is the secret ever mandatory — in Edit mode a
+        // blank field means "keep the current one" (see `submitHookConfig`), so it is never
+        // `required` there, even though the same input element serves both modes.
+        const isCreate = document.getElementById('edit-hook-id')?.value === '';
+        if (secretInput) secretInput.required = needsSecret && isCreate;
 
         const hint = document.getElementById(`${prefix}-auth-mode-hint`);
         if (hint) hint.innerHTML = HookExecutorClient.AUTH_MODE_HINTS[mode] || '';
@@ -929,11 +919,29 @@ class HookExecutorClient {
     // one; only *choosing* it going forward is discouraged, via `disabled` plus a tooltip.
     applyKeylessHooksGuard() {
         const allowed = this.state.profile?.keyless_hooks_allowed !== false;
-        document.querySelectorAll('#hook-auth-mode option[value="NONE"], #edit-hook-auth-mode option[value="NONE"]')
+        document.querySelectorAll('#edit-hook-auth-mode option[value="NONE"]')
             .forEach(opt => {
                 opt.disabled = !allowed;
                 opt.title = allowed ? '' : 'This deployment requires signed requests (REQUIRE_SIGNED_REQUESTS) — a NONE hook would never actually be reachable keylessly';
             });
+    }
+
+    // Task 2: the Hook Auth Mode dropdown offers exactly three options — CANONICAL_V1, HMAC_ONLY,
+    // NONE — since API_KEY_ONLY conflated a key's own auth type with a hook's keyless policy. A hook
+    // already stored as API_KEY_ONLY (from before this cleanup) must not have its dropdown silently
+    // land on CANONICAL_V1 just because its real option is gone: this injects a clearly-labelled
+    // fourth, "legacy" option exactly when `currentMode` is API_KEY_ONLY, and removes it otherwise —
+    // called every time the modal opens, so it never lingers for the next hook edited afterward.
+    applyLegacyAuthModeOption(currentMode) {
+        const select = document.getElementById('edit-hook-auth-mode');
+        const existing = select.querySelector('option[value="API_KEY_ONLY"]');
+        if (existing) existing.remove();
+        if (currentMode === 'API_KEY_ONLY') {
+            const opt = document.createElement('option');
+            opt.value = 'API_KEY_ONLY';
+            opt.textContent = 'Bearer only (API_KEY_ONLY) — legacy, choose another mode to migrate off it';
+            select.insertBefore(opt, select.firstChild);
+        }
     }
 
     // ───────────────────────────────────────────────────────
@@ -968,7 +976,6 @@ class HookExecutorClient {
             const live = this.state.hooks.filter(h => !h.is_deleted);
             const byId = live.map(h => ({ value: h.id, label: h.name }));
             const byName = live.map(h => ({ value: h.name, label: h.name }));
-            this.runHookCombobox.setOptions(live.filter(h => h.can_execute).map(h => ({ value: h.id, label: h.name })));
             this.execHookFilterCombobox.setOptions(byName);
             this.rightsHookCombobox.setOptions(byId);
         } catch (e) {}
@@ -1276,33 +1283,27 @@ class HookExecutorClient {
     // ───────────────────────────────────────────────────────
     // Rendering — Run a Hook
     // ───────────────────────────────────────────────────────
-    onRunHookSelected(hookId) {
+    // Opens the Run Hook modal — the execution launcher — for one hook, pre-filled from its
+    // sample payload. This is the only way to reach Test/Launch now: a hook row's single "Run"
+    // action always opens here for review rather than firing blind, and there is no separate
+    // hook picker any more (the table it's launched from already is one).
+    openRunHookModal(hookId) {
         const hook = this.state.hooks.find(h => h.id === hookId);
-        const meta = document.getElementById('run-hook-meta');
-        const params = document.getElementById('run-hook-params');
-        const payloadGroup = document.getElementById('run-hook-payload-group');
-        const payloadInput = document.getElementById('run-hook-payload-json');
-        const payloadError = document.getElementById('run-hook-payload-error');
-        const result = document.getElementById('run-hook-result');
-        result.classList.add('hidden');
-        payloadError.classList.add('hidden');
+        if (!hook) return;
 
-        if (!hook) {
-            meta.classList.add('hidden');
-            payloadGroup.classList.add('hidden');
-            params.innerHTML = '<p class="text-muted text-sm">Select a hook to see its parameters.</p>';
-            document.getElementById('btn-execute-hook').disabled = true;
-            document.getElementById('btn-test-hook').disabled = true;
-            return;
-        }
+        document.getElementById('run-hook-modal-hook-id').value = hook.id;
+        document.getElementById('run-hook-modal-title').textContent = `Run "${hook.name}"`;
+        document.getElementById('run-hook-modal-result').classList.add('hidden');
+        document.getElementById('run-hook-modal-payload-error').classList.add('hidden');
 
-        meta.classList.remove('hidden');
+        const meta = document.getElementById('run-hook-modal-meta');
         meta.innerHTML = `
             <div class="font-mono text-sm">${escapeHtml(hook.script_path)}</div>
             <div class="text-muted text-sm">Timeout: ${hook.default_timeout_seconds}s${hook.description ? ' · ' + escapeHtml(hook.description) : ''}</div>
             ${hook.run_as_user ? `<div class="mt-2">${this.privilegeBadge(hook.run_as_user)}</div>` : ''}
         `;
 
+        const params = document.getElementById('run-hook-modal-params');
         if (hook.parameters.length === 0) {
             params.innerHTML = '<p class="text-muted text-sm">This hook takes no parameters.</p>';
         } else {
@@ -1314,19 +1315,16 @@ class HookExecutorClient {
             `).join('');
         }
 
-        payloadGroup.classList.remove('hidden');
-        payloadInput.value = hook.sample_payload_json || '{}';
-
-        document.getElementById('btn-execute-hook').disabled = false;
-        document.getElementById('btn-test-hook').disabled = false;
+        document.getElementById('run-hook-modal-payload').value = hook.sample_payload_json || '{}';
+        document.getElementById('run-hook-modal').classList.remove('hidden');
     }
 
     // Reads the live JSON payload editor. Returns `null` (and surfaces an inline error) on
     // malformed JSON or a non-object top level, rather than letting the request go out with a
     // parameter map the server would just reject anyway.
     collectRunParameters() {
-        const payloadInput = document.getElementById('run-hook-payload-json');
-        const payloadError = document.getElementById('run-hook-payload-error');
+        const payloadInput = document.getElementById('run-hook-modal-payload');
+        const payloadError = document.getElementById('run-hook-modal-payload-error');
         payloadError.classList.add('hidden');
         const raw = payloadInput.value.trim();
         if (raw === '') return {};
@@ -1417,24 +1415,21 @@ class HookExecutorClient {
 
     async executeHook(e) {
         e.preventDefault();
-        const hookId = document.getElementById('run-hook-id').value;
-        if (!hookId) {
-            this.showToast('Select a hook first', 'error');
-            return;
-        }
+        const hookId = document.getElementById('run-hook-modal-hook-id').value;
+        if (!hookId) return;
         const parameters = this.collectRunParameters();
         if (parameters === null) return;
 
-        const btn = document.getElementById('btn-execute-hook');
+        const btn = document.getElementById('run-hook-modal-execute-btn');
         btn.disabled = true;
-        btn.textContent = 'Executing...';
+        btn.textContent = 'Launching...';
         try {
             const res = await this.apiFetch(`/hooks/${hookId}/execute`, {
                 method: 'POST',
                 body: JSON.stringify({ parameters })
             });
 
-            const panel = document.getElementById('run-hook-result');
+            const panel = document.getElementById('run-hook-modal-result');
             panel.classList.remove('hidden');
             this.renderResultView(panel, {
                 headerHtml: `
@@ -1451,16 +1446,13 @@ class HookExecutorClient {
         } catch (err) {
         } finally {
             btn.disabled = false;
-            btn.textContent = 'Execute';
+            btn.textContent = 'Launch';
         }
     }
 
     async testHook() {
-        const hookId = document.getElementById('run-hook-id').value;
-        if (!hookId) {
-            this.showToast('Select a hook first', 'error');
-            return;
-        }
+        const hookId = document.getElementById('run-hook-modal-hook-id').value;
+        if (!hookId) return;
         const parameters = this.collectRunParameters();
         if (parameters === null) return;
 
@@ -1470,13 +1462,17 @@ class HookExecutorClient {
                 body: JSON.stringify({ parameters })
             });
 
-            const envRows = Object.entries(res.command.env)
-                .map(([k, v]) => `${k}=${v}`).join('\n');
-            const argList = res.command.args.length
+            // `command` is `null` exactly when an `args_template` couldn't be resolved (a
+            // referenced parameter with no value, or a forbidden character in one that was
+            // supplied) — there is no command to show in that case, only `blocking_reason`.
+            const envRows = res.command
+                ? Object.entries(res.command.env).map(([k, v]) => `${k}=${v}`).join('\n')
+                : '';
+            const argList = res.command && res.command.args.length
                 ? res.command.args.map((a, i) => `argv[${i + 1}] = ${a}`).join('\n')
                 : '(none)';
 
-            const panel = document.getElementById('run-hook-result');
+            const panel = document.getElementById('run-hook-modal-result');
             panel.classList.remove('hidden');
             this.renderResultView(panel, {
                 headerHtml: `
@@ -1484,14 +1480,14 @@ class HookExecutorClient {
                         ${res.would_execute ? 'DRY RUN OK' : 'BLOCKED'}
                     </span>
                     <span class="text-sm text-muted">timeout ${escapeHtml(res.timeout_seconds)}s</span>
-                    ${res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
+                    ${res.command && res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
                 `,
                 errorText: res.blocking_reason || null,
-                blocks: [
+                blocks: res.command ? [
                     this.outputBlock('command', res.command.program),
                     this.outputBlock('positional arguments', argList),
                     this.outputBlock('environment', envRows)
-                ]
+                ] : []
             });
             this.showToast(res.would_execute ? 'Dry run resolved successfully' : 'Dry run blocked', res.would_execute ? 'success' : 'error');
         } catch (err) {}
@@ -1577,101 +1573,6 @@ class HookExecutorClient {
         return `<span class="badge badge-elevated" title="Runs via sudo -n -u ${escapeHtml(runAsUser)} --">⬆ ${escapeHtml(runAsUser)}</span>`;
     }
 
-    // Collects a hook's parameters for a table-initiated run. Only parameters that already carry
-    // a default can be resolved without a form, so a hook with unsatisfied required parameters is
-    // routed to the Run panel rather than being launched with a guess.
-    hookNeedsInput(hook) {
-        return hook.parameters.some(p => p.is_required && p.default_value === null);
-    }
-
-    sendToRunPanel(hook, message) {
-        this.showToast(message, 'info');
-        document.querySelector('.tab-btn[data-tab="executions"]').click();
-        this.runHookCombobox.select({ value: hook.id, label: hook.name });
-    }
-
-    // Test = dry run. It resolves parameters and renders the exact command, environment and
-    // timeout that *would* be used, and deliberately spawns nothing — so there is no stdout,
-    // stderr or exit code to show, and claiming otherwise would be a lie about what ran.
-    async testHookFromTable(hookId) {
-        const hook = this.state.hooks.find(h => h.id === hookId);
-        if (!hook) return;
-        if (this.hookNeedsInput(hook)) {
-            this.sendToRunPanel(hook, 'This hook has required parameters — fill them in below, then Dry Run.');
-            return;
-        }
-
-        try {
-            const res = await this.apiFetch(`/hooks/${hookId}/test`, {
-                method: 'POST',
-                body: JSON.stringify({ parameters: {} })
-            });
-
-            const envRows = Object.entries(res.command.env).map(([k, v]) => `${k}=${v}`).join('\n');
-            const argList = res.command.args.length
-                ? res.command.args.map((a, i) => `argv[${i + 1}] = ${a}`).join('\n')
-                : '(none)';
-
-            this.showHookResultModal(`Dry Run — ${hook.name}`, {
-                headerHtml: `
-                    <span class="badge ${res.would_execute ? 'badge-success' : 'badge-failed'}">
-                        ${res.would_execute ? 'WOULD EXECUTE' : 'BLOCKED'}
-                    </span>
-                    <span class="text-sm text-muted">timeout ${escapeHtml(res.timeout_seconds)}s</span>
-                    ${res.command.run_as_user ? this.privilegeBadge(res.command.run_as_user) : ''}
-                `,
-                noteText: 'Nothing was executed — this is the command that would run.',
-                errorText: res.blocking_reason || null,
-                blocks: [
-                    this.outputBlock('program', res.command.program),
-                    this.outputBlock('positional arguments', argList),
-                    this.outputBlock('environment', envRows)
-                ]
-            });
-        } catch (e) {}
-    }
-
-    // Launch = the real thing, with the recorded stdout/stderr/exit code.
-    async launchHookFromTable(hookId) {
-        const hook = this.state.hooks.find(h => h.id === hookId);
-        if (!hook) return;
-        if (this.hookNeedsInput(hook)) {
-            this.sendToRunPanel(hook, 'This hook has required parameters — fill them in below, then Execute.');
-            return;
-        }
-
-        const ok = await this.showConfirmModal({
-            title: `Launch "${hook.name}"`,
-            message: hook.run_as_user
-                ? `This runs ${hook.script_path} as "${hook.run_as_user}" via sudo. Continue?`
-                : `This runs ${hook.script_path} for real. Continue?`,
-            confirmText: 'Launch',
-            danger: Boolean(hook.run_as_user)
-        });
-        if (!ok) return;
-
-        try {
-            const res = await this.apiFetch(`/hooks/${hookId}/execute`, {
-                method: 'POST',
-                body: JSON.stringify({ parameters: {} })
-            });
-
-            this.showHookResultModal(`Execution — ${hook.name}`, {
-                headerHtml: `
-                    ${this.statusBadge(res.status)}
-                    <span class="text-sm text-muted">exit ${escapeHtml(res.exit_code === null ? '–' : res.exit_code)} · ${escapeHtml(formatDuration(res.duration_ms))}</span>
-                    ${hook.run_as_user ? this.privilegeBadge(hook.run_as_user) : ''}
-                `,
-                blocks: [
-                    this.outputBlock('stdout', res.stdout),
-                    this.outputBlock('stderr', res.stderr)
-                ]
-            });
-            this.showToast(`Execution finished: ${res.status}`, res.status === 'SUCCESS' ? 'success' : 'error');
-            this.loadExecutions();
-        } catch (e) {}
-    }
-
     // Jumps to the execution history filtered to this hook.
     showHookLogs(hookId) {
         const hook = this.state.hooks.find(h => h.id === hookId);
@@ -1679,14 +1580,6 @@ class HookExecutorClient {
         document.querySelector('.tab-btn[data-tab="executions"]').click();
         document.getElementById('exec-hook-filter').value = hook.name;
         this.loadExecutions();
-    }
-
-    // `view` is the descriptor [`renderResultView`] takes, not an HTML string: the modal cannot be
-    // handed raw markup, which is what keeps hook output off the parsing path by construction.
-    showHookResultModal(title, view) {
-        document.getElementById('hook-result-title').textContent = title;
-        this.renderResultView(document.getElementById('hook-result-body'), view);
-        document.getElementById('hook-result-modal').classList.remove('hidden');
     }
 
     // Mirrors `require_manage` in src/api.rs. Master, or the hook's owner, or the R2 conjunction:
@@ -1727,11 +1620,20 @@ class HookExecutorClient {
 
     renderHooksTable() {
         const tbody = document.getElementById('hooks-table-body');
+        // Client-side only: every hook is already loaded for the Run-a-Hook combobox, so filtering
+        // the list view needs no server round trip. Matches on name or description, case-insensitive.
+        const rawFilter = document.getElementById('hooks-name-filter')?.value.trim().toLowerCase() || '';
+        const hooks = rawFilter
+            ? this.state.hooks.filter(h =>
+                h.name.toLowerCase().includes(rawFilter) || (h.description || '').toLowerCase().includes(rawFilter))
+            : this.state.hooks;
 
         if (this.state.hooks.length === 0) {
             tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">No hooks defined.</td></tr>';
+        } else if (hooks.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">No hooks match this filter.</td></tr>';
         } else {
-            tbody.innerHTML = this.state.hooks.map(h => {
+            tbody.innerHTML = hooks.map(h => {
                 // A trashed hook cannot be executed, edited, or have its parameters touched — the
                 // only actions left are Restore and a permanent (hard) delete, both master-only,
                 // matching `restore_hook`/`delete_hook?hard=true` server-side.
@@ -1786,10 +1688,8 @@ class HookExecutorClient {
                     <td><div class="scope-badges">${rights}</div></td>
                     <td>
                         <div class="flex gap-2">
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.testHookFromTable('${h.id}')" ${h.can_execute ? '' : 'disabled'}
-                                title="${h.can_execute ? 'Dry run: resolve the command without executing it' : 'Requires execute permission'}">Test</button>
-                            <button class="btn btn-sm btn-primary" onclick="window.app.launchHookFromTable('${h.id}')" ${h.can_execute ? '' : 'disabled'}
-                                title="${h.can_execute ? 'Execute this hook for real' : 'Requires execute permission'}">Launch</button>
+                            <button class="btn btn-sm btn-primary" onclick="window.app.openRunHookModal('${h.id}')" ${h.can_execute ? '' : 'disabled'}
+                                title="${h.can_execute ? 'Review the payload, then dry-run or execute' : 'Requires execute permission'}">Run</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.showHookLogs('${h.id}')">Logs</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openParamsModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Parameters</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openEditHookModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Edit</button>
@@ -1854,10 +1754,19 @@ class HookExecutorClient {
     // declared parameter absent from the sample falls back to its own `default_value`, and one with
     // neither renders as a `<key>` placeholder so the gap is visible rather than silently blank.
     //
-    // `declaredParams` is `[]` on the create form (nothing is declared yet — parameters are added
-    // after creation, through the Parameters modal), so the preview there is just the command and
-    // elevation with no arguments, which is still the accurate answer for that moment.
-    static computeCommandPreview(scriptPath, runAsUser, declaredParams, samplePayloadRaw) {
+    // `declaredParams` is `[]` on a brand-new hook not yet saved (parameters are added after
+    // creation, through the Parameters modal), so the preview is just the command and elevation
+    // with no arguments — or, with an `argsTemplate` typed ahead of any declared parameter existing
+    // to back it, every `$var` renders as its own `<var>` placeholder, which is still the accurate
+    // answer for that moment.
+    //
+    // `argsTemplate`, when non-blank, mirrors `executor::resolve_args_template` exactly: tokenized
+    // on whitespace, each token's `$var`/`${var}` references substituted from the same resolved
+    // values used for the no-template positional-args path. Unlike the real backend, an unresolved
+    // reference here degrades to a `<var>` placeholder rather than blocking the preview outright —
+    // this box is advisory only, and the server's own `/test` dry-run is the authoritative
+    // "would this actually run" answer (see `testHook`).
+    static computeCommandPreview(scriptPath, runAsUser, declaredParams, samplePayloadRaw, argsTemplate) {
         let sample = {};
         if (samplePayloadRaw && samplePayloadRaw.trim()) {
             try {
@@ -1879,7 +1788,23 @@ class HookExecutorClient {
 
         const quote = (v) => `"${String(v).replace(/"/g, '\\"')}"`;
         const path = scriptPath && scriptPath.trim() ? scriptPath.trim() : '<script_path>';
-        const argv = resolved.map(([, v]) => quote(v));
+
+        let argv;
+        if (argsTemplate && argsTemplate.trim()) {
+            const lookup = new Map(resolved);
+            argv = argsTemplate.trim().split(/\s+/).map(token => quote(
+                token.replace(
+                    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+                    (_match, braced, bare) => {
+                        const name = braced || bare;
+                        return lookup.has(name) ? lookup.get(name) : `<${name}>`;
+                    }
+                )
+            ));
+        } else {
+            argv = resolved.map(([, v]) => quote(v));
+        }
+
         let command = runAsUser && runAsUser.trim()
             ? `sudo -n -u ${runAsUser.trim()} -- ${path}`
             : path;
@@ -1889,118 +1814,107 @@ class HookExecutorClient {
         return envLines.length ? `${envLines.join('\n')}\n${command}` : command;
     }
 
-    // Recomputes and renders one form's preview box. `prefix` follows the same
-    // `${prefix}-script-path`/`${prefix}-run-as-user`/`${prefix}-sample-payload` convention as
-    // `syncHookAuthFields`, except the create form's fields have no `hook-` *value* prefix doubled
-    // (they are simply `hook-script-path` etc.) — `fieldPrefix` and `hookId` are threaded through
-    // separately because the create form has no backing hook to read declared parameters from.
+    // Recomputes and renders the hook-config modal's preview box. `fieldPrefix` is always
+    // `'edit-hook'` — the single Create/Edit modal — and `hookId` is threaded through separately
+    // because a brand-new hook not yet saved has no backing hook to read declared parameters from.
     renderCommandPreview(fieldPrefix, previewId, hookId) {
         const scriptPath = document.getElementById(`${fieldPrefix}-script-path`)?.value || '';
         const runAsUser = document.getElementById(`${fieldPrefix}-run-as-user`)?.value || '';
         const sampleRaw = document.getElementById(`${fieldPrefix}-sample-payload`)?.value || '';
+        const argsTemplate = document.getElementById(`${fieldPrefix}-args-template`)?.value || '';
         const hook = hookId ? this.state.hooks.find(h => h.id === hookId) : null;
         const declaredParams = hook ? hook.parameters : [];
         const preview = document.getElementById(previewId);
-        if (preview) preview.textContent = HookExecutorClient.computeCommandPreview(scriptPath, runAsUser, declaredParams, sampleRaw);
+        if (preview) preview.textContent = HookExecutorClient.computeCommandPreview(scriptPath, runAsUser, declaredParams, sampleRaw, argsTemplate);
     }
 
-    // Builds the auth-mode slice of a hook create/update payload from whichever form `prefix`
-    // names. Shared because the two forms carry the same fields under the same suffix convention —
-    // see `syncHookAuthFields`. `forCreate` governs whether `hmac_secret` is mandatory-if-visible
-    // (create, where there is no existing secret to fall back to) versus opt-in (edit, where a
-    // blank field means "keep the current one" and must be omitted rather than sent as `""`, which
-    // would instead clear it).
-    collectHookAuthPayload(prefix, forCreate) {
-        const mode = document.getElementById(`${prefix}-auth-mode`).value;
+    // Builds the auth-mode slice of a hook create/update payload. `forCreate` governs whether
+    // `hmac_secret` is mandatory-if-visible (create, where there is no existing secret to fall back
+    // to) versus opt-in (edit, where a blank field means "keep the current one" and must be omitted
+    // rather than sent as `""`, which would instead clear it).
+    collectHookAuthPayload(forCreate) {
+        const mode = document.getElementById('edit-hook-auth-mode').value;
         const payload = { auth_mode: mode };
 
         if (mode === 'HMAC_ONLY') {
-            const secret = document.getElementById(`${prefix}-hmac-secret`).value;
+            const secret = document.getElementById('edit-hook-hmac-secret').value;
             if (forCreate || secret !== '') payload.hmac_secret = secret;
-            payload.signature_header = document.getElementById(`${prefix}-signature-header`).value;
-            payload.signature_prefix = document.getElementById(`${prefix}-signature-prefix`).value;
+            payload.signature_header = document.getElementById('edit-hook-signature-header').value;
+            payload.signature_prefix = document.getElementById('edit-hook-signature-prefix').value;
         }
         if (mode === 'CANONICAL_V1') {
-            payload.canonical_template = document.getElementById(`${prefix}-canonical-template`).value;
+            payload.canonical_template = document.getElementById('edit-hook-canonical-template').value;
         }
         return payload;
     }
 
-    async createHook(e) {
-        e.preventDefault();
-        const payload = {
-            name: document.getElementById('hook-name').value,
-            script_path: document.getElementById('hook-script-path').value,
-            default_timeout_seconds: parseInt(document.getElementById('hook-timeout').value, 10),
-            // Blank means "no elevation"; the backend normalizes it to NULL.
-            run_as_user: document.getElementById('hook-run-as-user').value.trim() || null,
-            description: document.getElementById('hook-description').value || null,
-            sample_payload_json: document.getElementById('hook-sample-payload').value || null,
-            ...this.collectHookAuthPayload('hook', true)
-        };
-        try {
-            await this.apiFetch('/hooks', { method: 'POST', body: JSON.stringify(payload) });
-            document.getElementById('form-create-hook').reset();
-            document.getElementById('hook-timeout').value = 30;
-            document.getElementById('hook-auth-mode').value = 'CANONICAL_V1';
-            this.syncHookAuthFields('hook');
-            this.renderCommandPreview('hook', 'hook-command-preview', null);
-            this.showToast('Hook created', 'success');
-            this.loadHooks();
-        } catch (err) {}
-    }
+    // Opens the single Hook Configuration modal in Create mode (`id` omitted/`null`) or Edit mode
+    // (`id` set) — see the modal's own HTML comment for why one shared field set serves both.
+    openEditHookModal(id = null) {
+        const h = id ? this.state.hooks.find(h => h.id === id) : null;
+        if (id && !h) return;
 
-    openEditHookModal(id) {
-        const h = this.state.hooks.find(h => h.id === id);
-        if (!h) return;
-        document.getElementById('edit-hook-id').value = h.id;
-        document.getElementById('edit-hook-name').value = h.name;
-        document.getElementById('edit-hook-script-path').value = h.script_path;
-        document.getElementById('edit-hook-timeout').value = h.default_timeout_seconds;
-        document.getElementById('edit-hook-run-as-user').value = h.run_as_user || '';
-        document.getElementById('edit-hook-description').value = h.description || '';
+        document.getElementById('edit-hook-modal-title').textContent = h ? 'Edit Hook' : 'Create Hook';
+        document.getElementById('edit-hook-submit-btn').textContent = h ? 'Save Changes' : 'Create Hook';
+        document.getElementById('edit-hook-id').value = h ? h.id : '';
+        document.getElementById('edit-hook-name').value = h ? h.name : '';
+        document.getElementById('edit-hook-script-path').value = h ? h.script_path : '';
+        document.getElementById('edit-hook-args-template').value = h ? (h.args_template || '') : '';
+        document.getElementById('edit-hook-timeout').value = h ? h.default_timeout_seconds : 30;
+        document.getElementById('edit-hook-run-as-user').value = h ? (h.run_as_user || '') : '';
+        document.getElementById('edit-hook-description').value = h ? (h.description || '') : '';
 
-        document.getElementById('edit-hook-auth-mode').value = h.auth_mode;
+        document.getElementById('edit-hook-auth-mode').value = h ? h.auth_mode : 'CANONICAL_V1';
+        this.applyLegacyAuthModeOption(h ? h.auth_mode : null);
         // The secret itself is never returned — see `hook::Model::hmac_secret`'s doc comment — so
         // this field always starts blank ("leave blank to keep the current secret"), and only its
         // *configured* status is shown.
         document.getElementById('edit-hook-hmac-secret').value = '';
-        document.getElementById('edit-hook-hmac-secret-status').textContent = h.hmac_secret_configured
-            ? 'A secret is currently configured. Enter a new value to rotate it.'
-            : 'No secret is configured yet — required before this mode can accept a keyless caller.';
-        document.getElementById('edit-hook-signature-header').value = h.signature_header || '';
-        document.getElementById('edit-hook-signature-prefix').value = h.signature_prefix || '';
-        document.getElementById('edit-hook-canonical-template').value = h.canonical_template || '';
-        document.getElementById('edit-hook-sample-payload').value = h.sample_payload_json || '';
+        document.getElementById('edit-hook-hmac-secret-status').textContent = h
+            ? (h.hmac_secret_configured
+                ? 'A secret is currently configured. Enter a new value to rotate it.'
+                : 'No secret is configured yet — required before this mode can accept a keyless caller.')
+            : 'Required before this mode can accept a keyless caller.';
+        document.getElementById('edit-hook-signature-header').value = h ? (h.signature_header || '') : '';
+        document.getElementById('edit-hook-signature-prefix').value = h ? (h.signature_prefix || '') : '';
+        document.getElementById('edit-hook-canonical-template').value = h ? (h.canonical_template || '') : '';
+        document.getElementById('edit-hook-sample-payload').value = h ? (h.sample_payload_json || '') : '';
         this.syncHookAuthFields('edit-hook');
-        this.renderCommandPreview('edit-hook', 'edit-hook-command-preview', h.id);
+        this.renderCommandPreview('edit-hook', 'edit-hook-command-preview', h ? h.id : null);
 
         // Re-applied on open: the modal's inputs persist across renders, so the guard has to be
         // reasserted rather than assumed from login time.
         this.applyRunAsUserGuard();
+        this.applyKeylessHooksGuard();
         document.getElementById('edit-hook-modal').classList.remove('hidden');
     }
 
-    async submitEditHook(e) {
+    async submitHookConfig(e) {
         e.preventDefault();
         const id = document.getElementById('edit-hook-id').value;
+        const forCreate = !id;
         const payload = {
             name: document.getElementById('edit-hook-name').value,
             script_path: document.getElementById('edit-hook-script-path').value,
             default_timeout_seconds: parseInt(document.getElementById('edit-hook-timeout').value, 10),
-            // Always sent, so clearing the field is an explicit "drop elevation" rather than a
-            // no-op: the backend distinguishes an empty string from an absent field.
+            // Always sent, so clearing the field is an explicit "drop elevation"/"clear" rather
+            // than a no-op: the backend distinguishes an empty string from an absent field, which
+            // matters for edit; for create there is no prior state for the distinction to lose.
             run_as_user: document.getElementById('edit-hook-run-as-user').value.trim(),
             description: document.getElementById('edit-hook-description').value,
-            // "" clears it (backend convention shared with canonical_template etc.); omitting is
-            // not an option here since the field is always sent, matching run_as_user/description.
+            args_template: document.getElementById('edit-hook-args-template').value,
             sample_payload_json: document.getElementById('edit-hook-sample-payload').value,
-            ...this.collectHookAuthPayload('edit-hook', false)
+            ...this.collectHookAuthPayload(forCreate)
         };
         try {
-            await this.apiFetch(`/hooks/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+            if (forCreate) {
+                const created = await this.apiFetch('/hooks', { method: 'POST', body: JSON.stringify(payload) });
+                this.showToast(`Hook '${created.name}' created`, 'success');
+            } else {
+                await this.apiFetch(`/hooks/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+                this.showToast('Hook updated', 'success');
+            }
             document.getElementById('edit-hook-modal').classList.add('hidden');
-            this.showToast('Hook updated', 'success');
             this.loadHooks();
         } catch (err) {}
     }
@@ -2061,7 +1975,7 @@ class HookExecutorClient {
         const preview = document.getElementById('params-modal-command-preview');
         if (preview) {
             preview.textContent = HookExecutorClient.computeCommandPreview(
-                hook.script_path, hook.run_as_user, hook.parameters, hook.sample_payload_json || ''
+                hook.script_path, hook.run_as_user, hook.parameters, hook.sample_payload_json || '', hook.args_template || ''
             );
         }
     }
@@ -2781,9 +2695,12 @@ class HookExecutorClient {
             });
         });
 
-        // Run a hook
-        document.getElementById('run-hook-form').addEventListener('submit', (e) => this.executeHook(e));
-        document.getElementById('btn-test-hook').addEventListener('click', () => this.testHook());
+        // Run Hook modal — the execution launcher, opened per-hook from the table's "Run" action.
+        document.getElementById('run-hook-modal-execute-btn').addEventListener('click', (e) => this.executeHook(e));
+        document.getElementById('run-hook-modal-test-btn').addEventListener('click', () => this.testHook());
+        document.getElementById('run-hook-modal-close').addEventListener('click', () => {
+            document.getElementById('run-hook-modal').classList.add('hidden');
+        });
 
         // Execution filters — explicit search only: the button, Enter in the hook filter, or the
         // status dropdown's own change event. Typing alone never fires a request.
@@ -2816,37 +2733,28 @@ class HookExecutorClient {
             this.updateExecPaginationUI();
         });
 
-        // Hooks
-        document.getElementById('form-create-hook').addEventListener('submit', (e) => this.createHook(e));
-        document.getElementById('form-edit-hook').addEventListener('submit', (e) => this.submitEditHook(e));
+        // Hooks & Runner
+        document.getElementById('btn-open-create-hook-modal').addEventListener('click', () => this.openEditHookModal(null));
+        document.getElementById('form-edit-hook').addEventListener('submit', (e) => this.submitHookConfig(e));
         document.getElementById('edit-hook-cancel').addEventListener('click', () => {
             document.getElementById('edit-hook-modal').classList.add('hidden');
         });
         document.getElementById('hooks-show-deleted').addEventListener('change', () => this.loadHooks());
+        document.getElementById('hooks-name-filter').addEventListener('input', () => this.renderHooksTable());
 
-        // Hook auth mode — one listener per form, driving the shared `syncHookAuthFields`. The
-        // create form's hint is primed once here so it reads correctly before the first `change`.
-        document.getElementById('hook-auth-mode').addEventListener('change', () => this.syncHookAuthFields('hook'));
         document.getElementById('edit-hook-auth-mode').addEventListener('change', () => this.syncHookAuthFields('edit-hook'));
-        this.syncHookAuthFields('hook');
 
-        // Live Command Preview — recomputed on every keystroke in the fields it depends on. The
-        // create form has no backing hook (nothing declared yet); the edit form reads whichever
-        // hook id its own hidden field currently names, so this keeps working across repeated opens
-        // of the same modal for different hooks without re-binding anything.
-        ['hook-script-path', 'hook-run-as-user', 'hook-sample-payload'].forEach(id => {
-            document.getElementById(id).addEventListener('input', () => this.renderCommandPreview('hook', 'hook-command-preview', null));
-        });
-        ['edit-hook-script-path', 'edit-hook-run-as-user', 'edit-hook-sample-payload'].forEach(id => {
+        // Live Command Preview — recomputed on every keystroke in the fields it depends on. Reads
+        // whichever hook id `edit-hook-id` currently names (empty for a brand-new, unsaved hook), so
+        // this keeps working across repeated opens of the modal for different hooks — and for
+        // Create — without re-binding anything.
+        ['edit-hook-script-path', 'edit-hook-run-as-user', 'edit-hook-sample-payload', 'edit-hook-args-template'].forEach(id => {
             document.getElementById(id).addEventListener('input', () =>
-                this.renderCommandPreview('edit-hook', 'edit-hook-command-preview', document.getElementById('edit-hook-id').value));
+                this.renderCommandPreview('edit-hook', 'edit-hook-command-preview', document.getElementById('edit-hook-id').value || null));
         });
-        this.renderCommandPreview('hook', 'hook-command-preview', null);
 
-        // Auth-help drawer — either form's "?" trigger opens the one shared instance.
-        ['hook-auth-help-btn', 'edit-hook-auth-help-btn'].forEach(id => {
-            document.getElementById(id).addEventListener('click', () => this.openAuthHelpDrawer());
-        });
+        // Auth-help drawer.
+        document.getElementById('edit-hook-auth-help-btn').addEventListener('click', () => this.openAuthHelpDrawer());
         document.getElementById('auth-help-close').addEventListener('click', () => this.closeAuthHelpDrawer());
         document.getElementById('key-lineage-close').addEventListener('click', () => this.closeLineageDrawer());
 
@@ -2893,9 +2801,6 @@ class HookExecutorClient {
         });
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
-        });
-        document.getElementById('hook-result-close').addEventListener('click', () => {
-            document.getElementById('hook-result-modal').classList.add('hidden');
         });
 
         // Settings

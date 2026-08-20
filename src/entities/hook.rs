@@ -144,6 +144,16 @@ pub struct Model {
     /// at creation/update time (`api::hooks::validate_sample_payload_matches_parameters`) so a
     /// parameter contract cannot silently drift from the shape callers actually send.
     pub sample_payload_json: Option<String>,
+    /// An optional argument-vector template, tokenized on whitespace at execution time with each
+    /// token's `$var`/`${var}` references substituted from resolved parameter values (see
+    /// [`crate::executor::build_command_plan`]). `None` (the default, and every hook predating this
+    /// column) means the pre-existing behavior: every resolved parameter appended positionally, in
+    /// declaration order, with no templating at all. Every `$var`/`${var}` this references must name
+    /// a currently-declared parameter — checked at create/update time by
+    /// `api::hooks::validate_args_template_matches_parameters`, the same allowlist discipline
+    /// `sample_payload_json` applies. Never passed through a shell: substitution produces complete
+    /// `argv` entries, not a string that gets re-parsed.
+    pub args_template: Option<String>,
 }
 
 /// Relations from `hooks` to other entities.

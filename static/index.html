@@ -74,17 +74,67 @@
 
         <!-- Tab Navigation -->
         <nav class="tab-nav" role="tablist">
-            <button class="tab-btn active" data-tab="executions" role="tab" aria-selected="true">Executions</button>
-            <button class="tab-btn" data-tab="hooks" id="hooks-tab-btn" role="tab" aria-selected="false">Hooks Management</button>
+            <button class="tab-btn active" data-tab="hooks" id="hooks-tab-btn" role="tab" aria-selected="true">Hooks &amp; Runner</button>
+            <button class="tab-btn" data-tab="executions" role="tab" aria-selected="false">Execution History</button>
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
             <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
 
         <!-- ═══════════════════════════════════════════════ -->
-        <!-- TAB: Executions / Dashboard                     -->
+        <!-- TAB: Hooks & Runner                             -->
         <!-- ═══════════════════════════════════════════════ -->
-        <main id="tab-executions" class="tab-panel active">
+        <main id="tab-hooks" class="tab-panel active">
+            <div class="admin-grid">
+                <section class="card list-section">
+                    <div class="list-header">
+                        <h2>Hooks</h2>
+                        <div class="filters">
+                            <input type="text" id="hooks-name-filter" class="input-field" placeholder="Filter by name or description...">
+                        </div>
+                    </div>
+                    <p class="subtitle">Define the executables this daemon is allowed to run. Use a row's "Run" action to review its payload, then dry-run or execute it.</p>
+
+                    <div class="batch-actions mt-2">
+                        <button type="button" id="btn-open-create-hook-modal" class="btn btn-primary">Create Hook</button>
+                        <label class="checkbox-container checkbox-toggle mr-4 push-right">
+                            Show deleted (trash)
+                            <input type="checkbox" id="hooks-show-deleted">
+                            <span class="checkmark"></span>
+                        </label>
+                        <button type="button" id="delete-selected-hooks" class="btn btn-batch-delete hidden">Delete Selected</button>
+                    </div>
+
+                    <div class="table-container mt-4">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="select-all-hooks" title="Select all"></th>
+                                    <th>Name</th>
+                                    <th>Script Path</th>
+                                    <th>Runs As</th>
+                                    <th>Timeout</th>
+                                    <th>Auth Mode</th>
+                                    <th>Parameters</th>
+                                    <th>Your Rights</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="hooks-table-body">
+                                <tr>
+                                    <td colspan="9" class="text-center text-muted">No hooks loaded.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Execution History                          -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-executions" class="tab-panel">
             <section class="stat-grid">
                 <div class="stat-tile">
                     <span class="stat-label">Executions (loaded)</span>
@@ -108,43 +158,7 @@
                 </div>
             </section>
 
-            <div class="grid-layout">
-                <section class="card form-section" id="run-hook-section">
-                    <h2>Run a Hook</h2>
-                    <p class="subtitle">Pick a hook, fill its parameters, then dry-run or execute it.</p>
-
-                    <div class="form-group">
-                        <label for="run-hook-search">Hook <span>*</span></label>
-                        <div class="combobox" id="run-hook-combobox">
-                            <input type="text" id="run-hook-search" class="input-field combobox-input" placeholder="-- Select Hook --" autocomplete="off">
-                            <input type="hidden" id="run-hook-id">
-                            <div class="combobox-menu hidden"></div>
-                        </div>
-                    </div>
-
-                    <div id="run-hook-meta" class="hook-meta hidden"></div>
-
-                    <form id="run-hook-form" class="manage-form">
-                        <div id="run-hook-params" class="param-fields">
-                            <p class="text-muted text-sm">Select a hook to see its parameters.</p>
-                        </div>
-
-                        <div class="form-group hidden" id="run-hook-payload-group">
-                            <label for="run-hook-payload-json">Payload (JSON) <span>*</span></label>
-                            <textarea id="run-hook-payload-json" class="input-field font-mono" rows="8" spellcheck="false"></textarea>
-                            <span class="text-muted text-sm">Auto-filled from the hook's sample payload. Edit freely before running — declared parameters are resolved from matching top-level keys.</span>
-                            <div id="run-hook-payload-error" class="message error hidden mt-2"></div>
-                        </div>
-
-                        <div class="form-actions">
-                            <button type="button" id="btn-test-hook" class="btn btn-secondary" disabled>Dry Run</button>
-                            <button type="submit" id="btn-execute-hook" class="btn btn-primary" disabled>Execute</button>
-                        </div>
-                    </form>
-
-                    <div id="run-hook-result" class="hidden"></div>
-                </section>
-
+            <div class="admin-grid">
                 <section class="card list-section">
                     <div class="list-header">
                         <h2>Execution History</h2>
@@ -197,143 +211,6 @@
                         <button id="exec-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
                         <span id="exec-page-indicator">Page 1</span>
                         <button id="exec-btn-next" class="btn btn-icon">Next &raquo;</button>
-                    </div>
-                </section>
-            </div>
-        </main>
-
-        <!-- ═══════════════════════════════════════════════ -->
-        <!-- TAB: Hooks Management                           -->
-        <!-- ═══════════════════════════════════════════════ -->
-        <main id="tab-hooks" class="tab-panel">
-            <div class="admin-grid">
-                <section class="card admin-section">
-                    <h2>Hooks</h2>
-                    <p class="subtitle">Define the executables this daemon is allowed to run.</p>
-
-                    <form id="form-create-hook" class="admin-form">
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="hook-name">Hook Name <span>*</span></label>
-                                <input type="text" id="hook-name" placeholder="e.g. nftables_ban" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="hook-timeout">Timeout (seconds) <span>*</span></label>
-                                <input type="number" id="hook-timeout" value="30" min="1" max="86400" required class="input-field">
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="hook-script-path">Script Path (absolute) <span>*</span></label>
-                                <input type="text" id="hook-script-path" placeholder="/usr/local/bin/ban.sh" required class="input-field">
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="hook-run-as-user">Run as User (sudo)</label>
-                                <input type="text" id="hook-run-as-user" placeholder="leave empty to run as the daemon user" class="input-field">
-                                <span class="text-muted text-sm">Runs the script via <code>sudo -n -u &lt;user&gt; --</code>. Requires a matching NOPASSWD rule in sudoers.</span>
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="hook-description">Description</label>
-                                <textarea id="hook-description" class="input-field" rows="2" placeholder="What does this hook do?"></textarea>
-                            </div>
-                        </div>
-
-                        <!--
-                          A valid API key with can_execute always has execution authority on this
-                          hook, regardless of what is chosen below — auth_mode only ever adds a way
-                          in for a caller presenting no X-API-Key at all. See the "?" drawer.
-                        -->
-                        <div class="auth-mode-row mt-4">
-                            <div class="form-group">
-                                <label for="hook-auth-mode">Keyless Auth Mode <span>*</span>
-                                    <button type="button" class="btn-help-trigger" id="hook-auth-help-btn" title="Explain hook authentication" aria-label="Explain hook authentication">?</button>
-                                </label>
-                                <select id="hook-auth-mode" class="input-field select-field">
-                                    <optgroup label="Standard API Key Required">
-                                        <option value="CANONICAL_V1" selected>Signed (CANONICAL_V1) — key + HMAC signature</option>
-                                        <option value="API_KEY_ONLY">Bearer only (API_KEY_ONLY) — key header, no signature</option>
-                                    </optgroup>
-                                    <option value="HMAC_ONLY">External Webhook HMAC Signature (HMAC_ONLY)</option>
-                                    <option value="NONE">Public / No Auth Required (NONE)</option>
-                                </select>
-                            </div>
-                            <p class="auth-mode-hint field-hint" id="hook-auth-mode-hint" aria-live="polite"></p>
-                        </div>
-
-                        <div class="form-grid mt-2" id="hook-hmac-secret-group">
-                            <div class="form-group col-span-2">
-                                <label for="hook-hmac-secret">HMAC Secret <span>*</span></label>
-                                <input type="password" id="hook-hmac-secret" placeholder="Shared secret the sender signs with" class="input-field" autocomplete="off">
-                                <span class="text-muted text-sm">Encrypted at rest. Never shown again once saved — rotate by setting a new value.</span>
-                            </div>
-                        </div>
-                        <div class="form-grid mt-2" id="hook-hmac-transport-group">
-                            <div class="form-group">
-                                <label for="hook-signature-header">Signature Header</label>
-                                <input type="text" id="hook-signature-header" class="input-field font-mono" placeholder="X-Signature-256 (default)" autocomplete="off" spellcheck="false">
-                            </div>
-                            <div class="form-group">
-                                <label for="hook-signature-prefix">Signature Prefix</label>
-                                <input type="text" id="hook-signature-prefix" class="input-field font-mono" placeholder="sha256= (default)" autocomplete="off" spellcheck="false">
-                            </div>
-                        </div>
-                        <div class="form-group mt-2" id="hook-canonical-template-group">
-                            <label for="hook-canonical-template">Custom Canonical Template</label>
-                            <input type="text" id="hook-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
-                            <span class="text-muted text-sm">Overrides what a <em>keyed, signed</em> caller's signature is verified against for this hook alone. Leave blank for the service-wide default.</span>
-                        </div>
-
-                        <div class="form-group mt-2">
-                            <label for="hook-sample-payload">Sample JSON Payload</label>
-                            <textarea id="hook-sample-payload" class="input-field font-mono" rows="4" placeholder='{"target_ip": "203.0.113.5", "reason": "abuse"}' spellcheck="false"></textarea>
-                            <span class="text-muted text-sm">
-                                An example body a real caller sends. Drives the Live Command Preview below and the JSON
-                                Payload Extractor in the Parameters modal. If this hook already has declared parameters,
-                                every one of their keys must appear here as a top-level field.
-                            </span>
-                        </div>
-                        <div class="form-group mt-2" id="hook-command-preview-group">
-                            <label>Live Command Preview</label>
-                            <pre id="hook-command-preview" class="help-code-block font-mono text-sm"></pre>
-                            <span class="text-muted text-sm">
-                                Computed client-side from the script path, elevation, and sample payload above — advisory
-                                only, not what the daemon actually validates at execution time.
-                            </span>
-                        </div>
-
-                        <div class="form-actions mt-4">
-                            <button type="submit" class="btn btn-primary">Create Hook</button>
-                        </div>
-                    </form>
-
-                    <div class="batch-actions mt-4">
-                        <label class="checkbox-container checkbox-toggle mr-4">
-                            Show deleted (trash)
-                            <input type="checkbox" id="hooks-show-deleted">
-                            <span class="checkmark"></span>
-                        </label>
-                        <button type="button" id="delete-selected-hooks" class="btn btn-batch-delete hidden">Delete Selected</button>
-                    </div>
-
-                    <div class="table-container mt-4">
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th><input type="checkbox" id="select-all-hooks" title="Select all"></th>
-                                    <th>Name</th>
-                                    <th>Script Path</th>
-                                    <th>Runs As</th>
-                                    <th>Timeout</th>
-                                    <th>Auth Mode</th>
-                                    <th>Parameters</th>
-                                    <th>Your Rights</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="hooks-table-body">
-                                <tr>
-                                    <td colspan="9" class="text-center text-muted">No hooks loaded.</td>
-                                </tr>
-                            </tbody>
-                        </table>
                     </div>
                 </section>
             </div>
@@ -708,9 +585,15 @@
     </div>
 
     <!-- Edit Hook Modal -->
+    <!--
+      The single "Hook Configuration" modal: it serves both Create and Edit, distinguished only by
+      whether `#edit-hook-id` carries a value (empty = create). One shared field set, rather than a
+      near-duplicate inline create form, is the whole point — `syncHookAuthFields`/
+      `renderCommandPreview` were already written to be prefix-parameterized for exactly this reuse.
+    -->
     <div id="edit-hook-modal" class="modal-overlay hidden">
         <div class="modal-card modal-card-wide card">
-            <h3>Edit Hook</h3>
+            <h3 id="edit-hook-modal-title">Edit Hook</h3>
             <form id="form-edit-hook">
                 <input type="hidden" id="edit-hook-id">
                 <div class="form-grid">
@@ -724,7 +607,19 @@
                     </div>
                     <div class="form-group col-span-2">
                         <label for="edit-hook-script-path">Script Path <span>*</span></label>
-                        <input type="text" id="edit-hook-script-path" required class="input-field">
+                        <input type="text" id="edit-hook-script-path" placeholder="/usr/local/bin/ban.sh" required class="input-field">
+                        <span class="text-muted text-sm">Absolute path to a single executable — never a shell command line. Arguments come from Parameters and the Arguments Template below, never from text typed here.</span>
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="edit-hook-args-template">Arguments Template</label>
+                        <input type="text" id="edit-hook-args-template" class="input-field font-mono" placeholder="add bad_ip ${target_ip}" autocomplete="off" spellcheck="false">
+                        <span class="text-muted text-sm">
+                            Optional. Tokenized on whitespace at execution time; each token's <code>$var</code>/<code>${var}</code>
+                            references are substituted from the resolved parameter of that name — every variable referenced here
+                            must be one of this hook's declared Parameters. Leave blank to pass every resolved parameter as a
+                            plain positional argument instead (the pre-existing behavior). Never a shell: substitution produces
+                            complete argument-vector entries, never a re-parsed string.
+                        </span>
                     </div>
                     <div class="form-group col-span-2">
                         <label for="edit-hook-run-as-user">Run as User (sudo)</label>
@@ -739,16 +634,24 @@
 
                 <div class="auth-mode-row mt-4">
                     <div class="form-group">
-                        <label for="edit-hook-auth-mode">Keyless Auth Mode <span>*</span>
+                        <label for="edit-hook-auth-mode">Hook Auth Mode <span>*</span>
                             <button type="button" class="btn-help-trigger" id="edit-hook-auth-help-btn" title="Explain hook authentication" aria-label="Explain hook authentication">?</button>
                         </label>
+                        <!--
+                          Exactly three options: which execution-policy CANONICAL_V1/API_KEY_ONLY
+                          distinction used to exist here (both meant "a valid API key required",
+                          differing only in a documented keyed-caller intent nobody set from this
+                          UI) conflated a key's *own* auth type with the hook's keyless policy. A
+                          hook already stored as API_KEY_ONLY keeps working and is not silently
+                          migrated on save — `applyLegacyAuthModeOption` injects a fourth, clearly-
+                          labelled "legacy" option only when that hook's *current* mode is
+                          API_KEY_ONLY, so an operator explicitly chooses to move off it rather than
+                          having the dropdown default away from it unnoticed.
+                        -->
                         <select id="edit-hook-auth-mode" class="input-field select-field">
-                            <optgroup label="Standard API Key Required">
-                                <option value="CANONICAL_V1">Signed (CANONICAL_V1) — key + HMAC signature</option>
-                                <option value="API_KEY_ONLY">Bearer only (API_KEY_ONLY) — key header, no signature</option>
-                            </optgroup>
+                            <option value="CANONICAL_V1">Standard API Key Required (CANONICAL_V1)</option>
                             <option value="HMAC_ONLY">External Webhook HMAC Signature (HMAC_ONLY)</option>
-                            <option value="NONE">Public / No Auth Required (NONE)</option>
+                            <option value="NONE">Public / Unauthenticated (NONE)</option>
                         </select>
                     </div>
                     <p class="auth-mode-hint field-hint" id="edit-hook-auth-mode-hint" aria-live="polite"></p>
@@ -793,7 +696,7 @@
 
                 <div class="form-actions mt-4">
                     <button type="button" id="edit-hook-cancel" class="btn btn-cancel">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="submit" id="edit-hook-submit-btn" class="btn btn-primary">Save Changes</button>
                 </div>
             </form>
         </div>
@@ -867,16 +770,36 @@
         </div>
     </div>
 
-    <!-- Hook run result (Test dry-run preview, or Launch execution output) -->
-    <div id="hook-result-modal" class="modal-overlay hidden">
+    <!--
+      Run Hook modal: the execution launcher, opened from a hook row's "Run" action. Replaces the
+      "Run a Hook" panel that used to sit permanently beside the Hooks list — the table already
+      offers the same search/filter this panel's own hook picker duplicated, so launching from the
+      row it's already on removes the redundant second way to find a hook.
+    -->
+    <div id="run-hook-modal" class="modal-overlay hidden">
         <div class="modal-card modal-card-wide card">
-            <h3 id="hook-result-title">Hook Result</h3>
-            <div id="hook-result-body"></div>
+            <h3 id="run-hook-modal-title">Run Hook</h3>
+            <input type="hidden" id="run-hook-modal-hook-id">
+            <div id="run-hook-modal-meta" class="hook-meta"></div>
+            <div id="run-hook-modal-params" class="param-fields mt-2"></div>
+
+            <div class="form-group mt-2">
+                <label for="run-hook-modal-payload">Payload (JSON) <span>*</span></label>
+                <textarea id="run-hook-modal-payload" class="input-field font-mono" rows="8" spellcheck="false"></textarea>
+                <span class="text-muted text-sm">Auto-filled from the hook's sample payload. Edit freely before running — declared parameters are resolved from matching top-level keys.</span>
+                <div id="run-hook-modal-payload-error" class="message error hidden mt-2"></div>
+            </div>
+
+            <div id="run-hook-modal-result" class="hidden mt-4"></div>
+
             <div class="form-actions mt-4">
-                <button type="button" id="hook-result-close" class="btn btn-primary">Close</button>
+                <button type="button" id="run-hook-modal-close" class="btn btn-cancel">Cancel</button>
+                <button type="button" id="run-hook-modal-test-btn" class="btn btn-secondary">Test</button>
+                <button type="button" id="run-hook-modal-execute-btn" class="btn btn-primary">Launch</button>
             </div>
         </div>
     </div>
+
 
     <!--
       Custom Confirmation Modal (replaces native window.confirm()).

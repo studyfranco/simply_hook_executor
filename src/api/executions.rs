@@ -190,8 +190,10 @@ pub struct TestHookResponse {
     pub resolved_parameters: serde_json::Value,
     /// Required parameters that were neither supplied nor defaulted.
     pub missing_required: Vec<String>,
-    /// The exact program, argument vector, and environment that would be used.
-    pub command: executor::CommandPlan,
+    /// The exact program, argument vector, and environment that would be used. `None` exactly when
+    /// `blocking_reason` names an `args_template` substitution failure — there is no command to
+    /// show when the template itself could not be resolved into a valid argument vector.
+    pub command: Option<executor::CommandPlan>,
     /// The timeout that would be applied, in seconds.
     pub timeout_seconds: u64,
 }
@@ -219,13 +221,24 @@ pub async fn test_hook(
     let supplied = extract_parameter_map(&body)?;
     let declared = load_parameters(&state.db, hook_model.id).await?;
     let resolved = executor::resolve_parameters(&declared, &supplied)?;
-    let plan = executor::build_command_plan(&hook_model, &resolved, &state.config);
+    // Built regardless of `missing_required`, exactly as before `args_template` existed: a
+    // template-less hook's plan is infallible, so it is still worth showing whatever partial
+    // command a hook with no `args_template` would produce even while a required parameter is
+    // still missing. A hook *with* an `args_template` referencing that same missing parameter
+    // fails here too — `plan` becomes `None` — but `blocking_reason` below always prefers the
+    // `missing_required` message when both fired, since it names the actual root cause.
+    let (plan, template_error) = match executor::build_command_plan(&hook_model, &resolved, &state.config) {
+        Ok(plan) => (Some(plan), None),
+        Err(e) => (None, Some(e.detail)),
+    };
 
     let blocking_reason = if !resolved.missing_required.is_empty() {
         Some(format!(
             "Missing required parameter(s): {}",
             resolved.missing_required.join(", ")
         ))
+    } else if let Some(msg) = template_error {
+        Some(msg)
     } else {
         // A dry run reports the permission/path diagnostic as data instead of failing: seeing
         // exactly why a hook would be refused is the whole point of the preview.

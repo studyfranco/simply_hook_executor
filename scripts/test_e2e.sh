@@ -4933,6 +4933,120 @@ check "204" "clean up the regen-target key"
 api_call DELETE "/api/keys/$BEARER_ONLY_ID" "$MASTER_KEY"
 check "204" "clean up the bearer-only key"
 
+# ── 54. args_template: templated argument-vector substitution ──────────────
+
+log_section "54. args_template — Templated Argument-Vector Substitution"
+
+TEMPLATE_SCRIPT=$(make_hook_script "args_template_hook.sh" 'echo "argv:$1|$2"')
+
+# --- Validated against declared parameters at creation, same allowlist discipline as
+# sample_payload_json ---
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$TEMPLATE_SCRIPT" '{name:"args_template_undeclared",script_path:$p,parameters:[{param_key:"target_ip",is_required:true}],args_template:"add bad_ip ${target_ip} port ${target_port}"}')"
+check "400" "args_template referencing an undeclared parameter is refused at creation"
+check_true '.error | contains("target_port")' "the error names the undeclared parameter"
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$TEMPLATE_SCRIPT" '{name:"args_template_hook",script_path:$p,parameters:[{param_key:"target_ip",is_required:true},{param_key:"port",default_value:"443",is_required:true}],args_template:"add bad_ip ${target_ip}:$port"}')"
+check "200" "a template naming only declared parameters is accepted"
+check_jq ".args_template" 'add bad_ip ${target_ip}:$port' "the template is stored and returned verbatim"
+TEMPLATE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# --- Updating to reference an undeclared variable is refused the same way ---
+api_call PUT "/api/hooks/$TEMPLATE_HOOK_ID" "$MASTER_KEY" '{"args_template":"add ${nonexistent}"}'
+check "400" "updating to reference an undeclared parameter is refused"
+
+# --- Dry run: the real command preview reflects the substituted template, both syntaxes ---
+api_call POST "/api/hooks/$TEMPLATE_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target_ip":"10.12.8.93"}}'
+check "200" "dry run against the templated hook succeeds"
+check_true '.would_execute' "the template resolves with the required parameter supplied"
+check_jq ".command.args | join(\",\")" "add,bad_ip,10.12.8.93:443" \
+    "positional args are the substituted template, not the bare declared-parameter list"
+
+# --- Execute: the script actually receives the substituted, templated argv ---
+api_call POST "/api/hooks/$TEMPLATE_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"target_ip":"10.12.8.93"}}'
+check "200" "execute the templated hook for real"
+# check_jq's own `actual=$(...)` capture strips trailing newlines regardless of the JSON string's
+# real content, so the expected value here must be newline-free too, matching that extraction.
+check_jq ".stdout" "argv:add|bad_ip" "the script received the templated positional arguments"
+
+# --- An args_template referencing a parameter with no resolved value blocks, dry run and real ---
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$TEMPLATE_SCRIPT" '{name:"args_template_optional_gap",script_path:$p,parameters:[{param_key:"opt",is_required:false}],args_template:"run ${opt}"}')"
+check "200" "create a hook whose template references an optional, undefaulted parameter"
+GAP_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$GAP_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{}}'
+check "200" "dry run still succeeds as a request"
+check_true '.would_execute == false' "but reports it would not execute"
+check_true '.command == null' "no command can be shown when the template cannot be resolved"
+check_true '.blocking_reason | contains("opt")' "the reason names the unresolved variable"
+
+api_call POST "/api/hooks/$GAP_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{}}'
+check "400" "a real execution refuses rather than silently dropping the variable"
+
+# --- A resolved value containing a forbidden character blocks too ---
+api_call POST "/api/hooks/$TEMPLATE_HOOK_ID/test" "$MASTER_KEY" \
+    '{"parameters":{"target_ip":"safe; rm -rf /"}}'
+check "200" "dry run accepts the request"
+check_true '.would_execute == false' "but blocks on the forbidden character"
+
+api_call POST "/api/hooks/$TEMPLATE_HOOK_ID/execute" "$MASTER_KEY" \
+    '{"parameters":{"target_ip":"safe; rm -rf /"}}'
+check "400" "the real execution is refused the same way"
+
+# --- Clearing the template (empty string) reverts to plain positional arguments ---
+api_call PUT "/api/hooks/$TEMPLATE_HOOK_ID" "$MASTER_KEY" '{"args_template":""}'
+check "200" "clearing args_template with an empty string succeeds"
+check_jq ".args_template" "null" "the template is gone"
+api_call POST "/api/hooks/$TEMPLATE_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target_ip":"10.12.8.93"}}'
+check_jq ".command.args | join(\",\")" "10.12.8.93,443" \
+    "with no template, positional args are back to the bare declared-parameter list in order"
+
+for CLEANUP_ID in "$TEMPLATE_HOOK_ID" "$GAP_HOOK_ID"; do
+    api_call DELETE "/api/hooks/$CLEANUP_ID?hard=true" "$MASTER_KEY"
+    check "204" "clean up an args_template probe hook"
+done
+
+# --- A real Python argparse script, not just /bin/sh's bare $1/$2 — proves flag-style literal
+# tokens (--target, --port) survive untouched alongside the substituted $var/${var} values, since
+# args_template is plain whitespace tokenization, nothing shell/interpreter-specific. Skipped, not
+# failed, on a host with no python3 — the same treatment §19 gives an absent openssl. ---
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_HOOK_SCRIPT="$HOOK_DIR/ban_argparse.py"
+    cat > "$PYTHON_HOOK_SCRIPT" <<'PYEOF'
+#!/usr/bin/env python3
+import argparse
+p = argparse.ArgumentParser()
+p.add_argument('--target', required=True)
+p.add_argument('--port', required=True)
+p.add_argument('--dry-run', action='store_true')
+args = p.parse_args()
+print(f"banned target={args.target} port={args.port} dry_run={args.dry_run}")
+PYEOF
+    chmod 755 "$PYTHON_HOOK_SCRIPT"
+
+    api_call POST "/api/hooks" "$MASTER_KEY" \
+        "$(jq -nc --arg p "$PYTHON_HOOK_SCRIPT" '{name:"argparse_hook",script_path:$p,parameters:[{param_key:"target_ip",is_required:true},{param_key:"port",default_value:"443",is_required:true}],args_template:"--target ${target_ip} --port $port --dry-run"}')"
+    check "200" "create a hook wrapping a real python argparse script"
+    PYTHON_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/hooks/$PYTHON_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target_ip":"203.0.113.9"}}'
+    check "200" "dry run against the argparse hook succeeds"
+    check_jq ".command.args | join(\",\")" "--target,203.0.113.9,--port,443,--dry-run" \
+        "flag-style literal tokens survive untouched alongside the substituted values"
+
+    api_call POST "/api/hooks/$PYTHON_HOOK_ID/execute" "$MASTER_KEY" '{"parameters":{"target_ip":"203.0.113.9"}}'
+    check "200" "execute the argparse hook for real"
+    check_jq ".status" "SUCCESS" "the real python interpreter actually parsed the substituted flags"
+    check_jq ".stdout" "banned target=203.0.113.9 port=443 dry_run=True" "the script's own output confirms it received and parsed the substituted flags"
+
+    api_call DELETE "/api/hooks/$PYTHON_HOOK_ID?hard=true" "$MASTER_KEY"
+    check "204" "clean up the argparse probe hook"
+else
+    skip "§54 python argparse args_template check: python3 not found on PATH"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

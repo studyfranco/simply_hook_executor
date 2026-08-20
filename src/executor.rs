@@ -235,12 +235,159 @@ pub fn validate_run_as_user(run_as_user: &str) -> Result<(), ScriptError> {
     Ok(())
 }
 
+/// Characters (or short sequences) forbidden in any parameter value substituted into an
+/// `args_template` — defense-in-depth. Nothing in this codebase ever shells out (`AGENT.MD` §3,
+/// pinned by `verify_convergence.sh`'s "Hooks are never spawned through a shell" check), so none of
+/// these already carries shell-metacharacter meaning at the point they'd land in `argv` — but
+/// rejecting them here means a caller-supplied value that could matter to some *downstream*
+/// consumer (a script that re-invokes a shell itself, a log line replayed elsewhere) never reaches
+/// the argument vector silently.
+const ARGS_TEMPLATE_FORBIDDEN: &[&str] = &["|", ";", "&", "\n", "$("];
+
+/// Whether `c` may appear in a `$var`/`${var}` reference's identifier, mirroring
+/// [`is_valid_param_key`]'s shape (`[A-Za-z_][A-Za-z0-9_]*`).
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Extracts every `$identifier` / `${identifier}` variable reference from `template`, in order of
+/// first appearance, without de-duplicating.
+///
+/// Used two ways: [`crate::api::hooks::validate_args_template_matches_parameters`] checks every
+/// name returned here against the hook's declared parameters at create/update time (an
+/// `args_template` is exactly as much an allowlist boundary as `sample_payload_json` — a caller must
+/// not be able to make a hook reference a parameter it never declared), and
+/// [`resolve_args_template`] below re-derives the same names at request time to know which
+/// resolved values it needs.
+pub fn extract_template_variable_names(template: &str) -> Vec<String> {
+    let chars: Vec<char> = template.chars().collect();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        if chars.get(i + 1) == Some(&'{') {
+            let start = i + 2;
+            let mut j = start;
+            while j < chars.len() && chars[j] != '}' {
+                j += 1;
+            }
+            if j > start && j < chars.len() {
+                names.push(chars[start..j].iter().collect());
+            }
+            i = j + 1;
+        } else if matches!(chars.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == '_') {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() && is_ident_char(chars[j]) {
+                j += 1;
+            }
+            names.push(chars[start..j].iter().collect());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
+/// Substitutes every `$identifier` / `${identifier}` reference in one whitespace-delimited `token`
+/// using `lookup`, returning the resulting `argv` entry.
+///
+/// A reference naming a parameter absent from `lookup` (declared but neither supplied nor
+/// defaulted — an optional parameter simply omitted) fails outright: there is no placeholder worth
+/// leaving in an argument vector a process actually receives, unlike this same gap in
+/// `sample_payload_json`'s advisory-only preview. A resolved value containing anything in
+/// [`ARGS_TEMPLATE_FORBIDDEN`] fails the same way, naming the parameter rather than the character —
+/// the operator controls the template, but the value came from the caller.
+fn substitute_token(token: &str, lookup: &HashMap<&str, &str>) -> Result<String, ScriptError> {
+    let reject = |detail: String| {
+        Err(ScriptError::new(ScriptRejection::ArgsTemplateSubstitution, detail))
+    };
+
+    let chars: Vec<char> = token.chars().collect();
+    let mut out = String::with_capacity(token.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let (name, next_i) = if chars.get(i + 1) == Some(&'{') {
+            let start = i + 2;
+            let mut j = start;
+            while j < chars.len() && chars[j] != '}' {
+                j += 1;
+            }
+            if j >= chars.len() {
+                return reject(format!(
+                    "args_template has an unterminated '${{' in '{token}'"
+                ));
+            }
+            (chars[start..j].iter().collect::<String>(), j + 1)
+        } else if matches!(chars.get(i + 1), Some(c) if c.is_ascii_alphabetic() || *c == '_') {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() && is_ident_char(chars[j]) {
+                j += 1;
+            }
+            (chars[start..j].iter().collect::<String>(), j)
+        } else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+
+        let value = match lookup.get(name.as_str()) {
+            Some(v) => v,
+            None => {
+                return reject(format!(
+                    "args_template references '${name}' in '{token}', which has no resolved value \
+                     (not supplied and no default)"
+                ));
+            }
+        };
+        if let Some(bad) = ARGS_TEMPLATE_FORBIDDEN.iter().find(|f| value.contains(*f)) {
+            return reject(format!(
+                "parameter '{name}' resolved to a value containing the forbidden sequence '{bad}'"
+            ));
+        }
+        out.push_str(value);
+        i = next_i;
+    }
+    Ok(out)
+}
+
+/// Builds the `argv` entries an `args_template` expands to: tokenized on whitespace, each token's
+/// `$var`/`${var}` references substituted from `resolved`'s values.
+fn resolve_args_template(
+    template: &str,
+    resolved: &ResolvedParameters,
+) -> Result<Vec<String>, ScriptError> {
+    let lookup: HashMap<&str, &str> =
+        resolved.values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    template.split_whitespace().map(|token| substitute_token(token, &lookup)).collect()
+}
+
 /// Builds the [`CommandPlan`] for a hook and a set of resolved parameters.
 ///
-/// Each resolved parameter is passed **both** ways, so a script may consume whichever suits it:
-/// as `HOOK_PARAM_<UPPERCASED_KEY>` in the environment, and as a bare positional argument (for
-/// Python/shell scripts reading `sys.argv`/`$1`). Positional order is the parameter declaration
-/// order, which the `/test` endpoint surfaces explicitly so it never has to be guessed.
+/// Each resolved parameter is always injected as `HOOK_PARAM_<UPPERCASED_KEY>` in the environment,
+/// so a script may read it from there regardless of what follows. What becomes the *positional*
+/// argument vector depends on whether the hook declares an `args_template`
+/// (`hooks.args_template`):
+///
+/// - **No template** (the default): every resolved parameter is appended as a bare positional
+///   argument, in declaration order — for Python/shell scripts reading `sys.argv`/`$1`. This is the
+///   entire pre-existing behavior and cannot fail.
+/// - **A template set**: the template is tokenized on whitespace and each token's `$var`/`${var}`
+///   references are substituted from the resolved values (see [`resolve_args_template`]), which
+///   *can* fail — a referenced parameter with no resolved value, or a resolved value containing a
+///   character `ARGS_TEMPLATE_FORBIDDEN` blocks. Still never a shell: substitution produces
+///   complete `argv` entries handed to [`tokio::process::Command`] exactly like the no-template
+///   case, never a string that gets re-parsed.
 ///
 /// When the hook declares a `run_as_user`, the program becomes [`SUDO_BINARY`] and the vector is
 /// prefixed with `-n -u <user> --`:
@@ -253,7 +400,7 @@ pub fn build_command_plan(
     hook: &hook::Model,
     resolved: &ResolvedParameters,
     config: &RuntimeConfig,
-) -> CommandPlan {
+) -> Result<CommandPlan, ScriptError> {
     let mut env = BTreeMap::new();
 
     // Controlled inheritance: only the operator's passthrough allowlist, and only those names
@@ -270,7 +417,6 @@ pub fn build_command_plan(
         env.insert(format!("{PARAM_ENV_PREFIX}{}", key.to_uppercase()), value.clone());
     }
 
-    let positional = resolved.values.iter().map(|(_, v)| v.clone());
     let run_as_user = effective_run_as_user(hook.run_as_user.as_deref());
 
     let (program, mut args) = match run_as_user {
@@ -286,14 +432,18 @@ pub fn build_command_plan(
         ),
         None => (hook.script_path.clone(), Vec::new()),
     };
-    args.extend(positional);
 
-    CommandPlan {
+    match hook.args_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(template) => args.extend(resolve_args_template(template, resolved)?),
+        None => args.extend(resolved.values.iter().map(|(_, v)| v.clone())),
+    }
+
+    Ok(CommandPlan {
         program,
         args,
         env,
         run_as_user: run_as_user.map(str::to_owned),
-    }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -322,6 +472,9 @@ pub enum ScriptRejection {
     InvalidRunAsUser,
     /// `sudo` is required by this hook but is not usable.
     SudoUnavailable,
+    /// `args_template` references a parameter with no resolved value, or a resolved value contains
+    /// a forbidden character — see [`build_command_plan`].
+    ArgsTemplateSubstitution,
     /// Anything else the OS reported.
     Unusable,
 }
@@ -1004,7 +1157,7 @@ pub async fn execute_hook(
         None => None,
     };
 
-    let plan = build_command_plan(hook, resolved, &state.config);
+    let plan = build_command_plan(hook, resolved, &state.config)?;
     let timeout = state.config.timeout_for(hook.default_timeout_seconds);
     let started_at = chrono::Utc::now().naive_utc();
 
@@ -1168,6 +1321,7 @@ mod tests {
             signature_prefix: None,
             canonical_template: None,
             sample_payload_json: None,
+            args_template: None,
         }
     }
 
@@ -1190,7 +1344,8 @@ mod tests {
             missing_required: Vec::new(),
         };
         // An empty passthrough list keeps this assertion independent of the host environment.
-        let plan = build_command_plan(&hook, &resolved, &isolated_config());
+        let plan = build_command_plan(&hook, &resolved, &isolated_config())
+            .expect("no args_template: infallible");
         assert_eq!(plan.program, "/usr/local/bin/demo.sh");
         assert_eq!(plan.args, vec!["203.0.113.7", "abuse"]);
         assert_eq!(plan.run_as_user, None);
@@ -1210,7 +1365,8 @@ mod tests {
             missing_required: Vec::new(),
         };
 
-        let plan = build_command_plan(&hook, &resolved, &isolated_config());
+        let plan = build_command_plan(&hook, &resolved, &isolated_config())
+            .expect("no args_template: infallible");
 
         assert_eq!(plan.program, SUDO_BINARY);
         // The exact vector matters: -n (never prompt), -u <user>, then `--` before anything
@@ -1236,7 +1392,8 @@ mod tests {
     fn plan_treats_blank_run_as_user_as_unprivileged() {
         let resolved = ResolvedParameters::default();
         for blank in ["", "   ", "\t"] {
-            let plan = build_command_plan(&demo_hook(Some(blank)), &resolved, &isolated_config());
+            let plan = build_command_plan(&demo_hook(Some(blank)), &resolved, &isolated_config())
+                .expect("no args_template: infallible");
             assert_eq!(plan.program, "/usr/local/bin/demo.sh", "{blank:?} must not trigger sudo");
             assert!(plan.args.is_empty());
             assert_eq!(plan.run_as_user, None);
@@ -1245,7 +1402,8 @@ mod tests {
 
     #[test]
     fn plan_trims_surrounding_whitespace_from_run_as_user() {
-        let plan = build_command_plan(&demo_hook(Some("  postgres  ")), &ResolvedParameters::default(), &isolated_config());
+        let plan = build_command_plan(&demo_hook(Some("  postgres  ")), &ResolvedParameters::default(), &isolated_config())
+            .expect("no args_template: infallible");
         assert_eq!(plan.args, vec!["-n", "-u", "postgres", "--", "/usr/local/bin/demo.sh"]);
         assert_eq!(plan.run_as_user.as_deref(), Some("postgres"));
     }
@@ -1258,11 +1416,87 @@ mod tests {
             values: vec![("flag".to_owned(), "--login".to_owned())],
             missing_required: Vec::new(),
         };
-        let plan = build_command_plan(&demo_hook(Some("root")), &resolved, &isolated_config());
+        let plan = build_command_plan(&demo_hook(Some("root")), &resolved, &isolated_config())
+            .expect("no args_template: infallible");
 
         let separator = plan.args.iter().position(|a| a == "--").expect("the -- separator is present");
         let hostile = plan.args.iter().position(|a| a == "--login").expect("the value is present");
         assert!(hostile > separator, "a option-shaped value must sit after the separator");
+    }
+
+    #[test]
+    fn extracts_both_variable_syntaxes_in_order_without_deduplicating() {
+        assert_eq!(
+            extract_template_variable_names("add $target_ip block ${target_ip} port ${port}"),
+            vec!["target_ip", "target_ip", "port"]
+        );
+        assert!(extract_template_variable_names("no variables here").is_empty());
+        // A bare trailing '$' or an empty '${}' names nothing.
+        assert!(extract_template_variable_names("cost is $5 not ${}").is_empty());
+    }
+
+    #[test]
+    fn args_template_substitutes_both_syntaxes_from_resolved_values() {
+        let mut hook = demo_hook(None);
+        hook.args_template = Some("add bad_ip ${target_ip}:$port".to_owned());
+        let resolved = ResolvedParameters {
+            values: vec![
+                ("target_ip".to_owned(), "10.12.8.93".to_owned()),
+                ("port".to_owned(), "443".to_owned()),
+            ],
+            missing_required: Vec::new(),
+        };
+        let plan = build_command_plan(&hook, &resolved, &isolated_config())
+            .expect("every referenced variable resolves");
+        assert_eq!(plan.args, vec!["add", "bad_ip", "10.12.8.93:443"]);
+        // Env injection still happens regardless of the template.
+        assert_eq!(plan.env.get("HOOK_PARAM_TARGET_IP").map(String::as_str), Some("10.12.8.93"));
+    }
+
+    #[test]
+    fn args_template_fails_closed_on_an_unresolved_variable() {
+        let mut hook = demo_hook(None);
+        hook.args_template = Some("add ${missing}".to_owned());
+        let err = build_command_plan(&hook, &ResolvedParameters::default(), &isolated_config())
+            .expect_err("missing must block, not silently blank");
+        assert_eq!(err.rejection, ScriptRejection::ArgsTemplateSubstitution);
+        assert!(err.detail.contains("missing"));
+    }
+
+    #[test]
+    fn args_template_rejects_forbidden_characters_in_a_resolved_value() {
+        for (name, hostile) in [
+            ("pipe", "a|b"),
+            ("semicolon", "a;b"),
+            ("ampersand", "a&b"),
+            ("newline", "a\nb"),
+            ("subshell", "a$(b)"),
+        ] {
+            let mut hook = demo_hook(None);
+            hook.args_template = Some("run $val".to_owned());
+            let resolved = ResolvedParameters {
+                values: vec![("val".to_owned(), hostile.to_owned())],
+                missing_required: Vec::new(),
+            };
+            let err = build_command_plan(&hook, &resolved, &isolated_config())
+                .expect_err(&format!("{name} must be rejected"));
+            assert_eq!(err.rejection, ScriptRejection::ArgsTemplateSubstitution, "for {name}");
+        }
+    }
+
+    #[test]
+    fn args_template_empty_or_blank_falls_back_to_plain_positional_args() {
+        for blank in [None, Some(""), Some("   ")] {
+            let mut hook = demo_hook(None);
+            hook.args_template = blank.map(str::to_owned);
+            let resolved = ResolvedParameters {
+                values: vec![("k".to_owned(), "v".to_owned())],
+                missing_required: Vec::new(),
+            };
+            let plan = build_command_plan(&hook, &resolved, &isolated_config())
+                .expect("blank template is treated as absent");
+            assert_eq!(plan.args, vec!["v"]);
+        }
     }
 
     #[test]

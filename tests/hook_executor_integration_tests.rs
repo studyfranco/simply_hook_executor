@@ -1908,6 +1908,7 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         signature_prefix: Set(None),
         canonical_template: Set(None),
         sample_payload_json: Set(None),
+        args_template: Set(None),
     }
     .insert(&db)
     .await
@@ -7629,4 +7630,388 @@ async fn audit_logs_filter_by_acting_key() {
 
     let none_match = send(&app, json_request("GET", "/api/audit-logs?api_key=NoSuchKeyNameAtAll", &master, None)).await;
     assert_eq!(none_match.json.as_array().map(Vec::len).unwrap_or(0), 0);
+}
+
+// ─────────────────────────────────────────────────────────────
+// `args_template`: templated argument-vector substitution
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn args_template_is_validated_against_declared_parameters_at_create_and_update() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("ipset_hook.sh", "#!/bin/sh\necho \"$@\"\n");
+
+    // A template referencing an undeclared parameter is refused at creation.
+    let undeclared = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "undeclared_template_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "target_ip", "is_required": true}],
+                "args_template": "add bad_ip ${target_ip} port ${target_port}"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(undeclared.status, StatusCode::BAD_REQUEST, "{}", undeclared.raw);
+    assert!(undeclared.raw.contains("target_port"), "the error names the undeclared parameter: {}", undeclared.raw);
+
+    // A template naming only declared parameters is accepted and stored verbatim.
+    let ok = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "templated_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "target_ip", "is_required": true}],
+                "args_template": "add bad_ip ${target_ip}"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.raw);
+    assert_eq!(ok.field("args_template").as_str(), Some("add bad_ip ${target_ip}"));
+    let hook_id = ok.string("id");
+
+    // Updating to reference a variable the hook does not (yet) declare is refused the same way.
+    let bad_update = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "args_template": "add bad_ip ${nonexistent}" })),
+        ),
+    )
+    .await;
+    assert_eq!(bad_update.status, StatusCode::BAD_REQUEST, "{}", bad_update.raw);
+
+    // Clearing it with an empty string reverts to plain positional arguments.
+    let cleared = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "args_template": "" }))),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
+    assert_eq!(cleared.field("args_template"), &json!(null));
+}
+
+#[tokio::test]
+async fn args_template_is_dispatch_configuration_gated_like_script_path() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("owned.sh", "#!/bin/sh\necho ok\n");
+
+    // A Daughter holding only the creation right (no can_manage_keys) owns what it creates, but R2's
+    // dispatch-configuration clause still refuses it editing args_template on ownership alone —
+    // identical to the existing script_path/run_as_user coverage above.
+    let (_, owner) = insert_key(&db, "creator", "", KeyScopes::hook_manager()).await;
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &owner,
+            Some(json!({
+                "name": "owned_template_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "k", "is_required": true}]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+    assert_eq!(created.field("is_owner"), &json!(true));
+
+    let denied = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &owner,
+            Some(json!({ "args_template": "run $k" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "ownership alone must not authorise setting args_template: {}",
+        denied.raw
+    );
+}
+
+#[tokio::test]
+async fn dry_run_and_execute_substitute_args_template_from_the_real_payload() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("templated.sh", "#!/bin/sh\necho \"argv:$1|$2\"\n");
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "templated_exec_hook",
+                "script_path": script,
+                "parameters": [
+                    {"param_key": "target_ip", "is_required": true},
+                    {"param_key": "port", "default_value": "443", "is_required": true}
+                ],
+                "args_template": "add bad_ip ${target_ip}:$port"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+
+    // Dry run: the command preview reflects the substituted template, not plain positional args.
+    let dry = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &master,
+            Some(json!({ "parameters": { "target_ip": "10.12.8.93" } })),
+        ),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.raw);
+    assert_eq!(dry.field("would_execute"), &json!(true), "{}", dry.raw);
+    assert_eq!(
+        dry.json["command"]["args"],
+        json!(["add", "bad_ip", "10.12.8.93:443"]),
+        "{}",
+        dry.raw
+    );
+
+    // Execute: the script actually receives the substituted, templated argv — not the bare
+    // positional-per-declared-parameter shape this hook would have gotten with no args_template.
+    let ran = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({ "parameters": { "target_ip": "10.12.8.93" } })),
+        ),
+    )
+    .await;
+    assert_eq!(ran.status, StatusCode::OK, "{}", ran.raw);
+    assert_eq!(ran.field("stdout").as_str(), Some("argv:add|bad_ip\n"), "{}", ran.raw);
+}
+
+#[tokio::test]
+async fn args_template_referencing_an_unresolved_variable_blocks_the_dry_run_and_the_real_execution() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("templated2.sh", "#!/bin/sh\necho ok\n");
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "templated_optional_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "opt", "is_required": false}],
+                "args_template": "run ${opt}"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+
+    // `opt` is optional, undefaulted, and not supplied here — it has no resolved value, so the
+    // template cannot be built at all.
+    let dry = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/test"), &master, Some(json!({ "parameters": {} }))),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.raw);
+    assert_eq!(dry.field("would_execute"), &json!(false), "{}", dry.raw);
+    assert_eq!(dry.field("command"), &json!(null), "no command can be shown when the template fails: {}", dry.raw);
+    assert!(
+        dry.field("blocking_reason").as_str().unwrap_or_default().contains("opt"),
+        "{}",
+        dry.raw
+    );
+
+    let ran = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({ "parameters": {} }))),
+    )
+    .await;
+    assert_eq!(
+        ran.status,
+        StatusCode::BAD_REQUEST,
+        "a real execution must also refuse rather than silently drop the variable: {}",
+        ran.raw
+    );
+}
+
+#[tokio::test]
+async fn args_template_rejects_a_forbidden_character_in_a_supplied_value_at_execution_time() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("templated3.sh", "#!/bin/sh\necho ok\n");
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "templated_forbidden_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "val", "is_required": true}],
+                "args_template": "run $val"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+
+    let dry = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &master,
+            Some(json!({ "parameters": { "val": "safe; rm -rf /" } })),
+        ),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.raw);
+    assert_eq!(dry.field("would_execute"), &json!(false), "{}", dry.raw);
+
+    let ran = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({ "parameters": { "val": "safe; rm -rf /" } })),
+        ),
+    )
+    .await;
+    assert_eq!(ran.status, StatusCode::BAD_REQUEST, "{}", ran.raw);
+}
+
+#[tokio::test]
+async fn args_template_drives_a_real_python_argparse_script() {
+    // Proves the flag-style CLI shape (`--flag value`, as `argparse.add_argument("--target")`
+    // expects) works end to end against a real interpreter, not just `/bin/sh`'s bare `$1`/`$2` —
+    // args_template is plain whitespace tokenization plus substitution, so literal flag text
+    // passes through untouched alongside the substituted `$var`/`${var}` tokens.
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+
+    let script_path = scripts.path_for("ban_argparse.py");
+    std::fs::write(
+        &script_path,
+        "#!/usr/bin/env python3\n\
+         import argparse\n\
+         p = argparse.ArgumentParser()\n\
+         p.add_argument('--target', required=True)\n\
+         p.add_argument('--port', required=True)\n\
+         p.add_argument('--dry-run', action='store_true')\n\
+         args = p.parse_args()\n\
+         print(f\"banned target={args.target} port={args.port} dry_run={args.dry_run}\")\n",
+    )
+    .expect("script is writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("script is chmod-able");
+    }
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "argparse_hook",
+                "script_path": script_path,
+                "parameters": [
+                    {"param_key": "target_ip", "is_required": true},
+                    {"param_key": "port", "default_value": "443", "is_required": true}
+                ],
+                "args_template": "--target ${target_ip} --port $port --dry-run"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+
+    let dry = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &master,
+            Some(json!({ "parameters": { "target_ip": "203.0.113.9" } })),
+        ),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.raw);
+    assert_eq!(
+        dry.json["command"]["args"],
+        json!(["--target", "203.0.113.9", "--port", "443", "--dry-run"]),
+        "flag-style literal tokens (--target, --port, --dry-run) survive untouched alongside the substituted values: {}",
+        dry.raw
+    );
+
+    let ran = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({ "parameters": { "target_ip": "203.0.113.9" } })),
+        ),
+    )
+    .await;
+    assert_eq!(ran.status, StatusCode::OK, "{}", ran.raw);
+    assert_eq!(ran.field("status"), &json!("SUCCESS"), "{}", ran.raw);
+    assert_eq!(
+        ran.field("stdout").as_str(),
+        Some("banned target=203.0.113.9 port=443 dry_run=True\n"),
+        "the real python interpreter actually parsed the substituted flags: {}",
+        ran.raw
+    );
 }

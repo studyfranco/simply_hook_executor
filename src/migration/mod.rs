@@ -14,6 +14,7 @@ mod m20260810_090000_drop_api_key_owner_key_id;
 mod m20260819_120414_add_hook_auth_mode;
 mod m20260819_141730_consolidate_hmac_modes;
 mod m20260820_090000_add_hook_sample_payload;
+mod m20260821_090000_add_hook_args_template;
 
 /// The ordered set of all schema migrations for `simply_hook_executor`.
 pub struct Migrator;
@@ -34,6 +35,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260819_120414_add_hook_auth_mode::Migration),
             Box::new(m20260819_141730_consolidate_hmac_modes::Migration),
             Box::new(m20260820_090000_add_hook_sample_payload::Migration),
+            Box::new(m20260821_090000_add_hook_args_template::Migration),
         ]
     }
 }
