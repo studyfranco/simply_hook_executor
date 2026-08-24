@@ -267,6 +267,7 @@ Stores complete execution history, output logs, and performance metrics.
 | `parameters_json`| Text | NOT NULL | JSON string of resolved parameters passed to execution. |
 | `duration_ms` | Integer | NOT NULL | Total execution time in milliseconds. |
 | `timestamp` | DateTime | NOT NULL | Execution start timestamp (UTC). |
+| `caller_ip` | String | NOT NULL, DEFAULT `''` | Resolved client IP of whoever triggered the execution — same trust-aware resolution as `audit_logs.client_ip` (`config::resolve_client_ip`: `X-Forwarded-For`/`X-Real-IP` are consulted only when the direct TCP peer is itself a configured trusted proxy; the raw peer address otherwise). Added by migration `m20260824_090000_add_execution_caller_ip`; the empty-string default exists only to satisfy `NOT NULL` on rows that predate it and never captured one. |
 
 ---
 

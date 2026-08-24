@@ -54,6 +54,9 @@ pub struct Model {
     pub duration_ms: i32,
     /// Execution start timestamp (UTC).
     pub timestamp: DateTime,
+    /// The resolved client IP of whoever triggered this execution — same trust-aware resolution
+    /// as `audit_log::Model::client_ip` (`config::resolve_client_ip`).
+    pub caller_ip: String,
 }
 
 /// Relations from `executions` to other entities.

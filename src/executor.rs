@@ -1130,6 +1130,7 @@ pub async fn execute_hook(
     hook: &hook::Model,
     key: Option<&api_key::Model>,
     resolved: &ResolvedParameters,
+    caller_ip: std::net::IpAddr,
 ) -> Result<execution::Model, AppError> {
     let key_prefix = key.map(|k| k.prefix.as_str()).unwrap_or("(keyless)");
 
@@ -1192,6 +1193,7 @@ pub async fn execute_hook(
         parameters_json: Set(resolved.to_json_string()),
         duration_ms: Set(outcome.duration_ms),
         timestamp: Set(started_at),
+        caller_ip: Set(caller_ip.to_string()),
     };
 
     Ok(record.insert(&state.db).await?)

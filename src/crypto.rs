@@ -212,10 +212,23 @@ pub const DEFAULT_CANONICAL_TEMPLATE: &str = "{method}\n{path}\n{timestamp}\n{bo
 /// Renders a hook's custom canonical template, substituting `{method}`, `{path}`, `{timestamp}` and
 /// `{body}`.
 ///
-/// Substitution is purely textual — `body` is decoded as UTF-8 on a best-effort basis (invalid bytes
-/// become the Unicode replacement character) since a template is necessarily a `String`, and an
-/// unrecognized `{placeholder}` is left in the output verbatim rather than rejected. A template is
-/// data the hook's operator supplies and is responsible for; this function does not validate its
+/// **Single-pass by construction.** This scans `template` exactly once, left to right, and every
+/// substituted value is appended to the output without ever being scanned again. That is the whole
+/// fix, not an optimization: the previous implementation chained four `str::replace` calls, each of
+/// which rescans the *entire accumulated string* — including bytes a prior call had just inserted.
+/// A caller-controlled `path` or `body` containing the literal text `{timestamp}` (an ordinary,
+/// unremarkable substring in a URL query string or a JSON body) would then have that literal text
+/// overwritten by the real timestamp on the next `.replace()` call, exactly as if it had been part
+/// of the template. Two different `(method, path, timestamp, body)` tuples could then canonicalize
+/// to the *same* signed byte string — a canonicalization collision that lets a signature valid for
+/// one request verify for a different one. Scanning only the original `template` (never the
+/// growing `out` buffer) makes that impossible: a token-shaped substring inside a substituted value
+/// is data appended once, never a position this function inspects again.
+///
+/// Substitution is otherwise textual — `body` is decoded as UTF-8 on a best-effort basis (invalid
+/// bytes become the Unicode replacement character) since a template is necessarily a `String`, and
+/// an unrecognized `{placeholder}` is left in the output verbatim rather than rejected. A template
+/// is data the hook's operator supplies and is responsible for; this function does not validate its
 /// shape beyond performing the substitution, matching [`hooks.canonical_template`]'s documented
 /// contract.
 ///
@@ -229,12 +242,31 @@ pub fn render_canonical_template(
     body: &[u8],
 ) -> Vec<u8> {
     let body_text = String::from_utf8_lossy(body);
-    template
-        .replace("{method}", method)
-        .replace("{path}", path)
-        .replace("{timestamp}", timestamp)
-        .replace("{body}", &body_text)
-        .into_bytes()
+    let tokens: [(&str, &str); 4] = [
+        ("{method}", method),
+        ("{path}", path),
+        ("{timestamp}", timestamp),
+        ("{body}", body_text.as_ref()),
+    ];
+
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    'scan: while !rest.is_empty() {
+        for (token, value) in &tokens {
+            if let Some(after) = rest.strip_prefix(token) {
+                out.push_str(value);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        // No token starts here: copy exactly one character of the *template* and advance past it.
+        // `rest` is always a valid `&str` slice, so this is char-boundary safe.
+        let mut chars = rest.chars();
+        let c = chars.next().expect("rest is non-empty inside the loop guard");
+        out.push(c);
+        rest = chars.as_str();
+    }
+    out.into_bytes()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -443,6 +475,64 @@ mod tests {
         assert_ne!(
             base("POST", "/api/x", "1700000000", b""),
             base("POS", "T/api/x", "1700000000", b"")
+        );
+    }
+
+    // ─── render_canonical_template: single-pass substitution ───────────────
+
+    /// The regression this exists to catch: a caller-controlled `path` or `body` containing the
+    /// literal text of an unrelated placeholder (`{timestamp}`, `{method}`, `{path}`) must survive
+    /// verbatim in the rendered output. A sequential-`.replace()` implementation rescans its own
+    /// accumulated output on every call, so a literal `{timestamp}` sitting inside `path` — an
+    /// ordinary, unremarkable substring in a URL query string — would be overwritten by the real
+    /// timestamp on the very next `.replace()`, exactly as if it had been part of the template.
+    #[test]
+    fn render_canonical_template_never_rescans_substituted_values_for_placeholder_syntax() {
+        let rendered = render_canonical_template(
+            DEFAULT_CANONICAL_TEMPLATE,
+            "POST",
+            "/api/hooks?x={timestamp}&y={body}&z={method}",
+            "1700000000",
+            b"payload containing {method} and {path} literally, not as placeholders",
+        );
+        assert_eq!(
+            String::from_utf8(rendered).expect("all inputs here are valid UTF-8"),
+            "POST\n\
+             /api/hooks?x={timestamp}&y={body}&z={method}\n\
+             1700000000\n\
+             payload containing {method} and {path} literally, not as placeholders"
+        );
+    }
+
+    /// The direct security consequence of the bug above, stated as a collision rather than a
+    /// verbatim-preservation check: two genuinely different requests must never canonicalize to the
+    /// same signed byte string, even when one's `path` is crafted to contain the other's real
+    /// `timestamp` wrapped in placeholder syntax.
+    #[test]
+    fn crafted_path_cannot_make_two_different_requests_canonicalize_identically() {
+        let legitimate = render_canonical_template(
+            DEFAULT_CANONICAL_TEMPLATE, "GET", "/api/hooks", "1700000000", b"",
+        );
+        let crafted = render_canonical_template(
+            DEFAULT_CANONICAL_TEMPLATE, "GET", "/api/hooks{timestamp}", "1700000000", b"",
+        );
+        assert_ne!(
+            legitimate, crafted,
+            "a path containing literal placeholder syntax must not fold into a different request's canonical bytes"
+        );
+    }
+
+    /// An unrecognized `{placeholder}` — one of the four names misspelled, or a template author's
+    /// own unrelated `{...}` — is left in the output verbatim, same as before this function's
+    /// internals changed from chained `.replace()` calls to a single left-to-right scan.
+    #[test]
+    fn an_unrecognized_placeholder_in_the_template_itself_is_left_verbatim() {
+        let rendered = render_canonical_template(
+            "{method} {path} {nonsense} {timestamp}", "POST", "/x", "1700000000", b"",
+        );
+        assert_eq!(
+            String::from_utf8(rendered).unwrap(),
+            "POST /x {nonsense} 1700000000"
         );
     }
 

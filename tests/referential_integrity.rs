@@ -66,6 +66,7 @@ async fn insert_execution_by(db: &DatabaseConnection, hook_id: Uuid, key_id: Uui
         parameters_json: Set("{}".to_owned()),
         duration_ms: Set(5),
         timestamp: Set(chrono::Utc::now().naive_utc()),
+        caller_ip: Set("127.0.0.1".to_owned()),
     }
     .insert(db)
     .await

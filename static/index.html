@@ -196,12 +196,13 @@
                                     <th>Status</th>
                                     <th>Exit</th>
                                     <th>Duration</th>
+                                    <th>Caller IP</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="executions-table-body">
                                 <tr>
-                                    <td colspan="8" class="text-center text-muted">Loading data...</td>
+                                    <td colspan="9" class="text-center text-muted">Loading data...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -209,8 +210,16 @@
 
                     <div class="pagination">
                         <button id="exec-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
-                        <span id="exec-page-indicator">Page 1</span>
+                        <span id="exec-page-indicator">Page 1 of 1</span>
                         <button id="exec-btn-next" class="btn btn-icon">Next &raquo;</button>
+                        <span id="exec-total-count" class="text-muted text-sm"></span>
+                        <label for="exec-page-size" class="text-muted text-sm">Per page:</label>
+                        <select id="exec-page-size" class="input-field select-field">
+                            <option value="15">15</option>
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
                     </div>
                 </section>
             </div>

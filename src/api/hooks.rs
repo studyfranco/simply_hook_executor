@@ -208,6 +208,40 @@ pub struct HookDetail {
     pub sample_payload_json: Option<String>,
     /// Argument-vector template, or `None` if never set (plain positional arguments).
     pub args_template: Option<String>,
+    /// The path a caller — keyed, or keyless per [`HookDetail::auth_mode`] — invokes this hook at:
+    /// `/webhook/{name}`. Computed from the hook's own name, never stored, so a rename is reflected
+    /// immediately rather than needing a migration to backfill a denormalized copy.
+    ///
+    /// A path, not a full URL: this server has no reliable way to know its own externally-visible
+    /// scheme and host (a reverse proxy routinely rewrites both — see `AGENT.MD`'s "two distinct
+    /// API base paths" note on the WebUI's own signing-path override), so guessing one here would
+    /// be wrong exactly the deployments most likely to need this field printed somewhere. The
+    /// caller combines this with whatever base it already knows is correct for itself.
+    pub webhook_path: String,
+}
+
+/// Percent-encodes `name` for safe use as the single `{identifier}` path segment in
+/// `/webhook/{identifier}`.
+///
+/// A hook's `name` has no charset restriction beyond "non-empty after trimming" — nothing stops an
+/// operator naming one with a space, a `/`, or a `#` — so embedding it into a path unescaped could
+/// silently produce a URL that does not actually route back to this hook (a `/` would introduce an
+/// extra path segment; a `#` would truncate the path at a fragment). Rather than add a
+/// percent-encoding crate for the one call site that needs it, this keeps every byte in the RFC
+/// 3986 `unreserved` set (`ALPHA` / `DIGIT` / `-` / `.` / `_` / `~`) literal — which is every
+/// character every hook name in this codebase's own examples and tests already uses — and escapes
+/// everything else, one UTF-8 byte at a time, as `%XX`.
+fn percent_encode_path_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Assembles the [`HookDetail`] view for one hook as seen by one key.
@@ -228,6 +262,7 @@ pub(crate) async fn build_hook_detail(
             .map(|p| (p.can_execute, p.can_manage))
             .unwrap_or((false, false))
     };
+    let webhook_path = format!("/webhook/{}", percent_encode_path_segment(&model.name));
 
     Ok(HookDetail {
         id: model.id,
@@ -253,6 +288,7 @@ pub(crate) async fn build_hook_detail(
         canonical_template: model.canonical_template,
         sample_payload_json: model.sample_payload_json,
         args_template: model.args_template,
+        webhook_path,
     })
 }
 
@@ -471,7 +507,18 @@ pub async fn create_hook(
     let args_template = payload.args_template.filter(|s| !s.is_empty());
     let declared_keys: Vec<String> = declared.iter().map(|p| p.param_key.clone()).collect();
     validate_sample_payload_matches_parameters(sample_payload_json.as_deref(), &declared_keys)?;
-    validate_args_template_matches_parameters(args_template.as_deref(), &declared_keys)?;
+    // `args_template` is deliberately **not** checked against `declared_keys` here, unlike
+    // `update_hook`'s equivalent call. A hook's parameter contract is routinely built up in a
+    // second step, through the Parameters modal's own endpoints, after the hook itself exists — the
+    // WebUI's create flow has no parameter-declaring fields of its own for exactly this reason.
+    // Requiring every `$var`/`${var}` the template references to already be declared in the same
+    // request would make "write the template first, add its parameters after" — an ordinary,
+    // supported way to build a hook — fail with a 400 that has nothing to do with anything the
+    // caller actually got wrong yet. The same allowlist discipline still applies, just deferred to
+    // the moment it can be enforced meaningfully: `create_hook_parameter`/`update_hook_parameter`/
+    // `delete_hook_parameter` each re-validate the *current* template against the resulting
+    // parameter set, and `executor::resolve_args_template` refuses at execution time regardless if
+    // a referenced parameter still has no resolved value.
 
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
@@ -1146,6 +1193,18 @@ pub async fn update_hook_parameter(
         .filter(|p| p.hook_id == model.id)
         .ok_or(AppError::NotFound)?;
 
+    // `param_key` is not a field on `UpdateParameterPayload` at all — it is this row's identity,
+    // immutable here — so the hook's declared-key set cannot actually change as a result of this
+    // endpoint, and neither check below can newly fail from anything this request does. Kept anyway,
+    // alongside `delete_hook_parameter`'s own (load-bearing) re-validation: both endpoints re-check
+    // the *current* full parameter set against the hook's stored `args_template`/
+    // `sample_payload_json` rather than only ever being validated from `create_hook`/`update_hook`,
+    // so this stays correct with no further change if a future revision ever makes the key editable.
+    let declared_keys: Vec<String> =
+        load_parameters(&state.db, model.id).await?.into_iter().map(|p| p.param_key).collect();
+    validate_sample_payload_matches_parameters(model.sample_payload_json.as_deref(), &declared_keys)?;
+    validate_args_template_matches_parameters(model.args_template.as_deref(), &declared_keys)?;
+
     let param_key = param.param_key.clone();
     let mut active: hook_parameter::ActiveModel = param.into();
     if let Some(description) = payload.description {
@@ -1195,6 +1254,21 @@ pub async fn delete_hook_parameter(
         .ok_or(AppError::NotFound)?;
     let param_key = param.param_key.clone();
 
+    // The declared-key set *after* this deletion — `args_template` must still reference only keys
+    // that remain, or the hook is left silently broken: a template naming a parameter that no
+    // longer exists would fail only at the next execution, as an opaque "no resolved value" error
+    // pointing nowhere near its actual cause, instead of a clear 400 naming it right here, before
+    // the row is gone. `sample_payload_json` needs no equivalent check: removing a declared key can
+    // only shrink the set that check requires the sample to *contain*, so it can never newly fail
+    // as a result of a deletion.
+    let remaining_keys: Vec<String> = load_parameters(&state.db, model.id)
+        .await?
+        .into_iter()
+        .map(|p| p.param_key)
+        .filter(|k| k != &param_key)
+        .collect();
+    validate_args_template_matches_parameters(model.args_template.as_deref(), &remaining_keys)?;
+
     HookParameter::delete_by_id(param_id).exec(&state.db).await?;
 
     create_audit_log(
@@ -1211,4 +1285,33 @@ pub async fn delete_hook_parameter(
     .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_path_segment_leaves_ordinary_identifiers_untouched() {
+        assert_eq!(percent_encode_path_segment("ban_ip"), "ban_ip");
+        assert_eq!(percent_encode_path_segment("nftables-ban.v2"), "nftables-ban.v2");
+        assert_eq!(percent_encode_path_segment("Deploy_Prod_2026"), "Deploy_Prod_2026");
+    }
+
+    #[test]
+    fn percent_encode_path_segment_escapes_characters_that_would_break_the_path() {
+        // A space and a '/' are the two most likely accidents (a human-typed name, or a name that
+        // looks like a namespaced path); '#' and '?' would truncate or reinterpret the URL outright.
+        assert_eq!(percent_encode_path_segment("my hook"), "my%20hook");
+        assert_eq!(percent_encode_path_segment("team/deploy"), "team%2Fdeploy");
+        assert_eq!(percent_encode_path_segment("a#b"), "a%23b");
+        assert_eq!(percent_encode_path_segment("a?b"), "a%3Fb");
+    }
+
+    #[test]
+    fn percent_encode_path_segment_handles_multibyte_utf8() {
+        // Escaped byte-by-byte, not char-by-char — a multi-byte UTF-8 character becomes multiple
+        // `%XX` triplets, which is what a URL parser expects to reassemble it from.
+        assert_eq!(percent_encode_path_segment("héllo"), "h%C3%A9llo");
+    }
 }

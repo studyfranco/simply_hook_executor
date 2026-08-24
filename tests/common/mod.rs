@@ -55,6 +55,10 @@ pub fn test_config() -> Arc<RuntimeConfig> {
         // secure path — forwarding headers ignored, `bound_ips` evaluated against the TCP peer —
         // and a test that wants headers honoured must opt in via `test_state_with_trusted_proxies`.
         trusted_proxies: TrustedProxies::default(),
+        database_max_connections: 50,
+        database_min_connections: 10,
+        database_idle_timeout_secs: 600,
+        database_acquire_timeout_secs: 10,
     })
 }
 
@@ -609,6 +613,7 @@ pub async fn insert_execution_aged(
         parameters_json: Set("{}".to_owned()),
         duration_ms: Set(5),
         timestamp: Set((chrono::Utc::now() - chrono::Duration::days(age_days)).naive_utc()),
+        caller_ip: Set("127.0.0.1".to_owned()),
     }
     .insert(db)
     .await
@@ -734,6 +739,9 @@ pub struct TestResponse {
     /// The undecoded response body, for assertions about the exact bytes on the wire rather than
     /// about the parsed value.
     pub raw: String,
+    /// The full response header map, for endpoints (like `GET /api/executions`'s pagination
+    /// metadata) that ride information on headers rather than in the JSON body.
+    pub headers: axum::http::HeaderMap,
 }
 
 impl TestResponse {
@@ -748,6 +756,16 @@ impl TestResponse {
     pub fn string(&self, key: &str) -> String {
         self.field(key).as_str().unwrap_or_default().to_owned()
     }
+
+    /// Reads a response header as a `&str`, panicking with a useful message when absent or not
+    /// valid UTF-8 (every header this codebase sets is a plain ASCII value).
+    pub fn header(&self, name: &str) -> &str {
+        self.headers
+            .get(name)
+            .unwrap_or_else(|| panic!("response has no '{name}' header"))
+            .to_str()
+            .unwrap_or_else(|_| panic!("'{name}' header is not valid UTF-8"))
+    }
 }
 
 /// Sends a request through the router and decodes the response.
@@ -761,8 +779,8 @@ pub async fn send(app: &axum::Router, request: Request<Body>) -> TestResponse {
         .await
         .expect("the router is infallible");
     let status = response.status();
-    let content_type = response
-        .headers()
+    let headers = response.headers().clone();
+    let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
@@ -775,7 +793,7 @@ pub async fn send(app: &axum::Router, request: Request<Body>) -> TestResponse {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     };
     let raw = String::from_utf8_lossy(&bytes).into_owned();
-    TestResponse { status, json, content_type, raw }
+    TestResponse { status, json, content_type, raw, headers }
 }
 
 /// A temporary directory holding executable test scripts, removed on drop.

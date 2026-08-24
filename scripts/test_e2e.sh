@@ -4939,12 +4939,25 @@ log_section "54. args_template — Templated Argument-Vector Substitution"
 
 TEMPLATE_SCRIPT=$(make_hook_script "args_template_hook.sh" 'echo "argv:$1|$2"')
 
-# --- Validated against declared parameters at creation, same allowlist discipline as
-# sample_payload_json ---
+# --- A template referencing a parameter not declared in the same request is accepted at creation
+# — the WebUI's create flow has no parameter-declaring fields of its own, so a hook's parameters
+# are routinely added afterward via the Parameters modal's own endpoints, and requiring every
+# `$var` to already be declared in one request would make that ordinary flow fail with a 400
+# unrelated to anything the caller actually got wrong. The allowlist discipline is only deferred,
+# not abandoned: a dry run against the still-undeclared parameter blocks below. ---
 api_call POST "/api/hooks" "$MASTER_KEY" \
     "$(jq -nc --arg p "$TEMPLATE_SCRIPT" '{name:"args_template_undeclared",script_path:$p,parameters:[{param_key:"target_ip",is_required:true}],args_template:"add bad_ip ${target_ip} port ${target_port}"}')"
-check "400" "args_template referencing an undeclared parameter is refused at creation"
-check_true '.error | contains("target_port")' "the error names the undeclared parameter"
+check "200" "args_template referencing an undeclared parameter is accepted at creation, deferred"
+UNDECLARED_TEMPLATE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$UNDECLARED_TEMPLATE_HOOK_ID/test" "$MASTER_KEY" '{"parameters":{"target_ip":"203.0.113.5"}}'
+check "200" "dry run against the still-undeclared template is itself a normal request"
+check_true '.would_execute == false' "...but reports it would not actually execute"
+check_true '.command == null' "...with no command to show, since the template could not resolve"
+check_true '.blocking_reason | contains("target_port")' "the blocking reason names the undeclared parameter"
+
+api_call DELETE "/api/hooks/$UNDECLARED_TEMPLATE_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "clean up the deferred-validation probe hook"
 
 api_call POST "/api/hooks" "$MASTER_KEY" \
     "$(jq -nc --arg p "$TEMPLATE_SCRIPT" '{name:"args_template_hook",script_path:$p,parameters:[{param_key:"target_ip",is_required:true},{param_key:"port",default_value:"443",is_required:true}],args_template:"add bad_ip ${target_ip}:$port"}')"

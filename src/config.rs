@@ -475,6 +475,20 @@ const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const FALLBACK_TIMEOUT_SECONDS: u64 = 30;
 /// Default anti-replay window for signed requests, in seconds (5 minutes each way).
 const DEFAULT_SIGNATURE_MAX_AGE_SECONDS: i64 = 300;
+/// Default application-pool connection ceiling for PostgreSQL/MySQL. SQLite ignores this entirely
+/// — see `db::PoolLimits` for the backend-specific rules a bare number cannot express: an
+/// in-memory database is pinned to exactly one connection regardless of this setting (more than
+/// one connection to `sqlite::memory:` each get their own empty, isolated database), and a
+/// file-backed one clamps it far lower, since SQLite permits only one writer no matter how wide
+/// the pool is.
+const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 50;
+/// Default application-pool connection floor for PostgreSQL/MySQL. See
+/// [`DEFAULT_DATABASE_MAX_CONNECTIONS`] for why SQLite does not use this value directly.
+const DEFAULT_DATABASE_MIN_CONNECTIONS: u32 = 10;
+/// Default idle-connection reap window, in seconds, above [`DEFAULT_DATABASE_MIN_CONNECTIONS`].
+const DEFAULT_DATABASE_IDLE_TIMEOUT_SECS: u64 = 600;
+/// Default wait, in seconds, for a caller to acquire a pooled connection before failing.
+const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Immutable runtime configuration shared by every handler and background worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -535,6 +549,19 @@ pub struct RuntimeConfig {
     ///
     /// Entries may be addresses, CIDR ranges, or hostnames; see [`TrustedProxies`].
     pub trusted_proxies: TrustedProxies,
+    /// Application-pool connection ceiling, from `DATABASE_MAX_CONNECTIONS`. Applied directly on
+    /// PostgreSQL/MySQL; clamped on file-backed SQLite; ignored outright on in-memory SQLite. See
+    /// `db::PoolLimits::for_backend`.
+    pub database_max_connections: u32,
+    /// Application-pool connection floor, from `DATABASE_MIN_CONNECTIONS`. Same per-backend
+    /// treatment as [`RuntimeConfig::database_max_connections`].
+    pub database_min_connections: u32,
+    /// Seconds an idle pooled connection above the floor may sit before being closed, from
+    /// `DATABASE_IDLE_TIMEOUT_SECS`.
+    pub database_idle_timeout_secs: u64,
+    /// Seconds a caller may wait to acquire a pooled connection before the attempt fails, from
+    /// `DATABASE_ACQUIRE_TIMEOUT_SECS`.
+    pub database_acquire_timeout_secs: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -549,6 +576,10 @@ impl Default for RuntimeConfig {
             require_signed_requests: false,
             allowed_script_roots: Vec::new(),
             trusted_proxies: TrustedProxies::default(),
+            database_max_connections: DEFAULT_DATABASE_MAX_CONNECTIONS,
+            database_min_connections: DEFAULT_DATABASE_MIN_CONNECTIONS,
+            database_idle_timeout_secs: DEFAULT_DATABASE_IDLE_TIMEOUT_SECS,
+            database_acquire_timeout_secs: DEFAULT_DATABASE_ACQUIRE_TIMEOUT_SECS,
         }
     }
 }
@@ -637,6 +668,30 @@ impl RuntimeConfig {
                 defaults.require_signed_requests,
             ),
             allowed_script_roots,
+            // Clamped to at least 1: a pool of zero connections can serve nothing, which is a
+            // configuration foot-gun rather than a limit anyone intends. Backend- and
+            // topology-specific narrowing (in-memory SQLite pinned to 1, file-backed SQLite capped
+            // far lower) happens in `db::PoolLimits::for_backend`, not here — this is only the
+            // operator's stated ceiling for the backends that actually use it directly.
+            database_max_connections: parse_or_warn(
+                "DATABASE_MAX_CONNECTIONS",
+                defaults.database_max_connections,
+            )
+            .max(1),
+            database_min_connections: parse_or_warn(
+                "DATABASE_MIN_CONNECTIONS",
+                defaults.database_min_connections,
+            )
+            .max(1),
+            database_idle_timeout_secs: parse_or_warn(
+                "DATABASE_IDLE_TIMEOUT_SECS",
+                defaults.database_idle_timeout_secs,
+            ),
+            database_acquire_timeout_secs: parse_or_warn(
+                "DATABASE_ACQUIRE_TIMEOUT_SECS",
+                defaults.database_acquire_timeout_secs,
+            )
+            .max(1),
         })
     }
 

@@ -1652,6 +1652,61 @@ async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
     }
 }
 
+#[tokio::test]
+async fn a_running_hook_does_not_hold_the_database_connection_hostage() {
+    // `setup_test_db()`'s in-memory pool holds exactly one connection (SeaORM's own SQLite pin —
+    // see `db.rs`'s module header). Every database query `run_hook_request` issues before spawning
+    // the sub-process (`resolve_hook`, `guard_execute`, `load_parameters`) is a standalone pooled
+    // call that acquires and releases independently, and `executor::execute_hook` touches the
+    // database again only once, *after* the sub-process has fully exited, to insert the `executions`
+    // row — no transaction and no held connection guard spans the wait in between.
+    //
+    // If that ordering ever regressed — a connection (or a `DatabaseTransaction`) kept alive across
+    // the sub-process wait — this test would catch it directly: with only one connection in the
+    // pool, a second, completely unrelated query issued *while the hook is still sleeping* would have
+    // nothing to acquire and would block for the hook's entire runtime instead of returning promptly.
+    let dir = ScriptDir::new();
+    let marker = dir.path_for("running");
+    let script = dir.write_script("slow.sh", "touch \"$HOOK_PARAM_MARKER\"\nsleep 2");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (key_id, key) = insert_key(&db, "Slow", "0.0.0.0/0", KeyScopes::plain()).await;
+    let hook_id = insert_hook(&db, "slow", &script, 30).await;
+    insert_parameter(&db, hook_id, "marker", Some(&marker), true).await;
+    grant(&db, key_id, hook_id, true, false).await;
+
+    let uri = format!("/api/hooks/{hook_id}/execute");
+    let running = {
+        let app = app.clone();
+        let key = key.clone();
+        let uri = uri.clone();
+        tokio::spawn(async move { send(&app, json_request("POST", &uri, &key, None)).await })
+    };
+
+    let started =
+        wait_until(Duration::from_secs(10), async || std::path::Path::new(&marker).exists()).await;
+    assert!(started, "the hook never started");
+
+    // Issued *while the hook is still sleeping* — a request with nothing at all to do with the
+    // execution in flight, against the same (single-connection) pool.
+    let concurrent_started = std::time::Instant::now();
+    let concurrent = send(&app, json_request("GET", "/api/auth/me", &key, None)).await;
+    let concurrent_elapsed = concurrent_started.elapsed();
+
+    assert_eq!(concurrent.status, StatusCode::OK, "{}", concurrent.raw);
+    assert!(
+        concurrent_elapsed < Duration::from_millis(500),
+        "an unrelated query took {concurrent_elapsed:?} while a hook was executing — the pool's \
+         one connection was held for the sub-process's duration instead of being released before \
+         it was ever spawned"
+    );
+
+    let finished = running.await.expect("the hook's own request task completes");
+    assert_eq!(finished.status, StatusCode::OK, "{}", finished.raw);
+    assert_eq!(finished.field("status"), &json!("SUCCESS"));
+}
+
 // ─────────────────────────────────────────────────────────────
 // Validation (400)
 // ─────────────────────────────────────────────────────────────
@@ -2833,6 +2888,41 @@ async fn execution_history_is_scoped_and_filterable() {
         .to_owned();
     let cross_tenant = send(&app, json_request("GET", &format!("/api/executions/{beta_exec_id}"), &alpha, None)).await;
     assert_eq!(cross_tenant.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn execution_listing_exposes_pagination_headers_in_both_query_styles() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("ok.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let hook_id = insert_hook(&db, "paged_hook", &script, 30).await;
+
+    for _ in 0..5 {
+        send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None)).await;
+    }
+
+    // page/per_page style: page 1 of 2, per_page 3 -> 3 rows, 2 total pages.
+    let paged = send(&app, json_request("GET", "/api/executions?page=1&per_page=3", &master, None)).await;
+    assert_eq!(paged.status, StatusCode::OK);
+    assert_eq!(paged.json.as_array().map(Vec::len), Some(3));
+    assert_eq!(paged.header("x-total-count"), "5");
+    assert_eq!(paged.header("x-page"), "1");
+    assert_eq!(paged.header("x-per-page"), "3");
+    assert_eq!(paged.header("x-total-pages"), "2");
+
+    let second_page = send(&app, json_request("GET", "/api/executions?page=2&per_page=3", &master, None)).await;
+    assert_eq!(second_page.json.as_array().map(Vec::len), Some(2), "5 rows, 3 on page 1, 2 remain on page 2");
+    assert_eq!(second_page.header("x-page"), "2");
+
+    // legacy limit/offset style still reports the same total metadata.
+    let legacy = send(&app, json_request("GET", "/api/executions?limit=3&offset=3", &master, None)).await;
+    assert_eq!(legacy.json.as_array().map(Vec::len), Some(2));
+    assert_eq!(legacy.header("x-total-count"), "5");
+    assert_eq!(legacy.header("x-per-page"), "3");
+    assert_eq!(legacy.header("x-total-pages"), "2");
 }
 
 #[tokio::test]
@@ -7644,8 +7734,12 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
     let scripts = ScriptDir::new();
     let script = scripts.write_script("ipset_hook.sh", "#!/bin/sh\necho \"$@\"\n");
 
-    // A template referencing an undeclared parameter is refused at creation.
-    let undeclared = send(
+    // A template referencing a parameter not declared in the *same* request is accepted at
+    // creation — the WebUI's create flow has no parameter-declaring fields of its own, so a hook's
+    // parameters are routinely added afterward via the Parameters modal's own endpoints, and
+    // requiring every `$var` to already be declared in one request would make that ordinary,
+    // supported flow fail with a 400 unrelated to anything the caller actually got wrong.
+    let deferred = send(
         &app,
         json_request(
             "POST",
@@ -7660,8 +7754,59 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
         ),
     )
     .await;
-    assert_eq!(undeclared.status, StatusCode::BAD_REQUEST, "{}", undeclared.raw);
-    assert!(undeclared.raw.contains("target_port"), "the error names the undeclared parameter: {}", undeclared.raw);
+    assert_eq!(deferred.status, StatusCode::OK, "{}", deferred.raw);
+    let deferred_id = deferred.string("id");
+
+    // The allowlist discipline is not abandoned, only deferred: a dry run against the
+    // still-undeclared `target_port` fails exactly as `executor::resolve_args_template` documents,
+    // and declaring it is what a real operator does next.
+    let blocked = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{deferred_id}/test"),
+            &master,
+            Some(json!({ "parameters": { "target_ip": "203.0.113.5" } })),
+        ),
+    )
+    .await;
+    assert_eq!(blocked.status, StatusCode::OK, "{}", blocked.raw);
+    assert_eq!(blocked.field("would_execute"), &json!(false), "{}", blocked.raw);
+    assert!(blocked.field("command").is_null(), "{}", blocked.raw);
+    assert!(blocked.string("blocking_reason").contains("target_port"), "{}", blocked.raw);
+
+    // Declaring the missing parameter afterward — the deferred flow this relaxation exists for —
+    // is itself re-validated by `create_hook_parameter`'s sibling endpoints, and once declared, the
+    // template resolves normally.
+    let declare = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{deferred_id}/parameters"),
+            &master,
+            Some(json!({ "param_key": "target_port", "default_value": "443", "is_required": true })),
+        ),
+    )
+    .await;
+    assert_eq!(declare.status, StatusCode::OK, "{}", declare.raw);
+
+    let resolved = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{deferred_id}/test"),
+            &master,
+            Some(json!({ "parameters": { "target_ip": "203.0.113.5" } })),
+        ),
+    )
+    .await;
+    assert_eq!(resolved.field("would_execute"), &json!(true), "{}", resolved.raw);
+    assert_eq!(
+        resolved.json["command"]["args"],
+        json!(["add", "bad_ip", "203.0.113.5", "port", "443"]),
+        "{}",
+        resolved.raw
+    );
 
     // A template naming only declared parameters is accepted and stored verbatim.
     let ok = send(
@@ -7704,6 +7849,207 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
     .await;
     assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
     assert_eq!(cleared.field("args_template"), &json!(null));
+}
+
+/// Covers the WebUI's `deriveInitialParameters` (`static/app.js`): rather than saving a fresh hook
+/// with an empty parameter list, the create form derives `parameters` client-side from the Sample
+/// JSON Payload's own flat top-level keys and sends them inline in the same `POST /api/hooks`
+/// request — this is the shape that flow actually produces on the wire.
+#[tokio::test]
+async fn creating_a_hook_with_parameters_derived_from_its_own_sample_payload_succeeds() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("derive_hook.sh", "#!/bin/sh\necho \"$@\"\n");
+
+    // Every declared key has a matching sample entry — exactly what `deriveInitialParameters`
+    // always produces, since it only ever declares keys it found in the sample in the first place.
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "derived_params_hook",
+                "script_path": script,
+                "sample_payload_json": json!({ "target_ip": "203.0.113.5", "extra": "x" }).to_string(),
+                "parameters": [
+                    { "param_key": "target_ip", "default_value": "203.0.113.5", "is_required": true },
+                    { "param_key": "extra", "default_value": "x", "is_required": true }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let declared = created.field("parameters").as_array().cloned().unwrap_or_default();
+    assert_eq!(declared.len(), 2, "{}", created.raw);
+
+    // The unsafe shape this test guards against: a declared key absent from the sample. This is
+    // exactly what a naive version of `deriveInitialParameters` (one that also mined `args_template`
+    // for referenced-but-unsampled variable names) would have produced, and
+    // `validate_sample_payload_matches_parameters` correctly refuses it — the sample must be a
+    // *superset* of whatever gets declared, not merely overlap with it.
+    let unsafe_shape = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "unsampled_param_hook",
+                "script_path": script,
+                "sample_payload_json": json!({ "target_ip": "203.0.113.5" }).to_string(),
+                "parameters": [
+                    { "param_key": "target_ip", "default_value": "203.0.113.5", "is_required": true },
+                    { "param_key": "port", "is_required": true }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(unsafe_shape.status, StatusCode::BAD_REQUEST, "{}", unsafe_shape.raw);
+    assert!(unsafe_shape.string("error").contains("port"), "{}", unsafe_shape.raw);
+}
+
+#[tokio::test]
+async fn deleting_a_parameter_still_referenced_by_args_template_is_refused() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("del_param_hook.sh", "#!/bin/sh\necho ok\n");
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "delete_guard_hook",
+                "script_path": script,
+                "parameters": [
+                    {"param_key": "target_ip", "is_required": true},
+                    {"param_key": "port", "default_value": "443", "is_required": true}
+                ],
+                "args_template": "add ${target_ip}:$port"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+    let params: Vec<serde_json::Value> = created.json["parameters"].as_array().cloned().unwrap();
+    let target_ip_param_id =
+        params.iter().find(|p| p["param_key"] == "target_ip").unwrap()["id"].as_str().unwrap().to_owned();
+    let port_param_id =
+        params.iter().find(|p| p["param_key"] == "port").unwrap()["id"].as_str().unwrap().to_owned();
+
+    // `target_ip` is referenced by `args_template` — deleting it would leave the hook silently
+    // broken, so the deletion itself is refused rather than the breakage surfacing only at the
+    // next execution.
+    let refused = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/hooks/{hook_id}/parameters/{target_ip_param_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.raw);
+    assert!(refused.raw.contains("target_ip"), "the error names the still-referenced parameter: {}", refused.raw);
+
+    // The parameter survives the refused deletion.
+    let still_there = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}/parameters"), &master, None)).await;
+    assert_eq!(
+        still_there.json.as_array().map(Vec::len),
+        Some(2),
+        "a refused deletion must not have removed the row: {}",
+        still_there.raw
+    );
+
+    // Clearing the template first, then the same deletion succeeds — nothing references the
+    // parameter any more.
+    let cleared = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "args_template": "" }))),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
+
+    let allowed = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/hooks/{hook_id}/parameters/{target_ip_param_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::NO_CONTENT, "{}", allowed.raw);
+
+    // Deleting a parameter the (now-cleared) template never referenced in the first place was
+    // never blocked at all — `port` could have been removed just as freely before the clear above.
+    let unreferenced = send(
+        &app,
+        json_request("DELETE", &format!("/api/hooks/{hook_id}/parameters/{port_param_id}"), &master, None),
+    )
+    .await;
+    assert_eq!(unreferenced.status, StatusCode::NO_CONTENT, "{}", unreferenced.raw);
+}
+
+#[tokio::test]
+async fn updating_a_parameter_is_unaffected_by_args_template_revalidation() {
+    // `update_hook_parameter` re-validates the hook's current `args_template`/`sample_payload_json`
+    // against its full declared-key set on every call (see that handler's own comment on why) — but
+    // `param_key` is not a field `UpdateParameterPayload` carries at all, so the declared-key set
+    // cannot change as a result of this endpoint. This pins that the re-validation is genuinely
+    // inert: an update that only touches `description`/`default_value`/`is_required` succeeds
+    // regardless of what the hook's `args_template` references.
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("update_param_hook.sh", "#!/bin/sh\necho ok\n");
+
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "update_guard_hook",
+                "script_path": script,
+                "parameters": [{"param_key": "target_ip", "is_required": true}],
+                "args_template": "add ${target_ip}"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    let hook_id = created.string("id");
+    let param_id =
+        created.json["parameters"][0]["id"].as_str().expect("the declared parameter has an id").to_owned();
+
+    let updated = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}/parameters/{param_id}"),
+            &master,
+            Some(json!({ "default_value": "203.0.113.9", "is_required": false })),
+        ),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::OK, "{}", updated.raw);
+    assert_eq!(updated.field("default_value").as_str(), Some("203.0.113.9"));
 }
 
 #[tokio::test]
@@ -8014,4 +8360,84 @@ async fn args_template_drives_a_real_python_argparse_script() {
         "the real python interpreter actually parsed the substituted flags: {}",
         ran.raw
     );
+}
+
+#[tokio::test]
+async fn hook_responses_expose_an_invocable_webhook_path() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("url_hook.sh", "#!/bin/sh\necho ok\n");
+
+    // A name containing characters that would otherwise break a URL path segment, so the exposed
+    // `webhook_path` is checked against exactly the case percent-encoding exists for.
+    let created = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "url hook #2", "script_path": script })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    assert_eq!(created.field("webhook_path").as_str(), Some("/webhook/url%20hook%20%232"));
+
+    // `GET /api/hooks` and `GET /api/hooks/{id}` expose the same field, not only creation's response.
+    let hook_id = created.string("id");
+    let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
+    let listed_hook =
+        listed.json.as_array().unwrap().iter().find(|h| h["id"] == hook_id).expect("the hook is listed");
+    assert_eq!(listed_hook["webhook_path"], created.field("webhook_path").clone());
+
+    let fetched = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    assert_eq!(fetched.field("webhook_path"), created.field("webhook_path"));
+
+    // And the path is genuinely invocable, not merely well-formed — a keyed POST against exactly
+    // the exposed path runs the hook, the same as `/api/hooks/{id}/execute` would.
+    let invoked = send(&app, json_request("POST", fetched.string("webhook_path").as_str(), &master, None)).await;
+    assert_eq!(invoked.status, StatusCode::OK, "{}", invoked.raw);
+    assert_eq!(invoked.field("status"), &json!("SUCCESS"), "{}", invoked.raw);
+}
+
+#[tokio::test]
+async fn execution_records_capture_the_resolved_caller_ip() {
+    let db = setup_test_db().await;
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("ip_hook.sh", "#!/bin/sh\necho ok\n");
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    // No `TRUSTED_PROXIES` configured: `X-Forwarded-For` must be ignored entirely, and the
+    // recorded `caller_ip` must be the raw simulated TCP peer (`with_connect_info`'s 127.0.0.1) —
+    // never whatever an untrusted caller claims in a spoofable header.
+    {
+        let app = create_app(test_state(&db));
+        let hook_id = insert_hook(&db, "ip_hook_untrusted", &script, 30).await;
+
+        let mut req = json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None);
+        req.headers_mut().insert("X-Forwarded-For", "203.0.113.99".parse().unwrap());
+        let executed = send(&app, req).await;
+        assert_eq!(executed.status, StatusCode::OK, "{}", executed.raw);
+        assert_eq!(executed.field("caller_ip"), &json!("127.0.0.1"));
+
+        let history = send(&app, json_request("GET", "/api/executions", &master, None)).await;
+        let rows = history.json.as_array().cloned().unwrap_or_default();
+        let row = rows.iter().find(|r| r["hook_name"] == "ip_hook_untrusted").expect("row is present");
+        assert_eq!(row["caller_ip"], json!("127.0.0.1"));
+    }
+
+    // With `127.0.0.1` explicitly trusted, the same header is now honoured, and the rightmost
+    // untrusted hop is what gets recorded.
+    {
+        let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1"]));
+        let hook_id = insert_hook(&db, "ip_hook_trusted", &script, 30).await;
+
+        let mut req = json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None);
+        req.headers_mut().insert("X-Forwarded-For", "203.0.113.99".parse().unwrap());
+        let executed = send(&app, req).await;
+        assert_eq!(executed.status, StatusCode::OK, "{}", executed.raw);
+        assert_eq!(executed.field("caller_ip"), &json!("203.0.113.99"));
+    }
 }

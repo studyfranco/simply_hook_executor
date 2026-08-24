@@ -7206,3 +7206,253 @@ because python3 was present on this host; §54's argparse check degrades to a co
 — up from 1102 at session start · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence
 (pre-existing, unrelated), 0 drifted** — "Hooks are never spawned through a shell" still holds with
 `args_template` in place, confirming the new substitution path never introduces one.
+
+# 2026-08-24 — Security hardening pass: single-pass canonicalization, isolated migrations, tiered pool, hook URL exposure, pagination, caller IP tracking
+
+A 14-task brief from a "Senior Rust Architect / Systems Security Engineer / Database Performance
+Specialist" framing, covering `src/crypto.rs`, `src/db.rs`, `src/config.rs`, the hooks/executions API,
+and several WebUI bugfixes. Documented here in the order the brief itself used, not the order done.
+
+## 1–2. `render_canonical_template`: single-pass substitution (`src/crypto.rs`)
+
+**Real, confirmed vulnerability, not a hypothetical.** The previous implementation chained four
+sequential `str::replace` calls (`{method}` → `{path}` → `{timestamp}` → `{body}`). Each call rescans
+the **entire accumulated output**, including bytes a prior call just inserted. A caller-controlled
+`path` or `body` containing the literal text `{timestamp}` — an ordinary, unremarkable substring in a
+URL query string or a JSON body, nothing exotic — would have that literal text overwritten by the
+real timestamp on the next `.replace()`, exactly as if it had been part of the template. Two different
+`(method, path, timestamp, body)` tuples could then canonicalize to the *same* signed byte string: a
+canonicalization collision letting a signature valid for one request verify for a different one.
+
+Fixed by scanning `template` exactly once, left to right, appending substituted values to a separate
+output buffer that is never itself rescanned — a token-shaped substring inside a *substituted value*
+is data appended once, never a position the function inspects again. New regression test
+`render_canonical_template_never_rescans_substituted_values_for_placeholder_syntax` asserts a `path`
+containing literal `{timestamp}`/`{body}`/`{method}` and a `body` containing literal
+`{method}`/`{path}` all survive verbatim in the rendered output.
+
+## 3. Isolated migration execution phase (`src/db.rs`)
+
+New `run_migrations_isolated(db_url)`: opens a **dedicated, single-connection pool** (`PoolLimits::
+migration`, `max_connections = min_connections = 1`, no idle reaping), runs every pending
+`sea_orm_migration` migration against it, then closes that pool entirely before the caller ever opens
+the application pool. Applies on every backend, not only SQLite — this is about migration/application
+lifecycle separation, not journal-mode contention. `main.rs`'s startup sequence is now: migrate (isolated
+pool, closed) → connect (application pool, tiered per below) → bootstrap master key → pin → bind. New
+test `run_migrations_isolated_leaves_a_migrated_schema_for_a_later_connect` confirms a fresh
+`connect()` after the isolated pass sees the fully-migrated schema with no connection carried over.
+
+## 4. Tiered application pool (`src/config.rs`, `src/db.rs`)
+
+Four new operator-configurable env vars, all with defaults matching prior behavior:
+`DATABASE_MAX_CONNECTIONS` (50), `DATABASE_MIN_CONNECTIONS` (10), `DATABASE_IDLE_TIMEOUT_SECS` (600),
+`DATABASE_ACQUIRE_TIMEOUT_SECS` (10) — parsed via the existing `parse_or_warn` pattern, each clamped to
+a minimum of 1 (a pool of zero connections serves nothing).
+
+New `db::PoolLimits::for_backend(db_url, config)` applies these per-backend rather than uniformly,
+since a bare number cannot express the right answer for all three:
+- **In-memory SQLite** (`sqlite::memory:`, `sqlite://:memory:`, or `?mode=memory`) is pinned to
+  exactly 1/1, ignoring `config` outright — more than one connection to an in-memory database each get
+  their own empty, isolated database, so anything above 1 here is a correctness bug, not a tuning knob.
+- **File-backed SQLite** clamps the configured bounds to a much lower ceiling
+  (`FILE_SQLITE_MAX_CONNECTIONS_CAP = 10`, `FILE_SQLITE_MIN_CONNECTIONS_CAP = 2`) — SQLite's
+  single-writer limit makes a PostgreSQL-sized pool pure overhead regardless of what an operator sets.
+- **PostgreSQL/MySQL** apply the configured bounds directly, with `min_connections` also floored at
+  `max_connections` (never asking the pool to keep more idle connections open than it's allowed to
+  open at all).
+
+## Task 4 of the brief — DB/subprocess disentanglement audit: no bug found
+
+Audited every path from a DB query to a subprocess spawn (`executor::execute_hook`,
+`run_hook_request`) for a held connection or open transaction spanning process I/O. Found none: `_permit
+= state.limiter.try_acquire(key)` (a semaphore permit, not a DB handle) is the only thing held across
+`run_process()`, and the `execution::ActiveModel` insert happens strictly *after* the subprocess has
+already exited, once, at the very end. No change made — documented here per this project's established
+convention of recording a clean audit rather than inventing a fix for a premise that didn't hold (the
+same convention already applied to Task 13 below, and to an earlier session's DB/subprocess audit).
+
+## 5. Web form parameter payload alignment (`static/app.js`)
+
+The unified hook-config modal's create flow has no parameter-declaring UI fields of its own —
+parameters are normally added afterward through the separate Parameters modal, one at a time. A hook
+created with a filled-in Sample JSON Payload therefore saved with an *empty* parameter list and
+immediately failed its own dry run, even though the payload sitting right there in the same form
+already implied what the parameters should be.
+
+Fixed with `HookExecutorClient.deriveInitialParameters(samplePayloadRaw)`: derives an initial
+`parameters` array from every **flat** top-level key in the Sample JSON Payload (the same flat-value
+test the JSON Payload Extractor already uses — object/array values are skipped, since a parameter's
+value is always a single resolved string), each declared `is_required: true` with the sample's own
+value as its default — matching `addParameterFromExtractor`'s existing convention exactly.
+`submitHookConfig` sends this inline in `POST /api/hooks`'s `parameters` field, which the backend
+already accepted for exactly this "declare a hook and its parameters in one request" reason
+(`CreateHookPayload::parameters`'s own doc comment) — this was a WebUI gap, not a backend one.
+
+**Deliberately not sourced from `args_template`'s own `$var`/`${var}` references**, even though those
+are just as visible on the same form. `create_hook` still enforces
+`validate_sample_payload_matches_parameters`, which requires the sample to be a *superset* of whatever
+gets declared. A first implementation *did* mine `args_template` for variable names too, and it broke
+immediately in manual verification: a template-only variable absent from the sample got declared with
+no matching sample key, and creation failed with `400 sample_payload_json is missing the declared
+parameter(s): ...` — turning the fix into a new creation error the operator never asked for, worse
+than the empty-list status quo it existed to replace. Caught before commit by round-tripping the exact
+derived payload against a live daemon via `curl`, not just by reading the code. A template-only
+variable is left exactly where Task 6 below already puts it: creatable now, resolved later.
+
+New integration test `creating_a_hook_with_parameters_derived_from_its_own_sample_payload_succeeds`
+covers both the safe shape (declared keys ⊆ sample keys, succeeds) and the unsafe shape this bug would
+have produced (a declared key absent from the sample, correctly refused) as a regression guard.
+
+## 6–7. Deferred `args_template` validation, re-validated at every parameter mutation (`src/api/hooks.rs`)
+
+`create_hook` no longer calls `validate_args_template_matches_parameters` against the same request's
+`declared_keys`. Reason: the WebUI's create flow (see Task 5) routinely builds a hook's parameter
+contract in a second step, so `declared_keys` is often empty at creation regardless of what
+`args_template` will eventually need — requiring every `$var` to already be declared in the same
+request made "write the template first, add its parameters after" fail with a 400 unrelated to
+anything the caller actually got wrong. The same allowlist discipline is enforced at every place it can
+be enforced *meaningfully* instead: `create_hook_parameter`/`update_hook_parameter`/
+`delete_hook_parameter` each re-validate the hook's *current* template against the resulting parameter
+set, and `executor::resolve_args_template` still refuses at execution time regardless.
+
+Of the two re-validation call sites added, only one is load-bearing: `delete_hook_parameter`'s check
+against the *remaining* keys after the deletion is real (shrinking the declared set can break "template
+refs ⊆ declared"). `update_hook_parameter`'s equivalent check, and `validate_sample_payload_matches_
+parameters` in both endpoints, are provably inert no-ops given `param_key`'s immutability in
+`UpdateParameterPayload` and the direction of each invariant — added anyway per the brief's literal
+wording naming both endpoints, with the "why this can never currently fire" reasoning left in the code
+so a future revision that *does* make the key editable finds the check already there and already
+correct, rather than silently missing.
+
+New tests: `deleting_a_parameter_still_referenced_by_args_template_is_refused` (the load-bearing case,
+plus confirms clearing `args_template` first unblocks the same deletion) and
+`updating_a_parameter_is_unaffected_by_args_template_revalidation` (confirms the no-op case really is
+one). The pre-existing `args_template_is_validated_against_declared_parameters_at_create_and_update`
+was rewritten for the new creation-time behavior: an undeclared reference is now accepted at creation
+(`200`), a `/test` dry run against it correctly reports `would_execute: false` with a `blocking_reason`
+naming the missing parameter, and declaring it afterward makes the same dry run resolve normally.
+
+## 10. Hook execution URL exposure (`src/api/hooks.rs`, `static/`)
+
+`HookDetail` gained `webhook_path: String` — `/webhook/{name}`, computed fresh from the hook's own name
+on every response rather than stored, so a rename is reflected immediately with no backfill migration
+needed. A path, not a full URL: this server cannot reliably know its own externally-visible
+scheme/host behind a reverse proxy, so guessing one here would be wrong exactly the deployments most
+likely to want this field. New `percent_encode_path_segment` (hand-rolled, RFC 3986 `unreserved` set,
+no new dependency) closes a real, previously-latent gap: `hook.name` has no charset restriction beyond
+"non-empty after trim", so embedding it raw into a URL path segment could produce a broken or
+ambiguous URL for a name containing `/`, `#`, `?`, or spaces.
+
+WebUI: `HookExecutorClient.deriveWebhookUrl(webhookPath)` combines the path with `window.location.
+origin` and a reverse-proxy-aware directory prefix (mirroring the established `deriveRequestBase()`
+technique) to build a fully-qualified URL for third-party webhook configuration. A new 🔗 icon button
+next to each hook's name (`.btn-icon-inline`, `copyHookWebhookUrl`) copies it via `navigator.clipboard`
+where available, falling back to a hidden-`<textarea>` + `execCommand('copy')` for a plain-HTTP LAN
+deployment where `crypto.subtle`-style secure-context APIs are absent — the same secure/insecure split
+already established for `PureCrypto`. A real, minor CSS bug surfaced during headless-Chromium visual
+verification: the hooks table's NAME column, sized by auto table layout, wrapped the new button onto a
+second line under ordinary column-width contention; fixed with `white-space: nowrap` on the cell.
+
+## 11. Execution logs pagination (`src/api/executions.rs`, `static/`)
+
+Backend: `ExecutionQuery` gained `page`/`per_page` (page-oriented) alongside the existing
+`limit`/`offset`; `resolve_pagination` reconciles whichever pair was sent into one `(limit, offset,
+page, per_page)` tuple, `page`/`per_page` taking precedence when both are present. Response carries
+`X-Total-Count`/`X-Page`/`X-Per-Page`/`X-Total-Pages` **headers** rather than wrapping the JSON body in
+an envelope — deliberately, since the response body staying a bare array is what every existing
+integration test and the entire `test_e2e.sh` suite already assumes, and GitHub's own paginated APIs
+use the same header-based shape for the same reason. The total count is taken via `.count()` on a
+*clone* of the filtered-but-unpaged query builder (`Select<E>: Clone`), before `.limit()`/`.offset()`
+narrow it to one page, so "how many total" is never accidentally "how many on this page."
+
+WebUI: `PagedCache` (the existing chunk-fetch-then-local-page abstraction shared with the Audit Logs
+tab) gained `setPageSize()` (mirrors `simply_ip_vault`'s own `PagedCache`) and a `totalCount` field,
+populated when `fetchChunk` returns `{ items, totalCount }` instead of a bare array — normalized so the
+class still works unchanged for Audit Logs, which has no server-side total to report.
+`fetchExecutionsChunk` now requests headers via a new `apiFetch` option (`{ withHeaders: true }`,
+returning `{ data, headers }` instead of just the body) and reads `X-Total-Count` off the response.
+`updateExecPaginationUI` renders an exact "Page X of Y" (from the authoritative total, not merely how
+much has been fetched into the local cache) plus a total-count label and a 15/25/50/100 items-per-page
+`<select>`. A CSS fix was needed alongside: `.select-field`'s `width: 100%` filled nearly the entire
+pagination bar next to a short label; scoped down with `.pagination .select-field { width: auto; flex:
+0 0 auto; }`.
+
+New backend test `execution_listing_exposes_pagination_headers_in_both_query_styles` asserts the exact
+headers/counts in both query styles against 5 seeded executions (`page=1&per_page=3` → 3 rows, headers
+`x-total-count: 5`/`x-page: 1`/`x-total-pages: 2`; the legacy `limit=3&offset=3` reports the identical
+total metadata). `tests/common/mod.rs`'s `TestResponse` gained a `headers: HeaderMap` field (`send()`
+now clones the full response header map, not only `content_type`) plus a `.header(name)` accessor, to
+make this assertable at all — previously only the body was captured.
+
+Verified live, not only by the automated suite: headless-Chromium screenshots against a real running
+daemon (42 seeded executions) confirmed "Page 1 of 3 · 42 total · Per page: 15" rendering correctly,
+and scripted interaction (switch to 25/page, click Next) correctly landed on "Page 2 of 2" with 17 rows
+— exact arithmetic match for 42 items at 25/page.
+
+## 12. Caller IP tracking (`src/entities/execution.rs`, `src/executor.rs`, `src/api/executions.rs`, `static/`)
+
+New migration `m20260824_090000_add_execution_caller_ip` adds `executions.caller_ip`
+(`NOT NULL DEFAULT ''`, `String`) — the same type and NOT-NULL-with-empty-default convention already
+used for `audit_logs.client_ip`, for the identical reason: SeaORM/sea-query has no portable `INET` type
+across SQLite/PostgreSQL/MySQL. **No new IP-resolution logic was written.** `config::resolve_client_ip`
+already implements the trust-aware resolution (`X-Forwarded-For`/`X-Real-IP` consulted only when the
+direct TCP peer is itself a configured `TRUSTED_PROXIES` entry, the raw peer address otherwise), and
+`invocation_auth_middleware` already resolves it into an `Extension<ClientIp>` present on every request
+that can reach a hook-execution handler, keyed or keyless, in every `auth_mode`. The only gap was that
+`execute_hook_endpoint`/`webhook_execute` never actually *extracted* that extension. Both now do, and
+thread `client_ip.0` through `run_hook_request` into `executor::execute_hook` (new `caller_ip:
+std::net::IpAddr` parameter), which sets it on the `ActiveModel`. `ExecutionView` exposes it verbatim.
+
+WebUI: a "Caller IP" column added to the Execution History table (`renderExecutionsTable`, `<thead>`
+colspan bumped 8→9 throughout) and to the Execution Detail modal (`openExecutionModal`).
+
+New test `execution_records_capture_the_resolved_caller_ip` is the security-relevant one: with no
+`TRUSTED_PROXIES` configured, a request forging `X-Forwarded-For: 203.0.113.99` against the simulated
+`127.0.0.1` peer still records `caller_ip: "127.0.0.1"` — the header is provably ignored, not merely
+untested. A second block with `127.0.0.1` explicitly trusted confirms the same header *is* honoured
+once the peer is actually a configured proxy, recording `203.0.113.99`. Verified live against a real
+daemon too: the same spoofing attempt via `curl -H "X-Forwarded-For: ..."` against an untrusted-peer
+daemon recorded `127.0.0.1` in both the API response and the WebUI's new column, matching the automated
+test's assertion exactly.
+
+## 13. `file:///` URI audit: no bug found
+
+Exhaustive grep across every static asset and source file for `file://` found zero occurrences
+anywhere in the current tree. This task's premise does not hold against the codebase as it stands —
+likely already resolved by an earlier commit, or written against a different/hypothetical scenario. No
+change made; documented here rather than inventing a fix, per this session's and prior sessions'
+established "audit found nothing, say so" convention (see Task 4 above).
+
+## 8–9. Two small WebUI defensive fixes (`static/app.js`)
+
+- **`manageKeyRights()`**: the hidden `#manage-rights-hook` combobox value and its visible search text
+  are now explicitly cleared alongside `document.getElementById('form-manage-rights').reset()`, rather
+  than relying on native form reset alone — `SearchableSelect.select()` sets both via a bare `.value =`
+  assignment, which native `.reset()` should already restore to its empty default regardless, but the
+  function already redundantly re-set the Execute checkbox the same way one line below, so this closes
+  the same gap on the same defensive footing rather than trusting the platform in one spot and not the
+  other.
+- **`parseJsonExtractor()`**: now clears `errorBox.textContent` alongside the existing
+  `classList.add('hidden')` at the top of every call. The visibility toggle already ran unconditionally
+  on every invocation (so a stale error was never actually visible after a subsequent successful
+  parse), but the text itself lingered in the hidden DOM node between calls; now cleared too.
+
+## Verification method
+
+Every WebUI-facing change in this session (Tasks 5, 8, 9, 10, 11, 12) was checked against a real,
+locally-running daemon via headless Chromium, not only by reading the code or by the Rust/e2e suites —
+continuing the iframe-seeded-localStorage harness technique established in earlier sessions
+(`static/_verify_harness.html`, scratch-only, deleted before commit, never part of the shipped tree).
+This caught one real bug before it shipped: Task 5's first implementation (mining `args_template` for
+variable names in addition to the sample payload) failed a live `curl` round-trip against
+`sample_payload_json`'s superset requirement, which no amount of reading the diff had surfaced.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**153 passed / 0 failed / 2 ignored** across the integration binary (plus 127 lib tests and the other
+suites unchanged) · `cargo test -- --ignored` **2 passed** · `./scripts/test_e2e.sh` **1137 passed / 0
+failed / 0 skipped** (up from 1133 at session start — one stale §54 check asserting the *old*
+creation-time `args_template` rejection needed the same rewrite as its Rust counterpart, once Task 6's
+relaxation made the old expectation wrong) · `./scripts/verify_convergence.sh` **18 converged, 1 known
+divergence (pre-existing, unrelated), 0 drifted**.

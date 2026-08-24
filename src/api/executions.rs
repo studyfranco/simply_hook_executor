@@ -13,7 +13,7 @@ use axum::{
 };
 use sea_orm::{
     ColumnTrait, Condition, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -70,6 +70,11 @@ pub struct ExecutionView {
     pub duration_ms: i32,
     /// Execution start timestamp.
     pub timestamp: chrono::NaiveDateTime,
+    /// The resolved client IP of whoever triggered this execution — same trust-aware resolution
+    /// (`X-Forwarded-For`/`X-Real-IP` only from a configured trusted proxy, the raw TCP peer
+    /// otherwise) as `audit_logs.client_ip`. Empty for any execution recorded before this field
+    /// existed.
+    pub caller_ip: String,
 }
 
 impl ExecutionView {
@@ -94,6 +99,7 @@ impl ExecutionView {
             parameters,
             duration_ms: model.duration_ms,
             timestamp: model.timestamp,
+            caller_ip: model.caller_ip,
         }
     }
 }
@@ -119,6 +125,7 @@ pub(crate) async fn run_hook_request(
     key: Option<api_key::Model>,
     identifier: &str,
     body: &[u8],
+    caller_ip: std::net::IpAddr,
 ) -> Result<axum::response::Response, AppError> {
     let hook_model = resolve_hook(&state.db, identifier).await?;
     if let Some(key) = &key {
@@ -136,7 +143,7 @@ pub(crate) async fn run_hook_request(
         )));
     }
 
-    let record = executor::execute_hook(&state, &hook_model, key.as_ref(), &resolved).await?;
+    let record = executor::execute_hook(&state, &hook_model, key.as_ref(), &resolved, caller_ip).await?;
     let api_key_name = key.as_ref().map(|k| k.name.clone());
 
     // `200 OK` reports that the *request* was carried out; whether the script itself succeeded is
@@ -157,10 +164,11 @@ pub(crate) async fn run_hook_request(
 pub async fn execute_hook_endpoint(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
+    Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body).await
+    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body, client_ip.0).await
 }
 
 /// Handles `POST /webhook/{identifier}` — the webhook-facing alias of the execute endpoint, for
@@ -168,10 +176,11 @@ pub async fn execute_hook_endpoint(
 pub async fn webhook_execute(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
+    Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body).await
+    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body, client_ip.0).await
 }
 
 /// Dry-run preview returned by `POST /api/hooks/{id}/test`.
@@ -285,10 +294,39 @@ pub struct ExecutionQuery {
     pub since: Option<String>,
     /// Only executions strictly before this instant. RFC 3339, matching `audit::AuditLogQuery::until`.
     pub until: Option<String>,
-    /// Pagination limit.
+    /// Pagination limit. Ignored when [`ExecutionQuery::per_page`] is also present — see
+    /// [`resolve_pagination`].
     pub limit: Option<u64>,
-    /// Pagination offset.
+    /// Pagination offset. Ignored when [`ExecutionQuery::page`] is also present.
     pub offset: Option<u64>,
+    /// 1-indexed page number, an alternative to [`ExecutionQuery::offset`] for a caller that thinks
+    /// in pages rather than a raw row offset (the WebUI's own pagination controls). Takes
+    /// precedence over `offset` when both are present; `1` if absent while
+    /// [`ExecutionQuery::per_page`] is.
+    pub page: Option<u64>,
+    /// Items per page, an alternative to [`ExecutionQuery::limit`]. Takes precedence over `limit`
+    /// when both are present.
+    pub per_page: Option<u64>,
+}
+
+/// Resolves a query's `limit`/`offset`, preferring the `page`/`per_page` spelling when either is
+/// present — the two are two names for the same two numbers, never combined field-by-field, so a
+/// request naming `page` but not `per_page` still gets `per_page`'s default rather than pairing a
+/// page number against a leftover `limit`.
+///
+/// Returns `(limit, offset, page, per_page)` — `page`/`per_page` are always returned (derived from
+/// `offset`/`limit` when the caller used that spelling instead) so the response can report them
+/// back unconditionally, regardless of which style the request used.
+pub(crate) fn resolve_pagination(page: Option<u64>, per_page: Option<u64>, limit: Option<u64>, offset: Option<u64>) -> (u64, u64, u64, u64) {
+    if page.is_some() || per_page.is_some() {
+        let per_page = per_page.unwrap_or(DEFAULT_PAGE_LIMIT).max(1);
+        let page = page.unwrap_or(1).max(1);
+        (per_page, (page - 1) * per_page, page, per_page)
+    } else {
+        let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1);
+        let offset = offset.unwrap_or(0);
+        (limit, offset, offset / limit + 1, limit)
+    }
 }
 
 /// Parses a status filter, rejecting anything outside the enum.
@@ -363,10 +401,18 @@ pub async fn list_executions(
         q = q.filter(execution::Column::Timestamp.lt(crate::api::support::parse_instant("until", until)?));
     }
 
+    let (limit, offset, page, per_page) =
+        resolve_pagination(query.page, query.per_page, query.limit, query.offset);
+
+    // Counted over the *same* filtered-but-unpaged query, before `.limit()`/`.offset()` narrow it
+    // to one page — otherwise "how many total" would just be "how many on this page".
+    let total_count = q.clone().count(&state.db).await?;
+    let total_pages = total_count.div_ceil(per_page).max(1);
+
     let rows = q
         .find_also_related(Hook)
-        .limit(query.limit.unwrap_or(DEFAULT_PAGE_LIMIT))
-        .offset(query.offset.unwrap_or(0))
+        .limit(limit)
+        .offset(offset)
         .all(&state.db)
         .await?;
 
@@ -394,7 +440,39 @@ pub async fn list_executions(
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(views))
+    Ok((pagination_headers(total_count, page, per_page, total_pages)?, Json(views)))
+}
+
+/// Builds the `X-Total-Count`/`X-Page`/`X-Per-Page`/`X-Total-Pages` response headers pagination
+/// metadata rides on.
+///
+/// Headers, not a wrapper object around the JSON array: the response body staying a bare array is
+/// what every existing caller of `GET /api/executions` — this codebase's own integration and e2e
+/// suites included — already assumes, and there is no reason a caller uninterested in the total
+/// count should have to unwrap an envelope to reach the rows it always wanted. This is the same
+/// shape GitHub's and other paginated REST APIs use for exactly this reason.
+fn pagination_headers(
+    total_count: u64,
+    page: u64,
+    per_page: u64,
+    total_pages: u64,
+) -> Result<axum::http::HeaderMap, AppError> {
+    let mut headers = axum::http::HeaderMap::new();
+    for (name, value) in [
+        ("x-total-count", total_count),
+        ("x-page", page),
+        ("x-per-page", per_page),
+        ("x-total-pages", total_pages),
+    ] {
+        headers.insert(
+            axum::http::HeaderName::from_static(name),
+            // Always a plain ASCII digit string, so this can never actually fail — handled as a
+            // real `Result` anyway, per `AGENT.MD`'s "zero `.unwrap()`/`.expect()`" rule, rather
+            // than asserting an invariant the type system does not itself encode.
+            value.to_string().parse().map_err(|_| AppError::Internal)?,
+        );
+    }
+    Ok(headers)
 }
 
 /// Handles `GET /api/executions/{id}` — one execution with its full captured output.

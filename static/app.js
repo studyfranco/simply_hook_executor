@@ -117,6 +117,17 @@ class PagedCache {
         this.hasMoreOnServer = true;
         this.localPage = 0;
         this.prefetching = null; // in-flight prefetch promise, if any
+        this.totalCount = null; // authoritative server-side total, once a chunk has reported one
+    }
+
+    // Changes how many rows a local page holds, keeping the user roughly where they were: the
+    // first row currently on screen stays on screen rather than snapping back to page 1.
+    setPageSize(size) {
+        const next = Math.max(1, Math.floor(size));
+        if (next === this.pageSize) return;
+        const firstVisible = this.localPage * this.pageSize;
+        this.pageSize = next;
+        this.localPage = Math.floor(firstVisible / next);
     }
 
     get totalLocalPages() {
@@ -140,10 +151,19 @@ class PagedCache {
     // Discards everything cached and fetches a fresh first chunk — used on initial load and
     // whenever the active filters change (a different query is a different dataset, not more
     // pages of the old one).
+    // `fetchChunk` may return either a plain array (the audit log's shape — no server-side total is
+    // available) or `{ items, totalCount }` (executions — `resolve_pagination`/`pagination_headers`
+    // in `src/api/executions.rs` report an authoritative count). Normalized here so the rest of this
+    // class never needs to know which caller it's talking to.
+    _normalizeChunk(result) {
+        return Array.isArray(result) ? { items: result, totalCount: null } : result;
+    }
+
     async loadFirstChunk() {
         this.reset();
-        const chunk = await this.fetchChunk(0, this.chunkSize);
+        const { items: chunk, totalCount } = this._normalizeChunk(await this.fetchChunk(0, this.chunkSize));
         this.items = chunk;
+        if (totalCount !== null && totalCount !== undefined) this.totalCount = totalCount;
         this.serverOffset = chunk.length;
         this.hasMoreOnServer = chunk.length === this.chunkSize;
         this._maybePrefetch();
@@ -153,8 +173,11 @@ class PagedCache {
         if (!this.hasMoreOnServer) return;
         if (this.prefetching) return this.prefetching;
         this.prefetching = (async () => {
-            const chunk = await this.fetchChunk(this.serverOffset, this.chunkSize);
+            const { items: chunk, totalCount } = this._normalizeChunk(
+                await this.fetchChunk(this.serverOffset, this.chunkSize)
+            );
             this.items = [...this.items, ...chunk];
+            if (totalCount !== null && totalCount !== undefined) this.totalCount = totalCount;
             this.serverOffset += chunk.length;
             this.hasMoreOnServer = chunk.length === this.chunkSize;
             this.prefetching = null;
@@ -606,6 +629,27 @@ class HookExecutorClient {
     }
 
     /**
+     * Builds the full, absolute URL a third-party sender would actually POST to for one hook's
+     * `webhook_path` (e.g. `/webhook/ban_ip`) — the thing worth copying into a GitHub/Forgejo
+     * webhook config, unlike an API request, which is always same-origin and needs no scheme or
+     * host at all.
+     *
+     * Reuses `deriveRequestBase`'s own directory-detection technique rather than hardcoding `/`:
+     * `/webhook/*` is mounted at the same reverse-proxy-visible root `/api/*` is (see `src/lib.rs`),
+     * so a dashboard served under a subpath must prefix the webhook path with that same subpath, not
+     * assume it is served from the domain root. This is also `Task 13`'s fix point of principle:
+     * never fabricate an absolute URL from a hardcoded scheme/host/prefix — derive it from
+     * `window.location`, the one source that is actually correct for wherever this page was loaded
+     * from.
+     */
+    static deriveWebhookUrl(webhookPath) {
+        const path = window.location.pathname;
+        const dir = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+        const fullPath = `${dir}${webhookPath.replace(/^\//, '')}`.replace(/\/{2,}/g, '/');
+        return `${window.location.origin}${fullPath}`;
+    }
+
+    /**
      * Persists the API base path override and applies it to this session.
      *
      * Only signing is affected — where requests are *sent* stays derived from the page location.
@@ -680,7 +724,10 @@ class HookExecutorClient {
                 throw new Error(errMsg);
             }
 
-            return data;
+            // Opt-in: a caller that needs response headers (pagination metadata rides on
+            // `X-Total-Count` etc. rather than in the JSON body — see `fetchExecutionsChunk`) asks
+            // for them explicitly; everyone else keeps the plain-body return they already expect.
+            return options.withHeaders ? { data, headers: res.headers } : data;
 
         } catch (error) {
             this.showToast(error.message, 'error');
@@ -995,7 +1042,9 @@ class HookExecutorClient {
         if (since) params.append('since', since);
         if (until) params.append('until', until);
 
-        return await this.apiFetch(`/executions?${params.toString()}`);
+        const { data, headers } = await this.apiFetch(`/executions?${params.toString()}`, { withHeaders: true });
+        const totalCount = parseInt(headers.get('x-total-count'), 10);
+        return { items: data, totalCount: Number.isNaN(totalCount) ? null : totalCount };
     }
 
     clearExecutionFilters() {
@@ -1100,6 +1149,47 @@ class HookExecutorClient {
             toast.classList.remove('visible');
             setTimeout(() => toast.remove(), 300);
         }, 3000);
+    }
+
+    /**
+     * Copies `text` to the clipboard, same secure/insecure-context split this dashboard already
+     * applies to HMAC signing (see `RequestSigner`): `navigator.clipboard` exists only in a secure
+     * context (HTTPS or `localhost`), and this daemon is routinely reached over plain HTTP at a LAN
+     * address, which is a deployment choice, not a reason a copy button should silently do nothing.
+     * The fallback (`execCommand('copy')` on a temporary, invisible textarea) is deprecated but
+     * still universally supported, which is exactly the trade-off worth making for one narrow,
+     * non-security-critical convenience feature.
+     */
+    async copyToClipboard(text) {
+        if (window.isSecureContext && navigator.clipboard) {
+            await navigator.clipboard.writeText(text);
+            return;
+        }
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        try {
+            if (!document.execCommand('copy')) throw new Error('execCommand returned false');
+        } finally {
+            document.body.removeChild(textarea);
+        }
+    }
+
+    // Copies one hook's execution URL — see `HookExecutorClient.deriveWebhookUrl`.
+    async copyHookWebhookUrl(hookId) {
+        const hook = this.state.hooks.find(h => h.id === hookId);
+        if (!hook) return;
+        const url = HookExecutorClient.deriveWebhookUrl(hook.webhook_path);
+        try {
+            await this.copyToClipboard(url);
+            this.showToast(`Execution URL copied: ${url}`, 'success');
+        } catch (e) {
+            this.showToast(`Could not copy automatically — the execution URL is ${url}`, 'error');
+        }
     }
 
     // Custom dark-themed replacement for window.confirm(). Every call re-binds its own listeners
@@ -1245,7 +1335,7 @@ class HookExecutorClient {
         const rows = this.execCache.currentPageItems;
 
         if (rows.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No executions recorded.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">No executions recorded.</td></tr>';
         } else {
             tbody.innerHTML = rows.map(e => `
                 <tr>
@@ -1256,6 +1346,7 @@ class HookExecutorClient {
                     <td>${this.statusBadge(e.status)}</td>
                     <td class="font-mono text-sm">${e.exit_code === null || e.exit_code === undefined ? '–' : e.exit_code}</td>
                     <td class="text-sm">${formatDuration(e.duration_ms)}</td>
+                    <td class="font-mono text-sm">${e.caller_ip ? escapeHtml(e.caller_ip) : '<span class="text-muted">–</span>'}</td>
                     <td>
                         <div class="flex gap-2">
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openExecutionModal('${e.id}')">View</button>
@@ -1275,9 +1366,25 @@ class HookExecutorClient {
     }
 
     updateExecPaginationUI() {
-        document.getElementById('exec-btn-prev').disabled = !this.execCache.hasPrevPage;
-        document.getElementById('exec-btn-next').disabled = !this.execCache.hasNextPage;
-        document.getElementById('exec-page-indicator').textContent = `Page ${this.execCache.localPage + 1}`;
+        const cache = this.execCache;
+        document.getElementById('exec-btn-prev').disabled = !cache.hasPrevPage;
+        document.getElementById('exec-btn-next').disabled = !cache.hasNextPage;
+
+        // `totalCount` is the server's authoritative row count (from `X-Total-Count`), so the page
+        // count it implies is exact — unlike `cache.totalLocalPages`, which only knows about rows
+        // fetched into the client cache so far and would under-report until the last chunk arrives.
+        const totalPages = cache.totalCount !== null
+            ? Math.max(1, Math.ceil(cache.totalCount / cache.pageSize))
+            : (cache.hasMoreOnServer ? `${cache.totalLocalPages}+` : cache.totalLocalPages);
+        document.getElementById('exec-page-indicator').textContent = `Page ${cache.localPage + 1} of ${totalPages}`;
+
+        const countLabel = document.getElementById('exec-total-count');
+        if (countLabel) countLabel.textContent = cache.totalCount !== null ? `${cache.totalCount} total` : '';
+
+        const pageSizeSelect = document.getElementById('exec-page-size');
+        if (pageSizeSelect && document.activeElement !== pageSizeSelect) {
+            pageSizeSelect.value = String(cache.pageSize);
+        }
     }
 
     // ───────────────────────────────────────────────────────
@@ -1509,6 +1616,7 @@ class HookExecutorClient {
                     <div class="kv-item"><span class="kv-key">Exit code</span><span class="kv-value font-mono">${escapeHtml(e.exit_code === null ? '–' : e.exit_code)}</span></div>
                     <div class="kv-item"><span class="kv-key">Duration</span><span class="kv-value">${escapeHtml(formatDuration(e.duration_ms))}</span></div>
                     <div class="kv-item"><span class="kv-key">Started</span><span class="kv-value">${escapeHtml(new Date(e.timestamp + 'Z').toLocaleString())}</span></div>
+                    <div class="kv-item"><span class="kv-key">Caller IP</span><span class="kv-value font-mono">${e.caller_ip ? escapeHtml(e.caller_ip) : '<span class="text-muted">–</span>'}</span></div>
                     <div class="kv-item"><span class="kv-key">Execution ID</span><span class="kv-value font-mono text-sm">${escapeHtml(e.id)}</span></div>
                 `,
                 blocks: [
@@ -1679,7 +1787,11 @@ class HookExecutorClient {
                 return `
                 <tr>
                     <td>${deletable ? `<input type="checkbox" class="row-select" data-id="${h.id}">` : ''}</td>
-                    <td><strong>${escapeHtml(h.name)}</strong></td>
+                    <td class="hook-name-cell">
+                        <strong>${escapeHtml(h.name)}</strong>
+                        <button type="button" class="btn-icon-inline" onclick="window.app.copyHookWebhookUrl('${h.id}')"
+                            title="Copy this hook's execution URL (${escapeHtml(h.webhook_path)})" aria-label="Copy execution URL">🔗</button>
+                    </td>
                     <td class="font-mono text-sm truncate">${escapeHtml(h.script_path)}</td>
                     <td>${this.privilegeBadge(h.run_as_user)}</td>
                     <td class="text-sm">${h.default_timeout_seconds}s</td>
@@ -1814,6 +1926,54 @@ class HookExecutorClient {
         return envLines.length ? `${envLines.join('\n')}\n${command}` : command;
     }
 
+    // Builds an initial parameter contract for hook *creation* from every flat top-level key in
+    // `samplePayloadRaw` (the same "flat" test the JSON Payload Extractor uses — object/array
+    // values are skipped, since a parameter's value is always a single resolved string). Without
+    // this, a hook created with a filled-in Sample JSON Payload would save with an empty parameter
+    // list and immediately fail its own dry run, requiring an operator to reopen the separate
+    // Parameters modal and re-declare keys the sample already showed. `POST /api/hooks` accepts
+    // `parameters` directly for exactly this reason (`CreateHookPayload::parameters`'s own doc
+    // comment).
+    //
+    // Deliberately **not** sourced from `argsTemplate`'s own `$var`/`${var}` references too, even
+    // though those are just as visible on the same form: `create_hook` still enforces
+    // `validate_sample_payload_matches_parameters`, which requires the sample to be a *superset* of
+    // whatever gets declared. A template-only variable absent from the sample would be declared
+    // with no matching sample key, failing that check and turning this convenience into a creation
+    // error the operator never asked for — worse than the empty-list status quo it exists to fix.
+    // A template-only variable is left exactly where Task 6 already put it: creatable now,
+    // resolved later, either by adding it through the Parameters modal or by execution's own
+    // `resolve_args_template` check.
+    //
+    // Always `is_required: true`, matching `addParameterFromExtractor`'s existing convention for
+    // declaring a key straight from a sample: the sample value becomes the default, so nothing
+    // about execution actually changes, and "required" only matters for a real invocation that
+    // omits the key *and* has no default to fall back on — which this default always rules out.
+    static deriveInitialParameters(samplePayloadRaw) {
+        let sample = {};
+        if (samplePayloadRaw && samplePayloadRaw.trim()) {
+            try {
+                const parsed = JSON.parse(samplePayloadRaw);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) sample = parsed;
+            } catch {
+                // Malformed JSON is the server's own validation's job on submit; derivation just
+                // yields no parameters rather than erroring early here.
+            }
+        }
+
+        return Object.entries(sample)
+            .filter(([key, value]) => {
+                const flat = value === null || ['string', 'number', 'boolean'].includes(typeof value);
+                return flat && executorIsValidParamKey(key);
+            })
+            .map(([key, value]) => ({
+                param_key: key,
+                description: null,
+                default_value: String(value),
+                is_required: true
+            }));
+    }
+
     // Recomputes and renders the hook-config modal's preview box. `fieldPrefix` is always
     // `'edit-hook'` — the single Create/Edit modal — and `hookId` is threaded through separately
     // because a brand-new hook not yet saved has no backing hook to read declared parameters from.
@@ -1893,6 +2053,8 @@ class HookExecutorClient {
         e.preventDefault();
         const id = document.getElementById('edit-hook-id').value;
         const forCreate = !id;
+        const argsTemplate = document.getElementById('edit-hook-args-template').value;
+        const samplePayloadJson = document.getElementById('edit-hook-sample-payload').value;
         const payload = {
             name: document.getElementById('edit-hook-name').value,
             script_path: document.getElementById('edit-hook-script-path').value,
@@ -1902,10 +2064,17 @@ class HookExecutorClient {
             // matters for edit; for create there is no prior state for the distinction to lose.
             run_as_user: document.getElementById('edit-hook-run-as-user').value.trim(),
             description: document.getElementById('edit-hook-description').value,
-            args_template: document.getElementById('edit-hook-args-template').value,
-            sample_payload_json: document.getElementById('edit-hook-sample-payload').value,
+            args_template: argsTemplate,
+            sample_payload_json: samplePayloadJson,
             ...this.collectHookAuthPayload(forCreate)
         };
+        // Creation only: the Parameters modal (`openParamsModal`) is how an *existing* hook's
+        // contract is edited afterward, and `UpdateHookPayload` has no `parameters` field at all —
+        // this is the one moment a parameter list can ride the same request as the hook itself.
+        if (forCreate) {
+            const parameters = HookExecutorClient.deriveInitialParameters(samplePayloadJson);
+            if (parameters.length) payload.parameters = parameters;
+        }
         try {
             if (forCreate) {
                 const created = await this.apiFetch('/hooks', { method: 'POST', body: JSON.stringify(payload) });
@@ -2105,7 +2274,11 @@ class HookExecutorClient {
         const raw = document.getElementById('json-extractor-input').value;
         const errorBox = document.getElementById('json-extractor-error');
         const results = document.getElementById('json-extractor-results');
+        // Both the visibility and the text itself: hiding alone would leave a stale message sitting
+        // in the DOM (still reachable by a screen reader on some hidden-element implementations)
+        // between a failed attempt and whatever this call renders next, success or another failure.
         errorBox.classList.add('hidden');
+        errorBox.textContent = '';
         results.innerHTML = '';
 
         let parsed;
@@ -2414,6 +2587,13 @@ class HookExecutorClient {
             await this.apiFetch(`/keys/${keyId}/permissions`, { method: 'POST', body: JSON.stringify(payload) });
             this.showToast('Hook rights assigned', 'success');
             document.getElementById('form-manage-rights').reset();
+            // `form.reset()` restores a plain `<input>` to its HTML-attribute default, but the hook
+            // combobox's hidden value was set by `SearchableSelect.select()` via a bare `.value =`
+            // assignment, which never touched that default — left alone, the previously chosen
+            // hook's id (and its visible search text) would survive the reset and silently carry
+            // over into the next grant.
+            document.getElementById('manage-rights-hook').value = '';
+            document.getElementById('manage-rights-hook-search').value = '';
             document.getElementById('manage-rights-execute').checked = true;
             this.loadKeys();
         } catch (err) {}
@@ -2729,6 +2909,11 @@ class HookExecutorClient {
         });
         document.getElementById('exec-btn-next').addEventListener('click', async () => {
             await this.execCache.nextPage();
+            this.renderExecutionsTable();
+            this.updateExecPaginationUI();
+        });
+        document.getElementById('exec-page-size').addEventListener('change', (e) => {
+            this.execCache.setPageSize(parseInt(e.target.value, 10));
             this.renderExecutionsTable();
             this.updateExecPaginationUI();
         });

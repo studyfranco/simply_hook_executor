@@ -17,15 +17,15 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 
 ## Coverage
 
-**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-21.
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-24.
 
 | Group | Files | Where documented here |
 | :--- | :--- | :--- |
 | Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 14 | Table under **`src/migration/`** (13 migrations + `mod.rs`) |
-| **Total** | **44** | — |
+| Migrations (`src/migration/*.rs`) | 15 | Table under **`src/migration/`** (14 migrations + `mod.rs`) |
+| **Total** | **45** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
 (verified passing 2026-08-21, all three silent):
@@ -715,7 +715,7 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 | `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. Also carries `sample_payload_json` (nullable, `m20260820_090000`) — a WebUI convenience only, never read by `executor::build_command_plan` — and `args_template` (nullable, `m20260821_090000`), which *is* read by it: an optional whitespace-tokenized argument-vector template with `$var`/`${var}` substitution, the templated alternative to appending every resolved parameter as a bare positional argument. See `middleware.rs` below |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
-| `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus` |
+| `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus`. Also carries `caller_ip` (`NOT NULL DEFAULT ''`, `m20260824_090000`) — the resolved client IP, same trust-aware resolution as `audit_log.rs`'s `client_ip` |
 | `audit_log.rs` | `audit_logs` | Attribution stored as text so it outlives the acting key |
 | `mod.rs`, `prelude.rs` | — | Registry and bulk import |
 
@@ -741,6 +741,7 @@ one that has shipped.
 | `m20260819_141730_consolidate_hmac_modes` | **Retires** `api_keys.hmac_mode = BODY_ONLY` (rewrites any stored row to `CANONICAL_V1` via a typed `sea_query::Query::update`, not raw SQL) and **adds** `api_keys.canonical_template` — see `entities/api_key.rs` above |
 | `m20260820_090000_add_hook_sample_payload` | `hooks.sample_payload_json` (nullable `TEXT`) — the WebUI's Live Command Preview / Run Hook launcher auto-fill source, see `entities/hook.rs` and `api/hooks.rs` above |
 | `m20260821_090000_add_hook_args_template` | `hooks.args_template` (nullable `TEXT`) — the templated alternative to plain positional arguments, substituted by `executor::build_command_plan`, see `entities/hook.rs` and `executor.rs` above |
+| `m20260824_090000_add_execution_caller_ip` | `executions.caller_ip` (`NOT NULL DEFAULT ''`) — the resolved client IP of whoever triggered the execution, threaded from `Extension<ClientIp>` through `executor::execute_hook`, see `entities/execution.rs` and `executor.rs` above |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the

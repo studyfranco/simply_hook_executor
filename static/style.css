@@ -415,6 +415,26 @@ body {
     font-size: 0.8rem;
 }
 
+/* A tiny, borderless icon trigger meant to sit inline beside text (a hook's name, in the hooks
+   table) rather than in a button row of its own — the "Copy Execution URL" action, specifically,
+   which is one click an operator reaches for occasionally, not a primary row action worth the same
+   visual weight as Run/Edit/Delete. */
+.btn-icon-inline {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 0 0.25rem;
+    font-size: 0.85rem;
+    line-height: 1;
+    vertical-align: middle;
+    opacity: 0.75;
+    transition: opacity var(--transition-base);
+}
+
+.btn-icon-inline:hover {
+    opacity: 1;
+}
+
 /* Solid, high-contrast style for the "Delete Selected" batch-action buttons — the previous
    transparent/red-on-red outline style (further dimmed by .btn:disabled's opacity when there
    was nothing selected) was effectively unreadable against the dark surface behind it. */
@@ -633,6 +653,13 @@ body {
     vertical-align: middle;
 }
 
+/* Keeps a hook's name and its inline "Copy Execution URL" button on one line. Without this,
+   auto table layout is free to size the column to the name alone and wrap the button onto a
+   second line the moment every other column's own content leaves it less room to give. */
+.hook-name-cell {
+    white-space: nowrap;
+}
+
 .data-table tbody tr {
     transition: background-color var(--transition-fast);
 }
@@ -813,6 +840,20 @@ body {
     font-weight: 500;
     min-width: 60px;
     text-align: center;
+    white-space: nowrap;
+}
+
+.pagination label {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+/* Without this, `.select-field`'s `width: 100%` fills whatever the flex row leaves it — which,
+   next to nothing but a short label, is nearly the entire pagination bar. */
+.pagination .select-field {
+    width: auto;
+    flex: 0 0 auto;
 }
 
 /* ─── Toast Notifications ───────────────────────────────── */

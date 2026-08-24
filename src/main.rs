@@ -270,16 +270,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://simply_hook_executor.db?mode=rwc".to_owned());
 
-    tracing::info!("Connecting to database...");
-    // `db::connect` rather than `Database::connect`: for SQLite it builds the pool from
-    // `SqliteConnectOptions`, which is the only place the per-connection pragmas can be declared
-    // such that a connection SQLx opens or recycles *later* inherits them. `apply_sqlite_pragmas`
-    // below then reports what actually took effect. Other backends take the plain path unchanged.
-    let db: DatabaseConnection = db::connect(&db_url).await?;
+    // `db::migrate_and_connect` runs migrations to completion on their own, throwaway,
+    // single-connection pool — closed before the application pool below is even constructed — then
+    // builds that application pool with its bounds resolved per backend and topology
+    // (`db::PoolLimits::for_backend`: pinned to one connection for `sqlite::memory:`, a small
+    // WAL-friendly multi-reader pool for file-backed SQLite, the operator-configured bounds
+    // directly for PostgreSQL/MySQL). No connection the application ever hands out was open while a
+    // migration was in flight, which is what makes it safe for that pool to be wider than one
+    // connection at all — see `db`'s module header for the race this closes.
+    tracing::info!("Preparing database (migrations, then the application pool)...");
+    let db: DatabaseConnection = db::migrate_and_connect(&db_url, &config).await?;
 
-    // Before migrations: the migration run is itself a long write, and is exactly the moment a
-    // concurrently-starting replica would otherwise hit SQLITE_BUSY.
-    //
     // Explicitly non-fatal, and the `if let` rather than `?` is the point. These are *performance*
     // pragmas: WAL removes reader/writer contention and the busy timeout absorbs writer collisions,
     // but the daemon is entirely correct without either. Refusing to boot over one — on a
@@ -291,8 +292,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              reduced write concurrency, but correctness is unaffected."
         );
     }
-
-    db::run_migrations(&db).await?;
 
     // Built before the bootstrap key is minted, since that key's signing secret is sealed with it.
     // A malformed SIGNING_SECRET_KEY stops startup here rather than silently degrading to writing
