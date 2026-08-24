@@ -619,6 +619,29 @@ class HookExecutorClient {
     async init() {
         this.bindEvents();
 
+        // This dashboard is a same-origin SPA: every request it makes is a `fetch()` back to
+        // whatever server it was itself served from. Opened directly as a local file (double-
+        // clicking `index.html` instead of reaching it through the daemon's own HTTP server —
+        // there is no code path in this app that would ever navigate here on its own), the page's
+        // own origin *is* `file://`, and browsers refuse a `file://` page's `fetch()`/XHR calls
+        // outright as a security boundary — independent of whether the path requested is relative
+        // or root-relative, since it is the *origin*, not the path scheme, that is refused. That
+        // surfaces as a confusing "Content may not load or link to file:///..." console warning on
+        // every request this page tries to make (login included), rather than a clear explanation.
+        // Caught here, before anything tries to fetch, the same way `SigningBackend.available`
+        // below refuses loudly rather than letting an unusable session start silently.
+        if (window.location.protocol === 'file:') {
+            this.showLogin();
+            this.showLoginError(
+                "This dashboard must be opened through the daemon's own web server (http:// or " +
+                'https://), not as a local file — opening index.html directly blocks every request ' +
+                'this page makes.'
+            );
+            document.getElementById('login-form').querySelectorAll('input, button')
+                .forEach(el => { el.disabled = true; });
+            return;
+        }
+
         // Refuse before anything else if the page cannot sign at all. With the pure-JS fallback in
         // place this now means Web Crypto is absent *and* the fallback failed its own RFC 4231
         // vector — a broken build rather than an ordinary deployment — so it should fail loudly at
@@ -753,18 +776,10 @@ class HookExecutorClient {
 
             const res = await fetch(requestPath, { ...options, headers });
 
-            // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
-            // out. 403 means the key IS valid but lacks permission for this one action; it must
-            // NOT log the user out or swallow the server's specific "Permission denied: ..."
-            // message, which is exactly what the user needs to see.
-            if (res.status === 401) {
-                this.handleAuthFailure();
-                throw new Error("Session expired or invalid API key — please log in again.");
-            }
-
             // Read the body as text first and only parse when there's something to parse: several
             // endpoints return a bare 200 or a 204 with no body at all, and `res.json()` throws
-            // "Unexpected end of JSON input" on either.
+            // "Unexpected end of JSON input" on either. Read before the 401 branch below, not
+            // after: telling a replayed-signature 401 apart from a session-ending one needs it.
             const text = await res.text();
             let data = {};
             if (text && text.trim().length > 0) {
@@ -773,6 +788,29 @@ class HookExecutorClient {
                 } catch {
                     data = text;
                 }
+            }
+
+            // 401 usually means the key itself is invalid/missing — the session is unrecoverable,
+            // so log out. 403 means the key IS valid but lacks permission for this one action; it
+            // must NOT log the user out or swallow the server's specific "Permission denied: ..."
+            // message, which is exactly what the user needs to see.
+            //
+            // One specific 401 is neither: `src/middleware.rs`'s anti-replay guard also answers
+            // `401` when the exact same signed request (method + path + timestamp + body) arrives
+            // twice within the signing window — "This signature has already been used; sign a
+            // fresh request." That is a transient collision with the *request*, not a dead
+            // session; the key and secret are still perfectly valid, and simply retrying succeeds.
+            // Logging the user out over it would be strictly worse than doing nothing. The
+            // pagination re-entrancy guard in `gotoExecPage` closes the one known way this app
+            // could produce one itself; this is the defense-in-depth backstop for any other cause
+            // (a flaky connection triggering a browser-level retry, a doubled click elsewhere).
+            if (res.status === 401) {
+                const message = (data && typeof data === 'object' ? data.error : null) || '';
+                if (message.includes('already been used')) {
+                    throw new Error('Duplicate request detected — please try again.');
+                }
+                this.handleAuthFailure();
+                throw new Error("Session expired or invalid API key — please log in again.");
             }
 
             if (!res.ok) {
@@ -1501,6 +1539,18 @@ class HookExecutorClient {
     // request is in flight. Does not re-fetch the stats tiles: those are exact counts over the
     // whole filtered dataset (`renderStats`), which paging within that same dataset never changes.
     async gotoExecPage(mutate) {
+        // Re-entrancy guard. Without it, disabling `#exec-page-input` a few lines below — while it
+        // still holds focus, right after the user pressed Enter in it — synchronously fires that
+        // same input's own `blur` handler, which calls back into this function a *second* time
+        // before the first call's fetch has even started resolving. Both calls then race to sign
+        // and send the same navigation close enough in time to share a one-second-granularity
+        // timestamp, producing two byte-identical signed requests — and the backend's anti-replay
+        // guard (`src/middleware.rs`) correctly rejects the second one with a `401`, which this
+        // app's own 401 handling would otherwise read as the whole session having died over what
+        // was actually a client-side double-submission, not an expired or invalid key.
+        if (this._execPaginationBusy) return;
+        this._execPaginationBusy = true;
+
         const spinner = document.getElementById('exec-pagination-spinner');
         const controls = ['exec-btn-jump-back', 'exec-btn-prev', 'exec-page-input', 'exec-btn-next', 'exec-btn-jump-forward', 'exec-page-size']
             .map(id => document.getElementById(id));
@@ -1509,9 +1559,17 @@ class HookExecutorClient {
         try {
             await mutate(this.execCache);
             this.renderExecutionsTable();
+        } catch (e) {
+            // `apiFetch` already surfaced a toast naming the actual failure (a duplicate-request
+            // 401, a timeout, a `500` from the backend, whatever it was) and the session is left
+            // exactly as it was — nothing further to do here except stop the rejection from
+            // reaching this function's caller (a bare event-listener callback) unhandled, which is
+            // what an uncaught promise in the console would otherwise look like for an error the
+            // user was already told about.
         } finally {
             spinner.classList.add('hidden');
             this.updateExecPaginationUI();
+            this._execPaginationBusy = false;
         }
     }
 

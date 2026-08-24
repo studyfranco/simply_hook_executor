@@ -7595,3 +7595,135 @@ regardless of budget size, rather than pausing at it.
 `./scripts/test_e2e.sh` **1138 passed / 0 failed / 0 skipped** (up from 1137 — one e2e section needed
 the same name/script_path split as its Rust counterpart above) · `./scripts/verify_convergence.sh`
 **18 converged, 1 known divergence (pre-existing, unrelated), 0 drifted**.
+
+# 2026-08-24 (third pass) — Root-caused a real deep-pagination logout bug, deep-offset overflow, and a `file://`-access dead end
+
+## Root cause: pagination's own re-entrancy, not a misclassification in `apiFetch`
+
+The brief's framing ("any HTTP error or timeout during pagination is misidentified as an auth
+failure") did not match the code: `apiFetch`'s `handleAuthFailure()` call was already gated on
+`res.status === 401` alone, never on a 400/404/422/500 or a network error — those already just threw
+a toast-shown `Error` with no session teardown, which is exactly what the brief asked for. Reading
+`apiFetch:762` literally means the console message *"Session expired or invalid API key"* can only
+ever come from a **genuine `401`**, so the real question was why deep pagination would ever produce
+one.
+
+Traced it to a concrete, previously-shipped bug in last session's pagination rewrite:
+`gotoExecPage` disables `#exec-page-input` (among other controls) for the duration of a fetch —
+including while that same input still holds focus, right after the user presses Enter in it.
+Disabling a *focused* form control forces the browser to blur it **synchronously**, and
+`jumpToTypedExecPage` was wired to both `keydown` (Enter) *and* `blur`. The result: pressing Enter
+fired the handler once via `keydown`, which called `gotoExecPage`, which disabled the input, which
+synchronously fired `blur`, which called the *same* handler a second time — re-entrantly, before the
+first call had gotten anywhere near actually updating `execCache.currentPage` (the guard the handler
+relied on to skip a no-op re-jump). Two concurrent, identically-targeted signed requests went out
+close enough together to share a one-second-granularity `X-Timestamp`, producing byte-identical
+CANONICAL_V1 signatures — and `src/middleware.rs`'s anti-replay guard correctly rejects the *second*
+identical signature with a genuine `401` ("This signature has already been used; sign a fresh
+request"). `apiFetch` had no way to tell that apart from an actually-dead session, so it tore the
+whole session down over what was really a client-side double-submission it caused itself.
+
+A second, compounding bug: `gotoExecPage` had no `catch` of its own, only `try { ... } finally { ... }`
+around the fetch — so once `apiFetch` (correctly) re-threw after toasting, the rejection propagated
+straight out of a bare `async () => this.gotoExecPage(...)` event-listener callback with nothing left
+to await it, landing in the console as exactly `Uncaught (in promise) Error: ...` for *any* pagination
+failure, not only the replay case — matching the brief's own literal console excerpt independent of
+which underlying error triggered it.
+
+## Fixes (`static/app.js`)
+
+1. **Re-entrancy guard in `gotoExecPage`** (the actual root cause): a `this._execPaginationBusy` flag
+   checked and set before anything else runs, so the blur-triggered-by-disabling re-entry is a no-op
+   return rather than a second concurrent fetch. This is what stops the duplicate signed request from
+   ever being sent, closing the one known way this app could self-inflict a replay.
+2. **`gotoExecPage` now catches and swallows** the (already toasted, by `apiFetch`) rejection instead
+   of letting it propagate unhandled — the "Uncaught (in promise)" console noise is gone for every
+   pagination failure, not only the replay case, and the session state is left untouched either way.
+3. **Defense-in-depth in `apiFetch`**: a `401` whose body contains "already been used" now throws a
+   distinct, recoverable `"Duplicate request detected — please try again."` instead of calling
+   `handleAuthFailure()` — a backstop for any *other* way a duplicate signed request could ever reach
+   the server (a browser-level retry on a flaky connection, a future doubled-click elsewhere), not
+   only the one this session's fix (1) closes. Every other `401` — invalid/missing key, bad signature,
+   stale timestamp — still logs out exactly as before; verified live (below) that this backstop
+   doesn't loosen that.
+
+New tests: `a_replayed_signature_on_an_admin_route_names_itself_precisely` (integration) sends the
+identical signed `GET /api/executions` request twice and pins the exact wording — `auth_middleware`
+(unlike the three invocation routes' collapsed generic body) lets this specific message through
+unchanged, which is the backend contract `apiFetch`'s new substring match depends on; if that wording
+ever changes, this test catches it and the frontend check has to change with it.
+
+**Verified live** via headless Chromium against a running daemon (40 seeded executions), reproducing
+the exact original race and both branches of the new classification:
+- Typing a page number, dispatching `keydown` (Enter) and, with no delay, `blur` on the same
+  element — the precise sequence the bug required — landed cleanly on the requested page with the
+  dashboard still fully visible; no logout, no duplicate request.
+- A `fetch` shim forcing exactly one `/executions` call to return the real replay-401 body: a
+  `"Duplicate request detected"` toast appeared and the dashboard stayed up.
+- The same shim returning a `401` with a *different* message (`"Invalid API Key"`): the session
+  correctly tore down and the login screen reappeared — proving the new classification narrows only
+  the one specific case, not `401` handling in general.
+
+## Task 2 — Deep-offset arithmetic overflow (`src/api/executions.rs`), confirmed and fixed
+
+`resolve_pagination`'s `(page - 1) * per_page` was plain, unchecked `u64` multiplication — a genuine,
+reachable overflow from two ordinary-looking large query parameters (no special crafting: `page` and
+`per_page` are each independently valid `u64` values whose product exceeds `u64::MAX`), not a
+theoretical one. Reproduced first with a dedicated unit test
+(`resolve_pagination_never_panics_on_extreme_inputs`) against the *unpatched* function — confirmed it
+genuinely panics (`attempt to multiply with overflow`) in a debug build, which is what `cargo test`
+itself runs under, before writing the fix.
+
+Fixed with saturating arithmetic and a new `MAX_PAGINATION_VALUE = i64::MAX` ceiling, clamped rather
+than left at `u64::MAX`: every supported backend (SQLite, PostgreSQL, MySQL) ultimately binds
+`LIMIT`/`OFFSET` as a signed 64-bit integer at the driver level, so anything past `i64::MAX` risks
+failing *that* conversion even after the Rust-level overflow itself is gone — clamping once, up
+front, removes the question for every backend at once, with room to spare no real dataset could ever
+need (exabytes of history at one row per byte).
+
+An out-of-range page is deliberately **not** turned into a distinct error case: `LIMIT`/`OFFSET`
+past a table's real size is ordinary, portable SQL that already returns zero rows on every supported
+backend, which is exactly the clean `200`/`[]` this task asked for — no new validation branch needed,
+just arithmetic that can no longer misbehave computing the numbers that ordinary behavior already
+handles correctly. New integration test
+`deep_and_overflowing_pagination_requests_return_a_clean_empty_page` confirms this against the real
+database (not just the unit-level arithmetic): an ordinary far-future page, and both the `page`/
+`per_page` and legacy `limit`/`offset` overflow shapes, all round-trip as `200` with an empty array.
+
+## Task 3 — `file:///` audit: no reference found; a real access-mode gap addressed instead
+
+Exhaustive grep across `static/*.js`, `static/*.html`, and `src/*.rs` found zero occurrences of
+`file://` anywhere in the served code — consistent with the same audit's finding two sessions ago.
+`index.html`'s `<link href="style.css">` and `<script src="app.js">` **are** plain relative paths,
+but converting them to root-relative was **considered and reverted**: this is a previously
+hardened, deliberate design point (2026-08-19 sixth pass, "subpath-agnostic API resolution behind a
+reverse proxy") — `deriveRequestBase()`'s own directory computation explicitly relies on these two
+tags resolving by the *same* RFC 3986 §5.3 rule the browser already applies to them, and a
+reverse-proxy deployment mounted under a subpath depends on that relative resolution to reach its own
+assets at all. Root-relative paths would have silently broken exactly the deployment shape that
+established pattern was hardened for. Caught by checking `AGENT_NOTES.MD`'s own history before
+committing to the literal instruction, not by testing after the fact.
+
+The most plausible explanation for the reported symptom that survives this audit: the page was opened
+directly as a local file (`file:///…/index.html`) rather than through the daemon's own HTTP server —
+a real, if unsupported, access mode, not a code defect. A `file://` origin cannot `fetch()` anything at
+all, same-directory or not; that is a browser security boundary on the *origin*, independent of
+whether the paths involved are relative or root-relative, and no change to path schemes in the served
+files can repair it. Confirmed live: opening `static/index.html` directly under `file://` in headless
+Chromium, before any fix, left the login screen presentable but every subsequent action silently
+broken with exactly this class of console warning on each attempted fetch.
+
+**Fix**: `init()` now checks `window.location.protocol === 'file:'` before anything else runs (ahead
+of even the pre-existing `SigningBackend.available` check) and shows a clear, actionable message —
+"This dashboard must be opened through the daemon's own web server ... not as a local file" — with
+the login form disabled, mirroring the exact same "refuse loudly, up front" pattern already
+established for an unusable signing backend. Verified live: loading `index.html` via a real
+`file:///` URL in headless Chromium now shows this message immediately instead of a page that looks
+like it should work and silently doesn't.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**156 passed / 0 failed / 2 ignored** (integration binary; 129 lib tests, other suites unchanged) ·
+`./scripts/test_e2e.sh` **1138 passed / 0 failed / 0 skipped** (unchanged — no e2e assertions touched
+this pass) · verified live via headless Chromium (details above), not only by the automated suites.

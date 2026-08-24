@@ -289,6 +289,30 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
     assert_eq!(execution_count(&db).await, 5);
 }
 
+/// Pins the exact wording a replayed signature is refused with on an ordinary `/api/*` admin
+/// route — unlike the invocation routes above, `auth_middleware` does not collapse this into a
+/// generic body, and `static/app.js`'s `apiFetch` matches on this specific substring
+/// (`message.includes('already been used')`) to tell a replayed-request `401` (recoverable — the
+/// key and secret are still valid, only the signature was reused) apart from a genuine dead
+/// session, rather than logging the user out over what is really a client-side double-submission.
+/// If this message's wording ever changes, that frontend check has to change with it.
+#[tokio::test]
+async fn a_replayed_signature_on_an_admin_route_names_itself_precisely() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    let timestamp = now_timestamp();
+    let first = signed_request_at("GET", "/api/executions", &master.plaintext, &master.signing_secret, "", timestamp);
+    assert_eq!(send(&app, first).await.status, StatusCode::OK);
+
+    // The identical request, signature and all, sent again.
+    let replayed = signed_request_at("GET", "/api/executions", &master.plaintext, &master.signing_secret, "", timestamp);
+    let response = send(&app, replayed).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(response.string("error"), "This signature has already been used; sign a fresh request");
+}
+
 #[tokio::test]
 async fn signed_requests_require_a_well_formed_timestamp_header() {
     let dir = ScriptDir::new();
@@ -3002,6 +3026,46 @@ async fn execution_listing_exposes_pagination_headers_in_both_query_styles() {
     assert_eq!(legacy.header("x-total-count"), "5");
     assert_eq!(legacy.header("x-per-page"), "3");
     assert_eq!(legacy.header("x-total-pages"), "2");
+}
+
+/// A page/offset far past the real row count — or so large it would overflow plain `u64`
+/// arithmetic computing it — must still resolve to a clean `200` with an empty array, never a
+/// `500`, a panic, or a hang. `resolve_pagination`'s own unit test proves the arithmetic itself
+/// cannot overflow; this proves the *query* built from its output round-trips through the real
+/// database (SQLite here) without erroring on the resulting `LIMIT`/`OFFSET` values.
+#[tokio::test]
+async fn deep_and_overflowing_pagination_requests_return_a_clean_empty_page() {
+    let dir = ScriptDir::new();
+    let script = dir.write_script("ok.sh", "echo ok");
+
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let hook_id = insert_hook(&db, "deep_page_hook", &script, 30).await;
+    send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None)).await;
+
+    // An ordinary out-of-range page: past the one real row, well within any sane integer range.
+    let far = send(&app, json_request("GET", "/api/executions?page=1000&per_page=10", &master, None)).await;
+    assert_eq!(far.status, StatusCode::OK, "{}", far.raw);
+    assert_eq!(far.json.as_array().map(Vec::len), Some(0));
+    assert_eq!(far.header("x-total-count"), "1");
+
+    // A page/per_page pair whose product overflows plain u64 arithmetic if computed unchecked —
+    // this is the exact shape that panics `(page - 1) * per_page` without the saturating fix.
+    let overflow = send(
+        &app,
+        json_request("GET", &format!("/api/executions?page={}&per_page=4", u64::MAX / 2), &master, None),
+    )
+    .await;
+    assert_eq!(overflow.status, StatusCode::OK, "{}", overflow.raw);
+    assert_eq!(overflow.json.as_array().map(Vec::len), Some(0));
+
+    // The legacy limit/offset spelling, pushed to its own overflow-prone extreme.
+    let legacy_overflow =
+        send(&app, json_request("GET", &format!("/api/executions?limit=1&offset={}", u64::MAX), &master, None))
+            .await;
+    assert_eq!(legacy_overflow.status, StatusCode::OK, "{}", legacy_overflow.raw);
+    assert_eq!(legacy_overflow.json.as_array().map(Vec::len), Some(0));
 }
 
 #[tokio::test]

@@ -309,6 +309,16 @@ pub struct ExecutionQuery {
     pub per_page: Option<u64>,
 }
 
+/// The largest value this function will ever return as a `limit` or `offset`.
+///
+/// Every supported backend's `LIMIT`/`OFFSET` ultimately binds as a signed 64-bit integer at the
+/// driver level (SQLite's native integer type is `i64`; PostgreSQL's `bigint` and MySQL's `BIGINT`
+/// are the same width) — a raw `u64` anywhere near its own max would either fail that conversion
+/// outright or, if it happened to still fit, still be nonsense no real table will ever have that
+/// many rows to justify. Clamping here, once, removes the question entirely, with room to spare no
+/// legitimate request could ever need: at even one row per byte, this is exabytes of history.
+const MAX_PAGINATION_VALUE: u64 = i64::MAX as u64;
+
 /// Resolves a query's `limit`/`offset`, preferring the `page`/`per_page` spelling when either is
 /// present — the two are two names for the same two numbers, never combined field-by-field, so a
 /// request naming `page` but not `per_page` still gets `per_page`'s default rather than pairing a
@@ -317,14 +327,26 @@ pub struct ExecutionQuery {
 /// Returns `(limit, offset, page, per_page)` — `page`/`per_page` are always returned (derived from
 /// `offset`/`limit` when the caller used that spelling instead) so the response can report them
 /// back unconditionally, regardless of which style the request used.
+///
+/// Every arithmetic step here is saturating and every result is clamped to
+/// [`MAX_PAGINATION_VALUE`] — deliberately, not defensively: `page`/`per_page`/`limit`/`offset` are
+/// caller-supplied `u64` values with no upper bound of their own, and `(page - 1) * per_page` on two
+/// ordinary-looking large numbers genuinely overflows plain `u64` arithmetic (a debug build panics,
+/// a release build wraps silently to some unrelated small offset) — this is a reachable input, not
+/// a hypothetical one, confirmed by `resolve_pagination_never_panics_on_extreme_inputs` reproducing
+/// the panic against the unpatched version of this function. A resulting offset far past the real
+/// row count is not an error case to special-case: `LIMIT`/`OFFSET` beyond a table's size is
+/// ordinary, portable SQL that already returns zero rows, which is exactly the clean, empty `200`
+/// this function's callers want for an out-of-range page.
 pub(crate) fn resolve_pagination(page: Option<u64>, per_page: Option<u64>, limit: Option<u64>, offset: Option<u64>) -> (u64, u64, u64, u64) {
     if page.is_some() || per_page.is_some() {
-        let per_page = per_page.unwrap_or(DEFAULT_PAGE_LIMIT).max(1);
+        let per_page = per_page.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGINATION_VALUE);
         let page = page.unwrap_or(1).max(1);
-        (per_page, (page - 1) * per_page, page, per_page)
+        let offset = (page - 1).saturating_mul(per_page).min(MAX_PAGINATION_VALUE);
+        (per_page, offset, page, per_page)
     } else {
-        let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).max(1);
-        let offset = offset.unwrap_or(0);
+        let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGINATION_VALUE);
+        let offset = offset.unwrap_or(0).min(MAX_PAGINATION_VALUE);
         (limit, offset, offset / limit + 1, limit)
     }
 }
@@ -605,5 +627,24 @@ mod tests {
         assert_eq!(parse_status("success").expect("valid"), ExecutionStatus::Success);
         assert_eq!(parse_status("TIMEOUT").expect("valid"), ExecutionStatus::Timeout);
         assert!(parse_status("bogus").is_err());
+    }
+
+    #[test]
+    fn resolve_pagination_never_panics_on_extreme_inputs() {
+        // A `page`/`per_page` pair whose product genuinely overflows `u64` — reachable from a
+        // single caller-supplied query string with no special crafting beyond two large numbers,
+        // since `page`/`per_page` are parsed independently and neither on its own exceeds `u64`.
+        let (limit, offset, _page, per_page) = resolve_pagination(Some(u64::MAX / 2), Some(4), None, None);
+        assert_eq!(limit, per_page);
+        // Whatever the exact clamp, it must land on a value every supported backend's driver can
+        // actually bind as a signed 64-bit LIMIT/OFFSET without erroring — never past `i64::MAX`.
+        assert!(offset <= i64::MAX as u64, "offset {offset} exceeds i64::MAX");
+
+        // The legacy `limit`/`offset` spelling has its own overflow shape: `offset / limit + 1`
+        // with `offset` near `u64::MAX`.
+        let (limit2, offset2, page2, _) = resolve_pagination(None, None, Some(1), Some(u64::MAX));
+        assert!(offset2 <= i64::MAX as u64, "offset {offset2} exceeds i64::MAX");
+        assert!(page2 >= 1);
+        assert_eq!(limit2, 1);
     }
 }
