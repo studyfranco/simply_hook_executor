@@ -1245,6 +1245,82 @@ async fn hook_crud_lifecycle_and_creator_auto_provisioning() {
     );
 }
 
+/// Hooks are invocable by name (`/webhook/{name}`, `/api/hooks/{name}/execute` — see
+/// `hook_crud_lifecycle_and_creator_auto_provisioning`'s "readable by UUID and by name" check
+/// above), so a hook's name is also a URL path segment. `validate_hook_name` restricts it to RFC
+/// 3986's `unreserved` set for exactly that reason; this covers both the accepted set and the
+/// rejected one, at creation and at rename.
+#[tokio::test]
+async fn hook_name_is_validated_against_a_url_safe_charset() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+    let dir = ScriptDir::new();
+    let script = dir.write_script("charset.sh", "echo ok");
+
+    // Letters, digits, '-', '_', '.', '~' — the exact set `percent_encode_path_segment` never
+    // encodes — are all accepted, including at every position (leading/trailing/consecutive).
+    let valid_names = ["ban.ip", "my_hook-1", "Hook123", "a", "1", "..--__~~", "hook.name.v2"];
+    for name in valid_names {
+        let created = send(
+            &app,
+            json_request("POST", "/api/hooks", &master, Some(json!({ "name": name, "script_path": script }))),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::OK, "{name:?} should be accepted: {}", created.raw);
+        assert_eq!(created.field("name").as_str(), Some(name));
+    }
+
+    // A '/' splits the path outright; a space, a raw '%', and a literal percent-encoded sequence
+    // all force a caller to get percent-encoding right just to reach an otherwise ordinary hook —
+    // every one of these is refused with a 400, not silently accepted and later broken in the URL.
+    let invalid_names = ["ban/ip", "hook name", "hook%2Ftest", "hook?query", "hook#frag", "hook@host", "hook:8080"];
+    for name in invalid_names {
+        let rejected = send(
+            &app,
+            json_request("POST", "/api/hooks", &master, Some(json!({ "name": name, "script_path": script }))),
+        )
+        .await;
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "{name:?} should be refused: {}", rejected.raw);
+    }
+
+    // Empty (and whitespace-only, which trims to empty) names are refused the same way, distinctly
+    // from the charset check but through the same validator.
+    for name in ["", "   "] {
+        let rejected = send(
+            &app,
+            json_request("POST", "/api/hooks", &master, Some(json!({ "name": name, "script_path": script }))),
+        )
+        .await;
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "empty name {name:?} should be refused: {}", rejected.raw);
+        assert!(rejected.string("error").contains("required"), "{}", rejected.raw);
+    }
+
+    // Renaming an existing hook to an invalid name is refused the same way, not only creation.
+    let base = send(
+        &app,
+        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "renameable", "script_path": script }))),
+    )
+    .await;
+    assert_eq!(base.status, StatusCode::OK, "{}", base.raw);
+    let hook_id = base.string("id");
+
+    let bad_rename = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "name": "bad/name" }))),
+    )
+    .await;
+    assert_eq!(bad_rename.status, StatusCode::BAD_REQUEST, "{}", bad_rename.raw);
+
+    let good_rename = send(
+        &app,
+        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "name": "renamed.ok" }))),
+    )
+    .await;
+    assert_eq!(good_rename.status, StatusCode::OK, "{}", good_rename.raw);
+    assert_eq!(good_rename.field("name").as_str(), Some("renamed.ok"));
+}
+
 #[tokio::test]
 async fn hook_creation_and_management_respect_scopes() {
     let dir = ScriptDir::new();
@@ -2167,9 +2243,12 @@ async fn only_master_keys_may_assign_run_as_user() {
         "Only master API keys can assign run_as_user privileges"
     );
 
-    // Explicitly *not* elevating is fine for a non-master, in both spellings.
-    for null_ish in [json!(null), json!("")] {
-        let allowed = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": format!("plain_{null_ish}"), "script_path": script, "run_as_user": null_ish }))).await;
+    // Explicitly *not* elevating is fine for a non-master, in both spellings. The name is a plain
+    // index rather than derived from `null_ish` itself — `format!("{}", json!(""))` renders as the
+    // two literal quote characters `""`, which `validate_hook_name` now (correctly) refuses, and
+    // nothing about this test is actually exercising hook *names*.
+    for (i, null_ish) in [json!(null), json!("")].into_iter().enumerate() {
+        let allowed = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": format!("plain_{i}"), "script_path": script, "run_as_user": null_ish }))).await;
         assert_eq!(allowed.status, StatusCode::OK, "an unelevated hook must still be creatable");
         assert_eq!(allowed.field("run_as_user"), &json!(null));
     }
@@ -3307,39 +3386,59 @@ async fn hook_output_containing_live_markup_round_trips_verbatim_as_json() {
     assert_eq!(stored.field("stderr"), &json!(XSS_BREAKOUT_PAYLOAD));
 }
 
-/// A hook *name* and *script path* containing markup must also round-trip verbatim, since both are
-/// rendered into the hooks table and the audit log.
+/// A hook's *description* and *script path* containing markup must round-trip verbatim, since both
+/// are rendered into the hooks table and the audit log — and the *name* field must now refuse such
+/// content outright, a stronger mitigation than "store it safely" for the one field this service
+/// also treats as a URL path segment (`validate_hook_name`, see
+/// `hook_name_is_validated_against_a_url_safe_charset`).
 #[tokio::test]
 async fn hook_metadata_containing_markup_round_trips_verbatim() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let scripts = ScriptDir::new();
-
-    let script = scripts.write_script("meta.sh", "echo ok");
     let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
+    // The name field: no longer merely escaped at render time, refused at creation instead.
     let hostile_name = format!("hook{XSS_PAYLOAD}");
+    let script = scripts.write_script("meta.sh", "echo ok");
+    let rejected = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": hostile_name, "script_path": script })),
+        ),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "{}", rejected.raw);
+
+    // `script_path` carries no such charset restriction — it names a file on disk, not a URL path
+    // segment — so it (like `description`) is still expected to round-trip verbatim, unescaped,
+    // wherever it's rendered, including in the audit trail's `details` string
+    // (`format!("Created hook {} -> {} (...)", ..., payload.script_path, ...)`, `api/hooks.rs`).
+    let hostile_script = scripts.write_script(&format!("{XSS_PAYLOAD}.sh"), "echo ok");
     let created = send(
         &app,
         json_request(
             "POST",
             "/api/hooks",
             &master,
-            Some(json!({ "name": hostile_name, "script_path": script, "description": XSS_BREAKOUT_PAYLOAD })),
+            Some(json!({ "name": "meta_hook", "script_path": hostile_script, "description": XSS_BREAKOUT_PAYLOAD })),
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::OK);
-    assert_eq!(created.field("name"), &json!(hostile_name));
+    assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
+    assert_eq!(created.field("script_path"), &json!(hostile_script));
     assert_eq!(created.field("description"), &json!(XSS_BREAKOUT_PAYLOAD));
 
-    // The audit trail embeds the name in a human-readable `details` string; it must be stored as
-    // written rather than interpreted.
+    // The audit trail embeds `script_path` in a human-readable `details` string; it must be stored
+    // as written rather than interpreted.
     let logs = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_CREATE", &master, None)).await;
     assert_eq!(logs.status, StatusCode::OK);
     assert!(
         logs.raw.contains("onerror=alert(1)"),
-        "the hook name should appear in the audit details verbatim: {}",
+        "script_path should appear in the audit details verbatim: {}",
         logs.raw
     );
     assert_eq!(logs.content_type.as_deref(), Some("application/json"));
@@ -8370,26 +8469,25 @@ async fn hook_responses_expose_an_invocable_webhook_path() {
     let scripts = ScriptDir::new();
     let script = scripts.write_script("url_hook.sh", "#!/bin/sh\necho ok\n");
 
-    // A name containing characters that would otherwise break a URL path segment, so the exposed
-    // `webhook_path` is checked against exactly the case percent-encoding exists for.
-    let created = send(
-        &app,
-        json_request(
-            "POST",
-            "/api/hooks",
-            &master,
-            Some(json!({ "name": "url hook #2", "script_path": script })),
-        ),
-    )
-    .await;
+    // `validate_hook_name` refuses a name like this at creation now (see
+    // `hook_name_is_validated_against_a_url_safe_charset`), so the only way a hook can still carry
+    // one is a row that predates that validation — seeded directly into the database, bypassing the
+    // API, rather than through `POST /api/hooks`. `percent_encode_path_segment` still has to handle
+    // that legacy row correctly: this is exactly the defense-in-depth case it exists for.
+    let hook_id = insert_hook(&db, "url hook #2", &script, 30).await.to_string();
+    let created = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
     assert_eq!(created.field("webhook_path").as_str(), Some("/webhook/url%20hook%20%232"));
 
-    // `GET /api/hooks` and `GET /api/hooks/{id}` expose the same field, not only creation's response.
-    let hook_id = created.string("id");
+    // `GET /api/hooks` and `GET /api/hooks/{id}` expose the same field, not only the fetch above.
     let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
-    let listed_hook =
-        listed.json.as_array().unwrap().iter().find(|h| h["id"] == hook_id).expect("the hook is listed");
+    let listed_hook = listed
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"].as_str() == Some(hook_id.as_str()))
+        .expect("the hook is listed");
     assert_eq!(listed_hook["webhook_path"], created.field("webhook_path").clone());
 
     let fetched = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;

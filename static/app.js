@@ -103,54 +103,67 @@ class SearchableSelect {
 // "Next"/"Prev" clicks are then a pure client-side slice with no network round-trip at all.
 // Background-prefetches the next server chunk as soon as the user reaches the second-to-last
 // local page of whatever's currently cached.
+//
+// `currentPage` (1-indexed) is the single source of truth for "which page is this", tracked
+// independently of how much data happens to be cached — `windowStart` records the absolute
+// server-side row index `items[0]` corresponds to, which is `0` for the ordinary
+// sequential-accumulation path (`loadFirstChunk`/`fetchNextChunk`, which only ever grow the cache
+// from the start) and moves to an arbitrary offset only when `goToPage` jumps somewhere the
+// sequential cache hasn't reached — replacing the cache with exactly that page's window in one
+// request instead of walking there one `chunkSize` chunk at a time, which is what makes a jump to
+// a page hundreds or thousands away cost one request rather than hundreds.
 class PagedCache {
     constructor({ chunkSize = 100, pageSize = 15, fetchChunk }) {
         this.chunkSize = chunkSize;
         this.pageSize = pageSize;
-        this.fetchChunk = fetchChunk; // async (serverOffset, chunkSize) => Array<item>
+        this.fetchChunk = fetchChunk; // async (serverOffset, limit) => Array<item> | { items, totalCount }
         this.reset();
     }
 
     reset() {
         this.items = [];
+        this.windowStart = 0;
         this.serverOffset = 0;
         this.hasMoreOnServer = true;
-        this.localPage = 0;
+        this.currentPage = 1;
         this.prefetching = null; // in-flight prefetch promise, if any
         this.totalCount = null; // authoritative server-side total, once a chunk has reported one
-    }
-
-    // Changes how many rows a local page holds, keeping the user roughly where they were: the
-    // first row currently on screen stays on screen rather than snapping back to page 1.
-    setPageSize(size) {
-        const next = Math.max(1, Math.floor(size));
-        if (next === this.pageSize) return;
-        const firstVisible = this.localPage * this.pageSize;
-        this.pageSize = next;
-        this.localPage = Math.floor(firstVisible / next);
     }
 
     get totalLocalPages() {
         return Math.max(1, Math.ceil(this.items.length / this.pageSize));
     }
 
+    // The exact page count when `totalCount` is known (every executions fetch reports one);
+    // otherwise `null`, leaving the caller to render an honest "at least this many" estimate
+    // instead of a number this class cannot actually back up (the audit log's own cache never
+    // gets a total from its endpoint).
+    get totalPages() {
+        return this.totalCount !== null ? Math.max(1, Math.ceil(this.totalCount / this.pageSize)) : null;
+    }
+
+    // 0-indexed page number of `currentPage` relative to the *cached window* (`windowStart`) —
+    // equal to `currentPage - 1` in the ordinary sequential mode, where `windowStart` is always
+    // `0`; differs only right after a distant jump has moved the window.
+    get _relativePage() {
+        return Math.floor(((this.currentPage - 1) * this.pageSize - this.windowStart) / this.pageSize);
+    }
+
     get currentPageItems() {
-        const start = this.localPage * this.pageSize;
+        const start = Math.max(0, (this.currentPage - 1) * this.pageSize - this.windowStart);
         return this.items.slice(start, start + this.pageSize);
     }
 
     get hasNextPage() {
-        const nextPageStart = (this.localPage + 1) * this.pageSize;
+        if (this.totalCount !== null) return this.currentPage * this.pageSize < this.totalCount;
+        const nextPageStart = this.currentPage * this.pageSize - this.windowStart;
         return nextPageStart < this.items.length || this.hasMoreOnServer;
     }
 
     get hasPrevPage() {
-        return this.localPage > 0;
+        return this.currentPage > 1;
     }
 
-    // Discards everything cached and fetches a fresh first chunk — used on initial load and
-    // whenever the active filters change (a different query is a different dataset, not more
-    // pages of the old one).
     // `fetchChunk` may return either a plain array (the audit log's shape — no server-side total is
     // available) or `{ items, totalCount }` (executions — `resolve_pagination`/`pagination_headers`
     // in `src/api/executions.rs` report an authoritative count). Normalized here so the rest of this
@@ -159,6 +172,9 @@ class PagedCache {
         return Array.isArray(result) ? { items: result, totalCount: null } : result;
     }
 
+    // Discards everything cached and fetches a fresh first chunk — used on initial load and
+    // whenever the active filters change (a different query is a different dataset, not more
+    // pages of the old one).
     async loadFirstChunk() {
         this.reset();
         const { items: chunk, totalCount } = this._normalizeChunk(await this.fetchChunk(0, this.chunkSize));
@@ -185,27 +201,69 @@ class PagedCache {
         return this.prefetching;
     }
 
-    async nextPage() {
-        const nextPageStart = (this.localPage + 1) * this.pageSize;
-        if (nextPageStart >= this.items.length && this.hasMoreOnServer) {
+    // Jumps straight to a 1-indexed page. Three cases, cheapest first: the page is already fully
+    // cached (a pure slice, no network at all); the page sits just past the cached window and a
+    // single ordinary chunk fetch reaches it (the common "step forward" case, indistinguishable
+    // from `nextPage`'s old behavior); or the page is nowhere near the cached window (a distant
+    // jump, or stepping *backward* out of a window a previous jump narrowed to), in which case the
+    // cache is replaced with exactly that one page's data via a direct, single request.
+    async goToPage(pageNumber) {
+        const target = Math.max(1, Math.floor(pageNumber));
+        const start = (target - 1) * this.pageSize;
+        const relativeStart = start - this.windowStart;
+
+        if (relativeStart >= 0 && relativeStart + this.pageSize <= this.items.length) {
+            this.currentPage = target;
+            this._maybePrefetch();
+            return;
+        }
+        if (relativeStart >= 0 && relativeStart < this.items.length && this.hasMoreOnServer) {
             await this.fetchNextChunk();
+            this.currentPage = target;
+            this._maybePrefetch();
+            return;
         }
-        if (nextPageStart < this.items.length) {
-            this.localPage++;
-        }
-        this._maybePrefetch();
+
+        const { items: page, totalCount } = this._normalizeChunk(await this.fetchChunk(start, this.pageSize));
+        this.items = page;
+        this.windowStart = start;
+        if (totalCount !== null && totalCount !== undefined) this.totalCount = totalCount;
+        this.serverOffset = start + page.length;
+        this.hasMoreOnServer =
+            this.totalCount !== null ? this.serverOffset < this.totalCount : page.length === this.pageSize;
+        this.currentPage = target;
     }
 
-    prevPage() {
-        if (this.localPage > 0) this.localPage--;
+    async nextPage() {
+        await this.goToPage(this.currentPage + 1);
+    }
+
+    async prevPage() {
+        if (this.currentPage <= 1) return;
+        await this.goToPage(this.currentPage - 1);
+    }
+
+    async jumpPages(delta) {
+        await this.goToPage(this.currentPage + delta);
+    }
+
+    // Changes how many rows a page holds, keeping the user roughly where they were: the first row
+    // currently on screen stays on screen rather than snapping back to page 1. May need a fetch
+    // (via `goToPage`) if the recomputed page isn't within the now-differently-sized window.
+    async setPageSize(size) {
+        const next = Math.max(1, Math.floor(size));
+        if (next === this.pageSize) return;
+        const firstVisibleAbsolute = (this.currentPage - 1) * this.pageSize;
+        this.pageSize = next;
+        await this.goToPage(Math.floor(firstVisibleAbsolute / next) + 1);
     }
 
     // Fires a background fetch the moment the user lands on the second-to-last page of the
-    // currently cached chunk — re-evaluated off the live item count, so it correctly fires again
+    // currently cached window — re-evaluated off the live item count, so it correctly fires again
     // after each new chunk arrives.
     _maybePrefetch() {
         if (!this.hasMoreOnServer || this.prefetching) return;
-        if (this.localPage === this.totalLocalPages - 2) {
+        if (this._relativePage === this.totalLocalPages - 2) {
             this.fetchNextChunk();
         }
     }
@@ -1028,23 +1086,49 @@ class HookExecutorClient {
         } catch (e) {}
     }
 
-    async fetchExecutionsChunk(offset, limit) {
+    // The Execution History filter fields (hook/API key/since/until), shared by
+    // `fetchExecutionsChunk` and `renderStats`'s per-status counts below. `status` is deliberately
+    // excluded: the chunk fetch applies whatever the status dropdown currently says, while the
+    // stats tiles each override it per tile regardless of the dropdown, to render a true breakdown
+    // rather than three tiles that all read zero the moment one status is selected.
+    buildExecutionFilterParams() {
+        const params = new URLSearchParams();
         const hookQ = document.getElementById('exec-hook-filter').value;
-        const statusQ = document.getElementById('exec-status-filter').value;
         const keyQ = document.getElementById('exec-key-filter').value.trim();
         const since = HookExecutorClient.toRfc3339(document.getElementById('exec-since-filter').value);
         const until = HookExecutorClient.toRfc3339(document.getElementById('exec-until-filter').value);
-
-        const params = new URLSearchParams({ limit, offset });
         if (hookQ) params.append('hook', hookQ);
-        if (statusQ) params.append('status', statusQ);
         if (keyQ) params.append('api_key', keyQ);
         if (since) params.append('since', since);
         if (until) params.append('until', until);
+        return params;
+    }
+
+    async fetchExecutionsChunk(offset, limit) {
+        const statusQ = document.getElementById('exec-status-filter').value;
+        const params = this.buildExecutionFilterParams();
+        params.set('limit', limit);
+        params.set('offset', offset);
+        if (statusQ) params.set('status', statusQ);
 
         const { data, headers } = await this.apiFetch(`/executions?${params.toString()}`, { withHeaders: true });
         const totalCount = parseInt(headers.get('x-total-count'), 10);
         return { items: data, totalCount: Number.isNaN(totalCount) ? null : totalCount };
+    }
+
+    // An exact dataset-wide count for one `status` (or every status, if `status` is falsy),
+    // honoring the current hook/API key/date filters — a `limit=1` request whose body is thrown
+    // away, since only its `X-Total-Count` header is actually wanted. This is what lets the stats
+    // tiles report a true total instead of "however many happen to be sitting in the client-side
+    // page cache", which is what capped them at the chunk size before.
+    async fetchExecutionStatusCount(status) {
+        const params = this.buildExecutionFilterParams();
+        params.set('limit', 1);
+        params.set('offset', 0);
+        if (status) params.set('status', status);
+        const { headers } = await this.apiFetch(`/executions?${params.toString()}`, { withHeaders: true });
+        const count = parseInt(headers.get('x-total-count'), 10);
+        return Number.isNaN(count) ? 0 : count;
     }
 
     clearExecutionFilters() {
@@ -1059,7 +1143,7 @@ class HookExecutorClient {
             this.state.selectedExecutionIds.clear();
             await this.execCache.loadFirstChunk();
             this.renderExecutionsTable();
-            this.renderStats();
+            await this.renderStats();
             this.updateExecPaginationUI();
         } catch (e) {}
     }
@@ -1315,18 +1399,30 @@ class HookExecutorClient {
         return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
     }
 
-    renderStats() {
-        // Computed over the whole cached chunk (up to 100 records), not just the visible page, so
-        // the tiles summarize the current filter rather than the current scroll position.
-        const items = this.execCache.items;
-        const count = (s) => items.filter(e => e.status === s).length;
-        const durations = items.map(e => e.duration_ms).filter(d => typeof d === 'number');
+    async renderStats() {
+        // Total/Success/Failed/Timeout are exact counts across the *whole* filtered dataset
+        // (`fetchExecutionStatusCount`, via `X-Total-Count`), not merely how much has been fetched
+        // into `execCache` so far — that was the bug: a fixed `chunkSize` (100) capped every tile
+        // at whatever fit in one chunk, so a filter matching more than that always read "100"
+        // regardless of the real count.
+        const [total, success, failed, timeout] = await Promise.all([
+            this.fetchExecutionStatusCount(null),
+            this.fetchExecutionStatusCount('SUCCESS'),
+            this.fetchExecutionStatusCount('FAILED'),
+            this.fetchExecutionStatusCount('TIMEOUT')
+        ]);
+
+        // Avg duration has no equivalent header shortcut — there is no `X-Average-Duration` to
+        // read — so this one tile stays a sample over whatever is currently loaded, clearly labeled
+        // as such (see the tile's `title` in index.html) rather than claimed as an exact global
+        // figure it would take a bespoke aggregate endpoint to actually compute.
+        const durations = this.execCache.items.map(e => e.duration_ms).filter(d => typeof d === 'number');
         const avg = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null;
 
-        document.getElementById('stat-total').textContent = items.length;
-        document.getElementById('stat-success').textContent = count('SUCCESS');
-        document.getElementById('stat-failed').textContent = count('FAILED');
-        document.getElementById('stat-timeout').textContent = count('TIMEOUT');
+        document.getElementById('stat-total').textContent = total;
+        document.getElementById('stat-success').textContent = success;
+        document.getElementById('stat-failed').textContent = failed;
+        document.getElementById('stat-timeout').textContent = timeout;
         document.getElementById('stat-duration').textContent = avg === null ? '–' : formatDuration(avg);
     }
 
@@ -1367,16 +1463,27 @@ class HookExecutorClient {
 
     updateExecPaginationUI() {
         const cache = this.execCache;
-        document.getElementById('exec-btn-prev').disabled = !cache.hasPrevPage;
-        document.getElementById('exec-btn-next').disabled = !cache.hasNextPage;
+        const paged = true; // always true for executions — unlike ip_vault, there is no unpaged mode here.
 
-        // `totalCount` is the server's authoritative row count (from `X-Total-Count`), so the page
-        // count it implies is exact — unlike `cache.totalLocalPages`, which only knows about rows
-        // fetched into the client cache so far and would under-report until the last chunk arrives.
-        const totalPages = cache.totalCount !== null
-            ? Math.max(1, Math.ceil(cache.totalCount / cache.pageSize))
-            : (cache.hasMoreOnServer ? `${cache.totalLocalPages}+` : cache.totalLocalPages);
-        document.getElementById('exec-page-indicator').textContent = `Page ${cache.localPage + 1} of ${totalPages}`;
+        document.getElementById('exec-btn-jump-back').disabled = !paged || !cache.hasPrevPage;
+        document.getElementById('exec-btn-prev').disabled = !paged || !cache.hasPrevPage;
+        document.getElementById('exec-btn-next').disabled = !paged || !cache.hasNextPage;
+        document.getElementById('exec-btn-jump-forward').disabled = !paged || !cache.hasNextPage;
+
+        // `cache.totalPages` is exact whenever `totalCount` is known (every executions fetch
+        // reports one via `X-Total-Count`) — unlike `cache.totalLocalPages`, which only knows about
+        // rows fetched into the client cache so far and would under-report until the last chunk
+        // arrives. Falls back to a `totalLocalPages` estimate only if a fetch somehow never reported
+        // a total at all.
+        const total = cache.totalPages ?? (cache.hasMoreOnServer ? `${cache.totalLocalPages}+` : cache.totalLocalPages);
+        document.getElementById('exec-page-total').textContent = String(total);
+
+        const input = document.getElementById('exec-page-input');
+        input.disabled = !paged;
+        // Not written while focused: the user may be mid-keystroke on a multi-digit page number,
+        // and overwriting the field under them would make it impossible to type "1140".
+        if (document.activeElement !== input) input.value = String(cache.currentPage);
+        if (typeof total === 'number') input.max = String(total);
 
         const countLabel = document.getElementById('exec-total-count');
         if (countLabel) countLabel.textContent = cache.totalCount !== null ? `${cache.totalCount} total` : '';
@@ -1384,6 +1491,27 @@ class HookExecutorClient {
         const pageSizeSelect = document.getElementById('exec-page-size');
         if (pageSizeSelect && document.activeElement !== pageSizeSelect) {
             pageSizeSelect.value = String(cache.pageSize);
+        }
+    }
+
+    // Shared by every Execution History pagination control (jump±5, prev/next, the direct page
+    // input, the per-page selector): shows a spinner and disables the controls for the duration of
+    // whatever fetch `mutate` triggers, so a large jump — the one interaction here that cannot be a
+    // pure client-side slice — gives visible feedback instead of looking unresponsive while the
+    // request is in flight. Does not re-fetch the stats tiles: those are exact counts over the
+    // whole filtered dataset (`renderStats`), which paging within that same dataset never changes.
+    async gotoExecPage(mutate) {
+        const spinner = document.getElementById('exec-pagination-spinner');
+        const controls = ['exec-btn-jump-back', 'exec-btn-prev', 'exec-page-input', 'exec-btn-next', 'exec-btn-jump-forward', 'exec-page-size']
+            .map(id => document.getElementById(id));
+        spinner.classList.remove('hidden');
+        controls.forEach(el => { el.disabled = true; });
+        try {
+            await mutate(this.execCache);
+            this.renderExecutionsTable();
+        } finally {
+            spinner.classList.add('hidden');
+            this.updateExecPaginationUI();
         }
     }
 
@@ -2053,10 +2181,22 @@ class HookExecutorClient {
         e.preventDefault();
         const id = document.getElementById('edit-hook-id').value;
         const forCreate = !id;
+        const name = document.getElementById('edit-hook-name').value.trim();
+        // Mirrors `validate_hook_name` (`src/api/support.rs`) exactly: hooks are invocable by name
+        // at `/webhook/{name}`, so a name outside the URL-safe (RFC 3986 `unreserved`) set would be
+        // rejected server-side regardless — checked here too so the failure is an inline message
+        // next to the field, not a round trip to find out the same thing.
+        if (!/^[A-Za-z0-9._~-]+$/.test(name)) {
+            this.showToast(
+                "Hook name may only contain letters, digits, '.', '_', '-', and '~' — no '/' or spaces.",
+                'error'
+            );
+            return;
+        }
         const argsTemplate = document.getElementById('edit-hook-args-template').value;
         const samplePayloadJson = document.getElementById('edit-hook-sample-payload').value;
         const payload = {
-            name: document.getElementById('edit-hook-name').value,
+            name,
             script_path: document.getElementById('edit-hook-script-path').value,
             default_timeout_seconds: parseInt(document.getElementById('edit-hook-timeout').value, 10),
             // Always sent, so clearing the field is an explicit "drop elevation"/"clear" rather
@@ -2831,7 +2971,7 @@ class HookExecutorClient {
     updateAuditPaginationUI() {
         document.getElementById('audit-btn-prev').disabled = !this.auditCache.hasPrevPage;
         document.getElementById('audit-btn-next').disabled = !this.auditCache.hasNextPage;
-        document.getElementById('audit-page-indicator').textContent = `Page ${this.auditCache.localPage + 1}`;
+        document.getElementById('audit-page-indicator').textContent = `Page ${this.auditCache.currentPage}`;
     }
 
     // ───────────────────────────────────────────────────────
@@ -2901,22 +3041,36 @@ class HookExecutorClient {
         document.getElementById('exec-until-filter').addEventListener('change', () => this.loadExecutions());
         document.getElementById('exec-clear-filters-btn').addEventListener('click', () => this.clearExecutionFilters());
 
-        // Execution pagination — most clicks are a pure client-side slice of the cached chunk.
-        document.getElementById('exec-btn-prev').addEventListener('click', () => {
-            this.execCache.prevPage();
-            this.renderExecutionsTable();
-            this.updateExecPaginationUI();
+        // Execution pagination — most clicks are a pure client-side slice of the cached window;
+        // only a distant jump (±5 pages, or a typed page number) actually costs a request.
+        document.getElementById('exec-btn-jump-back').addEventListener('click', () =>
+            this.gotoExecPage((c) => c.jumpPages(-5)));
+        document.getElementById('exec-btn-prev').addEventListener('click', () =>
+            this.gotoExecPage((c) => c.prevPage()));
+        document.getElementById('exec-btn-next').addEventListener('click', () =>
+            this.gotoExecPage((c) => c.nextPage()));
+        document.getElementById('exec-btn-jump-forward').addEventListener('click', () =>
+            this.gotoExecPage((c) => c.jumpPages(5)));
+        document.getElementById('exec-page-size').addEventListener('change', (e) =>
+            this.gotoExecPage((c) => c.setPageSize(parseInt(e.target.value, 10))));
+
+        // Direct page input: jumps on Enter or on blur (typing a number and clicking elsewhere is
+        // just as valid an "I'm done" signal as pressing Enter). Clamped by `goToPage()` itself and
+        // written back by `updateExecPaginationUI()`, so an out-of-range or non-numeric value never
+        // needs its own validation here.
+        const execPageInput = document.getElementById('exec-page-input');
+        const jumpToTypedExecPage = () => {
+            const wanted = parseInt(execPageInput.value, 10);
+            if (Number.isNaN(wanted) || wanted === this.execCache.currentPage) return;
+            this.gotoExecPage((c) => c.goToPage(wanted));
+        };
+        execPageInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                jumpToTypedExecPage();
+            }
         });
-        document.getElementById('exec-btn-next').addEventListener('click', async () => {
-            await this.execCache.nextPage();
-            this.renderExecutionsTable();
-            this.updateExecPaginationUI();
-        });
-        document.getElementById('exec-page-size').addEventListener('change', (e) => {
-            this.execCache.setPageSize(parseInt(e.target.value, 10));
-            this.renderExecutionsTable();
-            this.updateExecPaginationUI();
-        });
+        execPageInput.addEventListener('blur', jumpToTypedExecPage);
 
         // Hooks & Runner
         document.getElementById('btn-open-create-hook-modal').addEventListener('click', () => this.openEditHookModal(null));
@@ -3008,8 +3162,8 @@ class HookExecutorClient {
         });
 
         // Audit pagination
-        document.getElementById('audit-btn-prev').addEventListener('click', () => {
-            this.auditCache.prevPage();
+        document.getElementById('audit-btn-prev').addEventListener('click', async () => {
+            await this.auditCache.prevPage();
             this.renderAuditLogsTable();
             this.updateAuditPaginationUI();
         });

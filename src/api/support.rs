@@ -253,6 +253,40 @@ pub(crate) fn validate_timeout(seconds: i32) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Validates a proposed hook name.
+///
+/// A hook's name is not merely a label: `resolve_hook`/`resolve_hook_including_deleted` accept
+/// either a UUID *or* a name wherever a hook identifier is taken, which is what makes
+/// `/webhook/{name}` and `/api/hooks/{name}/execute` work at all — so a hook's name is also a URL
+/// path segment, and every caller who invokes it by name (a `curl` script, a third-party webhook
+/// sender's own URL configuration, a reverse proxy in front of this daemon) has to get that segment
+/// exactly right.
+///
+/// Restricted to RFC 3986's `unreserved` set — ASCII letters, digits, `-`, `.`, `_`, `~` — the exact
+/// set `api::hooks::percent_encode_path_segment` itself never encodes. Not a narrow allowlist of
+/// "safe-looking" characters chosen for their own sake: anything outside this set either needs
+/// percent-encoding to survive as a path segment at all, or is a `/`, which doesn't merely need
+/// encoding but splits the path outright. A `/` in particular is worse than "needs encoding": a
+/// literal one 404s against this router's own single-segment route, and even a percent-encoded
+/// `%2F` risks being silently decoded back into one by a reverse proxy sitting in front of this
+/// daemon before the request ever reaches it — a difference the operator has no way to see from
+/// here. Everything genuinely URL-safe without encoding is still allowed; only what would force a
+/// caller to get percent-encoding right just to reach an ordinary hook is refused.
+pub(crate) fn validate_hook_name(name: &str) -> Result<(), AppError> {
+    if name.is_empty() {
+        return Err(AppError::InvalidInput("name is required".to_owned()));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')) {
+        return Err(AppError::InvalidInput(format!(
+            "name {name:?} contains a character that is not URL-safe (hooks are invocable by name \
+             at /webhook/{{name}}, so the name is also a URL path segment): only ASCII letters, \
+             digits, '-', '.', '_', and '~' are allowed — no '/', spaces, or other characters that \
+             would need percent-encoding"
+        )));
+    }
+    Ok(())
+}
+
 /// Validates every entry of a comma-separated CIDR list.
 pub(crate) fn validate_bound_ips(bound_ips: &str) -> Result<(), AppError> {
     for cidr in bound_ips.split(',') {
@@ -368,5 +402,15 @@ mod tests {
         assert!(validate_bound_ips("127.0.0.1/32, 10.0.0.0/8").is_ok());
         assert!(validate_bound_ips("").is_ok());
         assert!(validate_bound_ips("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn validates_hook_names_against_the_url_safe_charset() {
+        for name in ["ban.ip", "my_hook-1", "Hook123", "a", "1", "..--__~~"] {
+            assert!(validate_hook_name(name).is_ok(), "{name:?} should be accepted");
+        }
+        for name in ["ban/ip", "hook name", "hook%2Ftest", "hook?query", "hook#frag", "hook@host", ""] {
+            assert!(validate_hook_name(name).is_err(), "{name:?} should be refused");
+        }
     }
 }

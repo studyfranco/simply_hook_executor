@@ -7456,3 +7456,142 @@ failed / 0 skipped** (up from 1133 at session start — one stale §54 check ass
 creation-time `args_template` rejection needed the same rewrite as its Rust counterpart, once Task 6's
 relaxation made the old expectation wrong) · `./scripts/verify_convergence.sh` **18 converged, 1 known
 divergence (pre-existing, unrelated), 0 drifted**.
+
+# 2026-08-24 (second pass) — Hook name routing audit, caller IP audit (no bug), stats fix, advanced pagination
+
+## 1. Webhook routing audit — name-based routing is real and load-bearing
+
+Audited `resolve_hook`/`resolve_hook_including_deleted` (`src/api/support.rs`): a bare identifier on
+`/webhook/{identifier}`, `/api/hooks/{identifier}/execute`, and every other `{identifier}` route is
+tried as a UUID first, then falls back to a lookup by `hooks.name` — confirmed the "Option A" premise
+of this session's brief, not "Option B" (ID-only). `AGENT.MD` already documented this ("this service
+resolves hooks by name on `/webhook/{identifier}`") but nothing had ever restricted what a name could
+actually *contain*, which made it a real, previously-unclosed gap: a hook named with a `/`, a space, or
+any character needing percent-encoding either 404s outright against this router's single-segment route,
+or — worse — risks a reverse proxy in front of this daemon silently decoding a percent-encoded `%2F`
+back into a literal `/` before the request ever reaches here, a difference the operator has no way to
+see from this side.
+
+**Fix**: new `validate_hook_name` (`src/api/support.rs`), called from both `create_hook` and
+`update_hook` (on rename). Restricted to RFC 3986's `unreserved` set — ASCII letters, digits, `-`,
+`.`, `_`, `~` — the exact set `percent_encode_path_segment` (added last session) never encodes.
+Deliberately *not* a narrower "safe-looking characters" allowlist chosen for its own sake: anything
+outside `unreserved` either needs percent-encoding to survive as a path segment, or is a `/`, which
+doesn't merely need encoding but splits the path outright. Mid-session feedback from the user
+("be not too strict, I just want to forbid any non-URL-safe special characters") is why `~` is
+included and the set isn't narrower still — the goal is refusing what's genuinely unsafe, not
+imposing a stylistic slug convention.
+
+Frontend: `#edit-hook-name` gained a matching `pattern`/`title` attribute (native browser validation)
+plus an explicit JS check in `submitHookConfig` (an inline toast, not a round trip to find out the
+same thing server-side).
+
+New tests: `hook_name_is_validated_against_a_url_safe_charset` (integration — valid/invalid sets at
+create and at rename, including empty/whitespace-only) and
+`validates_hook_names_against_the_url_safe_charset` (unit, `src/api/support.rs`), per explicit
+mid-session request to add empty-name coverage specifically.
+
+**Fallout, expected and fixed**: three existing tests (Rust) plus one e2e section relied, incidentally
+or deliberately, on a hook name containing now-forbidden characters:
+- `hook_responses_expose_an_invocable_webhook_path` created a hook named `"url hook #2"` specifically
+  to exercise `percent_encode_path_segment`. Rewritten to seed that name directly into the database
+  (`insert_hook`, bypassing the API) rather than through `POST /api/hooks` — the only way such a hook
+  can still exist is a row that predates this validation, and `percent_encode_path_segment` still has
+  to handle that legacy row correctly; this is exactly the defense-in-depth case it exists for.
+- `only_master_keys_may_assign_run_as_user` derived a hook name from `format!("plain_{null_ish}")`
+  where `null_ish` was `json!("")` — whose `Display` renders as the two literal quote characters `""`,
+  never a name the test actually meant to exercise. Fixed to use a plain enumerated index instead.
+- `hook_metadata_containing_markup_round_trips_verbatim` (Rust) and e2e's "hook whose name and
+  description contain live markup" section both created a hook named
+  `format!("hook{XSS_PAYLOAD}")` (`hook<img src=x onerror=alert(1)>`) to prove markup in hook metadata
+  round-trips verbatim rather than being interpreted. For the *name* field specifically, refusing it
+  outright is now the correct, stronger behavior — rewritten to assert exactly that (`400`), and the
+  verbatim-round-trip half of the test moved onto `script_path` (which carries no such charset
+  restriction — it names a file on disk, not a URL path segment — and still flows into the same audit
+  `details` string the original assertion checked).
+
+## 2. Caller IP audit — no capture bug found; `-` values are pre-migration legacy rows
+
+Investigated the brief's premise ("execution logs show `-` for `caller_ip` across log pages") by
+re-reading the full resolution chain end to end and then proving it live rather than trusting the code
+read alone:
+- `config::resolve_client_ip` always returns a real `IpAddr` (never empty/optional) — the *only* way
+  `executions.caller_ip` can be an empty string is a row from before migration
+  `m20260824_090000_add_execution_caller_ip` existed, backfilled to `''` by necessity (a historical
+  request was never able to capture one at all).
+- Confirmed both invocation routes (`execute_hook_endpoint`, `webhook_execute`) extract
+  `Extension(client_ip): Extension<ClientIp>` and thread it through; confirmed `invocation_auth_middleware`
+  inserts that extension unconditionally, in every auth-mode branch, before either handler runs; confirmed
+  `list_executions` performs no `select_only()` that could exclude the column.
+- Live verification: seeded 20 executions via `/execute` plus one via `/webhook/{name}` against a fresh
+  daemon, read back both pages of `GET /api/executions?page=1&per_page=10` and `page=2`, and confirmed
+  every single row carried a correct `caller_ip: "127.0.0.1"` — proving the capture path is intact
+  end to end, across pagination, for both invocation routes, not merely "should work" from a code read.
+
+**No code change made.** Documented here per this project's established convention (Task 4/Task 13,
+prior session) of recording a clean audit honestly rather than inventing a fix for a premise that
+didn't hold against the current code. If a real deployment is still seeing all-`-` history, the
+two explanations this audit rules *in* are: the visible rows genuinely predate the caller-IP feature
+(most likely, if the deployment was upgraded recently and hasn't accumulated much fresh history yet),
+or the binary running there predates the migration that added the column at all (a deployment gap, not
+a code one) — the resolution logic itself is not the culprit.
+
+## 3. Execution statistics fix — true dataset-wide counts, not the loaded-chunk cap
+
+`renderStats()` computed every tile (`Total`, `Success`, `Failed`, `Timeout`) from `execCache.items` —
+the client-side chunk cache, capped at `chunkSize` (100) — so any filter matching more than 100 rows
+always read exactly `100` regardless of the real count, and the "Executions (loaded)" label was an
+honest admission of that cap rather than a bug in isolation. Fixed by computing each of the four count
+tiles from `X-Total-Count` (already added last session for pagination) via a new
+`fetchExecutionStatusCount(status)` — a `limit=1` request whose body is discarded, since only the
+header is wanted — issued once per status plus once unfiltered-by-status, honoring whatever
+hook/API-key/date filters are active (factored out into `buildExecutionFilterParams()`, shared with
+`fetchExecutionsChunk`). All four now report the *exact* dataset-wide figure, confirmed live: 130
+seeded executions read back as `130`/`130`/`0`/`0` across the whole paginated table, not `100`.
+
+`Avg duration` deliberately stays a sample over the currently-loaded chunk — there is no
+`X-Average-Duration` header to shortcut it the way a count can be, and a bespoke aggregate endpoint
+for one tile was judged out of scope here. Labeled honestly instead: the tile's `title` attribute now
+says so explicitly, and the "Executions (loaded)" tile itself was renamed "Total Executions" now that
+it is one.
+
+## 4. Advanced pagination: ±5 page jumps, direct page input, loading spinner
+
+`PagedCache` (`static/app.js`) was restructured around an explicit, authoritative `currentPage`
+(1-indexed) and `windowStart` (the absolute server-side row index its cached `items[0]` corresponds
+to) rather than inferring position purely from how much had been sequentially fetched. This was
+necessary, not cosmetic: `simply_ip_vault`'s own equivalent `goToPage` (the pattern this task named to
+match) walks forward one `chunkSize` chunk at a time until it reaches the target page, which is fine
+for that project's typical dataset size but would mean hundreds of sequential round trips for a jump to
+page 1000 of a dataset this project's own pagination bar can reach (`Page [ ] of 1141`-scale). The new
+`goToPage(pageNumber)` instead: (a) slices instantly if the target page is already fully cached, (b)
+extends the cache forward by one ordinary chunk if the target sits just past it (indistinguishable from
+the old "step forward" behavior, prefetch included), or (c) replaces the cache with exactly that one
+page's data via a single direct request otherwise — covering both a distant forward jump *and* the
+trickier case of stepping backward out of a window a previous jump had narrowed to (verified live:
+jumping to page 9 of 9, then clicking `‹` once, correctly re-fetched page 8 rather than returning
+empty/garbage data from a `.slice()` with a negative start index — the actual bug this design has to
+avoid). `nextPage`/`prevPage`/`jumpPages(±5)`/`setPageSize` are now all thin callers of `goToPage`, and
+all became `async` as a result (their call sites updated to `await`, both for Execution History and the
+shared Audit Logs cache, which needed no behavior change but does share the class).
+
+UI: the pagination bar now matches `simply_ip_vault`'s own IP-table pattern exactly — `« 5` / `‹` / a
+typed `Page [ N ] of Total` input (jumps on Enter or blur, clamped by `goToPage` itself) / `›` / `5 »` —
+plus a small CSS spinner (`#exec-pagination-spinner`) and control-disabling for the duration of any
+fetch a pagination action triggers, via a new shared `gotoExecPage(mutate)` wrapper. Verified live via
+headless Chromium against 130 seeded executions: page 1 → jump `5»` → "Page 6 of 9"; direct input `9` →
+"Page 9 of 9" with the correct remaining 10 rows and `Next`/`5»` both correctly disabled at the
+boundary; `‹` from there → "Page 8 of 9" with `Next`/`5»` correctly re-enabled. The spinner's own
+visibility toggle uses the identical `classList` pattern already exercised by the verified
+enable/disable logic, so it was reviewed rather than screenshotted mid-flight — catching a sub-100ms
+local-network fetch in a single headless screenshot proved impractical, and an artificially-delayed
+`fetch` shim in the verification harness was fast-forwarded past by Chromium's virtual-time-budget
+regardless of budget size, rather than pausing at it.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**154 passed / 0 failed / 2 ignored** (integration binary; 128 lib tests, other suites unchanged) ·
+`./scripts/test_e2e.sh` **1138 passed / 0 failed / 0 skipped** (up from 1137 — one e2e section needed
+the same name/script_path split as its Rust counterpart above) · `./scripts/verify_convergence.sh`
+**18 converged, 1 known divergence (pre-existing, unrelated), 0 drifted**.

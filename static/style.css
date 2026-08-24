@@ -827,14 +827,15 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 1rem;
+    flex-wrap: wrap;
+    gap: 0.6rem;
     margin-top: 1rem;
     padding-top: 0.75rem;
 }
 
-/* Matches every page indicator (#exec-page-indicator, #audit-page-indicator) rather than a
-   single hard-coded id, so adding another paginated table needs no CSS change. */
-.pagination span {
+/* Audit Logs still has the simple "Page N" indicator; Execution History's own bar uses the
+   .page-jumper below instead. */
+.pagination #audit-page-indicator {
     color: var(--text-muted);
     font-size: 0.85rem;
     font-weight: 500;
@@ -854,6 +855,69 @@ body {
 .pagination .select-field {
     width: auto;
     flex: 0 0 auto;
+}
+
+/* "Page [n] of N" — the number is an input so a page can be typed directly and jumped to on Enter
+   or blur, but it should read as text sitting in the sentence rather than as a form field. Matches
+   `simply_ip_vault`'s own IP table pagination pattern. */
+.page-jumper {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.page-jumper .page-input {
+    width: 4.25rem;
+    padding: 0.3rem 0.4rem;
+    text-align: center;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The spinners steal width from a field this narrow and add nothing — the value is typed or
+   driven by the surrounding buttons. */
+.page-jumper .page-input::-webkit-outer-spin-button,
+.page-jumper .page-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.page-jumper .page-input {
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+
+.page-jumper span {
+    font-variant-numeric: tabular-nums;
+    min-width: 1.5rem;
+}
+
+.pagination .btn-icon {
+    min-width: 2.25rem;
+}
+
+/* A small spinner shown next to the pagination controls while a page fetch is in flight —
+   particularly a large jump (±5 pages, or a typed page number far from what's cached), which is
+   the one pagination interaction that cannot be a pure client-side slice. Hidden the rest of the
+   time via the shared `.hidden` utility. */
+.pagination-spinner {
+    display: inline-block;
+    width: 1rem;
+    height: 1rem;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: pagination-spin 0.7s linear infinite;
+}
+
+@keyframes pagination-spin {
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 /* ─── Toast Notifications ───────────────────────────────── */

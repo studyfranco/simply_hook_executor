@@ -35,7 +35,7 @@ use super::guards::{
 };
 use super::support::{
     create_audit_log, describe_privilege, format_reference, load_parameters,
-    resolve_hook, resolve_hook_including_deleted, validate_timeout,
+    resolve_hook, resolve_hook_including_deleted, validate_hook_name, validate_timeout,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -473,9 +473,7 @@ pub async fn create_hook(
     let run_as_user = normalize_run_as_user(&key, payload.run_as_user.as_deref())?;
 
     let name = payload.name.trim().to_owned();
-    if name.is_empty() {
-        return Err(AppError::InvalidInput("name is required".to_owned()));
-    }
+    validate_hook_name(&name)?;
 
     executor::validate_script_path(&payload.script_path, &state.config.allowed_script_roots)?;
     let timeout = payload.default_timeout_seconds.unwrap_or(30);
@@ -784,9 +782,7 @@ pub async fn update_hook(
 
     if let Some(name) = payload.name {
         let trimmed = name.trim().to_owned();
-        if trimmed.is_empty() {
-            return Err(AppError::InvalidInput("name must not be empty".to_owned()));
-        }
+        validate_hook_name(&trimmed)?;
         changes.push(format!("name={trimmed}"));
         active.name = Set(trimmed);
     }

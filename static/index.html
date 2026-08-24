@@ -137,7 +137,7 @@
         <main id="tab-executions" class="tab-panel">
             <section class="stat-grid">
                 <div class="stat-tile">
-                    <span class="stat-label">Executions (loaded)</span>
+                    <span class="stat-label" title="Matches the current hook/API key/date filters, across the whole dataset — not only what has been fetched into this page.">Total Executions</span>
                     <span class="stat-value" id="stat-total">0</span>
                 </div>
                 <div class="stat-tile stat-success">
@@ -153,7 +153,7 @@
                     <span class="stat-value" id="stat-timeout">0</span>
                 </div>
                 <div class="stat-tile">
-                    <span class="stat-label">Avg duration</span>
+                    <span class="stat-label" title="Sampled from the most recently loaded page of results, not the whole dataset.">Avg duration</span>
                     <span class="stat-value" id="stat-duration">–</span>
                 </div>
             </section>
@@ -209,9 +209,17 @@
                     </div>
 
                     <div class="pagination">
-                        <button id="exec-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
-                        <span id="exec-page-indicator">Page 1 of 1</span>
-                        <button id="exec-btn-next" class="btn btn-icon">Next &raquo;</button>
+                        <button id="exec-btn-jump-back" class="btn btn-icon" title="Back 5 pages" disabled>&laquo;&nbsp;5</button>
+                        <button id="exec-btn-prev" class="btn btn-icon" title="Previous page" disabled>&lsaquo;</button>
+                        <span class="page-jumper">
+                            Page
+                            <input type="number" id="exec-page-input" class="input-field page-input" min="1" value="1"
+                                inputmode="numeric" aria-label="Go to page">
+                            of <span id="exec-page-total">1</span>
+                        </span>
+                        <button id="exec-btn-next" class="btn btn-icon" title="Next page">&rsaquo;</button>
+                        <button id="exec-btn-jump-forward" class="btn btn-icon" title="Forward 5 pages">5&nbsp;&raquo;</button>
+                        <span id="exec-pagination-spinner" class="pagination-spinner hidden" aria-hidden="true"></span>
                         <span id="exec-total-count" class="text-muted text-sm"></span>
                         <label for="exec-page-size" class="text-muted text-sm">Per page:</label>
                         <select id="exec-page-size" class="input-field select-field">
@@ -608,7 +616,9 @@
                 <div class="form-grid">
                     <div class="form-group">
                         <label for="edit-hook-name">Hook Name <span>*</span></label>
-                        <input type="text" id="edit-hook-name" required class="input-field">
+                        <input type="text" id="edit-hook-name" required class="input-field"
+                            pattern="[A-Za-z0-9._~-]+"
+                            title="Only letters, digits, '.', '_', '-', and '~' are allowed — hooks are invocable by name at /webhook/{name}, so the name is also a URL path segment.">
                     </div>
                     <div class="form-group">
                         <label for="edit-hook-timeout">Timeout (seconds) <span>*</span></label>

@@ -2329,11 +2329,22 @@ XSS_CT=$(curl -s -o /dev/null -w '%{content_type}' -H "X-API-Key: $MASTER_KEY" \
     "$BASE_URL/api/executions/$XSS_EXEC_ID")
 check_local "$XSS_CT" "application/json" "the execution endpoint is served as application/json"
 
-# Hook metadata is rendered into the hooks table and the audit log, so it is a sink too.
+# Hook metadata is rendered into the hooks table and the audit log, so it is a sink too — except
+# `name`, which this daemon also routes on (`/webhook/{name}`) and which `validate_hook_name` now
+# refuses outright for exactly this kind of content, a stronger mitigation than "store it safely"
+# for the one field that doubles as a URL path segment.
 api_call POST "/api/hooks" "$MASTER_KEY" \
-    "$(jq -nc --arg p "$XSS_SCRIPT" --arg n "hook$XSS_PAYLOAD" --arg d "$XSS_BREAKOUT" '{name:$n,script_path:$p,description:$d}')"
-check "200" "create a hook whose name and description contain live markup"
-check_jq ".name" "hook$XSS_PAYLOAD" "the hook name round-trips verbatim"
+    "$(jq -nc --arg p "$XSS_SCRIPT" --arg n "hook$XSS_PAYLOAD" '{name:$n,script_path:$p}')"
+check "400" "a hook name containing live markup is refused, not merely escaped later"
+
+# script_path carries no such charset restriction — it names a file on disk, not a URL path segment
+# — so it (like description) is still expected to round-trip verbatim, unescaped, wherever it's
+# rendered, including in the audit trail's details string.
+XSS_SCRIPT2=$(make_hook_script "${XSS_PAYLOAD}.sh" 'echo ok')
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$XSS_SCRIPT2" --arg d "$XSS_BREAKOUT" '{name:"xss_meta_hook",script_path:$p,description:$d}')"
+check "200" "create a hook whose script_path and description contain live markup"
+check_jq ".script_path" "$XSS_SCRIPT2" "the hook script_path round-trips verbatim"
 check_jq ".description" "$XSS_BREAKOUT" "the hook description round-trips verbatim"
 
 api_call GET "/api/audit-logs?action=HOOK_CREATE" "$MASTER_KEY"
