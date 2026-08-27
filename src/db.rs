@@ -13,6 +13,7 @@
 //! | `busy_timeout` | per-connection | **5000 ms** — SQLx sets it |
 //! | `journal_mode=WAL` | **persistent** (file header) | `delete` |
 //! | `synchronous=NORMAL` | per-connection | `FULL` (2) — **this one is a real change** |
+//! | `temp_store=MEMORY` | per-connection | `0` (engine's choice, usually a disk file) |
 //!
 //! ## `foreign_keys` is an assertion, not a fix
 //!
@@ -252,7 +253,11 @@ async fn connect_with_limits(db_url: &str, limits: PoolLimits) -> Result<Databas
         // gives up only the last transactions in a power loss, in exchange for not fsyncing on
         // every commit.
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)));
+        .busy_timeout(Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)))
+        // Temporary tables and indices SQLite creates internally (e.g. for a large `ORDER BY`) are
+        // held in memory rather than spilled to a disk file — the engine's own default. A no-op for
+        // an in-memory database, which has no disk to spill to in the first place.
+        .pragma("temp_store", "MEMORY");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(limits.max_connections)
@@ -427,13 +432,14 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
         Err(e) => tracing::warn!("Could not enable SQLite WAL mode: {e}. Continuing without it."),
     }
 
-    // The remaining three are set-and-log. Each is per-connection, so on a pool this reaches
+    // The remaining four are set-and-log. Each is per-connection, so on a pool this reaches
     // whichever connection serves it — which is precisely why `connect` declares them at open time
     // and why these calls are confirmation rather than mechanism.
     for (label, statement) in [
         ("foreign key enforcement", "PRAGMA foreign_keys=ON;".to_owned()),
         ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
         ("busy timeout", format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")),
+        ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
     ] {
         if let Err(e) =
             db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
@@ -443,7 +449,7 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     }
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms."
+         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY."
     );
 
     Ok(())
@@ -485,12 +491,12 @@ mod tests {
         }
     }
 
-    /// All four settings are in force on a pool built by [`connect`].
+    /// All five settings are in force on a pool built by [`connect`].
     ///
     /// A file-backed database is the only place WAL can actually engage, so that is where the
     /// assertion has to be made — an in-memory database would pass a weaker test vacuously.
     #[tokio::test]
-    async fn connect_applies_all_four_pragmas() {
+    async fn connect_applies_all_five_pragmas() {
         let tmp = TempDb::new();
         let db = connect(&tmp.url(), &RuntimeConfig::default())
             .await
@@ -503,6 +509,10 @@ mod tests {
             pragma::<i32>(&db, "PRAGMA busy_timeout;", "timeout").await,
             SQLITE_BUSY_TIMEOUT_MS as i32
         );
+        // `temp_store`: 0 = engine default (a disk file), 1 = FILE, 2 = MEMORY. `.pragma("temp_store",
+        // "MEMORY")` at connect time must actually have taken, not merely been accepted as a
+        // connection-string parameter and silently ignored.
+        assert_eq!(pragma::<i32>(&db, "PRAGMA temp_store;", "temp_store").await, 2, "MEMORY");
     }
 
     /// `synchronous` is the one setting [`connect`] genuinely *changes* rather than asserts.

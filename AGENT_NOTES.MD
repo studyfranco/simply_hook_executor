@@ -7727,3 +7727,71 @@ like it should work and silently doesn't.
 **156 passed / 0 failed / 2 ignored** (integration binary; 129 lib tests, other suites unchanged) ·
 `./scripts/test_e2e.sh` **1138 passed / 0 failed / 0 skipped** (unchanged — no e2e assertions touched
 this pass) · verified live via headless Chromium (details above), not only by the automated suites.
+
+# 2026-08-24 (fourth pass) — Full API reference catalog (`API_REFERENCE.md`), and a convergence drift closed along the way
+
+## `API_REFERENCE.md`: exhaustive endpoint catalog
+
+New root-level document cataloging every HTTP route this daemon exposes — method, path (with both
+verb aliases, `PUT`/`PATCH` on `/hooks/{identifier}` and `/keys/{id}`, and both probe spellings,
+`/health`+`/healthz`/`/ready`+`/readyz`), the exact authorization rule applied, every query
+parameter and request-body field with its type/optionality/default, and the full response shape
+including status codes and what triggers each.
+
+Built from a direct line-by-line audit rather than from memory or existing prose: read the complete
+router table in `src/lib.rs`, then every handler in `src/api/{hooks,keys,executions,audit,system,
+health}.rs` end to end, then the relevant sections of `src/api/guards.rs` (every guard function's
+own doc comment, which — this codebase's own convention — already states the exact `RBAC_MODEL.md`
+§/R rule it enforces and *why*), `src/extract.rs` (the `Strict*` extractor contract: every rejection
+renders in the standard `{"error": ...}` envelope, with the underlying status passed through rather
+than flattened to `400`), and `src/error.rs` (the `AppError` → status code mapping). Cross-referenced
+against `RBAC_MODEL.md` for terminology (§3 ownership/lifecycle authority, §4 oracle discipline and
+the three visibility scopes, §6 the cascade inventory, R1/R2/R6/R7 the permission-grant rules) rather
+than restating the handler comments' own paraphrase of it.
+
+**Completeness check**: extracted every `.route(...)` registration from `src/lib.rs` via `grep` and
+cross-referenced it against every `### \`METHOD /path\`` heading in the finished document — all 34
+registrations (32 distinct routes plus the 2 verb aliases) are represented, with the aliases folded
+into their primary entry's heading/text rather than duplicated as separate sections. No route,
+hidden query parameter, or DTO field was found undocumented by this pass.
+
+**Structure choices worth naming**: a shared "Authentication model" section up front (the two
+middleware postures, the header table, the per-hook `auth_mode` keyless-invocation matrix, the
+canonical-signing-string precedence, the anti-replay mechanism) and a shared "Standard error
+envelope" table, rather than repeating either under all 32 endpoints — every endpoint's own section
+then only states what is genuinely specific to it (its particular guard, its particular fields).
+`HookDetail`'s shape and the three shared enums (`AuthMode`, `HmacMode`, `ExecutionStatus`) are
+likewise pulled into one "Shared shapes" section at the end rather than repeated at every one of the
+five endpoints that return or accept them.
+
+## A convergence drift, found and closed while running the gates
+
+`./scripts/verify_convergence.sh` — required by this task's own gate list even though nothing in the
+API reference work touches `src/` — reported one **drift** (not a pre-existing accepted divergence):
+the peer project (`simply_ip_vault`) had, independently of this session, added a fifth SQLite
+session pragma (`PRAGMA temp_store=MEMORY`, holding SQLite's own internal temporary tables/indices
+in memory rather than spilling them to a disk file) that this service's `apply_sqlite_pragmas`/
+`connect` did not have. Unrelated to anything this session set out to do, and out of scope for a
+documentation task on its own terms — flagged to the user rather than silently fixed *or* silently
+left broken, since the task's own instructions required every gate to pass cleanly and this one
+didn't. Directed to close it.
+
+Mirrored the peer's implementation exactly rather than inventing an equivalent: `.pragma("temp_store",
+"MEMORY")` added to the `SqliteConnectOptions` builder in `connect_with_limits` (declared at open
+time, same reasoning as the other four — SQLx replays connection options on a reopened/recycled
+connection but does not replay `PRAGMA` statements issued afterward, so declaring it there is what
+makes it survive a recycle), the same pragma added to `apply_sqlite_pragmas`'s confirmation loop and
+its log line, the module doc comment's pragma table gained a row, and
+`connect_applies_all_four_pragmas` was renamed `connect_applies_all_five_pragmas` with a
+`PRAGMA temp_store;` readback assertion (`2` = `MEMORY`) added, matching the peer's own test
+one-for-one.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean · `cargo test`
+**156 passed / 0 failed / 2 ignored** (integration binary; 129 lib tests — including the renamed,
+now-five-assertion `connect_applies_all_five_pragmas` — other suites unchanged) ·
+`./scripts/test_e2e.sh` **1138 passed / 0 failed / 0 skipped** (unchanged — no e2e assertions touch
+`src/db.rs`) · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing,
+unrelated), 0 drifted** — up from 1 drifted at this pass's start; the SQLite pragma fingerprint now
+matches the peer's exactly.
