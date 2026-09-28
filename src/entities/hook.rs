@@ -56,6 +56,32 @@ pub enum AuthMode {
     NoAuth,
 }
 
+/// Where a hook's script actually runs.
+///
+/// Stored as a plain string rather than a native database enum, matching [`AuthMode`], so the
+/// schema stays portable across SQLite/PostgreSQL/MySQL without vendor-specific DDL.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumIter, DeriveActiveEnum, Serialize, Deserialize,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HookExecutionType {
+    /// **The default, and every hook predating this column.** [`Model::script_path`] is executed
+    /// directly on this host via [`crate::executor::run_process`] — shell-free by construction,
+    /// exactly as `AGENT.MD` §3 requires.
+    #[default]
+    #[sea_orm(string_value = "LOCAL")]
+    Local,
+    /// [`Model::script_path`] is executed on the remote host named by [`Model::ssh_target_id`]
+    /// (required, and validated to exist, exactly when this variant is selected — see
+    /// `api::hooks::validate_ssh_dispatch`), via [`crate::ssh::run_remote_process`]. Unlike local
+    /// execution, the remote command necessarily passes through the target's login shell — SSH's
+    /// `exec` channel has no shell-free primitive — so every token is unconditionally
+    /// POSIX-single-quoted before being joined; see `crate::ssh` for the full rationale.
+    #[sea_orm(string_value = "SSH")]
+    Ssh,
+}
+
 /// A single hook: a named, permission-guarded pointer to a local executable.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "hooks")]
@@ -154,6 +180,13 @@ pub struct Model {
     /// `sample_payload_json` applies. Never passed through a shell: substitution produces complete
     /// `argv` entries, not a string that gets re-parsed.
     pub args_template: Option<String>,
+    /// Where this hook's script executes. See [`HookExecutionType`].
+    pub execution_type: HookExecutionType,
+    /// The remote host to dispatch to when `execution_type = SSH`. `None` for
+    /// `execution_type = LOCAL`, and required (enforced at the application layer — see
+    /// `api::hooks::validate_ssh_dispatch`) when `execution_type = SSH`. Deleting a still-referenced
+    /// target is refused (`ON DELETE RESTRICT`) rather than silently downgrading this hook.
+    pub ssh_target_id: Option<Uuid>,
 }
 
 /// Relations from `hooks` to other entities.
@@ -168,6 +201,15 @@ pub enum Relation {
     /// Recorded executions of this hook.
     #[sea_orm(has_many = "super::execution::Entity")]
     Execution,
+    /// The remote target this hook dispatches to when `execution_type = SSH`.
+    #[sea_orm(
+        belongs_to = "super::ssh_target::Entity",
+        from = "Column::SshTargetId",
+        to = "super::ssh_target::Column::Id",
+        on_update = "Cascade",
+        on_delete = "Restrict"
+    )]
+    SshTarget,
 }
 
 impl Related<super::hook_parameter::Entity> for Entity {
@@ -185,6 +227,12 @@ impl Related<super::api_key_hook_permission::Entity> for Entity {
 impl Related<super::execution::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Execution.def()
+    }
+}
+
+impl Related<super::ssh_target::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::SshTarget.def()
     }
 }
 

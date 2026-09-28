@@ -508,6 +508,8 @@ pub async fn insert_hook_full(
         canonical_template: Set(None),
         sample_payload_json: Set(None),
         args_template: Set(None),
+        execution_type: Set(hook::HookExecutionType::Local),
+        ssh_target_id: Set(None),
     }
     .insert(db)
     .await
@@ -552,6 +554,8 @@ pub async fn insert_hook_deleted_days_ago(
         canonical_template: Set(None),
         sample_payload_json: Set(None),
         args_template: Set(None),
+        execution_type: Set(hook::HookExecutionType::Local),
+        ssh_target_id: Set(None),
     }
     .insert(db)
     .await

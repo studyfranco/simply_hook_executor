@@ -17,6 +17,7 @@
 //! | [`keys`] | Key CRUD, `GET /api/auth/me`, per-hook grants, the §6 cascade |
 //! | [`hooks`] | Hook definitions, parameter contracts, trash/restore/purge |
 //! | [`executions`] | Triggering hooks, and reading the records that result |
+//! | [`ssh`] | SSH credential/target management, connectivity tests, fingerprint fetch — master-only |
 //! | [`system`] | The effective configuration and instance counters — master-only |
 //! | [`audit`] | Reads over the audit trail — master-only |
 //! | [`health`] | Liveness and readiness probes. **The only unauthenticated routes in the service** |
@@ -50,6 +51,7 @@ pub mod guards;
 pub mod health;
 pub mod hooks;
 pub mod keys;
+pub mod ssh;
 pub mod support;
 pub mod system;
 
@@ -73,6 +75,11 @@ pub use keys::{
 };
 pub use audit::list_audit_logs;
 pub use health::{health_check, readiness_check};
+pub use ssh::{
+    create_ssh_credential, create_ssh_target, delete_ssh_credential, delete_ssh_target,
+    fetch_ssh_host_fingerprint, get_ssh_credential, get_ssh_target, list_ssh_credentials,
+    list_ssh_targets, test_ssh_target_connection, update_ssh_credential, update_ssh_target,
+};
 pub use system::get_settings;
 
 // The credential primitives are public because the test suite mints keys directly against the

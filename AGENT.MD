@@ -570,6 +570,80 @@ follow:
   envelope, so the body's shape never depends on the call site.
 - A `details` carrying its own `error` key does **not** overwrite the message. The envelope wins.
 
+### 3f. Remote SSH Execution Engine
+
+`hooks.execution_type` (`LOCAL`, the default, or `SSH`) selects where `executor::execute_hook`
+dispatches a hook's script: `executor::run_process` on this host (§3, unchanged), or
+`crate::ssh::run_remote_process` over an SSH connection to `hooks.ssh_target_id`'s `ssh_targets` row.
+`executor::build_command_plan` produces the same `CommandPlan` either way — the branch happens only at
+the point of actually running it, never in how the plan is built.
+
+- **§3's "no shell, ever" does not, and cannot, extend to SSH's `exec` channel as written.** SSH's
+  `exec` request ([RFC 4254 §6.5](https://www.rfc-editor.org/rfc/rfc4254#section-6.5)) is inherently
+  one opaque command string, interpreted by whatever shell the remote account's `sshd` invokes — there
+  is no shell-free SSH primitive to fall back to, unlike `tokio::process::Command::new(...).args(...)`
+  locally. The safety property here is therefore necessarily different in *kind*: `crate::ssh`
+  unconditionally POSIX-single-quotes (`shell_quote`) every token — `script_path`, every resolved
+  argument, every injected `KEY=VALUE` assignment — before joining them into the one command line SSH
+  requires. "No shell, ever" becomes "the remote shell only ever sees single-quoted literals, never
+  syntax it can act on." Never construct that command line by any means other than `shell_quote`ing
+  every token individually.
+- **`script_path` validation is loosened, not skipped, for `execution_type = SSH`.** This daemon has no
+  filesystem to check a remote command against, so `api::support::validate_ssh_dispatch` applies
+  `executor::validate_remote_command` instead of `validate_script_path` for `SSH` hooks: non-empty, no
+  NUL bytes, and — the one SSH-specific rule — not shaped like a `NAME=VALUE` assignment. That last
+  check exists because the remote command line is always `env <KEY=VALUE...> <program> <args...>`, and
+  `env`(1) tells an environment assignment from the command to run purely by that shape; confirmed
+  empirically that GNU coreutils' `env` has **no** `--` end-of-options marker (unlike most GNU
+  utilities) to force the distinction explicitly, so a `script_path` that happened to look like
+  `NAME=VALUE` would silently become one more variable assignment instead of the program actually
+  being invoked.
+- **Environment passthrough uses `env`, not SSH's `SetEnv` request.** `SetEnv`
+  ([RFC 4254 §6.7 erratum](https://www.rfc-editor.org/rfc/rfc4254#section-6.7)) is routinely refused by
+  real-world `sshd` configurations (`AcceptEnv` allowlisting, disabled by default on most
+  distributions), which would make `HOOK_PARAM_*` delivery unreliable in practice. Prefixing the
+  command with `env` needs no server-side configuration at all.
+- **Host key verification is fingerprint pinning, never trust-on-first-use at connect time.**
+  `crate::ssh::HostKeyPinning` (a `russh::client::Handler`) accepts exactly the fingerprint stored on
+  `ssh_targets.host_key_fingerprint`, and `SshConnectionSpec::from_target_and_credential` refuses to
+  build a connection spec at all while that column is `NULL` — an execution against an unpinned target
+  fails before any TCP connection is attempted. Learning a fingerprint is a **separate**,
+  explicitly-named operation, `POST /api/ssh-targets/fetch-fingerprint`
+  (`crate::ssh::fetch_host_key_fingerprint`), which authenticates nothing and runs nothing. There is
+  deliberately no path where a hook's first real execution is also the first time its target's host key
+  is seen.
+- **SSH credential secrets (`ssh_credentials.encrypted_private_key`/`encrypted_passphrase`/
+  `encrypted_password`) reuse `SecretCipher`** (`src/crypto.rs`) — the same XChaCha20-Poly1305
+  mechanism already protecting `api_keys.signing_secret`/`hooks.hmac_secret` — rather than a second
+  encryption scheme. Decrypted strictly in-memory, only by
+  `SshConnectionSpec::from_target_and_credential`, immediately before the connection attempt that
+  consumes them. **Never returned by any `GET`**: `api::ssh::SshCredentialView` reports only
+  `has_private_key`/`has_passphrase`/`has_password` booleans, mirroring `HookDetail`'s
+  `hmac_secret_configured`.
+- **Database connections are released before the SSH network call, by construction rather than by a
+  special mechanism.** `executor::execute_hook`'s SSH branch loads `ssh_target`/`ssh_credential` via
+  ordinary `.one(&state.db)` queries and decrypts the credential into an owned, DB-free
+  `SshConnectionSpec` value; each such query returns its connection to the pool immediately after it
+  resolves (SeaORM/SQLx do not hold a connection across unrelated subsequent `.await` points), so
+  nothing needs to explicitly "release" anything before `run_remote_process` starts — there is simply
+  nothing left borrowing the pool by that point, the same property local execution already has.
+- **`crate::ssh::run_remote_process` never returns an error**, matching `run_process`'s own contract
+  exactly (§3): a target that cannot be reached, a credential the server rejects, a command that cannot
+  start, all become a `FAILED` (or, past the hook's timeout, `TIMEOUT`) execution record with the
+  failure captured in `stderr`, never a `500`.
+- **SSH management (`/api/ssh-credentials`, `/api/ssh-targets`) is master-only**, including target
+  reassignment on a hook and every credential operation — see `api/ssh.rs`'s own module doc comment.
+  `RBAC_MODEL.md` has no granular scope for "manage remote execution infrastructure"; this mirrors the
+  existing precedent for `hooks.run_as_user`, the one other place a hook's configuration already
+  reaches for elevated real-world capability. The one exception is `GET /api/ssh-targets`(`/{id}`),
+  also open to `can_manage_hooks`, so the hook configuration UI's target dropdown works for any key
+  entitled to configure hooks — a target carries no secret of its own.
+- **`execution_type`/`ssh_target_id` are dispatch configuration**, gated by
+  `api::guards::guard_dispatch_configuration` alongside `script_path`/`run_as_user`/`args_template`:
+  they decide *where* a hook's process runs exactly as directly as those decide *what* it receives.
+  Switching `execution_type` to `LOCAL` always clears `ssh_target_id` server-side, even if a request
+  sends one alongside the switch.
+
 ### 4. History, Output Capture & Log Retention
 
 - Every execution produces an `Execution` record storing status (`SUCCESS`, `FAILED`, `TIMEOUT`), exit code, full `stdout`, full `stderr`, duration in milliseconds, resolved parameters JSON, and timestamp.

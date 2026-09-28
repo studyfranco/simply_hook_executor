@@ -12,3 +12,7 @@ pub use super::execution::Entity as Execution;
 pub use super::hook::Entity as Hook;
 /// The `hook_parameters` entity.
 pub use super::hook_parameter::Entity as HookParameter;
+/// The `ssh_credentials` entity.
+pub use super::ssh_credential::Entity as SshCredential;
+/// The `ssh_targets` entity.
+pub use super::ssh_target::Entity as SshTarget;

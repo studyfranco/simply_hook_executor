@@ -7795,3 +7795,124 @@ now-five-assertion `connect_applies_all_five_pragmas` — other suites unchanged
 `src/db.rs`) · `./scripts/verify_convergence.sh` **18 converged, 1 known divergence (pre-existing,
 unrelated), 0 drifted** — up from 1 drifted at this pass's start; the SQLite pragma fingerprint now
 matches the peer's exactly.
+
+## 2026-09-28 — Remote SSH execution support (`ssh_credentials`, `ssh_targets`, `src/ssh.rs`, `api/ssh.rs`)
+
+New feature: a hook's script may now run on a remote host over SSH instead of on this daemon's own
+host. Two new tables (`ssh_credentials`, `ssh_targets`), a new crate-root module (`src/ssh.rs`) for the
+runner, a new API module (`api/ssh.rs`) for managing both, and two new columns on `hooks`
+(`execution_type`, `ssh_target_id`). Full rationale for each of these lives in the code itself — this
+entry records the decisions that were *not* obvious from the brief, and the two places a literal
+reading of it turned out to be wrong.
+
+### Deviations from the brief, and why
+
+- **XChaCha20-Poly1305 (`SecretCipher`, `src/crypto.rs`), not a new AES-256-GCM scheme.** The brief
+  asked for AES-256-GCM specifically. This codebase already has exactly one encryption-at-rest
+  mechanism, already protecting `api_keys.signing_secret` and `hooks.hmac_secret`, and it is a modern
+  AEAD cipher with no weaker security margin than AES-256-GCM — its 192-bit nonce is if anything a
+  stronger property (collision-safe random generation with no counter state to persist, unlike
+  AES-GCM's 96-bit nonce). Introducing a second AEAD implementation, a second key-management story, and
+  a second "is this daemon's data encrypted at rest" question for one feature would have fragmented a
+  property this codebase already has right, for no security benefit. The three new secret columns
+  (`encrypted_private_key`/`encrypted_passphrase`/`encrypted_password`) are sealed through the exact
+  same `SecretCipher::seal`/`open` every other secret in this schema already uses.
+- **RBAC: master-only in full, not `can_manage_webhooks`.** The brief named `can_manage_webhooks` as a
+  scope to gate SSH management with; that scope does not exist anywhere in this codebase (it is
+  `can_manage_hooks`, and it governs *hook* creation, not infrastructure management). Rather than invent
+  a new granular scope — which would mean editing `RBAC_MODEL.md`, the spec required to stay
+  **byte-identical** to `simply_ip_vault`'s copy and enforced by `scripts/verify_convergence.sh` — SSH
+  credential/target management was made master-only in full, mirroring the existing precedent for
+  `hooks.run_as_user` (`AGENT.MD` §3: master-only, checked before any other validation). `GET
+  /api/ssh-targets`(`/{id}`) is the one read exception, also open to `can_manage_hooks`, purely so the
+  hook-configuration UI's target dropdown works for the callers otherwise entitled to configure hooks —
+  a target carries no secret of its own, so this widens nothing the write side doesn't already gate.
+  *Assigning* an already-vetted target to an already-manageable hook (`hooks.execution_type`/
+  `ssh_target_id`) stays at the ordinary R2 dispatch-configuration conjunction, exactly like
+  `script_path`/`run_as_user` — see `AGENT.MD` §3f.
+
+### A schema decision the migration tooling forced mid-implementation
+
+The original plan gave `hooks.ssh_target_id` a real `ON DELETE RESTRICT` foreign key, symmetric with
+`ssh_targets.credential_id`. **This does not work under SQLite**: `sea-query`'s SQLite backend panics
+with `"Sqlite does not support modification of foreign key constraints to existing tables"` the moment
+a migration tries to add a foreign key to a table that already exists (confirmed by writing it the
+naive way first and running `cargo test` — the panic surfaced immediately, in
+`db::tests::migrate_and_connect_leaves_an_in_memory_database_usable` and five siblings). `ssh_targets`
+itself has no such problem — it is a brand-new table in the same migration, so its `credential_id`
+foreign key is declared inline on `Table::create()`, which every backend accepts. `hooks` predates this
+migration by a long history, so it cannot receive one.
+
+This is not a new problem for this schema: `m20230107_090000_key_lineage_and_resource_ownership` hit
+the identical shape for `hooks.owner_key_id`/`api_keys.parent_key_id`/`owner_key_id` and settled it the
+same way this migration now follows — no DDL `REFERENCES` clause on a reference column added to a
+pre-existing table, application-level enforcement instead. `api::ssh::delete_ssh_target` checks for
+referencing hooks and refuses with `409` naming them; `api::support::validate_ssh_dispatch` is the
+write-side invariant enforcement (`ssh_target_id` required and existing exactly when
+`execution_type = SSH`). `ssh_targets.credential_id`, having no such constraint on what it could be, was
+left with its real foreign key rather than weakened to match the column that had no choice.
+
+### `russh` over `ssh2`, and `ring` over the default `aws-lc-rs` backend
+
+`ssh2` binds to libssh2 (a C library), which this codebase has an established preference against — the
+same reasoning already on record for choosing `chacha20poly1305` (pure Rust) elsewhere. `russh` is pure
+Rust and async-native, fitting the Tokio ecosystem this daemon already uses throughout.
+`cargo tree` confirmed `ring v0.17` is *already* a transitive dependency (via `rustls`, pulled in by
+`sea-orm`'s `runtime-tokio-rustls` feature), so selecting `russh`'s `ring` crypto backend
+(`cargo add russh --no-default-features --features ring,rsa`) adds zero new toolchain requirements —
+the default `aws-lc-rs` backend would have needed `cmake` in every build environment, a new deployment
+requirement this codebase has never had.
+
+### The one thing that had to be verified empirically rather than assumed: `env`'s argument parsing
+
+The remote command line is always `env <KEY=VALUE...> <program> <args...>`, every token
+POSIX-single-quoted (`crate::ssh::shell_quote`) — SSH's `SetEnv` channel request is routinely refused by
+real `sshd` configs (`AcceptEnv` allowlisting), so `env` is the only portable way to deliver
+`HOOK_PARAM_*` values without server-side configuration. The original plan added a trailing `--` before
+the program name, matching the "end of options" convention most GNU utilities support. **This is
+wrong for `env` specifically**: tested directly against this machine's `env (GNU coreutils) 9.10`,
+`env -- /bin/echo hello` fails with `env: '--': No such file or directory` — GNU `env` has no `--`
+marker at all. Empirically confirmed instead that `env`'s actual parsing rule is sufficient on its own:
+an argument is consumed as a `NAME=VALUE` assignment only when it is shaped like one
+(`^[A-Za-z_][A-Za-z0-9_]*=`), and the first argument that is *not* shaped that way — and everything
+after it — is treated as the command and its arguments, verbatim, with no further reinterpretation.
+Since every injected `HOOK_PARAM_*`/passthrough name is already validated to match that identifier
+shape (`is_valid_param_key`, `RuntimeConfig::allowed_env_vars`), the only remaining risk was
+`script_path` itself accidentally being `NAME=VALUE`-shaped (a path containing no `/` and an `=`) —
+closed by `executor::validate_remote_command`'s `looks_like_env_assignment` check at hook
+definition/update time, rather than by relying on a `--` marker that does not exist.
+
+### Test strategy for "mock/local SSH execution"
+
+Rather than requiring a live system `sshd` (unavailable in most CI environments, and the kind of
+dependency `AGENT.MD`'s testing philosophy avoids wherever a property can be proven without a second
+host), `tests/ssh_runner_integration_tests.rs` spins up `russh::server` **in-process**, on an ephemeral
+loopback port, using the same `russh` crate the client side is built on. Six tests exercise the real
+wire protocol end to end against it: successful command execution with stdout/stderr/exit-status
+capture, a wrong-password auth failure, a host-key-mismatch refusal, the unpinned-target refusal
+(verified to happen with *no* connection attempt at all), `test_connection`'s and
+`fetch_host_key_fingerprint`'s own contracts. `tests/ssh_api_tests.rs` covers the REST layer
+separately — master-only enforcement, secret-never-returned, validation (bad port, nonexistent
+credential, malformed fingerprint, `NAME=VALUE`-shaped `script_path`), and both `409` referential
+conflicts (credential still used by a target, target still used by a hook) — using direct
+`ActiveModel` inserts for setup and the real router for the assertions, the same pattern every other
+integration test file in this suite already uses. `src/ssh.rs`'s own unit tests cover `shell_quote`,
+remote-command construction, and signal-to-exit-code mapping in isolation. What is **not** covered:
+behavior specific to a real OpenSSH server (its exact banner quirks, `AcceptEnv` enforcement itself,
+`ProxyCommand`/agent forwarding) — genuinely out of reach without a live host, and out of scope for
+what this feature needed proven.
+
+## Gates
+
+`cargo check --all-targets` clean · `cargo clippy --all-targets -- -D warnings` clean (a `cargo build
+--all-targets` sweep found zero warnings of any kind, including `missing_docs`) · `cargo test`
+**387 passed / 0 failed / 2 ignored** across 11 binaries — 141 lib tests (16 new: `ssh::tests`'
+`shell_quote`/remote-command/signal-mapping coverage, `api::ssh::tests`' validator coverage), the
+pre-existing 8 integration binaries unchanged in count, plus two new ones:
+`ssh_api_tests` (18, route-level RBAC/validation/conflict coverage) and
+`ssh_runner_integration_tests` (6, against an in-process `russh::server` — see above) ·
+`./scripts/test_e2e.sh` **1138 passed / 0 failed / 0 skipped** (unchanged from the pre-SSH baseline —
+this suite predates the feature and exercises none of its new routes; it is a regression check on
+everything else, not new-feature coverage) · `./scripts/verify_convergence.sh` **18 converged, 1 known
+divergence (pre-existing, unrelated), 0 drifted** — `RBAC_MODEL.md` remains byte-identical, confirmed
+untouched by this feature.

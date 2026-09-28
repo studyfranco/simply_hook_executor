@@ -34,6 +34,11 @@ This document defines the official database schema, SeaORM entity models, relati
 +-------------------+
 ```
 
+*(Diagram predates `ssh_credentials`/`ssh_targets`, added in `m20260928_090000_add_ssh_infrastructure`.
+Conceptually: `ssh_credentials` 1—M `ssh_targets` via `credential_id` (`ON DELETE RESTRICT`), and
+`ssh_targets` 1—M `hooks` via `hooks.ssh_target_id` — application-enforced rather than a DDL edge, for
+the SQLite reason given in the Foreign Key Enforcement section below. See tables 7 and 8.)*
+
 ---
 
 ## 📁 Database Tables & Fields
@@ -157,6 +162,8 @@ Defines executable script definitions and execution constraints.
 | `canonical_template` | Text | NULLABLE | Override of the `CANONICAL_V1` canonical string, consulted only when a **keyed** `CANONICAL_V1` caller invokes a hook whose own `auth_mode` is `CANONICAL_V1`. `NULL` means the service-wide default, `{method}\n{path}\n{timestamp}\n{body}`. Recognized placeholders: `{method}`, `{path}`, `{timestamp}`, `{body}`; substitution is purely textual. |
 | `sample_payload_json` | Text | NULLABLE | An example JSON body for the WebUI's Run Hook launcher modal and Live Command Preview to auto-fill from — purely a UI convenience, never consulted by `executor::build_command_plan` or any execute/test route. Added in `m20260820_090000_add_hook_sample_payload`. Validated at both create and update time by `validate_sample_payload_matches_parameters`: when set (and non-empty), it must parse as JSON, be a top-level object, and name every one of the hook's *currently* declared `hook_parameters.param_key` values as a top-level key — a `400` otherwise. `NULL`/empty is always accepted regardless of declared parameters (the field is optional). |
 | `args_template` | Text | NULLABLE | An optional argument-vector template (e.g. `add bad_ip ${target_ip}` or, for a flag-style CLI, `--target ${target_ip} --port $port`). Added in `m20260821_090000_add_hook_args_template`. When set (and non-empty), `executor::build_command_plan` tokenizes it on whitespace at execution time and substitutes each token's `$var`/`${var}` references from the resolved parameter of that name, producing the positional `argv` — literal text (flags, subcommands) passes through untouched. `NULL`/empty (the default, and every hook predating this column) keeps the pre-existing behavior: every resolved parameter appended positionally, in declaration order, with no templating. Never passed through a shell — substitution produces complete `argv` entries, never a re-parsed string. Validated at create/update time by `validate_args_template_matches_parameters`: every `$var`/`${var}` referenced must name a currently-declared parameter, the same allowlist discipline `sample_payload_json` applies in the other direction. At request time, a referenced parameter with no resolved value (not supplied, no default) or a resolved value containing a forbidden character (`\|`, `;`, `&`, newline, `$(`) blocks the request — reported as `blocking_reason` on a dry run, a `400` on a real execution. Treated as dispatch configuration alongside `script_path`/`run_as_user` (`api::guards::guard_dispatch_configuration`) even though it postdates `RBAC_MODEL.md`'s Terminology section and isn't named there — the more conservative reading, not a narrower one. |
+| `execution_type` | String | NOT NULL, DEFAULT `'LOCAL'` | Where this hook's script runs: `LOCAL` or `SSH`. Added in `m20260928_090000_add_ssh_infrastructure`. `LOCAL` (the default, and every hook predating this column) is the pre-existing behavior in full — `executor::run_process` on this host, `script_path` validated as an absolute, root-confined local path. `SSH` dispatches to `ssh_target_id` instead, via `crate::ssh::run_remote_process`; `script_path` is then validated only loosely (`executor::validate_remote_command`) as a remote command line, since this daemon has no filesystem to check it against. Treated as dispatch configuration alongside `script_path`/`run_as_user`/`args_template` (`api::guards::guard_dispatch_configuration`) — it decides *where* the process runs exactly as directly as those decide *what* it receives. |
+| `ssh_target_id` | UUID / String | NULLABLE, INDEXED (`idx-hooks-ssh_target_id`) | The `ssh_targets` row this hook dispatches to when `execution_type = SSH`; `NULL` for `LOCAL`. Enforced at the application layer, not by a DDL foreign key — see the Foreign Key Enforcement section below for why `hooks` specifically cannot carry one here. `api::hooks::validate_ssh_dispatch` (via `api::support`) is the sole writer-side enforcement: `NOT NULL` and existing exactly when `execution_type = SSH`; switching a hook back to `LOCAL` always clears this column, even if a value is sent in the same request. `api::ssh::delete_ssh_target` refuses to delete a target this column still references. |
 
 #### `auth_mode` is orthogonal to `api_keys.hmac_mode` and `api_keys.canonical_template`
 
@@ -316,12 +323,77 @@ System-wide audit trail for configuration changes.
 
 ---
 
+### 7. `ssh_credentials`
+Reusable SSH authentication material — a private key or a password — referenced by one or more
+`ssh_targets` rows. Added in `m20260928_090000_add_ssh_infrastructure`.
+
+| Field | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID / String | PRIMARY KEY | Unique identifier for the credential. |
+| `name` | String | NOT NULL, UNIQUE | Human-readable label (e.g. `deploy-key-prod`). |
+| `auth_type` | String | NOT NULL | `KEY` or `PASSWORD` — see the enumeration section below. Decides which of the three secret columns is populated. |
+| `encrypted_private_key` | Text | NULLABLE | The private key (PEM or OpenSSH format), sealed at rest with `crate::crypto::SecretCipher` — the same XChaCha20-Poly1305 mechanism protecting `api_keys.signing_secret`/`hooks.hmac_secret`, not a second scheme. Populated only when `auth_type = KEY`. Decrypted strictly in-memory, immediately before an SSH connection attempt, by `crate::ssh::SshConnectionSpec::from_target_and_credential`. **Never returned by any `GET`** — `api::ssh::SshCredentialView` reports only `has_private_key: bool`. |
+| `encrypted_passphrase` | Text | NULLABLE | The private key's passphrase, sealed the same way. `NULL` both for an unencrypted key and when `auth_type = PASSWORD`. Never returned; see above. |
+| `encrypted_password` | Text | NULLABLE | The login password, sealed the same way. Populated only when `auth_type = PASSWORD`. Never returned; see above. |
+| `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
+| `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
+
+Management (`POST`/`PUT`/`DELETE /api/ssh-credentials`) is **master-only in full** — `RBAC_MODEL.md`
+has no scope for "manage remote execution infrastructure", and a credential is secret material
+capable of authenticating against hosts entirely outside this service, which is a materially
+different decision from any existing granular verb. See `api::ssh`'s module doc comment for the full
+reasoning, and `AGENT_NOTES.MD` for the design-decision log entry.
+
+---
+
+### 8. `ssh_targets`
+A named, reusable remote SSH endpoint a hook may dispatch execution to. Added in
+`m20260928_090000_add_ssh_infrastructure`.
+
+| Field | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID / String | PRIMARY KEY | Unique identifier for the target. |
+| `name` | String | NOT NULL, UNIQUE | Human-readable label (e.g. `prod-web-01`). |
+| `host` | String | NOT NULL | Hostname or IP address. |
+| `port` | Integer | NOT NULL, DEFAULT `22` | TCP port. |
+| `username` | String | NOT NULL | The remote account authenticated as. |
+| `credential_id` | UUID / String | NOT NULL, FOREIGN KEY (`ssh_credentials.id` ON DELETE RESTRICT), INDEXED (`idx-ssh_targets-credential_id`) | The credential this target authenticates with. Deleting a still-referenced credential is refused — `api::ssh::delete_ssh_credential` checks first and names the blocking target(s); the DDL constraint is the backstop if that check is ever bypassed. |
+| `host_key_fingerprint` | String | NULLABLE | The pinned host key fingerprint, `SHA256:<base64>` — exactly as `ssh-keygen -lf` (and `POST /api/ssh-targets/fetch-fingerprint`) render it. `NULL` until an operator fetches and confirms one. **`crate::ssh::SshConnectionSpec::from_target_and_credential` refuses to build a connection spec at all while this is `NULL`** — there is no trust-on-first-use fallback at execution time, since that would make a hook's very first real run the one connection nobody actually verified. |
+| `created_at` | DateTime | NOT NULL | Creation timestamp (UTC). |
+| `updated_at` | DateTime | NOT NULL | Last modification timestamp (UTC). |
+
+Mutations (`POST`/`PUT`/`DELETE`, `.../test-connection`, `.../fetch-fingerprint`) are **master-only**.
+Reads (`GET /api/ssh-targets`, `GET /api/ssh-targets/{id}`) are also open to `can_manage_hooks`, so the
+hook create/edit UI's target dropdown works for any key entitled to configure hooks — a target carries
+no secret of its own, so this does not widen access to anything `guard_dispatch_configuration` doesn't
+already gate on the write side.
+
+---
+
 ## 🔠 Enumeration Types
 
 ### `ExecutionStatus`
 - `SUCCESS`: Process completed with exit code `0`.
 - `FAILED`: Process completed with non-zero exit code or failed to launch.
 - `TIMEOUT`: Process exceeded maximum runtime and was terminated.
+
+### `HookExecutionType` (`hooks.execution_type`)
+
+Stored as a plain string, selected **per hook**.
+
+| Value | Meaning |
+| :--- | :--- |
+| `LOCAL` *(default, and every hook predating this column)* | `script_path` runs on this host, via `executor::run_process` — shell-free by construction. |
+| `SSH` | `script_path` runs on the remote host named by `ssh_target_id` (required, and validated to exist, exactly when this variant is selected), via `crate::ssh::run_remote_process`. Unlike local execution, the remote command necessarily passes through the target's login shell — SSH's `exec` channel has no shell-free primitive — so every token (`script_path`, every argument, every injected `HOOK_PARAM_*` assignment) is unconditionally POSIX-single-quoted before being joined into one command string. See `crate::ssh`'s module doc comment for the full rationale, including why environment passthrough goes through `env <KEY=VALUE...>` rather than SSH's `SetEnv` request (routinely refused by real-world `sshd` configs). |
+
+### `SshAuthType` (`ssh_credentials.auth_type`)
+
+Stored as a plain string, selected **per credential**.
+
+| Value | Meaning |
+| :--- | :--- |
+| `KEY` | Authenticate with `encrypted_private_key`, optionally protected by `encrypted_passphrase`. |
+| `PASSWORD` | Authenticate with `encrypted_password`. |
 
 ### `HmacMode`
 
@@ -389,12 +461,14 @@ none at all.
 - **`Hook` -> `HookParameter`**: HasMany (`hook_id`)
 - **`Hook` -> `Execution`**: HasMany (`hook_id`)
 - **`ApiKey` -> `Execution`**: HasMany (`api_key_id`)
+- **`SshCredential` -> `SshTarget`**: HasMany (`credential_id`)
+- **`SshTarget` -> `Hook`**: HasMany (`ssh_target_id`)
 
 ---
 
 ## 🔐 Foreign Key Enforcement
 
-The schema declares **six** foreign keys. They are not decoration: they are the backstop that holds
+The schema declares **seven** foreign keys. They are not decoration: they are the backstop that holds
 when the application layer is bypassed — by a future handler, an operator at a SQL prompt, or a bug.
 
 | Child | Column | Parent | On delete |
@@ -405,6 +479,7 @@ when the application layer is bypassed — by a future handler, an operator at a
 | `executions` | `hook_id` | `hooks.id` | `CASCADE` |
 | `executions` | `api_key_id` | `api_keys.id` | **`SET NULL`** |
 | `audit_logs` | `api_key_id` | `api_keys.id` | **`SET NULL`** |
+| `ssh_targets` | `credential_id` | `ssh_credentials.id` | **`RESTRICT`** |
 
 ### The `CASCADE` / `SET NULL` asymmetry is deliberate
 
@@ -440,7 +515,7 @@ This service sets `PRAGMA foreign_keys=ON` explicitly, both through `SqliteConne
 returning `1` says a switch is set, not that the engine acts on it. Those tests were
 mutation-verified: five of the six go red with `foreign_keys=OFF`.
 
-### Two columns deliberately carry no foreign key
+### Three columns deliberately carry no foreign key
 
 `api_keys.parent_key_id` and `hooks.owner_key_id` reference `api_keys.id` and are **intentionally
 unconstrained**, as documented in `m20230107_090000_key_lineage_and_resource_ownership`:
@@ -454,3 +529,14 @@ So the guarantee for those two is application-level by design. `RBAC_MODEL.md` �
 must prevent a dangling reference; the schema deliberately declines to. A future migration that
 "fixes the missing constraint" would break §6 —
 `key_lineage_and_ownership_columns_are_unconstrained_by_design` exists to say so before it lands.
+
+`hooks.ssh_target_id` (references `ssh_targets.id`) is unconstrained for a **different**, purely
+mechanical reason: `hooks` already existed before `m20260928_090000_add_ssh_infrastructure`, and
+SQLite's `ALTER TABLE` cannot add a foreign key to an existing table at all — confirmed empirically
+when the naive `add_column` + `add_foreign_key` two-step this migration attempted first panicked with
+`"Sqlite does not support modification of foreign key constraints to existing tables"` in
+`sea-query`'s SQLite backend. `ssh_targets.credential_id` above hit no such limit because `ssh_targets`
+is a table this same migration *creates*, so its foreign key is declared inline on `Table::create()`,
+which every backend accepts. The desired *policy* is identical either way — a still-referenced row
+must refuse to delete rather than cascade or orphan — `hooks.ssh_target_id` just has to get there
+through `api::ssh::delete_ssh_target`'s application-level check instead of DDL.

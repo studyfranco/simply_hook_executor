@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -822,6 +822,72 @@ pub fn validate_script_path(
     Ok(())
 }
 
+/// Whether `s` would be parsed by `env`(1) as a `NAME=VALUE` assignment rather than as the command
+/// to run: a leading ASCII letter or underscore, followed by only letters/digits/underscores, up to
+/// an `=`.
+fn looks_like_env_assignment(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    for c in chars {
+        if c == '=' {
+            return true;
+        }
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Validates a hook's `script_path` when `execution_type = SSH`.
+///
+/// Deliberately much looser than [`validate_script_path`]: the command runs on a host this daemon
+/// has no filesystem visibility into, so there is no local root to confine it to and no point
+/// demanding an absolute path this daemon can never resolve — a relative path, or a bare command
+/// name resolved through the remote account's own `PATH`, is exactly as legitimate there as an
+/// absolute one.
+///
+/// What still matters, wherever the command runs, is that [`crate::ssh::run_remote_process`] can
+/// compose it into a single remote command line safely:
+///
+/// - No NUL bytes.
+/// - Not shaped like a `NAME=VALUE` assignment ([`looks_like_env_assignment`]). The remote command
+///   line is always `env <KEY=VALUE...> <program> <args...>`, every token individually
+///   POSIX-single-quoted; `env`(1) tells an environment assignment from the command to run purely
+///   by this shape (confirmed against GNU coreutils, which — unlike most other GNU utilities — has
+///   no `--` end-of-options marker to force the distinction explicitly), so a `script_path` that
+///   happened to match it would silently become one more variable assignment instead of the program
+///   actually being invoked.
+pub fn validate_remote_command(script_path: &str) -> Result<(), ScriptError> {
+    if script_path.trim().is_empty() {
+        return Err(ScriptError::new(
+            ScriptRejection::MalformedPath,
+            "script_path must not be empty".to_owned(),
+        ));
+    }
+    if script_path.contains('\0') {
+        return Err(ScriptError::new(
+            ScriptRejection::MalformedPath,
+            "script_path must not contain NUL bytes".to_owned(),
+        ));
+    }
+    if looks_like_env_assignment(script_path) {
+        return Err(ScriptError::new(
+            ScriptRejection::MalformedPath,
+            format!(
+                "script_path '{script_path}' looks like a NAME=VALUE assignment; the remote 'env' \
+                 invocation would consume it as an environment variable instead of running it as \
+                 the command. Rename it, or prefix it with './' if it is meant to run from the \
+                 current directory."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────
 // Per-key concurrency throttling
 // ─────────────────────────────────────────────────────────────
@@ -1116,7 +1182,10 @@ pub async fn run_process(
 }
 
 /// Milliseconds since `started`, saturating rather than wrapping at `i32::MAX` (~24 days).
-fn elapsed_ms(started: Instant) -> i32 {
+///
+/// `pub(crate)`: also used by [`crate::ssh::run_remote_process`], which needs the identical
+/// saturating-duration convention for its own [`ExecutionOutcome::duration_ms`].
+pub(crate) fn elapsed_ms(started: Instant) -> i32 {
     i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX)
 }
 
@@ -1134,10 +1203,18 @@ pub async fn execute_hook(
 ) -> Result<execution::Model, AppError> {
     let key_prefix = key.map(|k| k.prefix.as_str()).unwrap_or("(keyless)");
 
-    if let Err(diagnosis) = ensure_runnable(hook, &state.config) {
-        // Logged at WARN with the classification attached, so a misconfigured or tampered-with
-        // hook is greppable in journald (`rejection=PermissionDenied`) and not merely a 400 that
-        // only the caller ever sees.
+    // The local filesystem pre-flight (existence, execute bit, containment, sudo availability) has
+    // no remote counterpart this daemon could check without already having connected — an SSH-mode
+    // hook's `script_path` was validated only loosely at definition time
+    // (`validate_remote_command`), and whether it actually resolves is discovered the same way any
+    // other property of the remote host is: by the connection attempt itself, reported as a `FAILED`
+    // execution exactly like a bad local path is.
+    if hook.execution_type == hook::HookExecutionType::Local
+        && let Err(diagnosis) = ensure_runnable(hook, &state.config)
+    {
+        // Logged at WARN with the classification attached, so a misconfigured or tampered-with hook
+        // is greppable in journald (`rejection=PermissionDenied`) and not merely a 400 that only the
+        // caller ever sees.
         tracing::warn!(
             hook = %hook.name,
             key = %key_prefix,
@@ -1172,7 +1249,41 @@ pub async fn execute_hook(
         "Executing hook"
     );
 
-    let outcome = run_process(&plan, timeout, state.config.max_output_bytes).await;
+    let outcome = match hook.execution_type {
+        hook::HookExecutionType::Local => run_process(&plan, timeout, state.config.max_output_bytes).await,
+        hook::HookExecutionType::Ssh => {
+            // `hook.ssh_target_id` is guaranteed `Some` here: `api::hooks::validate_ssh_dispatch`
+            // refuses to ever store `execution_type = SSH` without one.
+            let target_id = match hook.ssh_target_id {
+                Some(id) => id,
+                None => {
+                    tracing::error!(hook = %hook.name, "SSH hook has no ssh_target_id");
+                    return Err(AppError::Internal);
+                }
+            };
+            let target = crate::entities::prelude::SshTarget::find_by_id(target_id)
+                .one(&state.db)
+                .await?
+                .ok_or_else(|| {
+                    tracing::error!(hook = %hook.name, target_id = %target_id, "SSH hook's target no longer exists");
+                    AppError::Internal
+                })?;
+            let credential = crate::entities::prelude::SshCredential::find_by_id(target.credential_id)
+                .one(&state.db)
+                .await?
+                .ok_or_else(|| {
+                    tracing::error!(hook = %hook.name, target = %target.name, "SSH target's credential no longer exists");
+                    AppError::Internal
+                })?;
+            // Decrypted into an owned, DB-free value *before* the SSH network call below — the two
+            // queries above have already returned their connections to the pool by this point
+            // (each `.one(&state.db).await` holds one only for its own duration), so no connection
+            // is held open across the handshake/execution window that follows.
+            let connection_spec =
+                crate::ssh::SshConnectionSpec::from_target_and_credential(&state.cipher, &target, &credential)?;
+            crate::ssh::run_remote_process(&connection_spec, &plan, timeout, state.config.max_output_bytes).await
+        }
+    };
 
     tracing::info!(
         hook = %hook.name,
@@ -1324,6 +1435,8 @@ mod tests {
             canonical_template: None,
             sample_payload_json: None,
             args_template: None,
+            execution_type: hook::HookExecutionType::Local,
+            ssh_target_id: None,
         }
     }
 

@@ -15,3 +15,7 @@ pub mod execution;
 pub mod hook;
 /// The `hook_parameters` table: the declared parameter contract of each hook.
 pub mod hook_parameter;
+/// The `ssh_credentials` table: reusable SSH authentication material.
+pub mod ssh_credential;
+/// The `ssh_targets` table: remote hosts a hook may dispatch execution to.
+pub mod ssh_target;

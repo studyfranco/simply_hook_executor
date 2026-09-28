@@ -17,18 +17,18 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 
 ## Coverage
 
-**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-08-24.
+**This index is exhaustive: every `.rs` file under `src/` appears below.** Verified 2026-09-28.
 
 | Group | Files | Where documented here |
 | :--- | :--- | :--- |
-| Crate root (`src/*.rs`) | 13 | One `###` section each, under **Top level** |
-| API layer (`src/api/*.rs`) | 9 | One `###` section each, under **`src/api/`** |
-| Entities (`src/entities/*.rs`) | 8 | Table under **`src/entities/`** (6 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 15 | Table under **`src/migration/`** (14 migrations + `mod.rs`) |
-| **Total** | **45** | — |
+| Crate root (`src/*.rs`) | 14 | One `###` section each, under **Top level** |
+| API layer (`src/api/*.rs`) | 10 | One `###` section each, under **`src/api/`** |
+| Entities (`src/entities/*.rs`) | 10 | Table under **`src/entities/`** (8 rows + a combined `mod.rs`/`prelude.rs` row) |
+| Migrations (`src/migration/*.rs`) | 16 | Table under **`src/migration/`** (15 migrations + `mod.rs`) |
+| **Total** | **50** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
-(verified passing 2026-08-21, all three silent):
+(verified passing 2026-09-28, all three silent):
 
 ```bash
 # 1. Crate-root and API modules, documented as `### `src/…`` headings
@@ -67,11 +67,13 @@ src/
 ├── config.rs               Environment parsing, proxy trust, client-IP resolution
 ├── crypto.rs               HMAC request signing + signing-secret encryption at rest
 ├── replay.rs               Single-use enforcement for CANONICAL_V1 signatures
-├── executor.rs             Script execution: argv, env isolation, timeout, killpg
+├── executor.rs             Script execution: argv, env isolation, timeout, killpg; dispatches to
+│                           `ssh.rs` for `execution_type = SSH`
 ├── retention.rs            Background sweeps for expired history and trashed hooks
 ├── db.rs                   Pool construction, SQLite session pragmas, migrations
 ├── error.rs                AppError → HTTP status mapping
 ├── extract.rs              StrictJson / OptionalStrictJson — §5's type-level body control
+├── ssh.rs                  Remote SSH execution engine: connect, pinned host key, exec, capture
 ├── api/
 │   ├── mod.rs              Module wiring, router-facing re-exports, policy constants
 │   ├── support.rs          Shared plumbing. Decides nothing
@@ -79,6 +81,7 @@ src/
 │   ├── keys.rs             Key CRUD, identity, grants, §6 cascade
 │   ├── hooks.rs            Hook definitions, parameters, trash lifecycle
 │   ├── executions.rs       Triggering hooks, and reading the records
+│   ├── ssh.rs              SSH credential/target management — master-only
 │   ├── audit.rs            Reads over the audit trail — master-only
 │   ├── system.rs           Effective configuration + counters — master-only
 │   └── health.rs           Liveness/readiness probes — the only public routes
@@ -263,12 +266,16 @@ it protects.
 ### `src/executor.rs` — 1,638 lines
 
 **Role & scope.** Everything about running a child process safely: argv construction, environment
-isolation, `run_as_user` handling, script-path containment, timeouts, and process-group kill. Must
-**not** make authorization decisions — by the time execution starts, the caller has been authorized.
+isolation, `run_as_user` handling, script-path containment, timeouts, and process-group kill. Also the
+one dispatch point deciding *where* that process actually runs — `execute_hook` branches on
+`hook.execution_type` between building the (dispatch-target-agnostic) `CommandPlan` and choosing
+`run_process` (this file) or `crate::ssh::run_remote_process`. Must **not** make authorization
+decisions — by the time execution starts, the caller has been authorized — and must **not** hold any
+SSH-transport code itself; see `src/ssh.rs`'s own rationale for why that boundary is drawn there.
 
 **Key exports.** `execute_hook`, `build_command_plan`, `resolve_parameters`, `validate_script_path`,
-`validate_run_as_user`, `effective_run_as_user`, `ensure_executable`, `run_process`,
-`is_valid_param_key`.
+`validate_remote_command`, `validate_run_as_user`, `effective_run_as_user`, `ensure_executable`,
+`run_process`, `is_valid_param_key`.
 
 **Rationale.** Large but coherent — one subject, deeply defended, and splitting it would be churn.
 This is the file where a mistake is remote code execution, so the defences are layered: path
@@ -276,6 +283,15 @@ containment, `env_clear` with an explicit allowlist, argv rather than shell stri
 a process that forks cannot outlive its timeout. **This file has no peer equivalent** — the peer
 service dispatches HTTP webhooks (`src/webhooks.rs`) rather than executing local scripts, and that
 asymmetry is the deepest architectural difference between the two codebases.
+
+`execute_hook`'s SSH branch loads the hook's `ssh_target`/`ssh_credential` rows and decrypts the
+credential (`crate::ssh::SshConnectionSpec::from_target_and_credential`) into an owned, DB-free value
+*before* calling `run_remote_process` — each `.one(&state.db)` lookup returns its connection to the
+pool immediately after the query, so no connection is held open across the SSH
+handshake/execution window, satisfying the same "release before the network call" requirement
+`a_running_hook_does_not_hold_the_database_connection_hostage` already pins for local execution.
+`ensure_runnable`'s local filesystem pre-flight (existence, execute bit, sudo availability) is skipped
+entirely for `execution_type = SSH` — there is nothing on *this* host to stat.
 
 ### `src/retention.rs` — 150 lines
 
@@ -372,6 +388,36 @@ than flattening it to `400`. The router-wide `DefaultBodyLimit` surfaces here as
 flattening would silently demote `413 Payload Too Large` into an indistinguishable bad request — and
 `PathRejection::MissingPathParams` is a `500` describing a defect in *this service*, which must never
 be reported to a caller as their bad request.
+
+### `src/ssh.rs` — 620 lines
+
+**Role & scope.** The remote SSH execution engine: connecting, verifying a pinned host key,
+authenticating, rendering a [`crate::executor::CommandPlan`] into the one command line SSH's `exec`
+channel accepts, and capturing its output. Must **not** make authorization decisions, and must
+**not** decide *whether* a hook dispatches over SSH at all — that is `hook::HookExecutionType`, read
+by `executor::execute_hook`, which is the only caller of this module's `run_remote_process`.
+
+**Key exports.** `SshConnectionSpec` (`from_target_and_credential`), `run_remote_process`,
+`test_connection`, `fetch_host_key_fingerprint`, `shell_quote`, `SshRunError`.
+
+**Rationale — why this is a crate-root module and not part of `executor.rs`.** `executor.rs`'s own
+module doc states its first invariant as "No shell, ever," enforced there by never constructing a
+command string at all. SSH's `exec` request ([RFC 4254 §6.5](https://www.rfc-editor.org/rfc/rfc4254#section-6.5))
+has no shell-free equivalent — it is inherently one opaque string, interpreted by whatever shell the
+remote account's `sshd` invokes — so this module's safety property is necessarily different in kind
+("every token is unconditionally single-quoted before being joined") rather than a network-attached
+copy of `executor.rs`'s. Folding it into `executor.rs` would blur that distinction inside one file
+whose central claim is "no shell, ever." `CommandPlan` itself stays dispatch-target-agnostic and lives
+in `executor.rs` unchanged — `build_command_plan` already produces `program`/`args`/`env` without
+knowing or caring whether the result runs locally or over SSH, which is what lets this module consume
+it without executor.rs importing anything from here.
+
+**Why fingerprint pinning, not trust-on-first-use at connect time.** `HostKeyPinning` (a
+`russh::client::Handler`) accepts exactly one fingerprint: the one already confirmed and stored on
+`ssh_targets.host_key_fingerprint`. Learning a fingerprint is a **separate**, explicitly-named
+operation (`fetch_host_key_fingerprint`, backing `POST /api/ssh-targets/fetch-fingerprint`) that
+authenticates nothing and runs nothing — there is deliberately no path where a hook's first real
+execution is also the first time its target's host key is seen.
 
 ---
 
@@ -563,6 +609,19 @@ not by a bare permission row. Parameter CRUD sits in the same file and behind th
 parameter is argv for whatever `script_path` names: a defaulted parameter on a hook running `/bin/sh`
 supplies `-c` and a command string without the caller ever touching `script_path`.
 
+`execution_type`/`ssh_target_id` (added alongside `src/ssh.rs`) join `script_path`/`run_as_user`/
+`args_template` as dispatch configuration for the identical reason `args_template` itself did:
+`execution_type` decides *where* the process runs, exactly as directly as those decide *what* it
+receives, so `update_hook`'s `touches_dispatch_configuration` check (feeding
+`guard_dispatch_configuration`) now also fires on either field. `api::support::validate_ssh_dispatch`
+is the one place the combination is validated — `LOCAL` forbids `ssh_target_id` and validates
+`script_path` as a local path (`executor::validate_script_path`); `SSH` requires an existing
+`ssh_target_id` and validates `script_path` only loosely (`executor::validate_remote_command`), since
+this daemon has no filesystem to check a remote command against. Both `create_hook` and `update_hook`
+call it with the *effective* values a write is about to store, mirroring the same effective-value
+pattern already used for `auth_mode`/`sample_payload_json`/`args_template` — switching `execution_type`
+without resending `script_path` still gets the new mode's validation applied to the existing path.
+
 `auth_mode` and its four supporting fields (`hmac_secret`, `signature_header`, `signature_prefix`,
 `canonical_template`) are **not** dispatch configuration under `RBAC_MODEL.md`'s Terminology section —
 only `script_path`/`run_as_user` are named there — so they are editable via ordinary `guard_manage`
@@ -625,6 +684,40 @@ it directly rather than duplicating the same two-branch lookup for its own `api_
 
 Note `delete_execution` is deliberately **stricter** than reading one — `can_view_execution` buys
 visibility, never destruction. An auditor is not a redactor.
+
+### `src/api/ssh.rs` — 640 lines
+
+**Role & scope.** Management API for `ssh_credentials`/`ssh_targets`: CRUD, a connectivity test, and
+the fingerprint-fetch step of this deployment's trust-on-first-use model. Must **not** run a hook, and
+must **not** decide a *hook's* `execution_type`/`ssh_target_id` — that stays in `api/hooks.rs`, gated
+by the ordinary `guard_dispatch_configuration` conjunction rather than this module's master-only rule.
+
+**Key exports.** `create_ssh_credential`, `list_ssh_credentials`, `get_ssh_credential`,
+`update_ssh_credential`, `delete_ssh_credential`; `create_ssh_target`, `list_ssh_targets`,
+`get_ssh_target`, `update_ssh_target`, `delete_ssh_target`, `test_ssh_target_connection`,
+`fetch_ssh_host_fingerprint`; `SshCredentialView`, `SshTargetView`.
+
+**Rationale — why every mutation is master-only.** `RBAC_MODEL.md` has no scope for "manage remote
+execution infrastructure" — its granular verbs (`can_manage_hooks`, `can_manage_keys`) predate SSH
+support and are about resources this service already modeled. An SSH credential authenticates against
+infrastructure *outside* this service entirely; delegating it is a materially different decision from
+delegating "can edit hook definitions," so this module does not invent new RBAC surface for it —
+master-only mirrors the existing precedent for `hooks.run_as_user` (`AGENT.MD` §3), the one other
+place a hook's configuration already reaches for elevated real-world capability. `list_ssh_targets`/
+`get_ssh_target` are the sole exception, also open to `can_manage_hooks`, because `api/hooks.rs`'s
+create/edit flow needs to populate a target dropdown for exactly the callers otherwise entitled to set
+a hook's `ssh_target_id` — a target carries no secret of its own, so this widens nothing
+`guard_dispatch_configuration` doesn't already gate on the write side.
+
+**Why secrets never round-trip.** `SshCredentialView` reports `has_private_key`/`has_passphrase`/
+`has_password` — booleans, never the sealed columns — the same shape `HookDetail.hmac_secret_configured`
+already established. A secret is write-only from the API's perspective; from the moment it is sealed,
+the only reader is `crate::ssh::SshConnectionSpec::from_target_and_credential`, at connection time.
+
+**Why `test-connection`/`fetch-fingerprint` are always `200`.** Mirrors `api::executions::test_hook`'s
+established contract: a probe's outcome (`{success, message}`) is *data* the caller asked for, not an
+error condition — "the connection failed" is exactly what `POST .../test-connection` exists to be able
+to say, so it says it in the body rather than as a `4xx`/`5xx`.
 
 ### `src/api/audit.rs` — 113 lines
 
@@ -712,11 +805,13 @@ One file per table, each a `DeriveEntityModel` plus its relations. These are the
 | File | Table | Note |
 | :--- | :--- | :--- |
 | `api_key.rs` | `api_keys` | **`master_marker` is deliberately absent from the model** — it is an engine-generated column, so SeaORM must never emit it in an `INSERT`. `parent_key_id` is the **only** key-to-key relationship; the dormant `owner_key_id` was dropped in `m20260810_090000`. Also defines `HmacMode` — a key's **own** signature mode, unrelated to `hook.rs`'s `AuthMode` below. `HmacMode` now has **one** variant (`CANONICAL_V1`) — `BODY_ONLY` was retired in `m20260819_141730`, superseded by hook-level `HMAC_ONLY`. `canonical_template` (added the same migration) is the per-key customization surface that replaced it |
-| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. Also carries `sample_payload_json` (nullable, `m20260820_090000`) — a WebUI convenience only, never read by `executor::build_command_plan` — and `args_template` (nullable, `m20260821_090000`), which *is* read by it: an optional whitespace-tokenized argument-vector template with `$var`/`${var}` substitution, the templated alternative to appending every resolved parameter as a bare positional argument. See `middleware.rs` below |
+| `hook.rs` | `hooks` | Carries `owner_key_id` (§3 — the **load-bearing** one, easily confused with the key column that was dropped) and the soft-delete columns. Also defines `AuthMode` (`CANONICAL_V1`/`API_KEY_ONLY`/`HMAC_ONLY`/`NONE`) and the four supporting columns (`hmac_secret`, `signature_header`, `signature_prefix`, `canonical_template`) added in `m20260819_120414` — **inbound** authentication for a request targeting *this hook*. `AuthMode` itself stays off `ApiKey` — `NONE`/`HMAC_ONLY` describe a keyless caller, incoherent as a property of a credential object — but `api_key.rs`'s own `canonical_template` (added later, `m20260819_141730`) is a deliberately separate, narrower field: a per-key template override, not a mode. Also carries `sample_payload_json` (nullable, `m20260820_090000`) — a WebUI convenience only, never read by `executor::build_command_plan` — and `args_template` (nullable, `m20260821_090000`), which *is* read by it: an optional whitespace-tokenized argument-vector template with `$var`/`${var}` substitution, the templated alternative to appending every resolved parameter as a bare positional argument. Also defines `HookExecutionType` (`LOCAL`/`SSH`, `m20260928_090000`) and carries `ssh_target_id` (nullable, no DDL foreign key — see `SCHEMA.MD`'s Foreign Key Enforcement section) — **outbound** dispatch target, orthogonal to `AuthMode`'s inbound question. See `middleware.rs` below |
 | `api_key_hook_permission.rs` | `api_key_hook_permissions` | The three verbs: `can_execute`, `can_manage`, `can_view_execution` |
 | `hook_parameter.rs` | `hook_parameters` | Declaration order is argv order |
 | `execution.rs` | `executions` | `api_key_id` is the acting key — the "creator" in §4's third scope. Defines `ExecutionStatus`. Also carries `caller_ip` (`NOT NULL DEFAULT ''`, `m20260824_090000`) — the resolved client IP, same trust-aware resolution as `audit_log.rs`'s `client_ip` |
 | `audit_log.rs` | `audit_logs` | Attribution stored as text so it outlives the acting key |
+| `ssh_credential.rs` | `ssh_credentials` | Defines `SshAuthType` (`KEY`/`PASSWORD`). The three secret columns are sealed with `crate::crypto::SecretCipher` and carry `#[serde(skip_serializing)]` as defense in depth — `api::ssh::SshCredentialView` is the only shape ever actually serialized to a client, and it omits them outright |
+| `ssh_target.rs` | `ssh_targets` | `credential_id` is a real `ON DELETE RESTRICT` foreign key (declared inline on this table's own `CREATE TABLE`, unlike `hooks.ssh_target_id` above — see `SCHEMA.MD`). `host_key_fingerprint` is `NULL` until an operator confirms one via `POST /api/ssh-targets/fetch-fingerprint`; `crate::ssh::SshConnectionSpec` refuses to connect at all while it is |
 | `mod.rs`, `prelude.rs` | — | Registry and bulk import |
 
 ---
@@ -742,6 +837,7 @@ one that has shipped.
 | `m20260820_090000_add_hook_sample_payload` | `hooks.sample_payload_json` (nullable `TEXT`) — the WebUI's Live Command Preview / Run Hook launcher auto-fill source, see `entities/hook.rs` and `api/hooks.rs` above |
 | `m20260821_090000_add_hook_args_template` | `hooks.args_template` (nullable `TEXT`) — the templated alternative to plain positional arguments, substituted by `executor::build_command_plan`, see `entities/hook.rs` and `executor.rs` above |
 | `m20260824_090000_add_execution_caller_ip` | `executions.caller_ip` (`NOT NULL DEFAULT ''`) — the resolved client IP of whoever triggered the execution, threaded from `Extension<ClientIp>` through `executor::execute_hook`, see `entities/execution.rs` and `executor.rs` above |
+| `m20260928_090000_add_ssh_infrastructure` | Creates `ssh_credentials` and `ssh_targets` (the latter's `credential_id` a real `ON DELETE RESTRICT` FK), and adds `hooks.execution_type` (`NOT NULL DEFAULT 'LOCAL'`) / `hooks.ssh_target_id` (nullable, no DDL FK — SQLite cannot add one to an existing table, confirmed empirically; see `SCHEMA.MD`) — see `entities/ssh_credential.rs`, `entities/ssh_target.rs`, `entities/hook.rs`, `src/ssh.rs`, and `api/ssh.rs` above |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the
@@ -775,7 +871,7 @@ cannot tell whether `main` actually honours it.
 
 | Gate | Size | Covers | Cannot cover |
 | :--- | :--- | :--- | :--- |
-| `cargo test` | **287** across 9 binaries, **2 ignored** | Handler logic through the real router (`oneshot`, no port), RBAC compliance, schema/referential integrity, health probes, source hygiene, request races | Anything about the process: argv, signals, exit codes, real spawned children |
+| `cargo test` | **363** across 9 binaries, **2 ignored** | Handler logic through the real router (`oneshot`, no port), RBAC compliance, schema/referential integrity, health probes, source hygiene, request races, SSH command construction/shell-quoting | Anything about the process: argv, signals, exit codes, real spawned children, and (for SSH specifically) anything needing a live SSH server — there is no mock/loopback `sshd` in this suite; see `AGENT_NOTES.MD` |
 | `cargo test -- --ignored` | **2** | The two tests needing a host tool — `sudo` and `setsid(1)`. They **assert** their precondition rather than skipping, so a host without the tool fails loudly instead of reporting a pass over nothing | Nothing else; it is a deliberate opt-in set |
 | `scripts/test_e2e.sh` | **958 checks**, 47 sections | The live daemon over HTTP: hook lifecycle, parameter contracts, real script execution, the RBAC matrix, HMAC signing, timeouts and `killpg`, startup refusals, the §42–§46 robustness set, and the §47 error-envelope contract | Anything needing a second host, a real proxy, or a non-SQLite backend |
 | `scripts/verify_convergence.sh` | 19 checks (18 converged, 1 accepted divergence) | Behavioural drift against `example/simply_ip_vault` — three byte-identical functions, shared constants, and `RBAC_MODEL.md` identity | Anything the peer does not also implement |

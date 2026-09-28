@@ -586,6 +586,8 @@ class HookExecutorClient {
             hooks: [],
             apiKeys: [],
             settings: null,
+            sshCredentials: [],
+            sshTargets: [],
             // Row-selection state for the batch-delete checkboxes, keyed by each row's own
             // stable UUID.
             selectedExecutionIds: new Set(),
@@ -913,10 +915,14 @@ class HookExecutorClient {
         document.getElementById('keys-tab-btn').style.display =
             (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
 
-        // Settings and audit logs are master-only on the backend, so hide the tab entirely
-        // rather than show it and let every request 403.
+        // Settings, audit logs, and SSH infrastructure management are master-only on the backend
+        // (`src/api/ssh.rs`'s own doc comment: an SSH credential authenticates against
+        // infrastructure outside this service entirely, so it is not delegable via can_manage_hooks
+        // the way ordinary hook management is), so hide each tab entirely rather than show it and
+        // let every request 403.
         document.getElementById('settings-tab-btn').style.display = p.is_master ? 'inline-block' : 'none';
         document.getElementById('audit-tab-btn').style.display = p.is_master ? 'inline-block' : 'none';
+        document.getElementById('ssh-tab-btn').style.display = p.is_master ? 'inline-block' : 'none';
 
         // The trash view (`?include_deleted=true`) is master-only server side
         // (`guard_master_for_deleted_view`), so the toggle is disabled rather than hidden — same
@@ -1087,6 +1093,45 @@ class HookExecutorClient {
         }
     }
 
+    // Shows/hides the SSH Target field and swaps the Script Path helper text based on
+    // `execution_type` — the same mode-dependent show/hide technique `syncHookAuthFields` uses for
+    // `auth_mode`, with `edit-hook-execution-type` as the trigger field instead. There is only ever
+    // one hook config modal instance, so this (like `syncHookAuthFields('edit-hook')`) is never
+    // called with any other prefix.
+    syncHookExecutionFields() {
+        const modeSelect = document.getElementById('edit-hook-execution-type');
+        if (!modeSelect) return;
+        const isSsh = modeSelect.value === 'SSH';
+
+        const group = document.getElementById('edit-hook-ssh-target-group');
+        if (group) group.classList.toggle('hidden', !isSsh);
+
+        const targetSelect = document.getElementById('edit-hook-ssh-target');
+        if (targetSelect) targetSelect.required = isSsh;
+
+        const hint = document.getElementById('edit-hook-script-path-hint');
+        if (hint) {
+            hint.textContent = isSsh
+                ? "The command to run on the remote host. Not validated against this daemon's " +
+                  'filesystem — validated only as non-empty and not shaped like a NAME=VALUE ' +
+                  'assignment.'
+                : 'Absolute path to a single executable — never a shell command line. Arguments ' +
+                  'come from Parameters and the Arguments Template below, never from text typed here.';
+        }
+    }
+
+    // Populates `edit-hook-ssh-target` from `this.state.sshTargets` (loaded fresh by
+    // `openEditHookModal` every time it opens) and selects `selectedId`, if it still names one of
+    // them.
+    populateHookSshTargetSelect(selectedId) {
+        const select = document.getElementById('edit-hook-ssh-target');
+        if (!select) return;
+        const targets = this.state.sshTargets || [];
+        select.innerHTML = '<option value="">-- Select SSH Target --</option>' +
+            targets.map(t => `<option value="${t.id}">${escapeHtml(t.name)} (${escapeHtml(t.host)}:${t.port})</option>`).join('');
+        select.value = (selectedId && targets.some(t => t.id === selectedId)) ? selectedId : '';
+    }
+
     // ───────────────────────────────────────────────────────
     // Data Loading
     // ───────────────────────────────────────────────────────
@@ -1099,6 +1144,8 @@ class HookExecutorClient {
         if (this.state.profile.is_master) {
             await this.loadSettings();
             await this.loadAuditLogs();
+            await this.loadSshCredentials();
+            await this.loadSshTargets();
         }
     }
 
@@ -1200,6 +1247,34 @@ class HookExecutorClient {
             this.state.settings = await this.apiFetch('/settings');
             this.renderSettings();
         } catch (e) {}
+    }
+
+    // Master-only (`src/api/ssh.rs`: even knowing a credential name exists is master-only). Called
+    // from `loadInitialData` for a master session, and again after every credential create/update/
+    // delete so the table and the target forms' credential dropdowns stay in sync.
+    async loadSshCredentials() {
+        try {
+            this.state.sshCredentials = await this.apiFetch('/ssh-credentials');
+            this.renderSshCredentialsTable();
+            this.populateSshCredentialSelects();
+        } catch (e) {}
+    }
+
+    // Readable by master *or* `can_manage_hooks` (`list_ssh_targets`'s own doc comment) — this one
+    // call is shared by the SSH Infrastructure tab (master) and the hook config modal's target
+    // dropdown (`openEditHookModal`, for any key that can manage hooks). A caller with neither right
+    // gets a 403 here, which `apiFetch` already turns into a toast; the empty `catch` below only
+    // stops that rejection from propagating into whichever caller triggered the load, leaving
+    // `state.sshTargets` at whatever it was (empty, on first load).
+    async loadSshTargets() {
+        try {
+            this.state.sshTargets = await this.apiFetch('/ssh-targets');
+            this.renderSshTargetsTable();
+            return true;
+        } catch (e) {
+            this.state.sshTargets = [];
+            return false;
+        }
     }
 
     // `<input type="datetime-local">` has no timezone of its own — the browser treats its value as
@@ -2196,7 +2271,12 @@ class HookExecutorClient {
 
     // Opens the single Hook Configuration modal in Create mode (`id` omitted/`null`) or Edit mode
     // (`id` set) — see the modal's own HTML comment for why one shared field set serves both.
-    openEditHookModal(id = null) {
+    //
+    // Async because the SSH Target dropdown is loaded fresh every time the modal opens
+    // (`GET /api/ssh-targets`, readable by master or `can_manage_hooks` — see `src/api/ssh.rs`'s own
+    // doc comment) rather than relying on whatever `state.sshTargets` happened to hold from the SSH
+    // Infrastructure tab, which a non-master `can_manage_hooks` key never visits at all.
+    async openEditHookModal(id = null) {
         const h = id ? this.state.hooks.find(h => h.id === id) : null;
         if (id && !h) return;
 
@@ -2227,6 +2307,22 @@ class HookExecutorClient {
         document.getElementById('edit-hook-sample-payload').value = h ? (h.sample_payload_json || '') : '';
         this.syncHookAuthFields('edit-hook');
         this.renderCommandPreview('edit-hook', 'edit-hook-command-preview', h ? h.id : null);
+
+        document.getElementById('edit-hook-execution-type').value = h ? h.execution_type : 'LOCAL';
+        const sshOption = document.querySelector('#edit-hook-execution-type option[value="SSH"]');
+        // Defensive rather than load-bearing: this modal only opens for a key that already holds
+        // `can_manage_hooks` (or master), which `list_ssh_targets` also accepts — so the fetch should
+        // normally succeed. If it doesn't, leave SSH unselectable with an explanation instead of
+        // offering a mode whose target dropdown has nothing in it.
+        const targetsLoaded = await this.loadSshTargets();
+        if (sshOption) {
+            sshOption.disabled = !targetsLoaded;
+            sshOption.title = targetsLoaded
+                ? ''
+                : 'Could not load SSH targets for this key — check permissions and try again';
+        }
+        this.populateHookSshTargetSelect(h ? h.ssh_target_id : null);
+        this.syncHookExecutionFields();
 
         // Re-applied on open: the modal's inputs persist across renders, so the guard has to be
         // reasserted rather than assumed from login time.
@@ -2266,6 +2362,17 @@ class HookExecutorClient {
             sample_payload_json: samplePayloadJson,
             ...this.collectHookAuthPayload(forCreate)
         };
+
+        // `execution_type` is always sent; `ssh_target_id` only while that mode is actually SSH —
+        // never as `""`, since the field is a UUID and an empty string would fail deserialization
+        // outright rather than reading as "no target". Switching to LOCAL clears `ssh_target_id`
+        // server-side regardless of what (if anything) rides along in the same request
+        // (`UpdateHookPayload::ssh_target_id`'s own doc comment), so omitting it here is enough.
+        const executionType = document.getElementById('edit-hook-execution-type').value;
+        payload.execution_type = executionType;
+        if (executionType === 'SSH') {
+            payload.ssh_target_id = document.getElementById('edit-hook-ssh-target').value || null;
+        }
         // Creation only: the Parameters modal (`openParamsModal`) is how an *existing* hook's
         // contract is edited afterward, and `UpdateHookPayload` has no `parameters` field at all —
         // this is the one moment a parameter list can ride the same request as the hook itself.
@@ -2945,6 +3052,321 @@ class HookExecutorClient {
     }
 
     // ───────────────────────────────────────────────────────
+    // SSH Infrastructure — credentials
+    // ───────────────────────────────────────────────────────
+    // Every mutation here is master-only server-side (`src/api/ssh.rs`'s own doc comment); the tab
+    // itself is hidden from a non-master session by `enforceRBACUI`, so no further per-control
+    // guarding is needed here the way `applyRunAsUserGuard`/`applyGlobalScopeGuard` guard fields
+    // that stay visible for a lesser key.
+
+    sshAuthTypeBadge(authType) {
+        return `<span class="badge badge-scope" title="${escapeHtml(authType)}">${authType === 'KEY' ? 'Private Key' : 'Password'}</span>`;
+    }
+
+    // Mirrors `SshCredentialView::has_private_key`/`has_passphrase`/`has_password` — booleans only,
+    // never the secrets themselves (`src/api/ssh.rs`: "a secret is write-only from the API's
+    // perspective").
+    sshSecretsConfiguredLabel(c) {
+        if (c.auth_type === 'KEY') {
+            if (!c.has_private_key) return '<span class="text-muted text-sm">Not set</span>';
+            return c.has_passphrase ? 'Private Key + Passphrase' : 'Private Key';
+        }
+        return c.has_password ? 'Password' : '<span class="text-muted text-sm">Not set</span>';
+    }
+
+    renderSshCredentialsTable() {
+        const tbody = document.getElementById('ssh-credentials-table-body');
+        if (!tbody) return;
+        const creds = this.state.sshCredentials || [];
+        tbody.innerHTML = creds.length === 0
+            ? '<tr><td colspan="5" class="text-center text-muted">No SSH credentials defined.</td></tr>'
+            : creds.map(c => `
+                <tr>
+                    <td><strong>${escapeHtml(c.name)}</strong></td>
+                    <td>${this.sshAuthTypeBadge(c.auth_type)}</td>
+                    <td class="text-sm">${this.sshSecretsConfiguredLabel(c)}</td>
+                    <td class="text-sm">${escapeHtml(new Date(c.created_at + 'Z').toLocaleString())}</td>
+                    <td>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditSshCredentialModal('${c.id}')">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteSshCredential('${c.id}')">Delete</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+    }
+
+    // Populates every `<select>` that offers a credential to authenticate an SSH target with — the
+    // create-target form and its edit modal both share this, since both need the exact same option
+    // list. Preserves each select's current value where it still names a live credential, so
+    // re-populating after a credential CRUD doesn't silently reset an in-progress edit.
+    populateSshCredentialSelects() {
+        const creds = this.state.sshCredentials || [];
+        const options = '<option value="">-- Select Credential --</option>' +
+            creds.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+        ['ssh-target-credential-id', 'edit-ssh-target-credential-id'].forEach(id => {
+            const select = document.getElementById(id);
+            if (!select) return;
+            const previous = select.value;
+            select.innerHTML = options;
+            if (previous && creds.some(c => c.id === previous)) select.value = previous;
+        });
+    }
+
+    // Shows/hides the Private Key(+Passphrase) vs Password field groups on a credential form,
+    // mirroring `syncHookAuthFields`'s mode-dependent show/hide technique. `prefix` is
+    // `'ssh-credential'` (create) or `'edit-ssh-credential'` (edit modal) — two independent forms,
+    // unlike the hook modal's single shared instance, since create and edit have different field
+    // requirements (edit's secret fields are never `required`; a blank means "keep the current one").
+    syncSshCredentialAuthFields(prefix) {
+        const select = document.getElementById(`${prefix}-auth-type`);
+        if (!select) return;
+        const isKey = select.value === 'KEY';
+        const toggle = (suffix, visible) => {
+            const el = document.getElementById(`${prefix}-${suffix}`);
+            if (el) el.classList.toggle('hidden', !visible);
+        };
+        toggle('key-group', isKey);
+        toggle('passphrase-group', isKey);
+        toggle('password-group', !isKey);
+    }
+
+    async createSshCredential(e) {
+        e.preventDefault();
+        const authType = document.getElementById('ssh-credential-auth-type').value;
+        const payload = {
+            name: document.getElementById('ssh-credential-name').value,
+            auth_type: authType,
+            private_key: document.getElementById('ssh-credential-private-key').value,
+            passphrase: document.getElementById('ssh-credential-passphrase').value,
+            password: document.getElementById('ssh-credential-password').value
+        };
+        try {
+            await this.apiFetch('/ssh-credentials', { method: 'POST', body: JSON.stringify(payload) });
+            this.showToast('SSH credential created', 'success');
+            document.getElementById('form-create-ssh-credential').reset();
+            this.syncSshCredentialAuthFields('ssh-credential');
+            this.loadSshCredentials();
+        } catch (err) {}
+    }
+
+    openEditSshCredentialModal(id) {
+        const c = (this.state.sshCredentials || []).find(c => c.id === id);
+        if (!c) return;
+        document.getElementById('edit-ssh-credential-id').value = c.id;
+        document.getElementById('edit-ssh-credential-name').value = c.name;
+        document.getElementById('edit-ssh-credential-auth-type').value = c.auth_type;
+        // The secrets themselves never round-trip — see `sshSecretsConfiguredLabel`'s doc comment —
+        // so every secret field always starts blank ("leave blank to keep the current secret"),
+        // matching `openEditHookModal`'s identical treatment of `edit-hook-hmac-secret`.
+        document.getElementById('edit-ssh-credential-private-key').value = '';
+        document.getElementById('edit-ssh-credential-passphrase').value = '';
+        document.getElementById('edit-ssh-credential-password').value = '';
+        document.getElementById('edit-ssh-credential-key-status').textContent = c.has_private_key
+            ? 'A private key is currently configured. Enter a new value to replace it.'
+            : 'No private key is configured yet.';
+        document.getElementById('edit-ssh-credential-password-status').textContent = c.has_password
+            ? 'A password is currently configured. Enter a new value to replace it.'
+            : 'No password is configured yet.';
+        this.syncSshCredentialAuthFields('edit-ssh-credential');
+        document.getElementById('edit-ssh-credential-modal').classList.remove('hidden');
+    }
+
+    async submitEditSshCredential(e) {
+        e.preventDefault();
+        const id = document.getElementById('edit-ssh-credential-id').value;
+        const payload = {
+            name: document.getElementById('edit-ssh-credential-name').value,
+            auth_type: document.getElementById('edit-ssh-credential-auth-type').value
+        };
+        // Omitted (rather than sent as `""`) when left blank, so the existing secret is kept — only
+        // an explicit `""` clears one server-side (`effective_sealed_secret`'s three-way split).
+        const privateKey = document.getElementById('edit-ssh-credential-private-key').value;
+        const passphrase = document.getElementById('edit-ssh-credential-passphrase').value;
+        const password = document.getElementById('edit-ssh-credential-password').value;
+        if (privateKey !== '') payload.private_key = privateKey;
+        if (passphrase !== '') payload.passphrase = passphrase;
+        if (password !== '') payload.password = password;
+        try {
+            await this.apiFetch(`/ssh-credentials/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+            this.showToast('SSH credential updated', 'success');
+            document.getElementById('edit-ssh-credential-modal').classList.add('hidden');
+            this.loadSshCredentials();
+        } catch (err) {}
+    }
+
+    async deleteSshCredential(id) {
+        const c = (this.state.sshCredentials || []).find(c => c.id === id);
+        const ok = await this.showConfirmModal({
+            title: 'Delete SSH Credential',
+            message: `Delete the SSH credential "${c ? c.name : id}"? Refused if any SSH target still uses it.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
+        try {
+            await this.apiFetch(`/ssh-credentials/${id}`, { method: 'DELETE' });
+            this.showToast('SSH credential deleted', 'success');
+            this.loadSshCredentials();
+        } catch (e) {}
+    }
+
+    // ───────────────────────────────────────────────────────
+    // SSH Infrastructure — targets
+    // ───────────────────────────────────────────────────────
+    renderSshTargetsTable() {
+        const tbody = document.getElementById('ssh-targets-table-body');
+        if (!tbody) return;
+        const targets = this.state.sshTargets || [];
+        tbody.innerHTML = targets.length === 0
+            ? '<tr><td colspan="7" class="text-center text-muted">No SSH targets defined.</td></tr>'
+            : targets.map(t => `
+                <tr>
+                    <td><strong>${escapeHtml(t.name)}</strong></td>
+                    <td class="font-mono text-sm">${escapeHtml(t.host)}:${t.port}</td>
+                    <td class="text-sm">${escapeHtml(t.username)}</td>
+                    <td class="text-sm">${escapeHtml(t.credential_name)}</td>
+                    <td class="font-mono text-sm">${t.host_key_fingerprint
+                        ? escapeHtml(t.host_key_fingerprint)
+                        : '<span class="badge badge-timeout" title="No connection can succeed until a fingerprint is fetched and pinned">Not pinned</span>'}</td>
+                    <td class="text-sm">${escapeHtml(new Date(t.created_at + 'Z').toLocaleString())}</td>
+                    <td>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.testSshTargetConnection('${t.id}')">Test Connection</button>
+                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditSshTargetModal('${t.id}')">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteSshTarget('${t.id}')">Delete</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+    }
+
+    // Shared by the create form and the edit modal's own "Fetch Fingerprint" button. `prefix` is
+    // `'ssh-target'` or `'edit-ssh-target'`; reads that prefix's own Host/Port fields, calls the
+    // always-200 fetch-fingerprint endpoint, and — on success — fills that prefix's fingerprint
+    // field with the returned value. Never auto-trusted: the toast on success spells out that the
+    // operator must still verify it out of band before saving, matching `fetch_ssh_host_fingerprint`'s
+    // own doc comment on why this is trust-on-first-use, not verification.
+    async fetchSshFingerprint(prefix) {
+        const host = document.getElementById(`${prefix}-host`).value.trim();
+        if (!host) {
+            this.showToast('Enter a host before fetching its fingerprint', 'error');
+            return;
+        }
+        const portRaw = document.getElementById(`${prefix}-port`).value;
+        const port = portRaw ? parseInt(portRaw, 10) : undefined;
+        const btn = document.getElementById(`${prefix}-fetch-fingerprint-btn`);
+        btn.disabled = true;
+        try {
+            const res = await this.apiFetch('/ssh-targets/fetch-fingerprint', {
+                method: 'POST',
+                body: JSON.stringify({ host, port })
+            });
+            if (res.success) {
+                document.getElementById(`${prefix}-fingerprint`).value = res.fingerprint;
+                this.showToast(
+                    `Fetched ${res.fingerprint} — verify this out of band before saving`,
+                    'success'
+                );
+            } else {
+                this.showToast(res.message || 'Could not fetch a host key fingerprint', 'error');
+            }
+        } catch (err) {
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async createSshTarget(e) {
+        e.preventDefault();
+        const fingerprint = document.getElementById('ssh-target-fingerprint').value.trim();
+        const portValue = parseInt(document.getElementById('ssh-target-port').value, 10);
+        const payload = {
+            name: document.getElementById('ssh-target-name').value,
+            host: document.getElementById('ssh-target-host').value,
+            port: Number.isNaN(portValue) ? undefined : portValue,
+            username: document.getElementById('ssh-target-username').value,
+            credential_id: document.getElementById('ssh-target-credential-id').value,
+            host_key_fingerprint: fingerprint || null
+        };
+        if (!payload.credential_id) {
+            this.showToast('Select a credential for this target', 'error');
+            return;
+        }
+        try {
+            await this.apiFetch('/ssh-targets', { method: 'POST', body: JSON.stringify(payload) });
+            this.showToast('SSH target created', 'success');
+            document.getElementById('form-create-ssh-target').reset();
+            document.getElementById('ssh-target-port').value = 22;
+            this.loadSshTargets();
+        } catch (err) {}
+    }
+
+    openEditSshTargetModal(id) {
+        const t = (this.state.sshTargets || []).find(t => t.id === id);
+        if (!t) return;
+        document.getElementById('edit-ssh-target-id').value = t.id;
+        document.getElementById('edit-ssh-target-name').value = t.name;
+        document.getElementById('edit-ssh-target-host').value = t.host;
+        document.getElementById('edit-ssh-target-port').value = t.port;
+        document.getElementById('edit-ssh-target-username').value = t.username;
+        this.populateSshCredentialSelects();
+        document.getElementById('edit-ssh-target-credential-id').value = t.credential_id;
+        document.getElementById('edit-ssh-target-fingerprint').value = t.host_key_fingerprint || '';
+        document.getElementById('edit-ssh-target-modal').classList.remove('hidden');
+    }
+
+    async submitEditSshTarget(e) {
+        e.preventDefault();
+        const id = document.getElementById('edit-ssh-target-id').value;
+        // Every field sent, full-overwrite style — the same "an edit is a complete replacement,
+        // except secrets" convention `submitEditSshCredential`/`submitHookConfig` already follow.
+        // `host_key_fingerprint` follows `UpdateSshTargetPayload`'s own "" = unpin" contract: an
+        // empty field is sent as `""`, not omitted, so clearing it is an explicit action rather than
+        // a no-op.
+        const payload = {
+            name: document.getElementById('edit-ssh-target-name').value,
+            host: document.getElementById('edit-ssh-target-host').value,
+            port: parseInt(document.getElementById('edit-ssh-target-port').value, 10),
+            username: document.getElementById('edit-ssh-target-username').value,
+            credential_id: document.getElementById('edit-ssh-target-credential-id').value,
+            host_key_fingerprint: document.getElementById('edit-ssh-target-fingerprint').value.trim()
+        };
+        try {
+            await this.apiFetch(`/ssh-targets/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+            this.showToast('SSH target updated', 'success');
+            document.getElementById('edit-ssh-target-modal').classList.add('hidden');
+            this.loadSshTargets();
+        } catch (err) {}
+    }
+
+    async deleteSshTarget(id) {
+        const t = (this.state.sshTargets || []).find(t => t.id === id);
+        const ok = await this.showConfirmModal({
+            title: 'Delete SSH Target',
+            message: `Delete the SSH target "${t ? t.name : id}"? Refused if any hook still dispatches to it.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
+        try {
+            await this.apiFetch(`/ssh-targets/${id}`, { method: 'DELETE' });
+            this.showToast('SSH target deleted', 'success');
+            this.loadSshTargets();
+        } catch (e) {}
+    }
+
+    // Always HTTP 200 (`TestSshConnectionResponse` — success or failure alike is data, not an error
+    // path), so this reads `.success` from the parsed body rather than treating a failed connection
+    // as a thrown `apiFetch` rejection.
+    async testSshTargetConnection(id) {
+        try {
+            const res = await this.apiFetch(`/ssh-targets/${id}/test-connection`, { method: 'POST' });
+            this.showToast(res.message, res.success ? 'success' : 'error');
+        } catch (e) {}
+    }
+
+    // ───────────────────────────────────────────────────────
     // Rendering — Settings & audit
     // ───────────────────────────────────────────────────────
     renderSettings() {
@@ -3140,6 +3562,7 @@ class HookExecutorClient {
         document.getElementById('hooks-name-filter').addEventListener('input', () => this.renderHooksTable());
 
         document.getElementById('edit-hook-auth-mode').addEventListener('change', () => this.syncHookAuthFields('edit-hook'));
+        document.getElementById('edit-hook-execution-type').addEventListener('change', () => this.syncHookExecutionFields());
 
         // Live Command Preview — recomputed on every keystroke in the fields it depends on. Reads
         // whichever hook id `edit-hook-id` currently names (empty for a brand-new, unsaved hook), so
@@ -3198,6 +3621,24 @@ class HookExecutorClient {
         });
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
+        });
+
+        // SSH Infrastructure
+        document.getElementById('form-create-ssh-credential').addEventListener('submit', (e) => this.createSshCredential(e));
+        document.getElementById('ssh-credential-auth-type').addEventListener('change', () => this.syncSshCredentialAuthFields('ssh-credential'));
+        this.syncSshCredentialAuthFields('ssh-credential');
+        document.getElementById('form-edit-ssh-credential').addEventListener('submit', (e) => this.submitEditSshCredential(e));
+        document.getElementById('edit-ssh-credential-auth-type').addEventListener('change', () => this.syncSshCredentialAuthFields('edit-ssh-credential'));
+        document.getElementById('edit-ssh-credential-cancel').addEventListener('click', () => {
+            document.getElementById('edit-ssh-credential-modal').classList.add('hidden');
+        });
+
+        document.getElementById('form-create-ssh-target').addEventListener('submit', (e) => this.createSshTarget(e));
+        document.getElementById('ssh-target-fetch-fingerprint-btn').addEventListener('click', () => this.fetchSshFingerprint('ssh-target'));
+        document.getElementById('form-edit-ssh-target').addEventListener('submit', (e) => this.submitEditSshTarget(e));
+        document.getElementById('edit-ssh-target-fetch-fingerprint-btn').addEventListener('click', () => this.fetchSshFingerprint('edit-ssh-target'));
+        document.getElementById('edit-ssh-target-cancel').addEventListener('click', () => {
+            document.getElementById('edit-ssh-target-modal').classList.add('hidden');
         });
 
         // Settings

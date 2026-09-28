@@ -57,6 +57,7 @@ pub mod middleware;
 pub mod migration;
 pub mod replay;
 pub mod retention;
+pub mod ssh;
 pub mod state;
 
 use state::AppState;
@@ -113,6 +114,23 @@ pub fn create_app(state: AppState) -> Router {
         .route("/settings", get(api::get_settings))
         // System maintenance
         .route("/system/purge-hooks", post(api::purge_deleted_hooks))
+        // SSH credentials
+        .route("/ssh-credentials", post(api::create_ssh_credential))
+        .route("/ssh-credentials", get(api::list_ssh_credentials))
+        .route("/ssh-credentials/{id}", get(api::get_ssh_credential))
+        .route("/ssh-credentials/{id}", put(api::update_ssh_credential))
+        .route("/ssh-credentials/{id}", delete(api::delete_ssh_credential))
+        // SSH targets
+        .route("/ssh-targets", post(api::create_ssh_target))
+        .route("/ssh-targets", get(api::list_ssh_targets))
+        // Fixed path ahead of `/{id}` in registration order so it is never shadowed by the dynamic
+        // segment — Axum matches static segments first regardless, but the order here documents the
+        // intent for a reader.
+        .route("/ssh-targets/fetch-fingerprint", post(api::fetch_ssh_host_fingerprint))
+        .route("/ssh-targets/{id}", get(api::get_ssh_target))
+        .route("/ssh-targets/{id}", put(api::update_ssh_target))
+        .route("/ssh-targets/{id}", delete(api::delete_ssh_target))
+        .route("/ssh-targets/{id}/test-connection", post(api::test_ssh_target_connection))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{
-    api_key, api_key_hook_permission, hook, hook::AuthMode, hook_parameter, prelude::*,
+    api_key, api_key_hook_permission, hook, hook::AuthMode, hook::HookExecutionType,
+    hook_parameter, prelude::*,
 };
 use crate::error::AppError;
 use crate::extract::{StrictJson, StrictPath, StrictQuery};
@@ -35,7 +36,8 @@ use super::guards::{
 };
 use super::support::{
     create_audit_log, describe_privilege, format_reference, load_parameters,
-    resolve_hook, resolve_hook_including_deleted, validate_hook_name, validate_timeout,
+    resolve_hook, resolve_hook_including_deleted, validate_hook_name, validate_ssh_dispatch,
+    validate_timeout,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -98,6 +100,13 @@ pub struct CreateHookPayload {
     /// `validate_args_template_matches_parameters`. `None`/absent keeps the pre-existing behavior:
     /// every resolved parameter appended positionally, in declaration order.
     pub args_template: Option<String>,
+    /// Where this hook's script executes. Defaults to [`HookExecutionType::Local`]. `SSH` requires
+    /// `ssh_target_id`; `script_path` is validated against whichever mode is actually in effect —
+    /// see `validate_ssh_dispatch`.
+    pub execution_type: Option<HookExecutionType>,
+    /// The remote target to dispatch to when `execution_type` is `SSH`. Ignored (but accepted) for
+    /// `LOCAL`, so a target can be pre-selected before flipping a hook over to `SSH`.
+    pub ssh_target_id: Option<Uuid>,
 }
 
 /// Payload for updating a hook. Every field is optional; omitted fields are left untouched.
@@ -154,6 +163,17 @@ pub struct UpdateHookPayload {
     /// the same protection here is a strictly more conservative reading of that section's intent,
     /// never a narrower one.
     pub args_template: Option<String>,
+    /// New `execution_type`. Omitting the field leaves the current mode untouched. Switching to
+    /// `LOCAL` always clears `ssh_target_id`, regardless of whether this request also sent one.
+    /// Treated as dispatch configuration alongside `script_path`/`run_as_user`/`args_template`
+    /// (`guard_dispatch_configuration`) for the same reason `args_template` is: it decides *where*
+    /// the process actually runs, which `script_path`/`run_as_user` already cover for the local
+    /// case.
+    pub execution_type: Option<HookExecutionType>,
+    /// New `ssh_target_id`, consulted only while the effective `execution_type` (this payload's, or
+    /// the hook's current one) is `SSH`. Omitting the field leaves the current target untouched.
+    /// Dispatch configuration, gated identically to `execution_type`.
+    pub ssh_target_id: Option<Uuid>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -208,6 +228,11 @@ pub struct HookDetail {
     pub sample_payload_json: Option<String>,
     /// Argument-vector template, or `None` if never set (plain positional arguments).
     pub args_template: Option<String>,
+    /// Where this hook's script executes.
+    pub execution_type: HookExecutionType,
+    /// The remote target this hook dispatches to when `execution_type` is `SSH`, or `None` for
+    /// `LOCAL`.
+    pub ssh_target_id: Option<Uuid>,
     /// The path a caller — keyed, or keyless per [`HookDetail::auth_mode`] — invokes this hook at:
     /// `/webhook/{name}`. Computed from the hook's own name, never stored, so a rename is reflected
     /// immediately rather than needing a migration to backfill a denormalized copy.
@@ -288,6 +313,8 @@ pub(crate) async fn build_hook_detail(
         canonical_template: model.canonical_template,
         sample_payload_json: model.sample_payload_json,
         args_template: model.args_template,
+        execution_type: model.execution_type,
+        ssh_target_id: model.ssh_target_id,
         webhook_path,
     })
 }
@@ -475,7 +502,21 @@ pub async fn create_hook(
     let name = payload.name.trim().to_owned();
     validate_hook_name(&name)?;
 
-    executor::validate_script_path(&payload.script_path, &state.config.allowed_script_roots)?;
+    let execution_type = payload.execution_type.unwrap_or_default();
+    validate_ssh_dispatch(
+        &state.db,
+        execution_type,
+        payload.ssh_target_id,
+        &payload.script_path,
+        &state.config.allowed_script_roots,
+    )
+    .await?;
+    // Never stored for a `LOCAL` hook, even if the caller sent one — see `CreateHookPayload`'s own
+    // doc comment on `ssh_target_id`.
+    let ssh_target_id = match execution_type {
+        HookExecutionType::Local => None,
+        HookExecutionType::Ssh => payload.ssh_target_id,
+    };
     let timeout = payload.default_timeout_seconds.unwrap_or(30);
     validate_timeout(timeout)?;
 
@@ -542,6 +583,8 @@ pub async fn create_hook(
         canonical_template: Set(canonical_template),
         sample_payload_json: Set(sample_payload_json),
         args_template: Set(args_template),
+        execution_type: Set(execution_type),
+        ssh_target_id: Set(ssh_target_id),
     };
 
     if let Err(err) = Hook::insert(model).exec(&state.db).await {
@@ -686,11 +729,17 @@ pub async fn update_hook(
     // lets the owner through on ownership alone. Checked as its own step, before validation, so an
     // owner whose `can_manage_hooks` was revoked is refused here rather than by a guard further
     // down that happens to also catch it for an unrelated reason.
-    // `args_template` decides what the process actually receives as `argv` exactly as directly as
-    // `script_path`/`run_as_user` do, so it is gated identically even though `RBAC_MODEL.md`'s
-    // Terminology section predates this column and does not name it — see `UpdateHookPayload`'s own
-    // doc comment on why this is the more conservative reading, not a narrower one.
-    if payload.script_path.is_some() || payload.run_as_user.is_some() || payload.args_template.is_some() {
+    // `args_template`, `execution_type`, and `ssh_target_id` each decide what the process actually
+    // receives or where it runs exactly as directly as `script_path`/`run_as_user` do, so all three
+    // are gated identically even though `RBAC_MODEL.md`'s Terminology section predates them and does
+    // not name them — see `UpdateHookPayload`'s own doc comments on why this is the more
+    // conservative reading, not a narrower one.
+    let touches_dispatch_configuration = payload.script_path.is_some()
+        || payload.run_as_user.is_some()
+        || payload.args_template.is_some()
+        || payload.execution_type.is_some()
+        || payload.ssh_target_id.is_some();
+    if touches_dispatch_configuration {
         guard_dispatch_configuration(&state.db, &key, &model).await?;
     }
     // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
@@ -738,11 +787,29 @@ pub async fn update_hook(
         None => None,
     };
 
-    if let Some(script_path) = &payload.script_path {
-        executor::validate_script_path(script_path, &state.config.allowed_script_roots)?;
-    }
     if let Some(timeout) = payload.default_timeout_seconds {
         validate_timeout(timeout)?;
+    }
+
+    // The *effective* execution mode/target/script, mirroring `effective_auth_mode` below: the
+    // payload's, if it named the field, otherwise whatever the row already has. Switching to `LOCAL`
+    // always drops `ssh_target_id`, even if this same request also sent one — `LOCAL` never carries
+    // a target, by the same invariant `validate_ssh_dispatch` enforces on write.
+    let effective_execution_type = payload.execution_type.unwrap_or(model.execution_type);
+    let effective_ssh_target_id = match effective_execution_type {
+        HookExecutionType::Local => None,
+        HookExecutionType::Ssh => payload.ssh_target_id.or(model.ssh_target_id),
+    };
+    let effective_script_path = payload.script_path.as_deref().unwrap_or(&model.script_path);
+    if touches_dispatch_configuration {
+        validate_ssh_dispatch(
+            &state.db,
+            effective_execution_type,
+            effective_ssh_target_id,
+            effective_script_path,
+            &state.config.allowed_script_roots,
+        )
+        .await?;
     }
 
     let effective_auth_mode = payload.auth_mode.unwrap_or(model.auth_mode);
@@ -838,6 +905,14 @@ pub async fn update_hook(
     if payload.args_template.is_some() {
         changes.push("args_template".to_owned());
         active.args_template = Set(effective_args_template);
+    }
+    if payload.execution_type.is_some() || payload.ssh_target_id.is_some() {
+        changes.push(format!(
+            "execution_type={effective_execution_type:?} ssh_target_id={}",
+            effective_ssh_target_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_owned())
+        ));
+        active.execution_type = Set(effective_execution_type);
+        active.ssh_target_id = Set(effective_ssh_target_id);
     }
     active.updated_at = Set(Utc::now().naive_utc());
 

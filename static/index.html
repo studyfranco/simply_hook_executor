@@ -77,6 +77,7 @@
             <button class="tab-btn active" data-tab="hooks" id="hooks-tab-btn" role="tab" aria-selected="true">Hooks &amp; Runner</button>
             <button class="tab-btn" data-tab="executions" role="tab" aria-selected="false">Execution History</button>
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
+            <button class="tab-btn" data-tab="ssh" id="ssh-tab-btn" role="tab" aria-selected="false">SSH Infrastructure</button>
             <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
@@ -386,6 +387,144 @@
         </main>
 
         <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: SSH Infrastructure                         -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-ssh" class="tab-panel">
+            <div class="admin-grid">
+                <section class="card admin-section">
+                    <h2>SSH Credentials</h2>
+                    <p class="subtitle">
+                        Reusable SSH authentication material for remote execution targets. Master keys only — an SSH
+                        credential can authenticate against infrastructure outside this service entirely, so it is not
+                        delegable via Create Hooks the way ordinary hook management is.
+                    </p>
+
+                    <form id="form-create-ssh-credential" class="admin-form">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="ssh-credential-name">Name <span>*</span></label>
+                                <input type="text" id="ssh-credential-name" placeholder="e.g. deploy-key-prod" required class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="ssh-credential-auth-type">Auth Type <span>*</span></label>
+                                <select id="ssh-credential-auth-type" class="input-field select-field">
+                                    <option value="KEY">Private Key</option>
+                                    <option value="PASSWORD">Password</option>
+                                </select>
+                            </div>
+                            <div class="form-group col-span-2" id="ssh-credential-key-group">
+                                <label for="ssh-credential-private-key">Private Key <span>*</span></label>
+                                <textarea id="ssh-credential-private-key" class="input-field font-mono" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false"></textarea>
+                            </div>
+                            <div class="form-group col-span-2" id="ssh-credential-passphrase-group">
+                                <label for="ssh-credential-passphrase">Passphrase</label>
+                                <input type="password" id="ssh-credential-passphrase" class="input-field" placeholder="(none)" autocomplete="off">
+                            </div>
+                            <div class="form-group col-span-2 hidden" id="ssh-credential-password-group">
+                                <label for="ssh-credential-password">Password <span>*</span></label>
+                                <input type="password" id="ssh-credential-password" class="input-field" autocomplete="off">
+                            </div>
+                        </div>
+                        <div class="form-actions mt-4">
+                            <button type="submit" class="btn btn-primary">Create Credential</button>
+                        </div>
+                    </form>
+
+                    <div class="table-container mt-4">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Auth Type</th>
+                                    <th>Secrets Configured</th>
+                                    <th>Created</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ssh-credentials-table-body">
+                                <tr>
+                                    <td colspan="5" class="text-center text-muted">No SSH credentials defined.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section class="card admin-section">
+                    <h2>SSH Targets</h2>
+                    <p class="subtitle">
+                        Remote hosts a hook may dispatch execution to. A target's host key must be fetched and pinned
+                        before it can be tested or used — there is no trust-on-first-use fallback at execution time.
+                    </p>
+
+                    <form id="form-create-ssh-target" class="admin-form">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="ssh-target-name">Name <span>*</span></label>
+                                <input type="text" id="ssh-target-name" placeholder="e.g. prod-web-01" required class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="ssh-target-credential-id">Credential <span>*</span></label>
+                                <select id="ssh-target-credential-id" class="input-field select-field" required>
+                                    <option value="">-- Select Credential --</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="ssh-target-host">Host <span>*</span></label>
+                                <input type="text" id="ssh-target-host" placeholder="e.g. 10.0.0.5" required class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="ssh-target-port">Port</label>
+                                <input type="number" id="ssh-target-port" min="1" max="65535" value="22" class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="ssh-target-username">Username <span>*</span></label>
+                                <input type="text" id="ssh-target-username" required class="input-field">
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label for="ssh-target-fingerprint">Host Key Fingerprint</label>
+                                <div class="flex gap-2">
+                                    <input type="text" id="ssh-target-fingerprint" class="input-field font-mono" placeholder="SHA256:... (unpinned)" autocomplete="off" spellcheck="false">
+                                    <button type="button" id="ssh-target-fetch-fingerprint-btn" class="btn btn-secondary">Fetch Fingerprint</button>
+                                </div>
+                                <span class="text-muted text-sm">
+                                    Fetches the host key currently offered by the Host/Port above — connects, records the key,
+                                    and disconnects without authenticating. Verify the returned fingerprint out of band
+                                    (documentation, a provisioning system, a phone call) before trusting it; this is
+                                    trust-on-first-use, not verification.
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-actions mt-4">
+                            <button type="submit" class="btn btn-primary">Create Target</button>
+                        </div>
+                    </form>
+
+                    <div class="table-container mt-4">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Host:Port</th>
+                                    <th>Username</th>
+                                    <th>Credential</th>
+                                    <th>Fingerprint</th>
+                                    <th>Created</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ssh-targets-table-body">
+                                <tr>
+                                    <td colspan="7" class="text-center text-muted">No SSH targets defined.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
         <!-- TAB: System Settings                            -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-settings" class="tab-panel">
@@ -627,7 +766,7 @@
                     <div class="form-group col-span-2">
                         <label for="edit-hook-script-path">Script Path <span>*</span></label>
                         <input type="text" id="edit-hook-script-path" placeholder="/usr/local/bin/ban.sh" required class="input-field">
-                        <span class="text-muted text-sm">Absolute path to a single executable — never a shell command line. Arguments come from Parameters and the Arguments Template below, never from text typed here.</span>
+                        <span class="text-muted text-sm" id="edit-hook-script-path-hint">Absolute path to a single executable — never a shell command line. Arguments come from Parameters and the Arguments Template below, never from text typed here.</span>
                     </div>
                     <div class="form-group col-span-2">
                         <label for="edit-hook-args-template">Arguments Template</label>
@@ -638,6 +777,24 @@
                             must be one of this hook's declared Parameters. Leave blank to pass every resolved parameter as a
                             plain positional argument instead (the pre-existing behavior). Never a shell: substitution produces
                             complete argument-vector entries, never a re-parsed string.
+                        </span>
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-hook-execution-type">Execution Mode</label>
+                        <select id="edit-hook-execution-type" class="input-field select-field">
+                            <option value="LOCAL">Local Subprocess</option>
+                            <option value="SSH">Remote SSH Server</option>
+                        </select>
+                    </div>
+                    <div class="form-group col-span-2 hidden" id="edit-hook-ssh-target-group">
+                        <label for="edit-hook-ssh-target">SSH Target <span>*</span></label>
+                        <select id="edit-hook-ssh-target" class="input-field select-field">
+                            <option value="">-- Select SSH Target --</option>
+                        </select>
+                        <span class="text-muted text-sm">
+                            The remote host this hook's script executes on, from SSH Infrastructure &gt; SSH Targets.
+                            Deleting a still-referenced target is refused, and switching back to Local always clears
+                            this.
                         </span>
                     </div>
                     <div class="form-group col-span-2">
@@ -768,6 +925,89 @@
                 <p class="text-muted text-sm mt-2 mb-4 hidden" id="edit-key-scopes-locked-note"></p>
                 <div class="form-actions">
                     <button type="button" id="edit-key-cancel" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Edit SSH Credential Modal -->
+    <div id="edit-ssh-credential-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>Edit SSH Credential</h3>
+            <form id="form-edit-ssh-credential">
+                <input type="hidden" id="edit-ssh-credential-id">
+                <div class="form-group">
+                    <label for="edit-ssh-credential-name">Name <span>*</span></label>
+                    <input type="text" id="edit-ssh-credential-name" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-ssh-credential-auth-type">Auth Type <span>*</span></label>
+                    <select id="edit-ssh-credential-auth-type" class="input-field select-field">
+                        <option value="KEY">Private Key</option>
+                        <option value="PASSWORD">Password</option>
+                    </select>
+                </div>
+                <div class="form-group" id="edit-ssh-credential-key-group">
+                    <label for="edit-ssh-credential-private-key">Private Key</label>
+                    <textarea id="edit-ssh-credential-private-key" class="input-field font-mono" rows="4" placeholder="leave blank to keep the current key" autocomplete="off" spellcheck="false"></textarea>
+                    <span class="text-muted text-sm" id="edit-ssh-credential-key-status"></span>
+                </div>
+                <div class="form-group" id="edit-ssh-credential-passphrase-group">
+                    <label for="edit-ssh-credential-passphrase">Passphrase</label>
+                    <input type="password" id="edit-ssh-credential-passphrase" class="input-field" placeholder="leave blank to keep the current passphrase" autocomplete="off">
+                </div>
+                <div class="form-group hidden" id="edit-ssh-credential-password-group">
+                    <label for="edit-ssh-credential-password">Password</label>
+                    <input type="password" id="edit-ssh-credential-password" class="input-field" placeholder="leave blank to keep the current password" autocomplete="off">
+                    <span class="text-muted text-sm" id="edit-ssh-credential-password-status"></span>
+                </div>
+                <div class="form-actions">
+                    <button type="button" id="edit-ssh-credential-cancel" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Edit SSH Target Modal -->
+    <div id="edit-ssh-target-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>Edit SSH Target</h3>
+            <form id="form-edit-ssh-target">
+                <input type="hidden" id="edit-ssh-target-id">
+                <div class="form-group">
+                    <label for="edit-ssh-target-name">Name <span>*</span></label>
+                    <input type="text" id="edit-ssh-target-name" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-ssh-target-credential-id">Credential <span>*</span></label>
+                    <select id="edit-ssh-target-credential-id" class="input-field select-field" required>
+                        <option value="">-- Select Credential --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="edit-ssh-target-host">Host <span>*</span></label>
+                    <input type="text" id="edit-ssh-target-host" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-ssh-target-port">Port</label>
+                    <input type="number" id="edit-ssh-target-port" min="1" max="65535" class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-ssh-target-username">Username <span>*</span></label>
+                    <input type="text" id="edit-ssh-target-username" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-ssh-target-fingerprint">Host Key Fingerprint</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="edit-ssh-target-fingerprint" class="input-field font-mono" placeholder="SHA256:... (blank = unpinned)" autocomplete="off" spellcheck="false">
+                        <button type="button" id="edit-ssh-target-fetch-fingerprint-btn" class="btn btn-secondary">Fetch Fingerprint</button>
+                    </div>
+                    <span class="text-muted text-sm">Clear this field to unpin the target. Fetching uses the Host/Port above; verify the result out of band before saving.</span>
+                </div>
+                <div class="form-actions">
+                    <button type="button" id="edit-ssh-target-cancel" class="btn btn-cancel">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save Changes</button>
                 </div>
             </form>

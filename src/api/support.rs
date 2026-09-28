@@ -23,7 +23,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::crypto::SecretCipher;
-use crate::entities::{api_key, api_key::HmacMode, audit_log, hook, hook_parameter, prelude::*};
+use crate::entities::{
+    api_key, api_key::HmacMode, audit_log, hook, hook::HookExecutionType, hook_parameter, prelude::*,
+};
 use crate::error::AppError;
 
 use super::{MAX_CONCURRENT_JOBS, MAX_TIMEOUT_SECONDS};
@@ -283,6 +285,55 @@ pub(crate) fn validate_hook_name(name: &str) -> Result<(), AppError> {
              digits, '-', '.', '_', and '~' are allowed — no '/', spaces, or other characters that \
              would need percent-encoding"
         )));
+    }
+    Ok(())
+}
+
+/// Validates a hook's `execution_type`/`ssh_target_id`/`script_path` as a combination, not as three
+/// independent fields.
+///
+/// Called with the *effective* values a write is about to store — `api::hooks::create_hook` passes
+/// the payload's directly; `update_hook` passes the same effective-value merge it already computes
+/// for `auth_mode`/`sample_payload_json`/`args_template`, so an update that flips `execution_type`
+/// without also resending `script_path` still gets the *new* mode's validation applied to the
+/// *existing* path, not skipped because the payload happened not to mention it.
+///
+/// - `LOCAL`: `ssh_target_id` must be absent (a local hook has nothing to dispatch to), and
+///   `script_path` is validated as an absolute, root-confined local path
+///   ([`crate::executor::validate_script_path`]).
+/// - `SSH`: `ssh_target_id` must name an existing [`ssh_target::Model`], and `script_path` is
+///   validated only loosely, as a remote command line
+///   ([`crate::executor::validate_remote_command`]) — this daemon has no filesystem to check it
+///   against.
+pub(crate) async fn validate_ssh_dispatch(
+    db: &sea_orm::DatabaseConnection,
+    execution_type: HookExecutionType,
+    ssh_target_id: Option<Uuid>,
+    script_path: &str,
+    allowed_script_roots: &[std::path::PathBuf],
+) -> Result<(), AppError> {
+    match execution_type {
+        HookExecutionType::Local => {
+            if ssh_target_id.is_some() {
+                return Err(AppError::InvalidInput(
+                    "ssh_target_id must not be set when execution_type is LOCAL".to_owned(),
+                ));
+            }
+            crate::executor::validate_script_path(script_path, allowed_script_roots)?;
+        }
+        HookExecutionType::Ssh => {
+            let target_id = ssh_target_id.ok_or_else(|| {
+                AppError::InvalidInput(
+                    "ssh_target_id is required when execution_type is SSH".to_owned(),
+                )
+            })?;
+            if SshTarget::find_by_id(target_id).one(db).await?.is_none() {
+                return Err(AppError::InvalidInput(
+                    "ssh_target_id does not name an existing SSH target".to_owned(),
+                ));
+            }
+            crate::executor::validate_remote_command(script_path)?;
+        }
     }
     Ok(())
 }

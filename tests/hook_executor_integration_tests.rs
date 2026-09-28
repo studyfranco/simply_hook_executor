@@ -2064,6 +2064,8 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         canonical_template: Set(None),
         sample_payload_json: Set(None),
         args_template: Set(None),
+        execution_type: Set(hook::HookExecutionType::Local),
+        ssh_target_id: Set(None),
     }
     .insert(&db)
     .await

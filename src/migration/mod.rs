@@ -16,6 +16,7 @@ mod m20260819_141730_consolidate_hmac_modes;
 mod m20260820_090000_add_hook_sample_payload;
 mod m20260821_090000_add_hook_args_template;
 mod m20260824_090000_add_execution_caller_ip;
+mod m20260928_090000_add_ssh_infrastructure;
 
 /// The ordered set of all schema migrations for `simply_hook_executor`.
 pub struct Migrator;
@@ -38,6 +39,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260820_090000_add_hook_sample_payload::Migration),
             Box::new(m20260821_090000_add_hook_args_template::Migration),
             Box::new(m20260824_090000_add_execution_caller_ip::Migration),
+            Box::new(m20260928_090000_add_ssh_infrastructure::Migration),
         ]
     }
 }
