@@ -906,6 +906,23 @@ class HookExecutorClient {
             ? `<span class="identity-pill-dot"></span> MASTER <span class="identity-pill-name">${escapeHtml(p.name)}</span>`
             : `<span class="identity-pill-dot"></span> ${escapeHtml(p.name)} <span class="identity-pill-prefix">${escapeHtml(p.prefix)}...</span>`;
 
+        const tier = p.is_master ? 'master' : (p.can_manage_keys ? 'parent' : 'daughter');
+        const banner = document.getElementById('current-key-tier');
+        if (banner) {
+            banner.className = `badge badge-tier badge-tier-${tier}`;
+            banner.textContent = tier.charAt(0).toUpperCase() + tier.slice(1);
+            banner.title = {
+                master: 'The Master key: full access, unique, and pinned at startup.',
+                parent: 'A Parent key: may create Daughter keys, but cannot grant global scopes (R4).',
+                daughter: 'A Daughter key: no key management, no resource creation.',
+            }[tier];
+        }
+
+        const btnOpenCreateKey = document.getElementById('btn-open-create-key');
+        if (btnOpenCreateKey) {
+            btnOpenCreateKey.style.display = (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
+        }
+
         // Hooks & Runner: anyone who can create hooks, or manage at least one existing hook.
         document.getElementById('hooks-tab-btn').style.display = canManageAnyHook ? 'inline-block' : 'none';
         // The "Create Hook" button specifically needs the global creation scope.
@@ -2838,7 +2855,11 @@ class HookExecutorClient {
         try {
             const res = await this.apiFetch('/keys', { method: 'POST', body: JSON.stringify(payload) });
             this.revealCredentials('API Key Created', res);
-            document.getElementById('form-create-apikey').reset();
+            const form = document.getElementById('form-create-apikey');
+            if (form) {
+                form.reset();
+                form.classList.add('hidden');
+            }
             document.getElementById('apikey-max-jobs').value = 10;
             this.syncApiKeySigningFields();
             this.loadKeys();
@@ -3610,6 +3631,26 @@ class HookExecutorClient {
         });
 
         // Keys
+        const btnOpenCreateKey = document.getElementById('btn-open-create-key');
+        if (btnOpenCreateKey) {
+            btnOpenCreateKey.addEventListener('click', () => {
+                const form = document.getElementById('form-create-apikey');
+                if (form) {
+                    form.classList.remove('hidden');
+                    document.getElementById('apikey-name')?.focus();
+                }
+            });
+        }
+        const btnCancelCreateKey = document.getElementById('btn-cancel-create-key');
+        if (btnCancelCreateKey) {
+            btnCancelCreateKey.addEventListener('click', () => {
+                const form = document.getElementById('form-create-apikey');
+                if (form) {
+                    form.classList.add('hidden');
+                    form.reset();
+                }
+            });
+        }
         document.getElementById('form-create-apikey').addEventListener('submit', (e) => this.createApiKey(e));
         document.getElementById('apikey-can-manage-keys').addEventListener('change', () => this.syncApiKeySigningFields());
         document.getElementById('apikey-generate-signing-secret').addEventListener('change', () => this.syncApiKeySigningFields());

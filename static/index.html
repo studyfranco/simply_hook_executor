@@ -60,15 +60,17 @@
 
     <!-- Main Dashboard Container -->
     <div id="dashboard-container" class="container hidden">
+      <div id="top-bar" class="top-bar">
         <header class="header">
             <div class="logo">
                 <div class="logo-icon"></div>
                 <h1>Simply Hook Executor</h1>
             </div>
             <div class="header-actions">
-                <span id="identity-badge" class="identity-pill"></span>
+                <span id="current-key-tier" class="badge badge-tier"></span>
+                <span id="identity-badge" class="identity-pill hidden"></span>
                 <button id="refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
-                <button id="logout-btn" class="btn btn-logout">Logout</button>
+                <button id="logout-btn" class="btn btn-logout btn-sm">Logout</button>
             </div>
         </header>
 
@@ -81,6 +83,7 @@
             <button class="tab-btn" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
+      </div>
 
         <!-- ═══════════════════════════════════════════════ -->
         <!-- TAB: Hooks & Runner                             -->
@@ -240,10 +243,13 @@
         <main id="tab-keys" class="tab-panel">
             <div class="admin-grid">
                 <section class="card admin-section">
-                    <h2>API Keys</h2>
+                    <div class="list-header">
+                        <h2>API Keys</h2>
+                        <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+                    </div>
                     <p class="subtitle">Create and manage API keys, their global scopes, and their execution budgets.</p>
 
-                    <form id="form-create-apikey" class="admin-form">
+                    <form id="form-create-apikey" class="admin-form hidden">
                         <div class="form-grid">
                             <div class="form-group">
                                 <label for="apikey-name">Key Name <span>*</span></label>
@@ -314,6 +320,7 @@
 
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create API Key</button>
+                            <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
                         </div>
                     </form>
 
