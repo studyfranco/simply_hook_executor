@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 
 /// How long a *successfully* resolved `TRUSTED_PROXIES` hostname is reused before being looked up
 /// again.
@@ -51,7 +51,7 @@ pub const TRUSTED_PROXY_BOOT_GRACE: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxySpec {
     /// A literal address or CIDR range. Matched arithmetically, with no name lookup.
-    Network(IpNetwork),
+    Network(IpNet),
     /// A DNS name (`traefik`, `proxy.internal`), resolved at match time.
     ///
     /// Exists for container platforms where the proxy's address is assigned by the orchestrator and
@@ -72,7 +72,7 @@ impl std::fmt::Display for ProxySpec {
 struct HostnameEntry {
     /// The host routes the name resolved to. Empty when the lookup failed, which is what makes a
     /// failed entry contribute nothing to the trusted set rather than falling back to something.
-    networks: Vec<IpNetwork>,
+    networks: Vec<IpNet>,
     /// Whether the lookup itself succeeded.
     ///
     /// Tracked separately from `networks.is_empty()` because the two carry different TTLs, and a
@@ -100,7 +100,7 @@ struct ResolvedProxies {
     hosts: HashMap<String, HostnameEntry>,
     /// Static networks merged with every cached hostname's addresses, precomputed so the hot path
     /// is an `Arc` clone rather than a walk over the map.
-    merged: Arc<Vec<IpNetwork>>,
+    merged: Arc<Vec<IpNet>>,
 }
 
 /// The set of peers whose forwarding headers are believed.
@@ -113,7 +113,7 @@ pub struct TrustedProxies {
     spec: Vec<ProxySpec>,
     /// Literal entries, precomputed. Also the complete answer when no hostnames are configured,
     /// which is the common case and costs nothing but an `Arc` clone to serve.
-    networks: Arc<Vec<IpNetwork>>,
+    networks: Arc<Vec<IpNet>>,
     /// Hostname entries awaiting resolution.
     hostnames: Vec<String>,
     /// Reuse window for a successful resolution.
@@ -163,7 +163,7 @@ impl Default for TrustedProxies {
 impl TrustedProxies {
     /// Builds the set from a parsed specification.
     pub fn new(spec: Vec<ProxySpec>) -> Self {
-        let networks: Vec<IpNetwork> = spec
+        let networks: Vec<IpNet> = spec
             .iter()
             .filter_map(|entry| match entry {
                 ProxySpec::Network(network) => Some(*network),
@@ -301,7 +301,7 @@ impl TrustedProxies {
     /// requests arriving on an expired entry into a *single* query: the rest queue, then find the
     /// entry fresh and return immediately. Combined with the negative TTL, that bounds DNS traffic
     /// to one query per name per window regardless of how much load the daemon is under.
-    pub async fn resolved(&self) -> Arc<Vec<IpNetwork>> {
+    pub async fn resolved(&self) -> Arc<Vec<IpNet>> {
         if self.hostnames.is_empty() {
             return Arc::clone(&self.networks);
         }
@@ -350,12 +350,12 @@ impl TrustedProxies {
 /// currently trusted", which is the safe direction to fail in. A DNS outage must never be able to
 /// *widen* what the daemon believes, and a container that is down should stop being trusted rather
 /// than keep a stale grant alive.
-async fn resolve_hostname(hostname: &str) -> (Vec<IpNetwork>, bool) {
+async fn resolve_hostname(hostname: &str) -> (Vec<IpNet>, bool) {
     // Port 0: `lookup_host` wants a socket address, but only the address half is used.
     match tokio::net::lookup_host((hostname, 0u16)).await {
         Ok(addrs) => {
-            let networks: Vec<IpNetwork> =
-                addrs.map(|addr| IpNetwork::from(normalize_ip(addr.ip()))).collect();
+            let networks: Vec<IpNet> =
+                addrs.map(|addr| IpNet::from(normalize_ip(addr.ip()))).collect();
             if networks.is_empty() {
                 tracing::warn!(
                     "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
@@ -365,7 +365,7 @@ async fn resolve_hostname(hostname: &str) -> (Vec<IpNetwork>, bool) {
             }
             tracing::debug!(
                 "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
-                networks.iter().map(|n| n.ip().to_string()).collect::<Vec<_>>().join(", ")
+                networks.iter().map(|n| n.addr().to_string()).collect::<Vec<_>>().join(", ")
             );
             (networks, true)
         }
@@ -393,8 +393,8 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 /// Reports whether `ip` falls inside any of the `trusted` networks.
-fn is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
-    trusted.iter().any(|net| net.contains(ip))
+fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
+    trusted.iter().any(|net| net.contains(&ip))
 }
 
 /// Determines the client address to authorize `bound_ips` against, and to record in the audit trail.
@@ -421,7 +421,7 @@ fn is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
 pub fn resolve_client_ip(
     peer: IpAddr,
     headers: &axum::http::HeaderMap,
-    trusted: &[IpNetwork],
+    trusted: &[IpNet],
 ) -> IpAddr {
     let peer = normalize_ip(peer);
 
@@ -1168,12 +1168,12 @@ fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxySpec>, TrustedProxyError>
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|entry| match entry.parse::<IpNetwork>() {
+        .map(|entry| match entry.parse::<IpNet>() {
             Ok(network) => Ok(ProxySpec::Network(network)),
-            // `IpNetwork`'s parser is the authority on CIDR text; these fallbacks cover the
+            // `IpNet`'s parser is the authority on CIDR text; these fallbacks cover the
             // bare-address and hostname spellings by construction rather than by string surgery.
             Err(_) => match entry.parse::<IpAddr>() {
-                Ok(addr) => Ok(ProxySpec::Network(IpNetwork::from(addr))),
+                Ok(addr) => Ok(ProxySpec::Network(IpNet::from(addr))),
                 Err(_) => match hostname_rejection(entry) {
                     None => Ok(ProxySpec::Hostname(entry.to_owned())),
                     Some(reason) => Err(TrustedProxyError {
@@ -1285,7 +1285,7 @@ mod tests {
         TrustedProxies::from_raw(raw).expect("test fixture is syntactically valid")
     }
 
-    fn nets(raw: &str) -> Vec<IpNetwork> {
+    fn nets(raw: &str) -> Vec<IpNet> {
         parse_trusted_proxies(raw)
             .expect("test fixture is well-formed")
             .into_iter()

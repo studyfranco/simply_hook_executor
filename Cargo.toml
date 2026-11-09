@@ -17,7 +17,7 @@ sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqli
 # index; AGENT.MD requires the daemon stay SQL-agnostic and PostgreSQL-ready, so this crate's
 # feature set must not silently narrow that promise.
 sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
-ipnetwork = "0.21"
+ipnet = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }

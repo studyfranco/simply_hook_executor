@@ -2,7 +2,7 @@
 //! HMAC-SHA256 request signing.
 
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 
@@ -443,7 +443,7 @@ async fn authenticate_bearer_key(
     // Authenticate, then authorize: an unauthenticated caller now gets `401` for every key, and
     // learns nothing from it beyond "not authenticated".
     let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
-    let networks: Vec<IpNetwork> = bound_ips_str
+    let networks: Vec<IpNet> = bound_ips_str
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -460,7 +460,7 @@ async fn authenticate_bearer_key(
     // restriction was decorative while the dashboard displayed it as enforced. A master key that
     // should reach the API from anywhere expresses that by leaving `bound_ips` empty (or listing
     // `0.0.0.0/0,::/0`), not by having the check skipped behind its back.
-    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
+    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(&client_ip));
 
     if !is_allowed {
         tracing::warn!(

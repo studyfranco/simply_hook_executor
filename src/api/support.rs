@@ -17,7 +17,7 @@
 
 use chrono::Utc;
 use rand::RngExt;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -345,7 +345,7 @@ pub(crate) fn validate_bound_ips(bound_ips: &str) -> Result<(), AppError> {
         if trimmed.is_empty() {
             continue;
         }
-        let _: IpNetwork = trimmed
+        let _: IpNet = trimmed
             .parse()
             .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {trimmed}")))?;
     }
