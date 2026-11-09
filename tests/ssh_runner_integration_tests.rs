@@ -115,6 +115,7 @@ fn password_credential(password: &str) -> ssh_credential::Model {
         encrypted_private_key: None,
         encrypted_passphrase: None,
         encrypted_password: Some(SecretCipher::Plaintext.seal(password).expect("plaintext sealing never fails")),
+        owner_key_id: None,
         created_at: now,
         updated_at: now,
     }
@@ -130,6 +131,7 @@ fn target(credential_id: Uuid, port: u16, host_key_fingerprint: Option<&str>) ->
         username: "testuser".to_owned(),
         credential_id,
         host_key_fingerprint: host_key_fingerprint.map(str::to_owned),
+        owner_key_id: None,
         created_at: now,
         updated_at: now,
     }

@@ -432,6 +432,7 @@ pub(crate) fn guard_master_to_grant_scopes(
     key: &api_key::Model,
     can_manage_keys: Option<bool>,
     can_manage_hooks: Option<bool>,
+    can_manage_ssh: Option<bool>,
 ) -> Result<(), AppError> {
     if key.is_master {
         return Ok(());
@@ -440,9 +441,10 @@ pub(crate) fn guard_master_to_grant_scopes(
     // `is_master` is deliberately absent: it is no longer a field on either payload, so there is
     // nothing here to gate. Refusing it is the deserializer's job now (`deny_unknown_fields`), and
     // it applies to master callers too — which this guard, by design, does not.
-    let requested: [(&str, bool); 2] = [
+    let requested: [(&str, bool); 3] = [
         ("can_manage_keys", can_manage_keys.unwrap_or(false)),
         ("can_manage_hooks", can_manage_hooks.unwrap_or(false)),
+        ("can_manage_ssh", can_manage_ssh.unwrap_or(false)),
     ];
     let Some((scope, _)) = requested.into_iter().find(|(_, wanted)| *wanted) else {
         return Ok(());
@@ -617,19 +619,18 @@ pub(crate) fn guard_master_self_edit_is_bound_ips_only(
     // catching it here first gives the specific "bound_ips only" message rather than the generic
     // can_manage_keys one, which is the more useful answer for an attempt that was really about
     // editing the master's own record.
-    let other_fields: [(&str, bool); 4] = [
+    let other_fields: [(&str, bool); 5] = [
         ("name", payload.name.is_some()),
         ("max_concurrent_jobs", payload.max_concurrent_jobs.is_some()),
         ("can_manage_keys", payload.can_manage_keys.is_some()),
-        ("canonical_template", payload.canonical_template.is_some()),
+        ("can_manage_hooks", payload.can_manage_hooks.is_some()),
+        ("can_manage_ssh", payload.can_manage_ssh.is_some()),
     ];
     let requested = other_fields
         .into_iter()
         .find(|(_, present)| *present)
         .map(|(field, _)| field)
-        // Split out so the array stays a fixed-size literal: `can_manage_hooks` is checked on the
-        // same footing as the four above.
-        .or_else(|| payload.can_manage_hooks.is_some().then_some("can_manage_hooks"));
+        .or_else(|| payload.canonical_template.is_some().then_some("canonical_template"));
 
     let Some(field) = requested else {
         return Ok(());
@@ -964,6 +965,49 @@ pub(crate) async fn guard_delegated_hook_grant(
     }
 
     Ok(())
+}
+
+/// Asserts that `key` is authorized to configure a hook with the given SSH target.
+///
+/// A caller may dispatch to an SSH target if:
+/// 1. The caller is Master.
+/// 2. The caller is the recorded owner of the target (`target.owner_key_id == Some(key.id)`).
+/// 3. The caller holds a grant in `api_key_ssh_target_permissions` with `can_use_in_hook = true`.
+pub(crate) async fn guard_ssh_target_usage(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    target_id: Uuid,
+) -> Result<(), AppError> {
+    if key.is_master {
+        return Ok(());
+    }
+
+    let target = SshTarget::find_by_id(target_id)
+        .one(db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if target.owner_key_id == Some(key.id) {
+        return Ok(());
+    }
+
+    let perm = ApiKeySshTargetPermission::find_by_id((key.id, target_id))
+        .one(db)
+        .await?;
+
+    if perm.map(|p| p.can_use_in_hook).unwrap_or(false) {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        key = %key.prefix,
+        target = %target.name,
+        "Blocked SSH target usage: key does not have permission to use target in a hook"
+    );
+    Err(AppError::Forbidden(format!(
+        "You do not have permission to use SSH target '{}' in a hook",
+        target.name
+    )))
 }
 
 #[cfg(test)]

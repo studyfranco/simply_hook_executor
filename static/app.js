@@ -939,7 +939,7 @@ class HookExecutorClient {
         // let every request 403.
         document.getElementById('settings-tab-btn').style.display = p.is_master ? 'inline-block' : 'none';
         document.getElementById('audit-tab-btn').style.display = p.is_master ? 'inline-block' : 'none';
-        document.getElementById('ssh-tab-btn').style.display = p.is_master ? 'inline-block' : 'none';
+        document.getElementById('ssh-tab-btn').style.display = (p.is_master || p.can_manage_ssh) ? 'inline-block' : 'none';
 
         // The trash view (`?include_deleted=true`) is master-only server side
         // (`guard_master_for_deleted_view`), so the toggle is disabled rather than hidden — same
@@ -992,10 +992,11 @@ class HookExecutorClient {
                 // tab would otherwise still be read by `createApiKey`.
                 document.getElementById('apikey-can-manage-keys').checked = false;
                 document.getElementById('apikey-can-manage-hooks').checked = false;
+                document.getElementById('apikey-can-manage-ssh').checked = false;
             }
         }
 
-        ['edit-key-can-manage-keys', 'edit-key-can-manage-hooks'].forEach(id => {
+        ['edit-key-can-manage-keys', 'edit-key-can-manage-hooks', 'edit-key-can-manage-ssh'].forEach(id => {
             const input = document.getElementById(id);
             if (input) {
                 input.disabled = !isMaster;
@@ -1158,11 +1159,13 @@ class HookExecutorClient {
         if (this.state.profile.is_master || this.state.profile.can_manage_keys) {
             await this.loadKeys();
         }
+        if (this.state.profile.is_master || this.state.profile.can_manage_ssh) {
+            await this.loadSshCredentials();
+            await this.loadSshTargets();
+        }
         if (this.state.profile.is_master) {
             await this.loadSettings();
             await this.loadAuditLogs();
-            await this.loadSshCredentials();
-            await this.loadSshTargets();
         }
     }
 
@@ -2055,6 +2058,11 @@ class HookExecutorClient {
                     ? 'Delete this hook'
                     : 'Only the hook owner or the Master key may delete a hook (§3)';
 
+                const canRun = h.can_execute && h.is_active;
+                const runTitle = !h.is_active
+                    ? `Cannot run: ${h.disabled_reason || 'Hook is deactivated'}`
+                    : (h.can_execute ? 'Review the payload, then dry-run or execute' : 'Requires execute permission');
+
                 const rights = [
                     h.is_owner ? '<span class="badge badge-scope badge-scope-master" title="You are answerable for this hook: you may edit, rename and delete it">Owner</span>' : '',
                     h.can_execute ? '<span class="badge badge-scope">Execute</span>' : '',
@@ -2067,6 +2075,7 @@ class HookExecutorClient {
                     <td>${deletable ? `<input type="checkbox" class="row-select" data-id="${h.id}">` : ''}</td>
                     <td class="hook-name-cell">
                         <strong>${escapeHtml(h.name)}</strong>
+                        ${!h.is_active ? `<span class="badge badge-timeout" title="${escapeHtml(h.disabled_reason || 'Hook is deactivated')}">Deactivated</span>` : ''}
                         <button type="button" class="btn-icon-inline" onclick="window.app.copyHookWebhookUrl('${h.id}')"
                             title="Copy this hook's execution URL (${escapeHtml(h.webhook_path)})" aria-label="Copy execution URL">🔗</button>
                     </td>
@@ -2078,8 +2087,8 @@ class HookExecutorClient {
                     <td><div class="scope-badges">${rights}</div></td>
                     <td>
                         <div class="flex gap-2">
-                            <button class="btn btn-sm btn-primary" onclick="window.app.openRunHookModal('${h.id}')" ${h.can_execute ? '' : 'disabled'}
-                                title="${h.can_execute ? 'Review the payload, then dry-run or execute' : 'Requires execute permission'}">Run</button>
+                            <button class="btn btn-sm btn-primary" onclick="window.app.openRunHookModal('${h.id}')" ${canRun ? '' : 'disabled'}
+                                title="${escapeHtml(runTitle)}">Run</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.showHookLogs('${h.id}')">Logs</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openParamsModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Parameters</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openEditHookModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Edit</button>
@@ -2299,6 +2308,17 @@ class HookExecutorClient {
 
         document.getElementById('edit-hook-modal-title').textContent = h ? 'Edit Hook' : 'Create Hook';
         document.getElementById('edit-hook-submit-btn').textContent = h ? 'Save Changes' : 'Create Hook';
+
+        const deactivatedBanner = document.getElementById('edit-hook-deactivated-banner');
+        if (deactivatedBanner) {
+            if (h && !h.is_active) {
+                deactivatedBanner.textContent = `⚠️ This hook is deactivated (${h.disabled_reason || 'SSH target was deleted'}). Select a valid SSH target or choose Local mode and save to reactivate it.`;
+                deactivatedBanner.classList.remove('hidden');
+            } else {
+                deactivatedBanner.classList.add('hidden');
+            }
+        }
+
         document.getElementById('edit-hook-id').value = h ? h.id : '';
         document.getElementById('edit-hook-name').value = h ? h.name : '';
         document.getElementById('edit-hook-script-path').value = h ? h.script_path : '';
@@ -2396,6 +2416,11 @@ class HookExecutorClient {
         if (forCreate) {
             const parameters = HookExecutorClient.deriveInitialParameters(samplePayloadJson);
             if (parameters.length) payload.parameters = parameters;
+        } else {
+            const currentHook = (this.state.hooks || []).find(h => h.id === id);
+            if (currentHook && !currentHook.is_active) {
+                payload.is_active = true;
+            }
         }
         try {
             if (forCreate) {
@@ -2794,6 +2819,7 @@ class HookExecutorClient {
         if (k.is_master) scopes.push('<span class="badge badge-scope badge-scope-master">Master</span>');
         if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">Manage Keys</span>');
         if (k.can_manage_hooks) scopes.push('<span class="badge badge-scope">Create Hooks</span>');
+        if (k.can_manage_ssh) scopes.push('<span class="badge badge-scope">Manage SSH</span>');
 
         const hookBadges = (k.hook_permissions || []).map(p => {
             // X = execute, M = manage, V = view history. `V` is listed last so an existing grant
@@ -2850,6 +2876,7 @@ class HookExecutorClient {
         if (this.state.profile && this.state.profile.is_master) {
             payload.can_manage_keys = document.getElementById('apikey-can-manage-keys').checked;
             payload.can_manage_hooks = document.getElementById('apikey-can-manage-hooks').checked;
+            payload.can_manage_ssh = document.getElementById('apikey-can-manage-ssh').checked;
         }
 
         try {
@@ -2951,6 +2978,7 @@ class HookExecutorClient {
         document.getElementById('edit-key-canonical-template').value = k.canonical_template || '';
         document.getElementById('edit-key-can-manage-keys').checked = k.can_manage_keys;
         document.getElementById('edit-key-can-manage-hooks').checked = k.can_manage_hooks;
+        document.getElementById('edit-key-can-manage-ssh').checked = Boolean(k.can_manage_ssh);
 
         // A minimally-visible key (§4's shared-resource scope) arrives without its global flags at
         // all, so say "not visible" rather than rendering `undefined` as an unticked box — which
@@ -2962,7 +2990,8 @@ class HookExecutorClient {
             if (!isMaster) {
                 const held = [
                     k.can_manage_keys ? 'Manage Keys' : '',
-                    k.can_manage_hooks ? 'Create Hooks' : ''
+                    k.can_manage_hooks ? 'Create Hooks' : '',
+                    k.can_manage_ssh ? 'Manage SSH' : ''
                 ].filter(Boolean).join(', ');
                 note.textContent = k.partial
                     ? 'Global scopes are not visible for a key you only share a hook with.'
@@ -2994,6 +3023,7 @@ class HookExecutorClient {
         if (this.state.profile && this.state.profile.is_master) {
             payload.can_manage_keys = document.getElementById('edit-key-can-manage-keys').checked;
             payload.can_manage_hooks = document.getElementById('edit-key-can-manage-hooks').checked;
+            payload.can_manage_ssh = document.getElementById('edit-key-can-manage-ssh').checked;
         }
 
         try {
@@ -3239,11 +3269,17 @@ class HookExecutorClient {
         const tbody = document.getElementById('ssh-targets-table-body');
         if (!tbody) return;
         const targets = this.state.sshTargets || [];
+        const isMaster = Boolean(this.state.profile?.is_master);
         tbody.innerHTML = targets.length === 0
             ? '<tr><td colspan="7" class="text-center text-muted">No SSH targets defined.</td></tr>'
-            : targets.map(t => `
+            : targets.map(t => {
+                const canManageTarget = isMaster || Boolean(t.is_owner);
+                return `
                 <tr>
-                    <td><strong>${escapeHtml(t.name)}</strong></td>
+                    <td>
+                        <strong>${escapeHtml(t.name)}</strong>
+                        ${t.is_owner ? '<span class="badge badge-scope badge-scope-master" title="You own this target">Owner</span>' : ''}
+                    </td>
                     <td class="font-mono text-sm">${escapeHtml(t.host)}:${t.port}</td>
                     <td class="text-sm">${escapeHtml(t.username)}</td>
                     <td class="text-sm">${escapeHtml(t.credential_name)}</td>
@@ -3254,12 +3290,14 @@ class HookExecutorClient {
                     <td>
                         <div class="flex gap-2">
                             <button class="btn btn-sm btn-secondary" onclick="window.app.testSshTargetConnection('${t.id}')">Test Connection</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditSshTargetModal('${t.id}')">Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteSshTarget('${t.id}')">Delete</button>
+                            ${canManageTarget ? `<button class="btn btn-sm btn-secondary" onclick="window.app.openTargetPermissionsModal('${t.id}')">Permissions</button>` : ''}
+                            ${canManageTarget ? `<button class="btn btn-sm btn-secondary" onclick="window.app.openEditSshTargetModal('${t.id}')">Edit</button>` : ''}
+                            ${canManageTarget ? `<button class="btn btn-sm btn-danger" onclick="window.app.deleteSshTarget('${t.id}')">Delete</button>` : ''}
                         </div>
                     </td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
     }
 
     // Shared by the create form and the edit modal's own "Fetch Fingerprint" button. `prefix` is
@@ -3365,7 +3403,7 @@ class HookExecutorClient {
         const t = (this.state.sshTargets || []).find(t => t.id === id);
         const ok = await this.showConfirmModal({
             title: 'Delete SSH Target',
-            message: `Delete the SSH target "${t ? t.name : id}"? Refused if any hook still dispatches to it.`,
+            message: `Delete the SSH target "${t ? t.name : id}"? Any referencing hooks will be deactivated until assigned a new target or local mode.`,
             confirmText: 'Delete',
             danger: true
         });
@@ -3374,6 +3412,7 @@ class HookExecutorClient {
             await this.apiFetch(`/ssh-targets/${id}`, { method: 'DELETE' });
             this.showToast('SSH target deleted', 'success');
             this.loadSshTargets();
+            this.loadHooks();
         } catch (e) {}
     }
 
@@ -3384,6 +3423,86 @@ class HookExecutorClient {
         try {
             const res = await this.apiFetch(`/ssh-targets/${id}/test-connection`, { method: 'POST' });
             this.showToast(res.message, res.success ? 'success' : 'error');
+        } catch (e) {}
+    }
+
+    async openTargetPermissionsModal(targetId) {
+        const target = (this.state.sshTargets || []).find(t => t.id === targetId);
+        if (!target) return;
+        document.getElementById('target-permissions-target-id').value = targetId;
+        document.getElementById('target-permissions-target-name').textContent = `Target: ${target.name} (${target.host}:${target.port})`;
+
+        const keySelect = document.getElementById('target-permission-api-key');
+        if (keySelect) {
+            if (!this.state.apiKeys || this.state.apiKeys.length === 0) {
+                await this.loadKeys();
+            }
+            const keys = (this.state.apiKeys || []).filter(k => !k.is_master);
+            keySelect.innerHTML = '<option value="">-- Select API Key --</option>' +
+                keys.map(k => `<option value="${k.id}">${escapeHtml(k.name)}</option>`).join('');
+        }
+
+        await this.loadTargetPermissions(targetId);
+        document.getElementById('target-permissions-modal').classList.remove('hidden');
+    }
+
+    async loadTargetPermissions(targetId) {
+        const tbody = document.getElementById('target-permissions-table-body');
+        if (!tbody) return;
+        try {
+            const perms = await this.apiFetch(`/ssh-targets/${targetId}/permissions`);
+            if (!perms || perms.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No permissions granted yet.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = perms.map(p => `
+                <tr>
+                    <td><strong>${escapeHtml(p.api_key_name || p.api_key_id)}</strong></td>
+                    <td><span class="badge badge-scope">Use in Hook</span></td>
+                    <td class="text-sm">${escapeHtml(new Date(p.created_at + 'Z').toLocaleString())}</td>
+                    <td>
+                        <button type="button" class="btn btn-sm btn-danger" onclick="window.app.revokeTargetPermission('${targetId}', '${p.api_key_id}')">Revoke</button>
+                    </td>
+                </tr>
+            `).join('');
+        } catch (e) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger">Failed to load permissions.</td></tr>';
+        }
+    }
+
+    async grantTargetPermission(e) {
+        e.preventDefault();
+        const targetId = document.getElementById('target-permissions-target-id').value;
+        const apiKeyId = document.getElementById('target-permission-api-key').value;
+        if (!apiKeyId) {
+            this.showToast('Select an API key to grant permission', 'error');
+            return;
+        }
+        try {
+            await this.apiFetch(`/ssh-targets/${targetId}/permissions`, {
+                method: 'POST',
+                body: JSON.stringify({ api_key_id: apiKeyId, can_use_in_hook: true })
+            });
+            this.showToast('Permission granted', 'success');
+            document.getElementById('form-grant-target-permission').reset();
+            await this.loadTargetPermissions(targetId);
+        } catch (e) {}
+    }
+
+    async revokeTargetPermission(targetId, apiKeyId) {
+        const ok = await this.showConfirmModal({
+            title: 'Revoke SSH Target Permission',
+            message: 'Revoke hook usage permission for this API key on this target?',
+            confirmText: 'Revoke',
+            danger: true
+        });
+        if (!ok) return;
+        try {
+            await this.apiFetch(`/ssh-targets/${targetId}/permissions/${apiKeyId}`, {
+                method: 'DELETE'
+            });
+            this.showToast('Permission revoked', 'success');
+            await this.loadTargetPermissions(targetId);
         } catch (e) {}
     }
 
@@ -3680,6 +3799,11 @@ class HookExecutorClient {
         document.getElementById('edit-ssh-target-fetch-fingerprint-btn').addEventListener('click', () => this.fetchSshFingerprint('edit-ssh-target'));
         document.getElementById('edit-ssh-target-cancel').addEventListener('click', () => {
             document.getElementById('edit-ssh-target-modal').classList.add('hidden');
+        });
+
+        document.getElementById('form-grant-target-permission').addEventListener('submit', (e) => this.grantTargetPermission(e));
+        document.getElementById('target-permissions-modal-close').addEventListener('click', () => {
+            document.getElementById('target-permissions-modal').classList.add('hidden');
         });
 
         // Settings

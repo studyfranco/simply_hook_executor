@@ -125,6 +125,7 @@ async fn bootstrap_master_key(
         parent_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
+        can_manage_ssh: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
     };

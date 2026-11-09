@@ -31,8 +31,9 @@ use crate::executor;
 use super::executions::PurgeQuery;
 use super::guards::{
     guard_dispatch_configuration, guard_lifecycle_authority, guard_manage,
-    guard_master_for_deleted_view, hook_permission, normalize_run_as_user,
-    guard_master_for_privileged_hook, guard_visibility, visible_hook_ids,
+    guard_master_for_deleted_view, guard_master_for_privileged_hook,
+    guard_ssh_target_usage, guard_visibility, hook_permission, normalize_run_as_user,
+    visible_hook_ids,
 };
 use super::support::{
     create_audit_log, describe_privilege, format_reference, load_parameters,
@@ -107,6 +108,8 @@ pub struct CreateHookPayload {
     /// The remote target to dispatch to when `execution_type` is `SSH`. Ignored (but accepted) for
     /// `LOCAL`, so a target can be pre-selected before flipping a hook over to `SSH`.
     pub ssh_target_id: Option<Uuid>,
+    /// Whether the hook is active upon creation. Defaults to `true`.
+    pub is_active: Option<bool>,
 }
 
 /// Payload for updating a hook. Every field is optional; omitted fields are left untouched.
@@ -174,6 +177,8 @@ pub struct UpdateHookPayload {
     /// the hook's current one) is `SSH`. Omitting the field leaves the current target untouched.
     /// Dispatch configuration, gated identically to `execution_type`.
     pub ssh_target_id: Option<Uuid>,
+    /// Explicitly activate (`true`) or deactivate (`false`) this hook.
+    pub is_active: Option<bool>,
 }
 
 /// A hook plus its parameter contract and the caller's effective rights over it.
@@ -233,6 +238,10 @@ pub struct HookDetail {
     /// The remote target this hook dispatches to when `execution_type` is `SSH`, or `None` for
     /// `LOCAL`.
     pub ssh_target_id: Option<Uuid>,
+    /// Whether this hook is active and permitted to run.
+    pub is_active: bool,
+    /// Human-readable explanation if this hook is deactivated.
+    pub disabled_reason: Option<String>,
     /// The path a caller — keyed, or keyless per [`HookDetail::auth_mode`] — invokes this hook at:
     /// `/webhook/{name}`. Computed from the hook's own name, never stored, so a rename is reflected
     /// immediately rather than needing a migration to backfill a denormalized copy.
@@ -315,6 +324,8 @@ pub(crate) async fn build_hook_detail(
         args_template: model.args_template,
         execution_type: model.execution_type,
         ssh_target_id: model.ssh_target_id,
+        is_active: model.is_active,
+        disabled_reason: model.disabled_reason,
         webhook_path,
     })
 }
@@ -511,6 +522,9 @@ pub async fn create_hook(
         &state.config.allowed_script_roots,
     )
     .await?;
+    if let (HookExecutionType::Ssh, Some(target_id)) = (execution_type, payload.ssh_target_id) {
+        guard_ssh_target_usage(&state.db, &key, target_id).await?;
+    }
     // Never stored for a `LOCAL` hook, even if the caller sent one — see `CreateHookPayload`'s own
     // doc comment on `ssh_target_id`.
     let ssh_target_id = match execution_type {
@@ -585,6 +599,12 @@ pub async fn create_hook(
         args_template: Set(args_template),
         execution_type: Set(execution_type),
         ssh_target_id: Set(ssh_target_id),
+        is_active: Set(payload.is_active.unwrap_or(true)),
+        disabled_reason: Set(if payload.is_active == Some(false) {
+            Some("Explicitly deactivated at creation".to_owned())
+        } else {
+            None
+        }),
     };
 
     if let Err(err) = Hook::insert(model).exec(&state.db).await {
@@ -810,6 +830,11 @@ pub async fn update_hook(
             &state.config.allowed_script_roots,
         )
         .await?;
+        if let (HookExecutionType::Ssh, Some(target_id)) = (effective_execution_type, effective_ssh_target_id)
+            && (payload.ssh_target_id.is_some() || payload.execution_type.is_some())
+        {
+            guard_ssh_target_usage(&state.db, &key, target_id).await?;
+        }
     }
 
     let effective_auth_mode = payload.auth_mode.unwrap_or(model.auth_mode);
@@ -844,6 +869,7 @@ pub async fn update_hook(
     validate_args_template_matches_parameters(effective_args_template.as_deref(), &declared_keys)?;
 
     let hook_id = model.id;
+    let was_active = model.is_active;
     let mut changes: Vec<String> = Vec::new();
     let mut active: hook::ActiveModel = model.into();
 
@@ -913,6 +939,25 @@ pub async fn update_hook(
         ));
         active.execution_type = Set(effective_execution_type);
         active.ssh_target_id = Set(effective_ssh_target_id);
+    }
+    if payload.is_active == Some(true)
+        || (!was_active
+            && (payload.ssh_target_id.is_some()
+                || payload.execution_type == Some(HookExecutionType::Local))
+            && payload.is_active != Some(false))
+    {
+        if effective_execution_type == HookExecutionType::Ssh && effective_ssh_target_id.is_none() {
+            return Err(AppError::InvalidInput(
+                "Cannot activate an SSH hook without an SSH target".to_owned(),
+            ));
+        }
+        active.is_active = Set(true);
+        active.disabled_reason = Set(None);
+        changes.push("reactivated".to_owned());
+    } else if payload.is_active == Some(false) {
+        active.is_active = Set(false);
+        active.disabled_reason = Set(Some("Deactivated by user".to_owned()));
+        changes.push("deactivated".to_owned());
     }
     active.updated_at = Set(Utc::now().naive_utc());
 

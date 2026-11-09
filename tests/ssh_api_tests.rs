@@ -37,6 +37,7 @@ async fn insert_password_credential(db: &sea_orm::DatabaseConnection, name: &str
         encrypted_private_key: Set(None),
         encrypted_passphrase: Set(None),
         encrypted_password: Set(Some("v1.plain.746573743031".to_owned())),
+        owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -59,6 +60,7 @@ async fn insert_target(db: &sea_orm::DatabaseConnection, name: &str, credential_
         username: Set("deploy".to_owned()),
         credential_id: Set(credential_id),
         host_key_fingerprint: Set(Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned())),
+        owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -380,10 +382,10 @@ async fn fetch_fingerprint_against_an_unreachable_host_reports_failure_as_200() 
 }
 
 #[tokio::test]
-async fn deleting_a_target_still_referenced_by_a_hook_is_refused() {
+async fn deleting_a_target_deactivates_referencing_hooks_instead_of_refusing() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (owner_id, master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
+    let (_owner_id, master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
     let cred_id = insert_password_credential(&db, "hook-cred").await;
     let target_id = insert_target(&db, "hook-target", cred_id).await;
 
@@ -403,11 +405,255 @@ async fn deleting_a_target_still_referenced_by_a_hook_is_refused() {
     )
     .await;
     assert_eq!(create_hook.status, StatusCode::OK, "{}", create_hook.raw);
-    let _ = owner_id;
+    let hook_id = create_hook.string("id");
 
+    // Deleting the target must succeed (204 No Content) and cascade deactivation to the hook.
     let response = send(&app, json_request("DELETE", &format!("/api/ssh-targets/{target_id}"), &master, None)).await;
-    assert_eq!(response.status, StatusCode::CONFLICT);
-    assert!(response.string("error").contains("ssh_hook"), "error should name the blocking hook: {}", response.raw);
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+
+    // Verify hook is now deactivated
+    let get_hook = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    assert_eq!(get_hook.status, StatusCode::OK);
+    assert_eq!(get_hook.field("is_active"), false);
+    assert!(get_hook.field("ssh_target_id").is_null());
+    assert_eq!(
+        get_hook.string("disabled_reason"),
+        "SSH target 'hook-target' was deleted"
+    );
+
+    // Attempting to execute the deactivated hook must fail
+    let run = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::BAD_REQUEST);
+    assert!(run.string("error").contains("deactivated"));
+
+    // Updating the hook to LOCAL and setting is_active = true reactivates it
+    let reactivate = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({
+                "execution_type": "LOCAL",
+                "script_path": "/bin/true",
+                "is_active": true
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(reactivate.status, StatusCode::OK, "{}", reactivate.raw);
+    assert_eq!(reactivate.field("is_active"), true);
+    assert!(reactivate.field("disabled_reason").is_null());
+}
+
+#[tokio::test]
+async fn ssh_manager_can_create_and_manage_own_credentials_and_targets() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_master_id, master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
+    let (_mgr_a_id, mgr_a) = insert_key(&db, "mgr-a", "0.0.0.0/0", KeyScopes::ssh_manager()).await;
+    let (_mgr_b_id, mgr_b) = insert_key(&db, "mgr-b", "0.0.0.0/0", KeyScopes::ssh_manager()).await;
+
+    // Manager A creates a credential
+    let cred = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/ssh-credentials",
+            &mgr_a,
+            Some(json!({
+                "name": "cred-a",
+                "auth_type": "PASSWORD",
+                "password": "secretpassword"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(cred.status, StatusCode::OK, "{}", cred.raw);
+    let cred_id = cred.string("id");
+    assert_eq!(cred.field("is_owner"), true);
+
+    // Manager A creates a target using that credential
+    let target = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/ssh-targets",
+            &mgr_a,
+            Some(json!({
+                "name": "target-a",
+                "host": "192.168.1.10",
+                "username": "admin",
+                "credential_id": cred_id
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(target.status, StatusCode::OK, "{}", target.raw);
+    let target_id = target.string("id");
+    assert_eq!(target.field("is_owner"), true);
+    assert_eq!(target.field("can_use_in_hook"), true);
+
+    // Manager B cannot see target-a without permission
+    let b_view = send(&app, json_request("GET", &format!("/api/ssh-targets/{target_id}"), &mgr_b, None)).await;
+    assert_eq!(b_view.status, StatusCode::NOT_FOUND);
+
+    // Manager B cannot modify or delete Manager A's target
+    let b_update = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/ssh-targets/{target_id}"),
+            &mgr_b,
+            Some(json!({"name": "hacked"})),
+        ),
+    )
+    .await;
+    assert_eq!(b_update.status, StatusCode::FORBIDDEN);
+
+    let b_del = send(&app, json_request("DELETE", &format!("/api/ssh-targets/{target_id}"), &mgr_b, None)).await;
+    assert_eq!(b_del.status, StatusCode::FORBIDDEN);
+
+    // Master can see and delete everything
+    let master_view = send(&app, json_request("GET", &format!("/api/ssh-targets/{target_id}"), &master, None)).await;
+    assert_eq!(master_view.status, StatusCode::OK);
+    assert_eq!(master_view.field("is_owner"), true);
+    assert_eq!(master_view.field("can_use_in_hook"), true);
+}
+
+#[tokio::test]
+async fn ssh_target_permissions_and_hook_creation_enforcement() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_master_id, _master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
+    let (owner_id, owner_key) = insert_key(&db, "owner-ssh", "0.0.0.0/0", KeyScopes::ssh_manager()).await;
+    let (dev_id, dev_key) = insert_key(&db, "dev-hook", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+
+    // Owner creates credential and target
+    let cred = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/ssh-credentials",
+            &owner_key,
+            Some(json!({
+                "name": "owner-cred",
+                "auth_type": "PASSWORD",
+                "password": "pwd"
+            })),
+        ),
+    )
+    .await;
+    let cred_id = cred.string("id");
+
+    let target = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/ssh-targets",
+            &owner_key,
+            Some(json!({
+                "name": "owner-target",
+                "host": "10.0.0.5",
+                "username": "user",
+                "credential_id": cred_id
+            })),
+        ),
+    )
+    .await;
+    let target_id = target.string("id");
+
+    // Dev tries to create hook referencing Owner's target without permission -> 403 Forbidden
+    let unauth_hook = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &dev_key,
+            Some(json!({
+                "name": "dev-hook",
+                "script_path": "run.sh",
+                "execution_type": "SSH",
+                "ssh_target_id": target_id
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(unauth_hook.status, StatusCode::FORBIDDEN, "{}", unauth_hook.raw);
+
+    // Owner grants permission to Dev
+    let grant = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/ssh-targets/{target_id}/permissions"),
+            &owner_key,
+            Some(json!({
+                "api_key_id": dev_id,
+                "can_use_in_hook": true
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(grant.status, StatusCode::OK, "{}", grant.raw);
+
+    // List permissions as Owner
+    let perms = send(
+        &app,
+        json_request("GET", &format!("/api/ssh-targets/{target_id}/permissions"), &owner_key, None),
+    )
+    .await;
+    assert_eq!(perms.status, StatusCode::OK, "{}", perms.raw);
+    assert_eq!(perms.json.as_array().expect("array").len(), 1);
+
+    // Now Dev can create the hook!
+    let auth_hook = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &dev_key,
+            Some(json!({
+                "name": "dev-hook",
+                "script_path": "run.sh",
+                "execution_type": "SSH",
+                "ssh_target_id": target_id
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(auth_hook.status, StatusCode::OK, "{}", auth_hook.raw);
+
+    // Owner revokes Dev's permission
+    let revoke = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/ssh-targets/{target_id}/permissions/{dev_id}"),
+            &owner_key,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(revoke.status, StatusCode::NO_CONTENT);
+
+    // Check permissions list is now empty
+    let perms_after = send(
+        &app,
+        json_request("GET", &format!("/api/ssh-targets/{target_id}/permissions"), &owner_key, None),
+    )
+    .await;
+    assert_eq!(perms_after.json.as_array().expect("array").len(), 0);
+    let _ = owner_id;
 }
 
 // ─────────────────────────────────────────────────────────────

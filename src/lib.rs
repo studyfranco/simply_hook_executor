@@ -131,6 +131,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/ssh-targets/{id}", put(api::update_ssh_target))
         .route("/ssh-targets/{id}", delete(api::delete_ssh_target))
         .route("/ssh-targets/{id}/test-connection", post(api::test_ssh_target_connection))
+        .route("/ssh-targets/{id}/permissions", get(api::list_ssh_target_permissions))
+        .route("/ssh-targets/{id}/permissions", post(api::grant_ssh_target_permission))
+        .route("/ssh-targets/{id}/permissions/{api_key_id}", delete(api::revoke_ssh_target_permission))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

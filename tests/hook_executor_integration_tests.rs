@@ -711,7 +711,7 @@ async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
     let id = Uuid::new_v4();
     let plaintext = simply_hook_executor::api::generate_random_key();
     let now = chrono::Utc::now().naive_utc();
-    api_key::ActiveModel {
+    api_key::Entity::insert(api_key::ActiveModel {
         id: sea_orm::Set(id),
         key_hash: sea_orm::Set(simply_hook_executor::api::hash_key(&plaintext)),
         name: sea_orm::Set("Legacy Sender".to_owned()),
@@ -729,8 +729,8 @@ async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
         created_at: sea_orm::Set(now),
         updated_at: sea_orm::Set(now),
         ..Default::default()
-    }
-    .insert(&db)
+    })
+    .exec(&db)
     .await
     .expect("seeding a legacy row succeeds");
     // Overwritten to the literal `BODY_ONLY` string afterward — `Expr::value` bypasses the
@@ -2066,6 +2066,8 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         args_template: Set(None),
         execution_type: Set(hook::HookExecutionType::Local),
         ssh_target_id: Set(None),
+        is_active: Set(true),
+        disabled_reason: Set(None),
     }
     .insert(&db)
     .await
@@ -4311,6 +4313,7 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
         parent_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
+        can_manage_ssh: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
     }

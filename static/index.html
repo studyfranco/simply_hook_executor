@@ -310,11 +310,16 @@
                                 <span class="checkmark"></span>
                                 Create Hooks
                             </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-manage-ssh">
+                                <span class="checkmark"></span>
+                                Manage SSH
+                            </label>
                         </div>
                         <!-- Shown in place of the grid above when the signed-in key is not Master. -->
                         <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scopes-locked-note">
-                            Only the Master key may grant <strong>Manage Keys</strong> or
-                            <strong>Create Hooks</strong> (RBAC_MODEL.md R4). Keys you create are
+                            Only the Master key may grant <strong>Manage Keys</strong>,
+                            <strong>Create Hooks</strong>, or <strong>Manage SSH</strong> (RBAC_MODEL.md R4). Keys you create are
                             Daughter keys: they hold neither scope.
                         </p>
 
@@ -757,6 +762,7 @@
     <div id="edit-hook-modal" class="modal-overlay hidden">
         <div class="modal-card modal-card-wide card">
             <h3 id="edit-hook-modal-title">Edit Hook</h3>
+            <div id="edit-hook-deactivated-banner" class="message error hidden mt-2 mb-2"></div>
             <form id="form-edit-hook">
                 <input type="hidden" id="edit-hook-id">
                 <div class="form-grid">
@@ -922,6 +928,10 @@
                         <input type="checkbox" id="edit-key-can-manage-hooks">
                         <span class="checkmark"></span> Create Hooks
                     </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-key-can-manage-ssh">
+                        <span class="checkmark"></span> Manage SSH
+                    </label>
                 </div>
                 <!--
                   Replaces the grid above for a non-Master signed-in key. The scopes are still
@@ -1018,6 +1028,49 @@
                     <button type="submit" class="btn btn-primary">Save Changes</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- SSH Target Permissions Modal -->
+    <div id="target-permissions-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="target-permissions-modal-title">
+        <div class="modal-card modal-card-wide card">
+            <div class="flex items-center justify-between mb-2">
+                <h3 id="target-permissions-modal-title">SSH Target Permissions</h3>
+                <button type="button" id="target-permissions-modal-close" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle" id="target-permissions-target-name"></p>
+            <input type="hidden" id="target-permissions-target-id">
+
+            <form id="form-grant-target-permission" class="admin-form mt-2 mb-4">
+                <div class="form-grid">
+                    <div class="form-group col-span-2">
+                        <label for="target-permission-api-key">Grant Hook Creation / Usage To API Key</label>
+                        <select id="target-permission-api-key" class="input-field select-field" required>
+                            <option value="">-- Select API Key --</option>
+                        </select>
+                        <span class="text-muted text-sm">Allow this API key to select this SSH target when creating or updating hooks.</span>
+                    </div>
+                </div>
+                <div class="form-actions mt-2">
+                    <button type="submit" class="btn btn-primary btn-sm">Grant Permission</button>
+                </div>
+            </form>
+
+            <div class="table-container mt-2">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>API Key Name</th>
+                            <th>Can Use in Hook</th>
+                            <th>Granted At</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="target-permissions-table-body">
+                        <tr><td colspan="4" class="text-center text-muted">No permissions granted yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 

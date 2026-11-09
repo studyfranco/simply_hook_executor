@@ -4,6 +4,8 @@
 pub use super::api_key::Entity as ApiKey;
 /// The `api_key_hook_permissions` entity.
 pub use super::api_key_hook_permission::Entity as ApiKeyHookPermission;
+/// The `api_key_ssh_target_permissions` entity.
+pub use super::api_key_ssh_target_permission::Entity as ApiKeySshTargetPermission;
 /// The `audit_logs` entity.
 pub use super::audit_log::Entity as AuditLog;
 /// The `executions` entity.

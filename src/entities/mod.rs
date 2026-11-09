@@ -7,6 +7,8 @@ pub mod prelude;
 pub mod api_key;
 /// The `api_key_hook_permissions` M:N junction table between API keys and hooks.
 pub mod api_key_hook_permission;
+/// The `api_key_ssh_target_permissions` M:N junction table between API keys and SSH targets.
+pub mod api_key_ssh_target_permission;
 /// The `audit_logs` table: the audit trail of mutating configuration operations.
 pub mod audit_log;
 /// The `executions` table: hook execution history, captured output, and metrics.

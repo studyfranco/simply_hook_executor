@@ -128,6 +128,16 @@ pub(crate) async fn run_hook_request(
     caller_ip: std::net::IpAddr,
 ) -> Result<axum::response::Response, AppError> {
     let hook_model = resolve_hook(&state.db, identifier).await?;
+    if !hook_model.is_active {
+        let reason = hook_model
+            .disabled_reason
+            .as_deref()
+            .unwrap_or("Hook is deactivated");
+        return Err(AppError::InvalidInput(format!(
+            "Hook '{}' is deactivated: {reason}",
+            hook_model.name
+        )));
+    }
     if let Some(key) = &key {
         guard_execute(&state.db, key, hook_model.id).await?;
     }
@@ -241,7 +251,15 @@ pub async fn test_hook(
         Err(e) => (None, Some(e.detail)),
     };
 
-    let blocking_reason = if !resolved.missing_required.is_empty() {
+    let blocking_reason = if !hook_model.is_active {
+        Some(format!(
+            "Hook is deactivated: {}",
+            hook_model
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("No reason provided")
+        ))
+    } else if !resolved.missing_required.is_empty() {
         Some(format!(
             "Missing required parameter(s): {}",
             resolved.missing_required.join(", ")

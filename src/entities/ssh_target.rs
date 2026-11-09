@@ -33,6 +33,8 @@ pub struct Model {
     /// there is no trust-on-first-use fallback at execution time, since that would make the very
     /// first real hook run against a target the one connection nobody actually verified.
     pub host_key_fingerprint: Option<String>,
+    /// The key that created or owns this target.
+    pub owner_key_id: Option<Uuid>,
     /// Target creation timestamp.
     pub created_at: DateTime,
     /// Target last-update timestamp.
@@ -51,10 +53,12 @@ pub enum Relation {
         on_delete = "Restrict"
     )]
     SshCredential,
-    /// Hooks configured to dispatch execution to this target. Deletion is refused
-    /// (`ON DELETE RESTRICT`) while any such hook exists.
+    /// Hooks configured to dispatch execution to this target.
     #[sea_orm(has_many = "super::hook::Entity")]
     Hook,
+    /// Permissions granted to API keys to use this target.
+    #[sea_orm(has_many = "super::api_key_ssh_target_permission::Entity")]
+    ApiKeySshTargetPermission,
 }
 
 impl Related<super::ssh_credential::Entity> for Entity {
@@ -66,6 +70,12 @@ impl Related<super::ssh_credential::Entity> for Entity {
 impl Related<super::hook::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Hook.def()
+    }
+}
+
+impl Related<super::api_key_ssh_target_permission::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::ApiKeySshTargetPermission.def()
     }
 }
 

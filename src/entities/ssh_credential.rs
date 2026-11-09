@@ -53,6 +53,8 @@ pub struct Model {
     /// `auth_type = PASSWORD`. Never serialized; see [`Self::encrypted_private_key`].
     #[serde(skip_serializing)]
     pub encrypted_password: Option<String>,
+    /// The key that created or owns this credential.
+    pub owner_key_id: Option<Uuid>,
     /// Credential creation timestamp.
     pub created_at: DateTime,
     /// Credential last-update timestamp.

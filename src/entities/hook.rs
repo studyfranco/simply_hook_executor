@@ -184,9 +184,12 @@ pub struct Model {
     pub execution_type: HookExecutionType,
     /// The remote host to dispatch to when `execution_type = SSH`. `None` for
     /// `execution_type = LOCAL`, and required (enforced at the application layer — see
-    /// `api::hooks::validate_ssh_dispatch`) when `execution_type = SSH`. Deleting a still-referenced
-    /// target is refused (`ON DELETE RESTRICT`) rather than silently downgrading this hook.
+    /// `api::hooks::validate_ssh_dispatch`) when `execution_type = SSH`.
     pub ssh_target_id: Option<Uuid>,
+    /// Whether this hook is active and permitted to run.
+    pub is_active: bool,
+    /// Human-readable explanation if this hook is deactivated.
+    pub disabled_reason: Option<String>,
 }
 
 /// Relations from `hooks` to other entities.

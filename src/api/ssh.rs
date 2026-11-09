@@ -56,7 +56,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::crypto::SecretCipher;
-use crate::entities::{api_key, hook, prelude::*, ssh_credential, ssh_credential::SshAuthType, ssh_target};
+use crate::entities::{
+    api_key, api_key_ssh_target_permission, hook, prelude::*, ssh_credential,
+    ssh_credential::SshAuthType, ssh_target,
+};
 use crate::error::AppError;
 use crate::extract::{StrictJson, StrictPath};
 use crate::middleware::ClientIp;
@@ -184,13 +187,18 @@ pub struct SshCredentialView {
     pub has_passphrase: bool,
     /// Whether a password is stored.
     pub has_password: bool,
+    /// The key that created or owns this credential.
+    pub owner_key_id: Option<Uuid>,
+    /// Whether the calling key is master or the owner of this credential.
+    pub is_owner: bool,
     /// Creation timestamp.
     pub created_at: NaiveDateTime,
     /// Last-update timestamp.
     pub updated_at: NaiveDateTime,
 }
 
-fn build_credential_view(model: ssh_credential::Model) -> SshCredentialView {
+fn build_credential_view(key: &api_key::Model, model: ssh_credential::Model) -> SshCredentialView {
+    let is_owner = key.is_master || model.owner_key_id == Some(key.id);
     SshCredentialView {
         id: model.id,
         name: model.name,
@@ -198,6 +206,8 @@ fn build_credential_view(model: ssh_credential::Model) -> SshCredentialView {
         has_private_key: model.encrypted_private_key.is_some(),
         has_passphrase: model.encrypted_passphrase.is_some(),
         has_password: model.encrypted_password.is_some(),
+        owner_key_id: model.owner_key_id,
+        is_owner,
         created_at: model.created_at,
         updated_at: model.updated_at,
     }
@@ -210,8 +220,8 @@ pub async fn create_ssh_credential(
     Extension(client_ip): Extension<ClientIp>,
     StrictJson(payload): StrictJson<CreateSshCredentialPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can manage SSH credentials".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
     let name = payload.name.trim().to_owned();
@@ -252,6 +262,7 @@ pub async fn create_ssh_credential(
         encrypted_private_key: Set(encrypted_private_key),
         encrypted_passphrase: Set(encrypted_passphrase),
         encrypted_password: Set(encrypted_password),
+        owner_key_id: Set(Some(key.id)),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -277,7 +288,7 @@ pub async fn create_ssh_credential(
     .await?;
 
     let created = SshCredential::find_by_id(id).one(&state.db).await?.ok_or(AppError::Internal)?;
-    Ok(Json(build_credential_view(created)))
+    Ok(Json(build_credential_view(&key, created)))
 }
 
 /// Handles `GET /api/ssh-credentials`.
@@ -285,12 +296,17 @@ pub async fn list_ssh_credentials(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can view SSH credentials".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
+    let query = if key.is_master {
+        SshCredential::find()
+    } else {
+        SshCredential::find().filter(ssh_credential::Column::OwnerKeyId.eq(key.id))
+    };
     let models =
-        SshCredential::find().order_by_asc(ssh_credential::Column::Name).all(&state.db).await?;
-    Ok(Json(models.into_iter().map(build_credential_view).collect::<Vec<_>>()))
+        query.order_by_asc(ssh_credential::Column::Name).all(&state.db).await?;
+    Ok(Json(models.into_iter().map(|m| build_credential_view(&key, m)).collect::<Vec<_>>()))
 }
 
 /// Handles `GET /api/ssh-credentials/{id}`.
@@ -299,11 +315,14 @@ pub async fn get_ssh_credential(
     Extension(key): Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can view SSH credentials".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let model = SshCredential::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    Ok(Json(build_credential_view(model)))
+    if !key.is_master && model.owner_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(build_credential_view(&key, model)))
 }
 
 /// Handles `PUT /api/ssh-credentials/{id}`.
@@ -314,10 +333,13 @@ pub async fn update_ssh_credential(
     StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateSshCredentialPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can manage SSH credentials".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let model = SshCredential::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && model.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden("Only master or the credential owner can manage this SSH credential".to_owned()));
+    }
 
     let effective_auth_type = payload.auth_type.unwrap_or(model.auth_type);
     // Whichever field the *other* mode used is unconditionally cleared, not carried over — the same
@@ -405,7 +427,7 @@ pub async fn update_ssh_credential(
     )
     .await?;
 
-    Ok(Json(build_credential_view(updated)))
+    Ok(Json(build_credential_view(&key, updated)))
 }
 
 /// Handles `DELETE /api/ssh-credentials/{id}`.
@@ -415,10 +437,13 @@ pub async fn delete_ssh_credential(
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can manage SSH credentials".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let model = SshCredential::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && model.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden("Only master or the credential owner can delete this SSH credential".to_owned()));
+    }
 
     let blocking = SshTarget::find().filter(ssh_target::Column::CredentialId.eq(id)).all(&state.db).await?;
     if !blocking.is_empty() {
@@ -509,6 +534,12 @@ pub struct SshTargetView {
     pub credential_name: String,
     /// The pinned host key fingerprint, or `None` if unpinned.
     pub host_key_fingerprint: Option<String>,
+    /// The key that created or owns this target.
+    pub owner_key_id: Option<Uuid>,
+    /// Whether the calling key is master or the owner of this target.
+    pub is_owner: bool,
+    /// Whether the calling key is permitted to use this target in a hook.
+    pub can_use_in_hook: bool,
     /// Creation timestamp.
     pub created_at: NaiveDateTime,
     /// Last-update timestamp.
@@ -517,6 +548,7 @@ pub struct SshTargetView {
 
 async fn build_target_view(
     db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
     model: ssh_target::Model,
 ) -> Result<SshTargetView, AppError> {
     // `credential_id` cannot dangle in practice (`ON DELETE RESTRICT`), but this reads the row
@@ -527,6 +559,16 @@ async fn build_target_view(
         .await?
         .map(|c| c.name)
         .unwrap_or_else(|| "(unknown)".to_owned());
+    let is_owner = key.is_master || model.owner_key_id == Some(key.id);
+    let can_use_in_hook = if is_owner {
+        true
+    } else {
+        ApiKeySshTargetPermission::find_by_id((key.id, model.id))
+            .one(db)
+            .await?
+            .map(|p| p.can_use_in_hook)
+            .unwrap_or(false)
+    };
     Ok(SshTargetView {
         id: model.id,
         name: model.name,
@@ -536,6 +578,9 @@ async fn build_target_view(
         credential_id: model.credential_id,
         credential_name,
         host_key_fingerprint: model.host_key_fingerprint,
+        owner_key_id: model.owner_key_id,
+        is_owner,
+        can_use_in_hook,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })
@@ -548,8 +593,8 @@ pub async fn create_ssh_target(
     Extension(client_ip): Extension<ClientIp>,
     StrictJson(payload): StrictJson<CreateSshTargetPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can manage SSH targets".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
     let name = payload.name.trim().to_owned();
@@ -569,9 +614,18 @@ pub async fn create_ssh_target(
     if let Some(fingerprint) = &payload.host_key_fingerprint {
         validate_host_key_fingerprint(fingerprint)?;
     }
-    if SshCredential::find_by_id(payload.credential_id).one(&state.db).await?.is_none() {
-        return Err(AppError::InvalidInput(
-            "credential_id does not name an existing SSH credential".to_owned(),
+    let credential = SshCredential::find_by_id(payload.credential_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| {
+            AppError::InvalidInput(
+                "credential_id does not name an existing SSH credential".to_owned(),
+            )
+        })?;
+
+    if !key.is_master && credential.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden(
+            "You do not own this SSH credential".to_owned(),
         ));
     }
 
@@ -585,6 +639,7 @@ pub async fn create_ssh_target(
         username: Set(username.clone()),
         credential_id: Set(payload.credential_id),
         host_key_fingerprint: Set(payload.host_key_fingerprint.clone()),
+        owner_key_id: Set(Some(key.id)),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -609,38 +664,76 @@ pub async fn create_ssh_target(
     .await?;
 
     let created = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::Internal)?;
-    Ok(Json(build_target_view(&state.db, created).await?))
+    Ok(Json(build_target_view(&state.db, &key, created).await?))
 }
 
-/// Handles `GET /api/ssh-targets`. Also readable by `can_manage_hooks` — see this module's own doc
-/// comment on why.
+/// Handles `GET /api/ssh-targets`.
 pub async fn list_ssh_targets(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_hooks {
+    if !key.is_master && !key.can_manage_ssh && !key.can_manage_hooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
-    let models = SshTarget::find().order_by_asc(ssh_target::Column::Name).all(&state.db).await?;
+    let models = if key.is_master {
+        SshTarget::find().order_by_asc(ssh_target::Column::Name).all(&state.db).await?
+    } else {
+        let owned = SshTarget::find()
+            .filter(ssh_target::Column::OwnerKeyId.eq(key.id))
+            .all(&state.db)
+            .await?;
+        let permitted_grants = ApiKeySshTargetPermission::find()
+            .filter(api_key_ssh_target_permission::Column::ApiKeyId.eq(key.id))
+            .filter(api_key_ssh_target_permission::Column::CanUseInHook.eq(true))
+            .all(&state.db)
+            .await?;
+        let permitted_target_ids: Vec<Uuid> =
+            permitted_grants.into_iter().map(|g| g.ssh_target_id).collect();
+        let permitted = if !permitted_target_ids.is_empty() {
+            SshTarget::find()
+                .filter(ssh_target::Column::Id.is_in(permitted_target_ids))
+                .all(&state.db)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let mut all = owned;
+        for p in permitted {
+            if !all.iter().any(|t| t.id == p.id) {
+                all.push(p);
+            }
+        }
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
+    };
     let mut views = Vec::with_capacity(models.len());
     for model in models {
-        views.push(build_target_view(&state.db, model).await?);
+        views.push(build_target_view(&state.db, &key, model).await?);
     }
     Ok(Json(views))
 }
 
-/// Handles `GET /api/ssh-targets/{id}`. Also readable by `can_manage_hooks` — see this module's own
-/// doc comment on why.
+/// Handles `GET /api/ssh-targets/{id}`.
 pub async fn get_ssh_target(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_hooks {
+    if !key.is_master && !key.can_manage_ssh && !key.can_manage_hooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let model = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    Ok(Json(build_target_view(&state.db, model).await?))
+    if !key.is_master && model.owner_key_id != Some(key.id) {
+        let has_perm = ApiKeySshTargetPermission::find_by_id((key.id, id))
+            .one(&state.db)
+            .await?
+            .map(|p| p.can_use_in_hook)
+            .unwrap_or(false);
+        if !has_perm {
+            return Err(AppError::NotFound);
+        }
+    }
+    Ok(Json(build_target_view(&state.db, &key, model).await?))
 }
 
 /// Handles `PUT /api/ssh-targets/{id}`.
@@ -651,10 +744,15 @@ pub async fn update_ssh_target(
     StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateSshTargetPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can manage SSH targets".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let model = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && model.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden(
+            "Only master or the target owner can manage this SSH target".to_owned(),
+        ));
+    }
 
     if let Some(port) = payload.port {
         validate_port(port)?;
@@ -664,12 +762,20 @@ pub async fn update_ssh_target(
     {
         validate_host_key_fingerprint(fingerprint)?;
     }
-    if let Some(credential_id) = payload.credential_id
-        && SshCredential::find_by_id(credential_id).one(&state.db).await?.is_none()
-    {
-        return Err(AppError::InvalidInput(
-            "credential_id does not name an existing SSH credential".to_owned(),
-        ));
+    if let Some(credential_id) = payload.credential_id {
+        let cred = SshCredential::find_by_id(credential_id)
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "credential_id does not name an existing SSH credential".to_owned(),
+                )
+            })?;
+        if !key.is_master && cred.owner_key_id != Some(key.id) {
+            return Err(AppError::Forbidden(
+                "You do not own this SSH credential".to_owned(),
+            ));
+        }
     }
 
     let mut changes: Vec<String> = Vec::new();
@@ -734,7 +840,7 @@ pub async fn update_ssh_target(
     )
     .await?;
 
-    Ok(Json(build_target_view(&state.db, updated).await?))
+    Ok(Json(build_target_view(&state.db, &key, updated).await?))
 }
 
 /// Handles `DELETE /api/ssh-targets/{id}`.
@@ -744,19 +850,29 @@ pub async fn delete_ssh_target(
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can manage SSH targets".to_owned()));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let model = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && model.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden(
+            "Only master or the target owner can delete this SSH target".to_owned(),
+        ));
+    }
 
-    let blocking = Hook::find().filter(hook::Column::SshTargetId.eq(id)).all(&state.db).await?;
-    if !blocking.is_empty() {
-        let names: Vec<String> = blocking.iter().map(|h| h.name.clone()).collect();
-        return Err(AppError::Conflict(format!(
-            "Cannot delete SSH target '{}': still used by hook(s): {}",
-            model.name,
-            names.join(", ")
-        )));
+    // Arbitrage 4: hooks referencing this target are deactivated rather than deleted.
+    let affected = Hook::find()
+        .filter(hook::Column::SshTargetId.eq(id))
+        .all(&state.db)
+        .await?;
+    let affected_count = affected.len();
+    for h in affected {
+        let mut active: hook::ActiveModel = h.into();
+        active.is_active = Set(false);
+        active.disabled_reason = Set(Some(format!("SSH target '{}' was deleted", model.name)));
+        active.ssh_target_id = Set(None);
+        active.updated_at = Set(Utc::now().naive_utc());
+        active.update(&state.db).await?;
     }
 
     SshTarget::delete_by_id(id).exec(&state.db).await?;
@@ -767,7 +883,11 @@ pub async fn delete_ssh_target(
         client_ip.0,
         "SSH_TARGET_DELETE",
         Some(model.name.clone()),
-        Some(format!("Deleted SSH target {}", format_reference(&model.name, id))),
+        Some(format!(
+            "Deleted SSH target {} (deactivated {} referencing hook(s))",
+            format_reference(&model.name, id),
+            affected_count
+        )),
     )
     .await?;
 
@@ -791,10 +911,12 @@ pub async fn test_ssh_target_connection(
     Extension(key): Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only master keys can test SSH targets".to_owned()));
-    }
     let target = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && (!key.can_manage_ssh || target.owner_key_id != Some(key.id)) {
+        return Err(AppError::Forbidden(
+            "Only master or the target owner can test this SSH target".to_owned(),
+        ));
+    }
     let credential = SshCredential::find_by_id(target.credential_id)
         .one(&state.db)
         .await?
@@ -849,20 +971,12 @@ pub struct FetchFingerprintResponse {
 /// Handles `POST /api/ssh-targets/fetch-fingerprint` — the one step in this deployment's
 /// trust-on-first-use model: connects to a bare `host:port` (no target needs to exist yet), records
 /// whatever host key it offers, and disconnects without authenticating.
-///
-/// The returned fingerprint is not stored by this call. The operator is expected to confirm it out
-/// of band (the host's own documentation, a provisioning system, a phone call to whoever built it)
-/// and then paste it into `host_key_fingerprint` on a create/update — this endpoint answers "what key
-/// is this host presenting", not "is this the right key", which nothing server-side can determine on
-/// its own.
 pub async fn fetch_ssh_host_fingerprint(
     Extension(key): Extension<api_key::Model>,
     StrictJson(payload): StrictJson<FetchFingerprintPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden(
-            "Only master keys can fetch an SSH host key fingerprint".to_owned(),
-        ));
+    if !key.is_master && !key.can_manage_ssh {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
     let host = payload.host.trim().to_owned();
     if host.is_empty() {
@@ -881,6 +995,167 @@ pub async fn fetch_ssh_host_fingerprint(
             Ok(Json(FetchFingerprintResponse { success: false, fingerprint: None, message: Some(e.to_string()) }))
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SSH target permissions
+// ─────────────────────────────────────────────────────────────
+
+/// Payload for granting or updating target permissions for an API key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantSshTargetPermissionPayload {
+    /// API key ID to grant rights to.
+    pub api_key_id: Uuid,
+    /// Whether the key can assign this target to its hooks.
+    pub can_use_in_hook: bool,
+}
+
+/// View of an assigned target permission.
+#[derive(Serialize)]
+pub struct SshTargetPermissionView {
+    /// The API key ID.
+    pub api_key_id: Uuid,
+    /// The API key's name, resolved for display.
+    pub api_key_name: String,
+    /// Whether the key can use this target in hooks.
+    pub can_use_in_hook: bool,
+    /// Grant timestamp.
+    pub created_at: NaiveDateTime,
+}
+
+/// Handles `GET /api/ssh-targets/{id}/permissions`.
+pub async fn list_ssh_target_permissions(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    StrictPath(id): StrictPath<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let target = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden(
+            "Only master or the target owner can view target permissions".to_owned(),
+        ));
+    }
+
+    let rows = ApiKeySshTargetPermission::find()
+        .filter(api_key_ssh_target_permission::Column::SshTargetId.eq(id))
+        .find_also_related(ApiKey)
+        .all(&state.db)
+        .await?;
+
+    let views = rows
+        .into_iter()
+        .map(|(perm, key_model)| SshTargetPermissionView {
+            api_key_id: perm.api_key_id,
+            api_key_name: key_model.map(|k| k.name).unwrap_or_else(|| "(unknown)".to_owned()),
+            can_use_in_hook: perm.can_use_in_hook,
+            created_at: perm.created_at,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(views))
+}
+
+/// Handles `POST /api/ssh-targets/{id}/permissions`.
+pub async fn grant_ssh_target_permission(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<GrantSshTargetPermissionPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    let target = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden(
+            "Only master or the target owner can manage target permissions".to_owned(),
+        ));
+    }
+
+    let target_key = ApiKey::find_by_id(payload.api_key_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| {
+            AppError::InvalidInput("api_key_id does not name an existing API key".to_owned())
+        })?;
+
+    let now = Utc::now().naive_utc();
+    let existing = ApiKeySshTargetPermission::find_by_id((payload.api_key_id, id))
+        .one(&state.db)
+        .await?;
+
+    let perm_model = match existing {
+        Some(m) => {
+            let mut active: api_key_ssh_target_permission::ActiveModel = m.into();
+            active.can_use_in_hook = Set(payload.can_use_in_hook);
+            active.update(&state.db).await?
+        }
+        None => {
+            let active = api_key_ssh_target_permission::ActiveModel {
+                api_key_id: Set(payload.api_key_id),
+                ssh_target_id: Set(id),
+                can_use_in_hook: Set(payload.can_use_in_hook),
+                created_at: Set(now),
+            };
+            active.insert(&state.db).await?
+        }
+    };
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "SSH_TARGET_PERMISSION_GRANT",
+        Some(target.name.clone()),
+        Some(format!(
+            "Set can_use_in_hook={} for key {} on target {}",
+            payload.can_use_in_hook,
+            format_reference(&target_key.name, target_key.id),
+            format_reference(&target.name, id)
+        )),
+    )
+    .await?;
+
+    Ok(Json(SshTargetPermissionView {
+        api_key_id: perm_model.api_key_id,
+        api_key_name: target_key.name,
+        can_use_in_hook: perm_model.can_use_in_hook,
+        created_at: perm_model.created_at,
+    }))
+}
+
+/// Handles `DELETE /api/ssh-targets/{id}/permissions/{api_key_id}`.
+pub async fn revoke_ssh_target_permission(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath((id, api_key_id)): StrictPath<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, AppError> {
+    let target = SshTarget::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::Forbidden(
+            "Only master or the target owner can manage target permissions".to_owned(),
+        ));
+    }
+
+    ApiKeySshTargetPermission::delete_by_id((api_key_id, id))
+        .exec(&state.db)
+        .await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "SSH_TARGET_PERMISSION_REVOKE",
+        Some(target.name.clone()),
+        Some(format!(
+            "Revoked SSH target permission for key {} on target {}",
+            api_key_id,
+            format_reference(&target.name, id)
+        )),
+    )
+    .await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

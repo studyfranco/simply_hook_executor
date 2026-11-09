@@ -1201,6 +1201,16 @@ pub async fn execute_hook(
     resolved: &ResolvedParameters,
     caller_ip: std::net::IpAddr,
 ) -> Result<execution::Model, AppError> {
+    if !hook.is_active {
+        let reason = hook
+            .disabled_reason
+            .as_deref()
+            .unwrap_or("Hook is deactivated");
+        return Err(AppError::InvalidInput(format!(
+            "Hook '{}' is deactivated: {reason}",
+            hook.name
+        )));
+    }
     let key_prefix = key.map(|k| k.prefix.as_str()).unwrap_or("(keyless)");
 
     // The local filesystem pre-flight (existence, execute bit, containment, sudo availability) has
@@ -1437,6 +1447,8 @@ mod tests {
             args_template: None,
             execution_type: hook::HookExecutionType::Local,
             ssh_target_id: None,
+            is_active: true,
+            disabled_reason: None,
         }
     }
 

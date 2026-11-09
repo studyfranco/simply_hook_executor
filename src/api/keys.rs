@@ -246,6 +246,8 @@ pub struct MeResponse {
     pub can_manage_keys: bool,
     /// Global hook creation scope.
     pub can_manage_hooks: bool,
+    /// Global SSH management scope.
+    pub can_manage_ssh: bool,
     /// Granular per-hook permissions.
     pub hook_permissions: Vec<HookPermissionView>,
     /// Whether this deployment can actually reach a hook set to `auth_mode = NONE` keylessly — see
@@ -300,6 +302,7 @@ pub async fn get_me(
         is_master: key.is_master,
         can_manage_keys: key.can_manage_keys,
         can_manage_hooks: key.can_manage_hooks,
+        can_manage_ssh: key.can_manage_ssh,
         hook_permissions,
         keyless_hooks_allowed: !state.config.require_signed_requests,
     }))
@@ -348,6 +351,8 @@ pub struct CreateApiKeyPayload {
     pub can_manage_keys: Option<bool>,
     /// Global hook-creation scope.
     pub can_manage_hooks: Option<bool>,
+    /// Global SSH-management scope.
+    pub can_manage_ssh: Option<bool>,
     /// Whether to mint a `key_id` + `signing_secret` pair for this key at all. Defaults to `true`
     /// (every key minted this way until now). Set `false` for a plain `X-API-Key`-only credential
     /// that never signs — the standard-API-key-only mode `key_id`'s own doc comment already
@@ -411,6 +416,8 @@ pub struct ApiKeySummary {
     pub can_manage_keys: bool,
     /// Global hook-creation scope.
     pub can_manage_hooks: bool,
+    /// Global SSH-management scope.
+    pub can_manage_ssh: bool,
     /// The key that created this one, for display only. `RBAC_MODEL.md` R3: "Rights are never
     /// derived from key lineage" — this is shown so an operator can see the key tree, never
     /// consulted by any guard. `None` for the bootstrap master and every key issued before lineage
@@ -507,6 +514,7 @@ pub(crate) async fn build_api_key_summary(
         is_master: model.is_master,
         can_manage_keys: model.can_manage_keys,
         can_manage_hooks: model.can_manage_hooks,
+        can_manage_ssh: model.can_manage_ssh,
         parent_key_id: model.parent_key_id,
         created_at: model.created_at,
         hook_permissions,
@@ -528,7 +536,12 @@ pub async fn create_api_key(
     // Checked before any field validation, for the same reason `run_as_user` is in the hook
     // handlers: an escalation attempt must surface as `403` rather than be masked by a `400` about
     // some unrelated field in the same payload.
-    guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
+    guard_master_to_grant_scopes(
+        &key,
+        payload.can_manage_keys,
+        payload.can_manage_hooks,
+        payload.can_manage_ssh,
+    )?;
 
     // A `can_manage_keys` holder must always sign (`middleware::authenticate_bearer_key`), so it
     // cannot be minted with nothing to sign with. Checked ahead of the other field validation,
@@ -590,6 +603,7 @@ pub async fn create_api_key(
         parent_key_id: Set(Some(key.id)),
         can_manage_keys: Set(payload.can_manage_keys.unwrap_or(false)),
         can_manage_hooks: Set(payload.can_manage_hooks.unwrap_or(false)),
+        can_manage_ssh: Set(payload.can_manage_ssh.unwrap_or(false)),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -702,6 +716,8 @@ pub struct UpdateApiKeyPayload {
     pub can_manage_keys: Option<bool>,
     /// New hook-creation scope.
     pub can_manage_hooks: Option<bool>,
+    /// New SSH-management scope.
+    pub can_manage_ssh: Option<bool>,
 }
 
 /// Handles `PUT /api/keys/{id}`.
@@ -724,8 +740,13 @@ pub async fn update_api_key(
     // ...and even for the master itself, `bound_ips` is the *only* field it reaches.
     guard_master_self_edit_is_bound_ips_only(&key, &target, &payload)?;
     // `UpdateApiKeyPayload` deliberately carries no `is_master` field, so promotion is impossible
-    // through this route regardless; the other two global scopes still need the gate.
-    guard_master_to_grant_scopes(&key, payload.can_manage_keys, payload.can_manage_hooks)?;
+    // through this route regardless; the other global scopes still need the gate.
+    guard_master_to_grant_scopes(
+        &key,
+        payload.can_manage_keys,
+        payload.can_manage_hooks,
+        payload.can_manage_ssh,
+    )?;
 
     // The *effective* can_manage_keys after this update, against the target's current — and, since
     // `hmac_mode` is immutable, permanent — signature mode. An omitted `can_manage_keys` in the
@@ -771,6 +792,9 @@ pub async fn update_api_key(
     }
     if let Some(v) = payload.can_manage_hooks {
         active.can_manage_hooks = Set(v);
+    }
+    if let Some(v) = payload.can_manage_ssh {
+        active.can_manage_ssh = Set(v);
     }
     active.updated_at = Set(Utc::now().naive_utc());
     let updated = active.update(&state.db).await?;

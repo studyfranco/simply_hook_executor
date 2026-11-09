@@ -1010,6 +1010,7 @@ async fn s5_exactly_one_master_immutable_and_undeletable() {
         parent_key_id: Set(None),
         can_manage_keys: Set(true),
         can_manage_hooks: Set(true),
+        can_manage_ssh: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -1209,6 +1210,7 @@ async fn s7_every_required_index_and_constraint_exists() {
         parent_key_id: Set(None),
         can_manage_keys: Set(false),
         can_manage_hooks: Set(false),
+        can_manage_ssh: Set(false),
         created_at: Set(now),
         updated_at: Set(now),
     }

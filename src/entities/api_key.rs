@@ -83,6 +83,8 @@ pub struct Model {
     /// Global privilege to create new hooks. Managing an *existing* hook additionally requires an
     /// explicit `can_manage` grant in `api_key_hook_permissions` (AGENT.MD least-privilege rule).
     pub can_manage_hooks: bool,
+    /// Global privilege to create and manage SSH credentials and targets.
+    pub can_manage_ssh: bool,
     /// The key that created this one. **Lineage only — never authority.**
     ///
     /// `RBAC_MODEL.md` R3 is emphatic: "`parent_key_id` exists solely for cascading deletion and
@@ -119,6 +121,15 @@ pub enum Relation {
     /// Audit log entries attributed to this key.
     #[sea_orm(has_many = "super::audit_log::Entity")]
     AuditLog,
+    /// SSH target permissions held by this key.
+    #[sea_orm(has_many = "super::api_key_ssh_target_permission::Entity")]
+    ApiKeySshTargetPermission,
+}
+
+impl Related<super::api_key_ssh_target_permission::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::ApiKeySshTargetPermission.def()
+    }
 }
 
 impl Related<super::api_key_hook_permission::Entity> for Entity {

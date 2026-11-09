@@ -77,8 +77,10 @@ pub use audit::list_audit_logs;
 pub use health::{health_check, readiness_check};
 pub use ssh::{
     create_ssh_credential, create_ssh_target, delete_ssh_credential, delete_ssh_target,
-    fetch_ssh_host_fingerprint, get_ssh_credential, get_ssh_target, list_ssh_credentials,
-    list_ssh_targets, test_ssh_target_connection, update_ssh_credential, update_ssh_target,
+    fetch_ssh_host_fingerprint, get_ssh_credential, get_ssh_target, grant_ssh_target_permission,
+    list_ssh_credentials, list_ssh_target_permissions, list_ssh_targets,
+    revoke_ssh_target_permission, test_ssh_target_connection, update_ssh_credential,
+    update_ssh_target,
 };
 pub use system::get_settings;
 

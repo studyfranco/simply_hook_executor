@@ -138,13 +138,20 @@ pub struct KeyScopes {
     pub is_master: bool,
     pub can_manage_keys: bool,
     pub can_manage_hooks: bool,
+    pub can_manage_ssh: bool,
     pub max_concurrent_jobs: i32,
 }
 
 impl KeyScopes {
     /// A master key.
     pub fn master() -> Self {
-        Self { is_master: true, can_manage_keys: true, can_manage_hooks: true, max_concurrent_jobs: 10 }
+        Self {
+            is_master: true,
+            can_manage_keys: true,
+            can_manage_hooks: true,
+            can_manage_ssh: true,
+            max_concurrent_jobs: 10,
+        }
     }
 
     /// A scoped key with no global rights.
@@ -160,6 +167,12 @@ impl KeyScopes {
     /// hook and will never afterwards be able to edit it; see [`Self::parent`].
     pub fn hook_manager() -> Self {
         Self { can_manage_hooks: true, max_concurrent_jobs: 10, ..Self::default() }
+    }
+
+    /// A scoped key allowed to manage SSH credentials and targets.
+    #[allow(dead_code)]
+    pub fn ssh_manager() -> Self {
+        Self { can_manage_ssh: true, max_concurrent_jobs: 10, ..Self::default() }
     }
 
     /// A **Parent** key: `can_manage_keys`, and nothing else global.
@@ -269,6 +282,7 @@ pub async fn insert_key_with_mode(
         parent_key_id: Set(None),
         can_manage_keys: Set(scopes.can_manage_keys),
         can_manage_hooks: Set(scopes.can_manage_hooks),
+        can_manage_ssh: Set(scopes.can_manage_ssh),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -510,6 +524,8 @@ pub async fn insert_hook_full(
         args_template: Set(None),
         execution_type: Set(hook::HookExecutionType::Local),
         ssh_target_id: Set(None),
+        is_active: Set(true),
+        disabled_reason: Set(None),
     }
     .insert(db)
     .await
@@ -556,6 +572,8 @@ pub async fn insert_hook_deleted_days_ago(
         args_template: Set(None),
         execution_type: Set(hook::HookExecutionType::Local),
         ssh_target_id: Set(None),
+        is_active: Set(true),
+        disabled_reason: Set(None),
     }
     .insert(db)
     .await
