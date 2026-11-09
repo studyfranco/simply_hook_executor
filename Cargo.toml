@@ -44,7 +44,7 @@ libc = "0.2"
 # plaintext to recompute a signature, so — unlike `key_hash` — it cannot be hashed. XChaCha20-Poly1305
 # (pure Rust, no C toolchain) keeps a database-only compromise from yielding forgeable signatures.
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
-russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
 
 [dev-dependencies]
 # `ServiceExt::oneshot`, used to drive the real router in integration tests without binding a port.
@@ -74,6 +74,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # breaking changes under a caret requirement — `ParserReturn::errors` became `diagnostics`, `labels`
 # went from `Option<Vec<_>>` to a slice, `offset()` widened to `u32`. A syntax checker that stops the
 # build for reasons unrelated to syntax is worse than no checker, so this one does not float.
-oxc_allocator = "0.145"
-oxc_parser = "0.145"
-oxc_span = "0.145"
+oxc_allocator = "0.158"
+oxc_parser = "0.158"
+oxc_span = "0.158"
