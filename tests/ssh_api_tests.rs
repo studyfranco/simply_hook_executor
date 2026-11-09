@@ -774,3 +774,108 @@ async fn switching_a_hook_back_to_local_clears_its_ssh_target() {
     assert_eq!(updated.field("execution_type"), "LOCAL");
     assert!(updated.field("ssh_target_id").is_null(), "ssh_target_id must be cleared: {}", updated.raw);
 }
+
+#[tokio::test]
+async fn deactivated_ssh_hook_cannot_be_executed_until_reactivated() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_id, master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    // 1. Create credential and target
+    let cred = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/ssh-credentials",
+            &master,
+            Some(json!({
+                "name": "deact-cred",
+                "auth_type": "PASSWORD",
+                "password": "pwd"
+            })),
+        ),
+    )
+    .await;
+    let cred_id = cred.string("id");
+
+    let target = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/ssh-targets",
+            &master,
+            Some(json!({
+                "name": "deact-target",
+                "host": "10.0.0.99",
+                "username": "deploy",
+                "credential_id": cred_id
+            })),
+        ),
+    )
+    .await;
+    let target_id = target.string("id");
+
+    // 2. Create SSH hook referencing target
+    let hook = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({
+                "name": "deact-hook",
+                "script_path": "deploy.sh",
+                "execution_type": "SSH",
+                "ssh_target_id": target_id
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(hook.status, StatusCode::OK);
+    let hook_id = hook.string("id");
+    assert_eq!(hook.field("is_active"), true);
+
+    // 3. Delete target -> hook must become deactivated
+    let del = send(
+        &app,
+        json_request("DELETE", &format!("/api/ssh-targets/{target_id}"), &master, None),
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::NO_CONTENT);
+
+    // Verify hook state is now deactivated
+    let inspect = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
+    assert_eq!(inspect.field("is_active"), false);
+    assert!(inspect.field("disabled_reason").as_str().unwrap().contains("SSH target"));
+
+    // 4. Executing the deactivated hook must fail with 400 Bad Request
+    let exec = send(
+        &app,
+        json_request("POST", "/api/hooks/deact-hook/execute", &master, None),
+    )
+    .await;
+    assert_eq!(exec.status, StatusCode::BAD_REQUEST);
+    assert!(exec.raw.contains("deactivated"));
+
+    // 5. Updating the hook to LOCAL re-activates it
+    let reactivated = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({
+                "execution_type": "LOCAL",
+                "script_path": "/bin/true",
+                "is_active": true
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(reactivated.status, StatusCode::OK);
+    assert_eq!(reactivated.field("is_active"), true);
+}

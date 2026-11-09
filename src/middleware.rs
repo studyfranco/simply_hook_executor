@@ -447,7 +447,12 @@ async fn authenticate_bearer_key(
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse())
+        .map(|s| {
+            s.parse::<IpNet>().or_else(|_| {
+                s.parse::<std::net::IpAddr>()
+                    .map(|ip| IpNet::from(crate::config::normalize_ip(ip)))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| {
             tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);

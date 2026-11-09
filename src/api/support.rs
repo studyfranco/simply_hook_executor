@@ -338,15 +338,27 @@ pub(crate) async fn validate_ssh_dispatch(
     Ok(())
 }
 
-/// Validates every entry of a comma-separated CIDR list.
+/// Parses a string as either a CIDR network or a bare IP address, promoting bare addresses
+/// to `/32` or `/128`.
+pub(crate) fn parse_cidr_or_ip(raw: &str) -> Result<IpNet, ()> {
+    let trimmed = raw.trim();
+    if let Ok(net) = trimmed.parse::<IpNet>() {
+        return Ok(net);
+    }
+    if let Ok(addr) = trimmed.parse::<std::net::IpAddr>() {
+        return Ok(IpNet::from(addr));
+    }
+    Err(())
+}
+
+/// Validates every entry of a comma-separated CIDR or IP list.
 pub(crate) fn validate_bound_ips(bound_ips: &str) -> Result<(), AppError> {
     for cidr in bound_ips.split(',') {
         let trimmed = cidr.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let _: IpNet = trimmed
-            .parse()
+        let _: IpNet = parse_cidr_or_ip(trimmed)
             .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {trimmed}")))?;
     }
     Ok(())
@@ -451,6 +463,7 @@ mod tests {
     fn validates_cidr_lists() {
         assert!(validate_bound_ips("0.0.0.0/0,::/0").is_ok());
         assert!(validate_bound_ips("127.0.0.1/32, 10.0.0.0/8").is_ok());
+        assert!(validate_bound_ips("192.168.1.5, ::1").is_ok());
         assert!(validate_bound_ips("").is_ok());
         assert!(validate_bound_ips("not-a-cidr").is_err());
     }
