@@ -898,19 +898,17 @@ class HookExecutorClient {
             || p.can_manage_hooks
             || (p.hook_permissions || []).some(h => h.can_manage);
 
-        // A compact pill rather than a bare string: Master gets its own high-contrast variant, so
-        // "who am I signed in as" is answerable at a glance rather than by reading a sentence.
+        // Keep header clean and aligned with Simply IP Vault: tier badge, Refresh, Logout.
         const badge = document.getElementById('identity-badge');
-        badge.className = `identity-pill${p.is_master ? ' identity-pill-master' : ''}`;
-        badge.innerHTML = p.is_master
-            ? `<span class="identity-pill-dot"></span> MASTER <span class="identity-pill-name">${escapeHtml(p.name)}</span>`
-            : `<span class="identity-pill-dot"></span> ${escapeHtml(p.name)} <span class="identity-pill-prefix">${escapeHtml(p.prefix)}...</span>`;
+        if (badge) {
+            badge.classList.add('hidden');
+        }
 
         const tier = p.is_master ? 'master' : (p.can_manage_keys ? 'parent' : 'daughter');
         const banner = document.getElementById('current-key-tier');
         if (banner) {
             banner.className = `badge badge-tier badge-tier-${tier}`;
-            banner.textContent = tier.charAt(0).toUpperCase() + tier.slice(1);
+            banner.textContent = tier.toUpperCase();
             banner.title = {
                 master: 'The Master key: full access, unique, and pinned at startup.',
                 parent: 'A Parent key: may create Daughter keys, but cannot grant global scopes (R4).',
