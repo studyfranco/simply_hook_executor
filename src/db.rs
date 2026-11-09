@@ -257,7 +257,10 @@ async fn connect_with_limits(db_url: &str, limits: PoolLimits) -> Result<Databas
         // Temporary tables and indices SQLite creates internally (e.g. for a large `ORDER BY`) are
         // held in memory rather than spilled to a disk file — the engine's own default. A no-op for
         // an in-memory database, which has no disk to spill to in the first place.
-        .pragma("temp_store", "MEMORY");
+        .pragma("temp_store", "MEMORY")
+        .pragma("mmap_size", "268435456")
+        .pragma("cache_size", "-64000")
+        .pragma("analysis_limit", "1000");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(limits.max_connections)
@@ -432,7 +435,7 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
         Err(e) => tracing::warn!("Could not enable SQLite WAL mode: {e}. Continuing without it."),
     }
 
-    // The remaining four are set-and-log. Each is per-connection, so on a pool this reaches
+    // The remaining pragmas are set-and-log. Each is per-connection, so on a pool this reaches
     // whichever connection serves it — which is precisely why `connect` declares them at open time
     // and why these calls are confirmation rather than mechanism.
     for (label, statement) in [
@@ -440,6 +443,9 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
         ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
         ("busy timeout", format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")),
         ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
+        ("mmap size", "PRAGMA mmap_size=268435456;".to_owned()),
+        ("cache size", "PRAGMA cache_size=-64000;".to_owned()),
+        ("analysis limit", "PRAGMA analysis_limit=1000;".to_owned()),
     ] {
         if let Err(e) =
             db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
@@ -449,8 +455,30 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     }
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY."
+         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY, mmap_size=256MB, \
+         cache_size=64MB, analysis_limit=1000."
     );
+
+    Ok(())
+}
+
+/// Runs SQLite query planner statistics optimization (`PRAGMA optimize;`) to ensure the query
+/// planner has optimal index selection statistics for query execution.
+pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+
+    tracing::info!("Running SQLite query planner optimization (PRAGMA optimize)...");
+    if let Err(e) = db
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA optimize;".to_owned(),
+        ))
+        .await
+    {
+        tracing::warn!("Could not run PRAGMA optimize: {e}");
+    }
 
     Ok(())
 }
@@ -491,12 +519,12 @@ mod tests {
         }
     }
 
-    /// All five settings are in force on a pool built by [`connect`].
+    /// All performance and safety settings are in force on a pool built by [`connect`].
     ///
     /// A file-backed database is the only place WAL can actually engage, so that is where the
     /// assertion has to be made — an in-memory database would pass a weaker test vacuously.
     #[tokio::test]
-    async fn connect_applies_all_five_pragmas() {
+    async fn connect_applies_all_pragmas() {
         let tmp = TempDb::new();
         let db = connect(&tmp.url(), &RuntimeConfig::default())
             .await
@@ -509,10 +537,10 @@ mod tests {
             pragma::<i32>(&db, "PRAGMA busy_timeout;", "timeout").await,
             SQLITE_BUSY_TIMEOUT_MS as i32
         );
-        // `temp_store`: 0 = engine default (a disk file), 1 = FILE, 2 = MEMORY. `.pragma("temp_store",
-        // "MEMORY")` at connect time must actually have taken, not merely been accepted as a
-        // connection-string parameter and silently ignored.
+        // `temp_store`: 0 = engine default (a disk file), 1 = FILE, 2 = MEMORY.
         assert_eq!(pragma::<i32>(&db, "PRAGMA temp_store;", "temp_store").await, 2, "MEMORY");
+        assert_eq!(pragma::<i32>(&db, "PRAGMA cache_size;", "cache_size").await, -64000);
+        assert_eq!(pragma::<i32>(&db, "PRAGMA analysis_limit;", "analysis_limit").await, 1000);
     }
 
     /// `synchronous` is the one setting [`connect`] genuinely *changes* rather than asserts.

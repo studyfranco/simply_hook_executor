@@ -293,6 +293,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              reduced write concurrency, but correctness is unaffected."
         );
     }
+    if let Err(e) = db::run_sqlite_optimize(&db).await {
+        tracing::warn!("Could not run SQLite optimization: {e}");
+    }
 
     // Built before the bootstrap key is minted, since that key's signing secret is sealed with it.
     // A malformed SIGNING_SECRET_KEY stops startup here rather than silently degrading to writing
