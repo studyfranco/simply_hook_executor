@@ -24,8 +24,8 @@ Companion documents: `AGENT.MD` (architectural rules), `SCHEMA.MD` (database), `
 | Crate root (`src/*.rs`) | 14 | One `###` section each, under **Top level** |
 | API layer (`src/api/*.rs`) | 10 | One `###` section each, under **`src/api/`** |
 | Entities (`src/entities/*.rs`) | 10 | Table under **`src/entities/`** (8 rows + a combined `mod.rs`/`prelude.rs` row) |
-| Migrations (`src/migration/*.rs`) | 16 | Table under **`src/migration/`** (15 migrations + `mod.rs`) |
-| **Total** | **50** | — |
+| Migrations (`src/migration/*.rs`) | 19 | Table under **`src/migration/`** (18 migrations + `mod.rs`) |
+| **Total** | **53** | — |
 
 To re-verify after adding a file — all three commands print nothing when coverage is complete
 (verified passing 2026-09-28, all three silent):
@@ -838,6 +838,9 @@ one that has shipped.
 | `m20260821_090000_add_hook_args_template` | `hooks.args_template` (nullable `TEXT`) — the templated alternative to plain positional arguments, substituted by `executor::build_command_plan`, see `entities/hook.rs` and `executor.rs` above |
 | `m20260824_090000_add_execution_caller_ip` | `executions.caller_ip` (`NOT NULL DEFAULT ''`) — the resolved client IP of whoever triggered the execution, threaded from `Extension<ClientIp>` through `executor::execute_hook`, see `entities/execution.rs` and `executor.rs` above |
 | `m20260928_090000_add_ssh_infrastructure` | Creates `ssh_credentials` and `ssh_targets` (the latter's `credential_id` a real `ON DELETE RESTRICT` FK), and adds `hooks.execution_type` (`NOT NULL DEFAULT 'LOCAL'`) / `hooks.ssh_target_id` (nullable, no DDL FK — SQLite cannot add one to an existing table, confirmed empirically; see `SCHEMA.MD`) — see `entities/ssh_credential.rs`, `entities/ssh_target.rs`, `entities/hook.rs`, `src/ssh.rs`, and `api/ssh.rs` above |
+| `m20261109_000000_ssh_target_rbac_and_hook_deactivation` | Adds `api_keys.can_manage_ssh`, `ssh_credentials.owner_key_id`, `ssh_targets.owner_key_id`, `hooks.is_active`, `hooks.disabled_reason`, and `api_key_ssh_target_permissions` join table |
+| `m20261109_000001_add_performance_indexes` | Composite indexes for execution listings (`hook_id`, `api_key_id`, `status` with timestamp DESC) and audit log queries (`action`, `api_key_id` with timestamp DESC) |
+| `m20261110_090000_add_performance_and_foreign_key_indexes` | Comprehensive performance & FK indexes across all tables: FK cascade indexes (`api_key_hook_permissions.hook_id`, `api_key_ssh_target_permissions.ssh_target_id`), owner indexes (`ssh_credentials.owner_key_id`, `ssh_targets.owner_key_id`), lookup & filter indexes (`api_keys.name`, `hooks(is_deleted, name)`, `hooks.is_active`, `audit_logs.target_resource`), and timestamp indexes (`api_keys.created_at`, `ssh_credentials.created_at`, `ssh_targets.created_at`, `hooks.created_at`, `hooks.deleted_at`) |
 
 `m20260810` is the only migration so far that **removes** something, and the reasoning is worth
 keeping close to the list: `m20230107` added `owner_key_id` to `api_keys` and `hooks` together, on the

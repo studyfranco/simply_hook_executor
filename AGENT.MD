@@ -131,6 +131,7 @@ That automation does **not** discharge the directive above. The script syncs onl
   - Zero compiler warnings, zero `clippy` warnings.
   - **Zero `.unwrap()` or `.expect()`** in production code or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
   - **Mandatory `rustdoc`**: All public modules, structs, enums, functions, and Axum handlers MUST be documented using `///` (or `//!` for crates/modules). Enforce `#![warn(missing_docs)]` in `lib.rs`.
+  - **Dependency & Supply Chain Security:** All external libraries/Cargo dependencies must always be kept at their latest compatible versions (`cargo update`, latest semver). `scripts/test_e2e.sh` and GitHub CI/CD workflows enforce `cargo update` and `cargo audit` (ignoring accepted upstream advisories `--ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2023-0071`). Testing and auditing are mandatory prerequisites before any deployment or container release.
 
 ---
 
@@ -787,8 +788,13 @@ Four things can ship broken while every other gate passes green, because no othe
 - **The dashboard must not send `is_master`** in a key payload.
 - **No raw SQL on any query path.** `src/` is scanned for `execute_unprepared`, `Statement::from_*`, `query_*_raw`, `execute_raw`, `from_raw_sql` and `Expr::cust`. Exactly **two** files are allowlisted, each with its reason recorded in the test and in `AGENT_NOTES.MD`: `src/db.rs` (SQLite `PRAGMA`s — not queries, and SeaORM's builders cannot express one) and `m20230106_090000_master_key_uniqueness` (`GENERATED ALWAYS AS` DDL, which `ColumnDef` cannot express). **Neither is reachable from a request, and neither interpolates a runtime value** — the sole substitution across both is a compile-time `const`. Those two properties are the test a third entry must pass; in particular, **an exemption must not be granted to a handler.** One was, briefly, for a literal `SELECT 1` in the readiness probe, and it was withdrawn when that probe moved to SeaORM's typed builder: it sat in code that is both request-reachable and unauthenticated, which is the worst place in the service to hold an exception, and it bought only a saved round-trip. A companion test fails if an allowlisted file stops containing raw SQL, so an exemption cannot outlive its justification and be silently inherited by whatever lands at that path next.
 
-### Harness safety
+### Harness safety & CI/CD Pre-Flight Checks
 
 `scripts/test_e2e.sh` and `scripts/verify_convergence.sh` both assert their working directory before doing anything else. Run from the wrong place they do not fail loudly — they silently exercise something else, or skip work and report a green run over checks that never executed. Each asserts twice: the directory basename, which catches an inherited `cd`, and a list of marker files, which catches a directory carrying the right name without being this checkout.
+
+`scripts/test_e2e.sh` and all GitHub CI/CD workflows (`ci.yml`, `docker-publish.yml`, `release-latest.yml`) strictly enforce:
+- Dependency currency via `cargo update` (logging failures loudly).
+- Vulnerability scanning via `cargo audit --ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2023-0071`.
+- Mandatory test suite execution (`cargo test --workspace --verbose`) prior to binary compilation, Docker publishing, or artifact release.
 
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*

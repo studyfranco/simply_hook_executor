@@ -706,9 +706,60 @@ pub async fn list_ssh_targets(
         all.sort_by(|a, b| a.name.cmp(&b.name));
         all
     };
+    if models.is_empty() {
+        return Ok(Json(Vec::<SshTargetView>::new()));
+    }
+
+    let cred_ids: Vec<Uuid> = models.iter().map(|m| m.credential_id).collect();
+    let credentials: std::collections::HashMap<Uuid, String> = SshCredential::find()
+        .filter(ssh_credential::Column::Id.is_in(cred_ids))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect();
+
+    let target_ids: Vec<Uuid> = models.iter().map(|m| m.id).collect();
+    let target_perms: std::collections::HashMap<Uuid, bool> = if key.is_master {
+        std::collections::HashMap::new()
+    } else {
+        ApiKeySshTargetPermission::find()
+            .filter(api_key_ssh_target_permission::Column::ApiKeyId.eq(key.id))
+            .filter(api_key_ssh_target_permission::Column::SshTargetId.is_in(target_ids))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|p| (p.ssh_target_id, p.can_use_in_hook))
+            .collect()
+    };
+
     let mut views = Vec::with_capacity(models.len());
     for model in models {
-        views.push(build_target_view(&state.db, &key, model).await?);
+        let credential_name = credentials
+            .get(&model.credential_id)
+            .cloned()
+            .unwrap_or_else(|| "(unknown)".to_owned());
+        let is_owner = key.is_master || model.owner_key_id == Some(key.id);
+        let can_use_in_hook = if is_owner {
+            true
+        } else {
+            target_perms.get(&model.id).copied().unwrap_or(false)
+        };
+        views.push(SshTargetView {
+            id: model.id,
+            name: model.name,
+            host: model.host,
+            port: model.port,
+            username: model.username,
+            credential_id: model.credential_id,
+            credential_name,
+            host_key_fingerprint: model.host_key_fingerprint,
+            owner_key_id: model.owner_key_id,
+            is_owner,
+            can_use_in_hook,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+        });
     }
     Ok(Json(views))
 }

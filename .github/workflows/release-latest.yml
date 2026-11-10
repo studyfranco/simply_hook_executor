@@ -9,8 +9,22 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
   build:
     name: Build binary (${{ matrix.target }})
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:

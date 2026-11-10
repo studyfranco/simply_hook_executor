@@ -461,41 +461,6 @@ pub enum ApiKeyView {
     Minimal(MinimalApiKeyView),
 }
 
-/// Builds the minimal view, restricting the permission list to the shared hooks.
-pub(crate) async fn build_minimal_api_key_view(
-    db: &sea_orm::DatabaseConnection,
-    model: api_key::Model,
-    shared_hook_ids: &[Uuid],
-) -> Result<MinimalApiKeyView, AppError> {
-    let rows = ApiKeyHookPermission::find()
-        .filter(api_key_hook_permission::Column::ApiKeyId.eq(model.id))
-        .filter(api_key_hook_permission::Column::HookId.is_in(shared_hook_ids.to_vec()))
-        .find_also_related(Hook)
-        .all(db)
-        .await?;
-
-    Ok(MinimalApiKeyView {
-        id: model.id,
-        name: model.name,
-        hook_permissions: rows
-            .into_iter()
-            .filter_map(|(perm, hook)| {
-                hook.map(|h| HookPermissionView {
-                    hook_id: perm.hook_id,
-                    hook_name: h.name,
-                    can_execute: perm.can_execute,
-                    can_manage: perm.can_manage,
-                    // Still §4-minimal: this is the target key's rights *on the shared hook alone*,
-                    // which the shared-resource scope explicitly permits ("that key's rights on that
-                    // resource alone"). No global flag or unrelated membership is added by it.
-                    can_view_execution: perm.can_view_execution,
-                })
-            })
-            .collect(),
-        partial: true,
-    })
-}
-
 pub(crate) async fn build_api_key_summary(
     db: &sea_orm::DatabaseConnection,
     model: api_key::Model,
@@ -671,16 +636,71 @@ pub async fn list_api_keys(
             .collect()
     };
 
+    let target_key_ids: Vec<Uuid> = keys
+        .iter()
+        .filter(|m| key.is_master || m.id == key.id || subtree.contains(&m.id) || shared_holders.contains(&m.id))
+        .map(|m| m.id)
+        .collect();
+
+    let all_perms = if target_key_ids.is_empty() {
+        Vec::new()
+    } else {
+        ApiKeyHookPermission::find()
+            .filter(api_key_hook_permission::Column::ApiKeyId.is_in(target_key_ids))
+            .find_also_related(Hook)
+            .all(&state.db)
+            .await?
+    };
+
+    let mut permissions_by_key: std::collections::HashMap<Uuid, Vec<HookPermissionView>> =
+        std::collections::HashMap::new();
+    for (perm, hook) in all_perms {
+        if let Some(h) = hook {
+            permissions_by_key.entry(perm.api_key_id).or_default().push(HookPermissionView {
+                hook_id: perm.hook_id,
+                hook_name: h.name,
+                can_execute: perm.can_execute,
+                can_manage: perm.can_manage,
+                can_view_execution: perm.can_view_execution,
+            });
+        }
+    }
+
     let mut views = Vec::with_capacity(keys.len());
     for model in keys {
         if key.is_master || model.id == key.id || subtree.contains(&model.id) {
-            views.push(ApiKeyView::Full(Box::new(
-                build_api_key_summary(&state.db, model).await?,
-            )));
+            let hook_permissions = permissions_by_key.remove(&model.id).unwrap_or_default();
+            views.push(ApiKeyView::Full(Box::new(ApiKeySummary {
+                id: model.id,
+                name: model.name,
+                prefix: model.prefix,
+                key_id: model.key_id,
+                has_signing_secret: model.signing_secret.is_some(),
+                hmac_mode: model.hmac_mode,
+                canonical_template: model.canonical_template,
+                bound_ips: model.bound_ips,
+                max_concurrent_jobs: model.max_concurrent_jobs,
+                is_master: model.is_master,
+                can_manage_keys: model.can_manage_keys,
+                can_manage_hooks: model.can_manage_hooks,
+                can_manage_ssh: model.can_manage_ssh,
+                parent_key_id: model.parent_key_id,
+                created_at: model.created_at,
+                hook_permissions,
+            })));
         } else if shared_holders.contains(&model.id) {
-            views.push(ApiKeyView::Minimal(
-                build_minimal_api_key_view(&state.db, model, &managed).await?,
-            ));
+            let perms = permissions_by_key
+                .remove(&model.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| managed.contains(&p.hook_id))
+                .collect();
+            views.push(ApiKeyView::Minimal(MinimalApiKeyView {
+                id: model.id,
+                name: model.name,
+                hook_permissions: perms,
+                partial: true,
+            }));
         }
         // Otherwise omitted entirely — a key outside every scope is not listed at all, which is the
         // listing form of oracle discipline: absent and invisible look the same.

@@ -21,8 +21,21 @@ env:
 
 
 jobs:
-  build:
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+  build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

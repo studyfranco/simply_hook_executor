@@ -278,27 +278,18 @@ fn percent_encode_path_segment(name: &str) -> String {
     out
 }
 
-/// Assembles the [`HookDetail`] view for one hook as seen by one key.
-pub(crate) async fn build_hook_detail(
-    db: &sea_orm::DatabaseConnection,
+/// Assembles the [`HookDetail`] view from already-loaded components.
+pub(crate) fn build_hook_detail_from_parts(
     key: &api_key::Model,
     model: hook::Model,
-) -> Result<HookDetail, AppError> {
-    let parameters = load_parameters(db, model.id).await?;
-    // §3 authority, reported alongside the operational verbs so a dashboard can grey out "delete"
-    // rather than discovering the refusal only after the click.
+    parameters: Vec<hook_parameter::Model>,
+    can_execute: bool,
+    can_manage: bool,
+) -> HookDetail {
     let is_owner = key.is_master || model.owner_key_id == Some(key.id);
-    let (can_execute, can_manage) = if key.is_master {
-        (true, true)
-    } else {
-        hook_permission(db, key.id, model.id)
-            .await?
-            .map(|p| (p.can_execute, p.can_manage))
-            .unwrap_or((false, false))
-    };
     let webhook_path = format!("/webhook/{}", percent_encode_path_segment(&model.name));
 
-    Ok(HookDetail {
+    HookDetail {
         id: model.id,
         name: model.name,
         description: model.description,
@@ -327,7 +318,28 @@ pub(crate) async fn build_hook_detail(
         is_active: model.is_active,
         disabled_reason: model.disabled_reason,
         webhook_path,
-    })
+    }
+}
+
+/// Assembles the [`HookDetail`] view for one hook as seen by one key.
+pub(crate) async fn build_hook_detail(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    model: hook::Model,
+) -> Result<HookDetail, AppError> {
+    let parameters = load_parameters(db, model.id).await?;
+    // §3 authority, reported alongside the operational verbs so a dashboard can grey out "delete"
+    // rather than discovering the refusal only after the click.
+    let (can_execute, can_manage) = if key.is_master {
+        (true, true)
+    } else {
+        hook_permission(db, key.id, model.id)
+            .await?
+            .map(|p| (p.can_execute, p.can_manage))
+            .unwrap_or((false, false))
+    };
+
+    Ok(build_hook_detail_from_parts(key, model, parameters, can_execute, can_manage))
 }
 
 /// Validates and seals a hook's `HMAC_ONLY` secret for storage, and rejects an `HMAC_ONLY` mode
@@ -705,9 +717,55 @@ pub async fn list_hooks(
     }
 
     let hooks = query.all(&state.db).await?;
+    if hooks.is_empty() {
+        return Ok(Json(Vec::<HookDetail>::new()));
+    }
+
+    let hook_ids: Vec<Uuid> = hooks.iter().map(|h| h.id).collect();
+
+    // Batch load all parameters across all hooks in a single query (eliminating N+1)
+    let all_parameters = HookParameter::find()
+        .filter(hook_parameter::Column::HookId.is_in(hook_ids.clone()))
+        .order_by_asc(hook_parameter::Column::CreatedAt)
+        .order_by_asc(hook_parameter::Column::ParamKey)
+        .all(&state.db)
+        .await?;
+    let mut parameters_by_hook: std::collections::HashMap<Uuid, Vec<hook_parameter::Model>> =
+        std::collections::HashMap::new();
+    for p in all_parameters {
+        parameters_by_hook.entry(p.hook_id).or_default().push(p);
+    }
+
+    // Batch load permissions across all hooks in a single query (eliminating N+1)
+    let permissions_by_hook: std::collections::HashMap<Uuid, (bool, bool)> = if key.is_master {
+        std::collections::HashMap::new()
+    } else {
+        ApiKeyHookPermission::find()
+            .filter(api_key_hook_permission::Column::ApiKeyId.eq(key.id))
+            .filter(api_key_hook_permission::Column::HookId.is_in(hook_ids))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|p| (p.hook_id, (p.can_execute, p.can_manage)))
+            .collect()
+    };
+
     let mut details = Vec::with_capacity(hooks.len());
     for model in hooks {
-        details.push(build_hook_detail(&state.db, &key, model).await?);
+        let hook_id = model.id;
+        let parameters = parameters_by_hook.remove(&hook_id).unwrap_or_default();
+        let (can_execute, can_manage) = if key.is_master {
+            (true, true)
+        } else {
+            permissions_by_hook.get(&hook_id).copied().unwrap_or((false, false))
+        };
+        details.push(build_hook_detail_from_parts(
+            &key,
+            model,
+            parameters,
+            can_execute,
+            can_manage,
+        ));
     }
     Ok(Json(details))
 }
