@@ -478,6 +478,15 @@ for bin in curl jq cargo; do
     log "Found $bin: $(command -v "$bin")"
 done
 
+if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
+    log "cargo-audit not found on PATH; attempting to install via 'cargo install cargo-audit'..."
+    if ! cargo install cargo-audit; then
+        err "cargo-audit is required for dependency security audits but is missing and could not be installed."
+        exit 1
+    fi
+fi
+log "Found cargo-audit: $(command -v cargo-audit 2>/dev/null || echo "cargo audit subcommand")"
+
 pick_port
 BASE_URL="http://$BIND_HOST:$SERVER_PORT"
 log "Test server base URL: $BASE_URL"
@@ -499,6 +508,31 @@ mkdir -p "$HOOK_DIR"
 # itself a symlink (e.g. /tmp -> /private/tmp), the literal and physical forms differ and every
 # containment check would fail for the wrong reason.
 HOOK_DIR="$(cd "$HOOK_DIR" && pwd -P)"
+
+# ── Dependencies & Security Audit ────────────────────────────────────────────
+
+log_section "Dependencies & Security Audit"
+
+log "Running cargo update in $PROJECT_ROOT ..."
+if ! (cd "$PROJECT_ROOT" && cargo update >"$WORK_DIR/cargo_update.log" 2>&1); then
+    err "cargo update failed:"
+    cat "$WORK_DIR/cargo_update.log" >&2
+    exit 1
+fi
+log "cargo update succeeded."
+
+log "Running cargo audit in $PROJECT_ROOT ..."
+# RUSTSEC-2026-0459: upstream unpatched SQLite CVE in libsqlite3-sys 0.37.0 transitively pinned by
+# sqlx-sqlite 0.9.0 (which restricts libsqlite3-sys <0.38.0). Ignored until sqlx publishes a patch release.
+# RUSTSEC-2023-0071: upstream unpatched timing sidechannel in rsa 0.10.0-rc.18 (Marvin attack on PKCS#1 v1.5
+# decryption), transitively pulled by russh 0.65.1. SSH uses RSA signatures, not PKCS#1 v1.5 decryption.
+AUDIT_ARGS=(${CARGO_AUDIT_ARGS:---ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2023-0071})
+if ! (cd "$PROJECT_ROOT" && cargo audit "${AUDIT_ARGS[@]}" >"$WORK_DIR/cargo_audit.log" 2>&1); then
+    err "cargo audit detected vulnerabilities or failed:"
+    cat "$WORK_DIR/cargo_audit.log" >&2
+    exit 1
+fi
+log "cargo audit passed cleanly."
 
 # ── Build & start ────────────────────────────────────────────────────────────
 
