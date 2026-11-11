@@ -132,19 +132,23 @@ async fn bootstrap_master_key(
 
     model.insert(db).await?;
 
+    const W: usize = 82;
+    let border = "═".repeat(W);
+    let body: String = [
+        format!("X-API-Key      : {plaintext_key}"),
+        format!("Signing secret : {signing_secret}"),
+        format!("Bound IPs      : {bound_ip}"),
+        String::new(),
+        "Both values are needed to sign requests (X-Timestamp + X-Signature-256).".to_owned(),
+        "They will NOT be shown again — store them securely!".to_owned(),
+    ]
+    .iter()
+    .map(|row| format!("║ {row:<W$} ║\n"))
+    .collect();
+
     tracing::info!(
-        "\n╔══════════════════════════════════════════════════════════════╗\n\
-         ║  BOOTSTRAP: Master API Key Generated                       ║\n\
-         ║  Key:      {}  ║\n\
-         ║  Key ID:   {:52}║\n\
-         ║  Secret:   {}  ║\n\
-         ║  Bound:    {:52}║\n\
-         ║  ⚠ Shown once. Store the key and signing secret securely!  ║\n\
-         ╚══════════════════════════════════════════════════════════════╝",
-        plaintext_key,
-        key_id,
-        signing_secret,
-        bound_ip
+        "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
+        "BOOTSTRAP: Master API Key Generated"
     );
 
     // tracing's fmt subscriber buffers writes; a reader tailing the redirected log right after
@@ -250,8 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Fatal when the variable is set and malformed; absence is the documented zero-config path and
     // is not an error. See [`config::validate_initial_master_key`] for why those two differ.
+    let initial_key_raw = config::get_secret_or_env("INITIAL_MASTER_KEY");
     let initial_master_key = match config::validate_initial_master_key(
-        std::env::var("INITIAL_MASTER_KEY").ok().as_deref(),
+        initial_key_raw.as_deref(),
     ) {
         Ok(key) => key,
         Err(e) => {
@@ -268,8 +273,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Runtime configuration loaded."
     );
 
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://simply_hook_executor.db?mode=rwc".to_owned());
+    let db_url = config::get_secret_or_env("DATABASE_URL")
+        .unwrap_or_else(|| "sqlite://simply_hook_executor.db?mode=rwc".to_owned());
 
     // `db::migrate_and_connect` runs migrations to completion on their own, throwaway,
     // single-connection pool — closed before the application pool below is even constructed — then

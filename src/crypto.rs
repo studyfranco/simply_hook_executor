@@ -339,14 +339,8 @@ impl SecretCipher {
     /// the variable believes their secrets are encrypted, and silently writing them in the clear
     /// would betray that belief at exactly the wrong moment.
     pub fn from_env() -> Result<Self, CryptoError> {
-        let configured = std::env::var(KEY_ENV_VAR)
-            .ok()
-            .filter(|raw| !raw.trim().is_empty())
-            .or_else(|| {
-                std::env::var(KEY_ENV_VAR_ALIAS)
-                    .ok()
-                    .filter(|raw| !raw.trim().is_empty())
-            });
+        let configured = crate::config::get_secret_or_env(KEY_ENV_VAR)
+            .or_else(|| crate::config::get_secret_or_env(KEY_ENV_VAR_ALIAS));
 
         match configured {
             Some(raw) => Self::from_hex_key(raw.trim()),

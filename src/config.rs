@@ -763,6 +763,35 @@ pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
+/// Reads a secret from `<VAR>_FILE`, `/run/secrets/<var_lowercase>`, or `<VAR>`.
+#[must_use]
+pub fn get_secret_or_env(var_name: &str) -> Option<String> {
+    if let Ok(file_path) = std::env::var(format!("{var_name}_FILE")) {
+        let trimmed = file_path.trim();
+        if !trimmed.is_empty() {
+            if let Ok(content) = std::fs::read_to_string(trimmed) {
+                let trimmed_content = content.trim().to_owned();
+                if !trimmed_content.is_empty() {
+                    return Some(trimmed_content);
+                }
+            }
+        }
+    }
+
+    let default_path = format!("/run/secrets/{}", var_name.to_ascii_lowercase());
+    if let Ok(content) = std::fs::read_to_string(&default_path) {
+        let trimmed_content = content.trim().to_owned();
+        if !trimmed_content.is_empty() {
+            return Some(trimmed_content);
+        }
+    }
+
+    std::env::var(var_name)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
 /// Required width of `INITIAL_MASTER_KEY`, in hex characters.
 ///
 /// Not an arbitrary number: [`crate::api::generate_random_key`] mints 32 random bytes and hex-encodes
