@@ -3593,7 +3593,7 @@ class HookExecutorClient {
                 <td class="text-sm">${new Date(log.timestamp + 'Z').toLocaleString()}</td>
                 <td class="text-sm">${escapeHtml(log.api_key_name)} <span class="text-muted text-sm">(${escapeHtml(log.api_key_prefix)}...)</span></td>
                 <td class="font-mono text-sm">${escapeHtml(log.client_ip)}</td>
-                <td><span class="badge badge-scope">${escapeHtml(log.action)}</span></td>
+                <td><span class="badge ${getActionBadgeClass(log.action)}">${escapeHtml(log.action)}</span></td>
                 <td class="text-sm">${escapeHtml(log.target_resource || '-')}</td>
                 <td class="text-sm">${escapeHtml(log.details || '-')}</td>
             </tr>
@@ -3874,6 +3874,20 @@ function formatDuration(ms) {
 // the authority on what a valid key is.
 function executorIsValidParamKey(key) {
     return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key);
+}
+
+/**
+ * Maps an audit log action string to harmonized CSS badge classes.
+ */
+function getActionBadgeClass(action) {
+    if (!action) return 'badge-scope';
+    const act = String(action).toUpperCase();
+    if (/CREATE|ADD|INSERT|REGISTER/.test(act)) return 'badge-action-create badge-success';
+    if (/DELETE|DESTROY|REVOKE|REMOVE|PURGE/.test(act)) return 'badge-action-delete badge-danger';
+    if (/UPDATE|EDIT|MODIFY|SET|ROTATE|RESTORE|LOCK|UNLOCK|GRANT/.test(act)) return 'badge-action-update badge-warning';
+    if (/EXECUTE|TRIGGER|DEPLOY|GENERATE|RELOAD|REFETCH|RUN|TEST|DISPATCH/.test(act)) return 'badge-action-execute badge-info badge-highlight';
+    if (/AUTH|LOGIN|SIGNIN|SIGNOUT|TOKEN/.test(act)) return 'badge-action-auth';
+    return 'badge-scope';
 }
 
 // Bootstrap

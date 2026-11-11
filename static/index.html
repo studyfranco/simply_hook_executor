@@ -47,8 +47,8 @@
                     <input type="text" id="login-api-base" placeholder="/api" class="input-field" autocomplete="off">
                     <span class="text-muted text-sm">
                         Leave blank unless a reverse proxy rewrites the path. Signatures must cover the path the
-                        <em>daemon</em> sees: if the proxy strips a prefix (<code>/hook_executor/api/hooks</code> →
-                        <code>/api/hooks</code>), keep this blank; if it forwards the prefix untouched, set
+                        <em>server</em> sees: if the proxy strips a prefix (<code>/hook_executor/api/hooks</code> →
+                        <code>/api/hooks</code>), keep <code>/api</code>; if it forwards the prefix untouched, set
                         <code>/hook_executor/api</code>. Requests themselves are always sent relative to this page.
                     </span>
                 </div>
