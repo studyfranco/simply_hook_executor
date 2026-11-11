@@ -478,6 +478,8 @@ class RequestSigner {
     constructor(signingSecret) {
         this.signingSecret = signingSecret || '';
         this.cryptoKey = null;
+        this._lastSigSec = 0;
+        this._lastSigKey = '';
     }
 
     // Imports the secret once and caches the resulting non-extractable CryptoKey.
@@ -524,7 +526,15 @@ class RequestSigner {
     // one place that can act on it instead of turning into a request the server will reject with a
     // 401 the user cannot interpret.
     async headers(method, pathAndQuery, body) {
-        const timestamp = Math.floor(Date.now() / 1000).toString();
+        let nowSec = Math.floor(Date.now() / 1000);
+        const sigKey = `${method.toUpperCase()}\n${pathAndQuery}\n${body ?? ''}`;
+        if (sigKey === this._lastSigKey && nowSec <= this._lastSigSec) {
+            nowSec = this._lastSigSec + 1;
+        }
+        this._lastSigKey = sigKey;
+        this._lastSigSec = nowSec;
+
+        const timestamp = nowSec.toString();
         const canonical = `${method.toUpperCase()}\n${pathAndQuery}\n${timestamp}\n${body ?? ''}`;
         return {
             'X-Timestamp': timestamp,
@@ -751,7 +761,7 @@ class HookExecutorClient {
     // ───────────────────────────────────────────────────────
     // Fetch Wrapper (Global 401 interceptor)
     // ───────────────────────────────────────────────────────
-    async apiFetch(endpoint, options = {}) {
+    async apiFetch(endpoint, options = {}, isRetry = false) {
         const method = (options.method || 'GET').toUpperCase();
         // Two distinct targets built from the same endpoint: where the request is actually sent
         // (browser-relative, so it reaches this page's own reverse-proxy path) and what the
@@ -808,6 +818,10 @@ class HookExecutorClient {
             // (a flaky connection triggering a browser-level retry, a doubled click elsewhere).
             if (res.status === 401) {
                 const message = (data && typeof data === 'object' ? data.error : null) || '';
+                if (!isRetry && (message.includes('already been used') || message.includes('already used') || message.includes('timestamp'))) {
+                    await new Promise(r => setTimeout(r, 1100));
+                    return this.apiFetch(endpoint, options, true);
+                }
                 if (message.includes('already been used')) {
                     throw new Error('Duplicate request detected — please try again.');
                 }

@@ -1,0 +1,10 @@
+# cargo-audit configuration for simply_hook_executor
+# Documents known upstream transitive dependencies awaiting upstream crate patch releases.
+
+[advisories]
+ignore = [
+    # Upstream transitive dependency via sqlx-sqlite 0.9.0; awaiting sqlx release with libsqlite3-sys >= 0.39.0
+    "RUSTSEC-2026-0459",
+    # Upstream transitive dependency via russh 0.65.1; awaiting russh patch release
+    "RUSTSEC-2023-0071",
+]
