@@ -1484,11 +1484,13 @@ input[type="checkbox"]:indeterminate::after {
     word-break: break-word;
 }
 
-/* ─── Wide Modals (execution detail, parameter editor) ──── */
+/* ─── Wide Modals (execution detail, parameter editor, hook config) ──── */
 
-.modal-card-wide {
-    max-width: min(960px, 92vw);
-    max-height: 88vh;
+.modal-card-wide,
+.modal-card-form {
+    width: 100%;
+    max-width: min(1800px, calc(100vw - 3rem));
+    max-height: 90vh;
     overflow-y: auto;
 }
 
