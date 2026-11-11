@@ -2893,14 +2893,15 @@ class HookExecutorClient {
 
         try {
             const res = await this.apiFetch('/keys', { method: 'POST', body: JSON.stringify(payload) });
-            this.revealCredentials('API Key Created', res);
+            const modal = document.getElementById('create-key-modal');
+            if (modal) modal.classList.add('hidden');
             const form = document.getElementById('form-create-apikey');
             if (form) {
                 form.reset();
-                form.classList.add('hidden');
             }
             document.getElementById('apikey-max-jobs').value = 10;
             this.syncApiKeySigningFields();
+            this.revealCredentials('API Key Created', res);
             this.loadKeys();
         } catch (err) {}
     }
@@ -2916,7 +2917,10 @@ class HookExecutorClient {
     revealCredentials(title, res) {
         const field = (label, value, hint) => `
             <div class="form-group">
-                <label>${escapeHtml(label)}</label>
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <label>${escapeHtml(label)}</label>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="navigator.clipboard?.writeText('${escapeHtml(value)}'); this.textContent = 'Copied!'; setTimeout(() => this.textContent = 'Copy', 1500);" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+                </div>
                 <code class="key-reveal-value">${escapeHtml(value)}</code>
                 ${hint ? `<span class="text-muted text-sm">${escapeHtml(hint)}</span>` : ''}
             </div>`;
@@ -3765,9 +3769,9 @@ class HookExecutorClient {
         const btnOpenCreateKey = document.getElementById('btn-open-create-key');
         if (btnOpenCreateKey) {
             btnOpenCreateKey.addEventListener('click', () => {
-                const form = document.getElementById('form-create-apikey');
-                if (form) {
-                    form.classList.remove('hidden');
+                const modal = document.getElementById('create-key-modal');
+                if (modal) {
+                    modal.classList.remove('hidden');
                     document.getElementById('apikey-name')?.focus();
                 }
             });
@@ -3775,13 +3779,23 @@ class HookExecutorClient {
         const btnCancelCreateKey = document.getElementById('btn-cancel-create-key');
         if (btnCancelCreateKey) {
             btnCancelCreateKey.addEventListener('click', () => {
-                const form = document.getElementById('form-create-apikey');
-                if (form) {
-                    form.classList.add('hidden');
-                    form.reset();
+                const modal = document.getElementById('create-key-modal');
+                if (modal) {
+                    modal.classList.add('hidden');
                 }
+                const form = document.getElementById('form-create-apikey');
+                if (form) form.reset();
             });
         }
+        document.getElementById('create-key-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'create-key-modal') {
+                e.target.classList.add('hidden');
+                document.getElementById('form-create-apikey')?.reset();
+            }
+        });
+        window.addEventListener('scroll', () => {
+            document.getElementById('top-bar')?.classList.toggle('stuck', window.scrollY > 4);
+        }, { passive: true });
         document.getElementById('form-create-apikey').addEventListener('submit', (e) => this.createApiKey(e));
         document.getElementById('apikey-can-manage-keys').addEventListener('change', () => this.syncApiKeySigningFields());
         document.getElementById('apikey-generate-signing-secret').addEventListener('change', () => this.syncApiKeySigningFields());

@@ -249,86 +249,6 @@
                     </div>
                     <p class="subtitle">Create and manage API keys, their global scopes, and their execution budgets.</p>
 
-                    <form id="form-create-apikey" class="admin-form hidden">
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="apikey-name">Key Name <span>*</span></label>
-                                <input type="text" id="apikey-name" placeholder="e.g. Vault Webhook Client" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="apikey-max-jobs">Max Concurrent Jobs <span>*</span></label>
-                                <input type="number" id="apikey-max-jobs" value="10" min="1" max="1000" required class="input-field">
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
-                                <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="apikey-generate-signing-secret" checked>
-                                    <span class="checkmark"></span>
-                                    Generate a signing secret (HMAC)
-                                </label>
-                                <span class="text-muted text-sm">
-                                    Uncheck for a plain <strong>Standard API Key</strong>: authenticates with the
-                                    <code>X-API-Key</code> header alone, no signature ever required or possible. Restores the
-                                    key shape from before signing secrets existed — same field, same meaning
-                                    (<code>key_id</code>/<code>signing_secret</code> both stay <code>null</code>). Cannot be
-                                    unchecked together with <strong>Manage Keys</strong>: that scope must always sign.
-                                </span>
-                            </div>
-                            <div class="form-group col-span-2" id="apikey-canonical-template-group">
-                                <label for="apikey-canonical-template">Custom Canonical Template</label>
-                                <input type="text" id="apikey-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
-                                <span class="text-muted text-sm">
-                                    Every key signs <code>CANONICAL_V1</code> — the only signature scheme this service has
-                                    (<code>BODY_ONLY</code> was retired in favor of a hook's own <code>HMAC_ONLY</code> mode for
-                                    keyless third-party senders). This overrides the exact string <em>this key's own</em>
-                                    signatures are verified against; leave blank for the service-wide default. Refused if
-                                    <strong>Manage Keys</strong> is also checked below — an admin credential must sign over the
-                                    one template this codebase's verification has actually been reviewed against.
-                                </span>
-                            </div>
-                        </div>
-
-                        <!--
-                          The "Master Access" checkbox that used to sit here is gone. `is_master` is
-                          not a field on any key payload (RBAC_MODEL.md §5: "no key-creation or
-                          key-update payload may carry it"), so the control promised something the
-                          API refuses — and because the payload types are `deny_unknown_fields`, the
-                          form was sending a key the deserializer rejected outright. Every key
-                          creation from this dashboard returned 422.
-                        -->
-                        <div class="permissions-grid mt-2 mb-4" id="apikey-master-only-scopes">
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-manage-keys">
-                                <span class="checkmark"></span>
-                                Manage Keys
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-manage-hooks">
-                                <span class="checkmark"></span>
-                                Create Hooks
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-manage-ssh">
-                                <span class="checkmark"></span>
-                                Manage SSH
-                            </label>
-                        </div>
-                        <!-- Shown in place of the grid above when the signed-in key is not Master. -->
-                        <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scopes-locked-note">
-                            Only the Master key may grant <strong>Manage Keys</strong>,
-                            <strong>Create Hooks</strong>, or <strong>Manage SSH</strong> (RBAC_MODEL.md R4). Keys you create are
-                            Daughter keys: they hold neither scope.
-                        </p>
-
-                        <div class="form-actions mt-4">
-                            <button type="submit" class="btn btn-primary">Create API Key</button>
-                            <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
-                        </div>
-                    </form>
-
                     <div class="batch-actions mt-4">
                         <button type="button" id="delete-selected-keys" class="btn btn-batch-delete hidden">Delete Selected</button>
                     </div>
@@ -1071,6 +991,86 @@
                     </tbody>
                 </table>
             </div>
+        </div>
+    </div>
+
+    <!-- Create API Key Modal -->
+    <div id="create-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-key-modal-title">
+        <div class="modal-card modal-card-form card">
+            <h3 id="create-key-modal-title">Create API Key</h3>
+            <p class="subtitle">Issue a new API key with specific network bindings, global scopes, and execution limits.</p>
+
+            <form id="form-create-apikey" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="apikey-name">Key Name <span>*</span></label>
+                        <input type="text" id="apikey-name" placeholder="e.g. Vault Webhook Client" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="apikey-max-jobs">Max Concurrent Jobs <span>*</span></label>
+                        <input type="number" id="apikey-max-jobs" value="10" min="1" max="1000" required class="input-field">
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
+                        <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-generate-signing-secret" checked>
+                            <span class="checkmark"></span>
+                            Generate a signing secret (HMAC)
+                        </label>
+                        <span class="text-muted text-sm">
+                            Uncheck for a plain <strong>Standard API Key</strong>: authenticates with the
+                            <code>X-API-Key</code> header alone, no signature ever required or possible. Restores the
+                            key shape from before signing secrets existed — same field, same meaning
+                            (<code>key_id</code>/<code>signing_secret</code> both stay <code>null</code>). Cannot be
+                            unchecked together with <strong>Manage Keys</strong>: that scope must always sign.
+                        </span>
+                    </div>
+                    <div class="form-group col-span-2" id="apikey-canonical-template-group">
+                        <label for="apikey-canonical-template">Custom Canonical Template</label>
+                        <input type="text" id="apikey-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
+                        <span class="text-muted text-sm">
+                            Every key signs <code>CANONICAL_V1</code> — the only signature scheme this service has
+                            (<code>BODY_ONLY</code> was retired in favor of a hook's own <code>HMAC_ONLY</code> mode for
+                            keyless third-party senders). This overrides the exact string <em>this key's own</em>
+                            signatures are verified against; leave blank for the service-wide default. Refused if
+                            <strong>Manage Keys</strong> is also checked below — an admin credential must sign over the
+                            one template this codebase's verification has actually been reviewed against.
+                        </span>
+                    </div>
+                </div>
+
+                <div class="permissions-grid mt-2 mb-4" id="apikey-master-only-scopes">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="apikey-can-manage-keys">
+                        <span class="checkmark"></span>
+                        Manage Keys
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="apikey-can-manage-hooks">
+                        <span class="checkmark"></span>
+                        Create Hooks
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="apikey-can-manage-ssh">
+                        <span class="checkmark"></span>
+                        Manage SSH
+                    </label>
+                </div>
+                <!-- Shown in place of the grid above when the signed-in key is not Master. -->
+                <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scopes-locked-note">
+                    Only the Master key may grant <strong>Manage Keys</strong>,
+                    <strong>Create Hooks</strong>, or <strong>Manage SSH</strong> (RBAC_MODEL.md R4). Keys you create are
+                    Daughter keys: they hold neither scope.
+                </p>
+
+                <div class="form-actions mt-4">
+                    <button type="submit" class="btn btn-primary">Create API Key</button>
+                    <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
+                </div>
+            </form>
         </div>
     </div>
 

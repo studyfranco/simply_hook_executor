@@ -1814,6 +1814,11 @@ input[type="checkbox"]:indeterminate::after {
     background-color: var(--bg-main);
     margin: -2rem -2rem 0;
     padding: 2rem 2rem 0;
+    transition: transform var(--transition-base), box-shadow var(--transition-base);
+}
+
+.top-bar.stuck {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
 
 .list-header {
