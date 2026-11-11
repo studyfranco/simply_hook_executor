@@ -1166,19 +1166,22 @@ class HookExecutorClient {
     // Data Loading
     // ───────────────────────────────────────────────────────
     async loadInitialData() {
-        await this.loadHooks();
-        await this.loadExecutions();
-        if (this.state.profile.is_master || this.state.profile.can_manage_keys) {
-            await this.loadKeys();
+        const tasks = [
+            this.loadHooks(),
+            this.loadExecutions(),
+        ];
+        if (this.state.profile?.is_master || this.state.profile?.can_manage_keys) {
+            tasks.push(this.loadKeys());
         }
-        if (this.state.profile.is_master || this.state.profile.can_manage_ssh) {
-            await this.loadSshCredentials();
-            await this.loadSshTargets();
+        if (this.state.profile?.is_master || this.state.profile?.can_manage_ssh) {
+            tasks.push(this.loadSshCredentials());
+            tasks.push(this.loadSshTargets());
         }
-        if (this.state.profile.is_master) {
-            await this.loadSettings();
-            await this.loadAuditLogs();
+        if (this.state.profile?.is_master) {
+            tasks.push(this.loadSettings());
+            tasks.push(this.loadAuditLogs());
         }
+        await Promise.allSettled(tasks);
     }
 
     async loadHooks() {

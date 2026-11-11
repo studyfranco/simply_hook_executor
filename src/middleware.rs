@@ -276,7 +276,7 @@ async fn authenticate_bearer_key(
     presented_key: &str,
     client_ip: std::net::IpAddr,
     req: Request<Body>,
-) -> Result<(Request<Body>, crate::entities::api_key::Model), AppError> {
+) -> Result<(Request<Body>, crate::entities::api_key::Model, Option<Vec<u8>>), AppError> {
     // Freshness before the database. A stale or malformed timestamp on a signed request is refused
     // here rather than after a query an unauthenticated caller provoked — see
     // [`prevalidate_timestamp_header`]. Its *absence* cannot be judged yet: that depends on the
@@ -336,7 +336,7 @@ async fn authenticate_bearer_key(
     let signature_required = state.config.require_signed_requests
         || (key_record.can_manage_keys && !key_record.is_master);
 
-    let req = match signature {
+    let (req, recorded_digest) = match signature {
         Some(signature) => {
             // CANONICAL_V1 binds the timestamp into the signed material and enforces the replay
             // window — the only mode a key can be in, so a timestamp is unconditionally required
@@ -421,14 +421,14 @@ async fn authenticate_bearer_key(
                 ));
             }
 
-            Request::from_parts(parts, Body::from(bytes))
+            (Request::from_parts(parts, Body::from(bytes)), Some(digest))
         }
         None if signature_required => {
             return Err(AppError::Unauthorized(format!(
                 "This request must be signed: send {SIGNATURE_HEADER} and {TIMESTAMP_HEADER}"
             )));
         }
-        None => req,
+        None => (req, None),
     };
 
     // ── Authorization ────────────────────────────────────────────────────────────────────────
@@ -478,7 +478,7 @@ async fn authenticate_bearer_key(
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
 
-    Ok((req, key_record))
+    Ok((req, key_record, recorded_digest))
 }
 
 /// Enforces API key authentication, CIDR binding, and (when present) body signing for every
@@ -536,13 +536,21 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .ok_or_else(|| AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header")))?;
 
-    let (mut req, key_record) =
+    let (mut req, key_record, recorded_digest) =
         authenticate_bearer_key(&state, &headers, presented_key, client_ip, req).await?;
 
+    let key_id = key_record.id;
     req.extensions_mut().insert(ClientIp(client_ip));
     req.extensions_mut().insert(key_record);
 
-    Ok(next.run(req).await)
+    let res = next.run(req).await;
+    if res.status().is_server_error() {
+        if let Some(digest) = recorded_digest {
+            state.replay_guard.unrecord(key_id, &digest);
+        }
+    }
+
+    Ok(res)
 }
 
 /// Carries the target hook into request extensions when [`invocation_auth_middleware`] has already
@@ -634,12 +642,21 @@ pub async fn invocation_auth_middleware(
                 req.extensions_mut().insert(InvocationHook(target));
             }
 
-            let (mut req, key_record) = authenticate_bearer_key(&state, &headers, presented_key, client_ip, req)
+            let (mut req, key_record, recorded_digest) = authenticate_bearer_key(&state, &headers, presented_key, client_ip, req)
                 .await
                 .map_err(uniformize_keyed_auth_failure)?;
+            let key_id = key_record.id;
             req.extensions_mut().insert(ClientIp(client_ip));
             req.extensions_mut().insert(key_record);
-            Ok(next.run(req).await)
+
+            let res = next.run(req).await;
+            if res.status().is_server_error() {
+                if let Some(digest) = recorded_digest {
+                    state.replay_guard.unrecord(key_id, &digest);
+                }
+            }
+
+            Ok(res)
         }
         None => {
             let identifier = identifier.ok_or_else(invocation_unauthorized)?;
