@@ -832,9 +832,9 @@ body {
 }
 
 .badge-scope-master {
-    background-color: rgba(28, 220, 154, 0.15);
-    color: var(--accent);
-    border: 1px solid rgba(28, 220, 154, 0.35);
+    background-color: rgba(231, 76, 60, 0.16);
+    color: #ff7b6b;
+    border: 1px solid rgba(231, 76, 60, 0.45);
     text-transform: none;
     font-family: var(--font-mono);
     font-size: 0.7rem;
@@ -1232,7 +1232,7 @@ body {
 
 .modal-card {
     width: 100%;
-    max-width: min(460px, 92vw);
+    max-width: clamp(520px, 46vw, 860px);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1514,7 +1514,7 @@ input[type="checkbox"]:indeterminate::after {
 
 .modal-card-form {
     width: 100%;
-    max-width: 780px;
+    max-width: clamp(620px, 56vw, 960px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
@@ -1523,15 +1523,15 @@ input[type="checkbox"]:indeterminate::after {
 #edit-hook-modal .modal-card-form,
 #run-hook-modal .modal-card-wide,
 #execution-detail-modal .modal-card-wide {
-    max-width: min(1100px, calc(100vw - 3rem));
+    max-width: min(1200px, calc(100vw - 3rem));
 }
 
-.list-header .filters {
+#tab-hooks .list-header .filters {
     flex: 0 1 420px;
 }
 
 #secret-reveal-modal .modal-card {
-    max-width: 560px;
+    max-width: clamp(580px, 48vw, 860px);
 }
 
 #create-key-modal .form-actions,
