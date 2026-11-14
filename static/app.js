@@ -2730,18 +2730,22 @@ class HookExecutorClient {
     renderKeysTable() {
         const tbody = document.getElementById('apikeys-table-body');
         if (this.state.apiKeys.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No API keys.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No API keys.</td></tr>';
         } else {
-            tbody.innerHTML = this.state.apiKeys.map(k => `
+            tbody.innerHTML = this.state.apiKeys.map(k => {
+                const tier = k.is_master ? 'master' : k.can_manage_keys ? 'parent' : 'daughter';
+                const tierLabel = tier.toUpperCase();
+                return `
                 <tr>
                     <td><input type="checkbox" class="row-select" data-id="${k.id}"></td>
                     <td><strong>${escapeHtml(k.name)}</strong><div class="text-muted text-sm font-mono">${escapeHtml(k.prefix)}...</div></td>
+                    <td><span class="badge badge-tier badge-${tier}">${tierLabel}</span></td>
                     <td>${this.hmacModeBadge(k)}</td>
                     <td class="font-mono text-sm">${escapeHtml(k.bound_ips || '-')}</td>
                     <td class="text-sm">${k.max_concurrent_jobs}</td>
                     <td>${this.renderKeyScopes(k)}</td>
-                    <td>
-                        <div class="flex gap-2">
+                    <td class="row-actions">
+                        <div class="flex gap-2" style="flex-wrap:nowrap;">
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.openLineageDrawer('${k.id}')" title="Show this key's parent/child lineage">Lineage</button>
                             <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKey('${k.id}')" title="Replace the X-API-Key bearer credential only; the signing secret is unchanged">Regenerate Key</button>
@@ -2750,7 +2754,8 @@ class HookExecutorClient {
                         </div>
                     </td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
         }
 
         this.wireRowSelection({
@@ -2832,9 +2837,9 @@ class HookExecutorClient {
     renderKeyScopes(k) {
         const scopes = [];
         if (k.is_master) scopes.push('<span class="badge badge-scope badge-scope-master">Master</span>');
-        if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">Manage Keys</span>');
-        if (k.can_manage_hooks) scopes.push('<span class="badge badge-scope">Create Hooks</span>');
-        if (k.can_manage_ssh) scopes.push('<span class="badge badge-scope">Manage SSH</span>');
+        if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">can_manage_keys</span>');
+        if (k.can_manage_hooks) scopes.push('<span class="badge badge-scope">can_manage_hooks</span>');
+        if (k.can_manage_ssh) scopes.push('<span class="badge badge-scope">can_manage_ssh</span>');
 
         const hookBadges = (k.hook_permissions || []).map(p => {
             // X = execute, M = manage, V = view history. `V` is listed last so an existing grant
@@ -2850,7 +2855,7 @@ class HookExecutorClient {
         });
 
         const badges = [...scopes, ...hookBadges];
-        if (badges.length === 0) return '<span class="text-muted text-sm">None</span>';
+        if (badges.length === 0) return '<span class="text-muted text-sm">none</span>';
         return `<div class="scope-badges">${badges.join('')}</div>`;
     }
 
@@ -2918,22 +2923,22 @@ class HookExecutorClient {
     // from the JSON, per the backend's `Option<String>` response fields). Each row is therefore
     // conditional on the field actually being present, not assumed.
     revealCredentials(title, res) {
-        const field = (label, value, hint) => `
-            <div class="form-group">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <label>${escapeHtml(label)}</label>
-                    <button type="button" class="btn btn-secondary btn-sm" onclick="navigator.clipboard?.writeText('${escapeHtml(value)}'); this.textContent = 'Copied!'; setTimeout(() => this.textContent = 'Copy', 1500);" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
-                </div>
-                <code class="key-reveal-value">${escapeHtml(value)}</code>
-                ${hint ? `<span class="text-muted text-sm">${escapeHtml(hint)}</span>` : ''}
-            </div>`;
+        const field = (label, value, isFirst) => `
+            <div style="display:flex;justify-content:space-between;align-items:center;${isFirst ? '' : 'margin-top:0.75rem;'}">
+                <p class="key-reveal-label" style="margin:0;">${escapeHtml(label)}</p>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="navigator.clipboard?.writeText('${escapeHtml(value)}'); this.textContent = 'Copied!'; setTimeout(() => this.textContent = 'Copy', 1500);" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+            </div>
+            <code class="key-reveal-value" style="margin-top:0.35rem;">${escapeHtml(value)}</code>`;
+
+        const rows = [];
+        if (res.plaintext_key) rows.push(field('API Key (Save this now — shown only once):', res.plaintext_key, rows.length === 0));
+        if (res.signing_secret) rows.push(field('Signing Secret (For HMAC-SHA256 — shown only once):', res.signing_secret, rows.length === 0));
+        if (!res.plaintext_key && !res.signing_secret && res.key_id) {
+            rows.push(field('Key ID:', res.key_id, true));
+        }
 
         document.getElementById('secret-reveal-title').textContent = title;
-        document.getElementById('secret-reveal-body').innerHTML = [
-            res.plaintext_key ? field('API Key', res.plaintext_key, 'Send as the X-API-Key header.') : '',
-            res.key_id ? field('Key ID', res.key_id, 'Public identifier, for display and log correlation. Not a credential.') : '',
-            res.signing_secret ? field('Signing Secret', res.signing_secret, 'Secret. Compute HMAC-SHA256 over the raw JSON body and send it as X-Signature-256: sha256=<hex>.') : ''
-        ].join('');
+        document.getElementById('secret-reveal-body').innerHTML = rows.join('');
         document.getElementById('secret-reveal-modal').classList.remove('hidden');
     }
 

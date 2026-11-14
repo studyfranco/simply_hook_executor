@@ -58,10 +58,10 @@ body {
    stops content over-stretching into unreadable full-bleed rows on a truly ultra-wide (3440px+)
    display — fluid does not mean unbounded. */
 .container {
-    max-width: 1800px;
+    max-width: min(2400px, 96vw);
     width: 100%;
     margin: 0 auto;
-    padding: 2rem clamp(1rem, 3vw, 4rem);
+    padding: 1.75rem clamp(1rem, 2.5vw, 3rem);
     transition: opacity var(--transition-slow), transform var(--transition-slow);
 }
 
@@ -349,16 +349,14 @@ body {
    confirm/delete button instead of blending into the card background. Matches simply_ip_vault's
    .btn-cancel. */
 .btn-cancel {
-    background-color: #1e293b;
-    color: #60a5fa;
-    border-color: #60a5fa;
-    font-weight: 600;
+    background-color: var(--bg-surface);
+    color: var(--text-muted);
+    border-color: var(--border);
 }
 
 .btn-cancel:hover:not(:disabled) {
-    background-color: #2563eb;
-    color: #ffffff;
-    border-color: #2563eb;
+    background-color: var(--border);
+    color: var(--text-main);
 }
 
 .btn-logout {
@@ -741,7 +739,9 @@ body {
     font-family: var(--font-mono);
     font-size: 0.85rem;
     color: var(--text-main);
-    word-break: break-all;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     padding: 0.5rem 0.7rem;
     background-color: var(--bg-input);
     border-radius: var(--radius);
@@ -800,20 +800,44 @@ body {
 .scope-badges {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.35rem;
-    max-width: 320px;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.badge-tier {
+    background-color: rgba(189, 195, 199, 0.1);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+}
+
+.badge-tier.badge-master {
+    background-color: rgba(28, 220, 154, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(28, 220, 154, 0.4);
+}
+
+.badge-tier.badge-parent {
+    background-color: rgba(61, 174, 233, 0.14);
+    color: var(--highlight);
+    border: 1px solid rgba(61, 174, 233, 0.4);
 }
 
 .badge-scope {
-    background-color: rgba(61, 174, 233, 0.12);
-    color: var(--highlight);
-    border: 1px solid rgba(61, 174, 233, 0.3);
+    background-color: rgba(28, 220, 154, 0.1);
+    color: var(--accent);
+    border: 1px solid rgba(28, 220, 154, 0.25);
+    text-transform: none;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
 }
 
 .badge-scope-master {
     background-color: rgba(28, 220, 154, 0.15);
     color: var(--accent);
-    border: 1px solid rgba(28, 220, 154, 0.3);
+    border: 1px solid rgba(28, 220, 154, 0.35);
+    text-transform: none;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
 }
 
 /* ─── Pagination ────────────────────────────────────────── */
@@ -1481,12 +1505,39 @@ input[type="checkbox"]:indeterminate::after {
 
 /* ─── Wide Modals (execution detail, parameter editor, hook config) ──── */
 
-.modal-card-wide,
-.modal-card-form {
+.modal-card-wide {
     width: 100%;
-    max-width: min(1800px, calc(100vw - 3rem));
+    max-width: min(1160px, calc(100vw - 3rem));
     max-height: 90vh;
     overflow-y: auto;
+}
+
+.modal-card-form {
+    width: 100%;
+    max-width: 780px;
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+}
+
+#hook-modal .modal-card-form,
+#edit-hook-modal .modal-card-form,
+#run-hook-modal .modal-card-wide,
+#execution-detail-modal .modal-card-wide {
+    max-width: min(1100px, calc(100vw - 3rem));
+}
+
+.list-header .filters {
+    flex: 0 1 420px;
+}
+
+#secret-reveal-modal .modal-card {
+    max-width: 560px;
+}
+
+#create-key-modal .form-actions,
+#edit-key-modal .form-actions,
+#secret-reveal-modal .form-actions {
+    justify-content: flex-start;
 }
 
 /* ─── Spacing Utilities ─────────────────────────────────── */
@@ -1857,16 +1908,14 @@ input[type="checkbox"]:indeterminate::after {
 }
 
 .btn-cancel {
-    background-color: #1e293b;
-    color: #60a5fa;
-    border-color: #60a5fa;
-    font-weight: 600;
+    background-color: var(--bg-surface);
+    color: var(--text-muted);
+    border-color: var(--border);
 }
 
 .btn-cancel:hover:not(:disabled) {
-    background-color: #2563eb;
-    color: #ffffff;
-    border-color: #2563eb;
+    background-color: var(--border);
+    color: var(--text-main);
 }
 
 /* ─── Harmonized Audit Log Action Badges ─────────────────── */
