@@ -62,7 +62,9 @@ pub struct ClientIp(pub std::net::IpAddr);
 /// allows, which is exactly what the window exists to prevent.
 fn validate_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
     let presented: i64 = raw.trim().parse().map_err(|_| {
-        AppError::Unauthorized(format!("{TIMESTAMP_HEADER} must be a Unix timestamp in seconds"))
+        AppError::Unauthorized(format!(
+            "{TIMESTAMP_HEADER} must be a Unix timestamp in seconds"
+        ))
     })?;
 
     let skew = (chrono::Utc::now().timestamp() - presented).abs();
@@ -255,7 +257,10 @@ fn uniformize_keyed_auth_failure(err: AppError) -> AppError {
 /// `HMAC_ONLY` should still be caught, not silently ignored.
 fn signature_material_present(headers: &axum::http::HeaderMap, target: &hook::Model) -> bool {
     headers.contains_key(SIGNATURE_HEADER)
-        || target.signature_header.as_deref().is_some_and(|h| headers.contains_key(h))
+        || target
+            .signature_header
+            .as_deref()
+            .is_some_and(|h| headers.contains_key(h))
 }
 
 /// Authenticates a presented `X-API-Key`, verifying its signature (when one is required or
@@ -276,7 +281,14 @@ async fn authenticate_bearer_key(
     presented_key: &str,
     client_ip: std::net::IpAddr,
     req: Request<Body>,
-) -> Result<(Request<Body>, crate::entities::api_key::Model, Option<Vec<u8>>), AppError> {
+) -> Result<
+    (
+        Request<Body>,
+        crate::entities::api_key::Model,
+        Option<Vec<u8>>,
+    ),
+    AppError,
+> {
     // Freshness before the database. A stale or malformed timestamp on a signed request is refused
     // here rather than after a query an unauthenticated caller provoked — see
     // [`prevalidate_timestamp_header`]. Its *absence* cannot be judged yet: that depends on the
@@ -300,7 +312,10 @@ async fn authenticate_bearer_key(
     // once, before any handler sees it — so the dozens of `key.is_master` reads downstream stay
     // correct without each having to remember to compare an id. See [`crate::master`] for why the
     // check lives at this choke point rather than at the decision sites.
-    state.master_pin.authenticate(&state.db, &mut key_record).await;
+    state
+        .master_pin
+        .authenticate(&state.db, &mut key_record)
+        .await;
 
     // Signature verification requires the raw body, which means buffering it and rebuilding the
     // request. That only happens when a signature is actually presented — unsigned requests keep
@@ -310,7 +325,10 @@ async fn authenticate_bearer_key(
     // accepted, and that mode is retired (see `HmacMode`'s doc comment). A caller wanting that
     // header's semantics now targets a hook whose `auth_mode` is `HMAC_ONLY`
     // (`invocation_auth_middleware`'s keyless path) instead of a key.
-    let signature = headers.get(SIGNATURE_HEADER).and_then(|h| h.to_str().ok()).map(str::to_owned);
+    let signature = headers
+        .get(SIGNATURE_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned);
 
     // The bearer key is itself the credential, so a signature is optional by default — when
     // present it must still verify, adding request integrity on top. `REQUIRE_SIGNED_REQUESTS`
@@ -356,7 +374,9 @@ async fn authenticate_bearer_key(
             let (parts, body) = req.into_parts();
             let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
                 .await
-                .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
+                .map_err(|_| {
+                    AppError::InvalidInput("Request body too large to verify".to_owned())
+                })?;
 
             // The canonical string a keyed signature is verified against, in precedence order:
             //
@@ -388,10 +408,11 @@ async fn authenticate_bearer_key(
             let original_uri = parts
                 .extensions
                 .get::<axum::extract::OriginalUri>()
-                .map(|original| &original.0)
-                .unwrap_or(&parts.uri);
-            let path_and_query =
-                original_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or_else(|| original_uri.path());
+                .map_or(&parts.uri, |original| &original.0);
+            let path_and_query = original_uri.path_and_query().map_or_else(
+                || original_uri.path(),
+                axum::http::uri::PathAndQuery::as_str,
+            );
             let base = match template {
                 Some(template) => render_canonical_template(
                     template,
@@ -400,7 +421,9 @@ async fn authenticate_bearer_key(
                     &timestamp,
                     &bytes,
                 ),
-                None => canonical_v1_payload(parts.method.as_str(), path_and_query, &timestamp, &bytes),
+                None => {
+                    canonical_v1_payload(parts.method.as_str(), path_and_query, &timestamp, &bytes)
+                }
             };
 
             let digest = verify_signature(&secret, &base, &signature)
@@ -431,6 +454,14 @@ async fn authenticate_bearer_key(
         None => (req, None),
     };
 
+    check_client_network(&key_record, client_ip)?;
+    Ok((req, key_record, recorded_digest))
+}
+
+fn check_client_network(
+    key_record: &crate::entities::api_key::Model,
+    client_ip: std::net::IpAddr,
+) -> Result<(), AppError> {
     // ── Authorization ────────────────────────────────────────────────────────────────────────
     // Everything above authenticates: it establishes *who* is calling. Only now, with that
     // settled, is the caller's source network checked.
@@ -445,7 +476,7 @@ async fn authenticate_bearer_key(
     let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
     let networks: Vec<IpNet> = bound_ips_str
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<IpNet>().or_else(|_| {
@@ -478,7 +509,7 @@ async fn authenticate_bearer_key(
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
 
-    Ok((req, key_record, recorded_digest))
+    Ok(())
 }
 
 /// Enforces API key authentication, CIDR binding, and (when present) body signing for every
@@ -507,7 +538,7 @@ async fn authenticate_bearer_key(
 ///
 /// On success the authenticated [`crate::entities::api_key::Model`] and the resolved [`ClientIp`]
 /// are placed in the request's extensions for handlers to consume.
-pub async fn auth_middleware(
+pub(crate) async fn auth_middleware(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -534,7 +565,11 @@ pub async fn auth_middleware(
     let presented_key = headers
         .get(API_KEY_HEADER)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header")))?;
+        .ok_or_else(|| {
+            AppError::Unauthorized(format!(
+                "Missing credentials: provide an {API_KEY_HEADER} header"
+            ))
+        })?;
 
     let (mut req, key_record, recorded_digest) =
         authenticate_bearer_key(&state, &headers, presented_key, client_ip, req).await?;
@@ -544,10 +579,10 @@ pub async fn auth_middleware(
     req.extensions_mut().insert(key_record);
 
     let res = next.run(req).await;
-    if res.status().is_server_error() {
-        if let Some(digest) = recorded_digest {
-            state.replay_guard.unrecord(key_id, &digest);
-        }
+    if res.status().is_server_error()
+        && let Some(digest) = recorded_digest
+    {
+        state.replay_guard.unrecord(key_id, &digest);
     }
 
     Ok(res)
@@ -618,7 +653,7 @@ struct InvocationHook(hook::Model);
 /// malformed or non-matching signature is reported as such, exactly as an invalid signature is on
 /// every keyed route — a caller that already knows to try signing something has proven it knows more
 /// than a bare prober does.
-pub async fn invocation_auth_middleware(
+pub(crate) async fn invocation_auth_middleware(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -630,88 +665,93 @@ pub async fn invocation_auth_middleware(
 
     let identifier = hook_identifier_from_path(req.uri().path());
 
-    match headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok()) {
-        Some(presented_key) => {
-            // The keyed path consults the target hook too, but only for the `canonical_template`
-            // override — never to decide *whether* to authenticate, which a valid key always does
-            // on its own. Resolution failures here are silently ignored rather than propagated: an
-            // unresolvable hook is the handler's `404` to report, not this middleware's.
-            if let Some(identifier) = identifier
-                && let Ok(target) = crate::api::support::resolve_hook(&state.db, identifier).await
-            {
-                req.extensions_mut().insert(InvocationHook(target));
-            }
+    if let Some(presented_key) = headers.get(API_KEY_HEADER).and_then(|h| h.to_str().ok()) {
+        // The keyed path consults the target hook too, but only for the `canonical_template`
+        // override — never to decide *whether* to authenticate, which a valid key always does
+        // on its own. Resolution failures here are silently ignored rather than propagated: an
+        // unresolvable hook is the handler's `404` to report, not this middleware's.
+        if let Some(identifier) = identifier
+            && let Ok(target) = crate::api::support::resolve_hook(&state.db, identifier).await
+        {
+            req.extensions_mut().insert(InvocationHook(target));
+        }
 
-            let (mut req, key_record, recorded_digest) = authenticate_bearer_key(&state, &headers, presented_key, client_ip, req)
+        let (mut req, key_record, recorded_digest) =
+            authenticate_bearer_key(&state, &headers, presented_key, client_ip, req)
                 .await
                 .map_err(uniformize_keyed_auth_failure)?;
-            let key_id = key_record.id;
-            req.extensions_mut().insert(ClientIp(client_ip));
-            req.extensions_mut().insert(key_record);
+        let key_id = key_record.id;
+        req.extensions_mut().insert(ClientIp(client_ip));
+        req.extensions_mut().insert(key_record);
 
-            let res = next.run(req).await;
-            if res.status().is_server_error() {
-                if let Some(digest) = recorded_digest {
-                    state.replay_guard.unrecord(key_id, &digest);
-                }
-            }
-
-            Ok(res)
+        let res = next.run(req).await;
+        if res.status().is_server_error()
+            && let Some(digest) = recorded_digest
+        {
+            state.replay_guard.unrecord(key_id, &digest);
         }
-        None => {
-            let identifier = identifier.ok_or_else(invocation_unauthorized)?;
-            let target = crate::api::support::resolve_hook(&state.db, identifier)
-                .await
-                .map_err(|_| invocation_unauthorized())?;
 
-            // Task 3 / defense in depth: a keyless caller presenting signature material against a
-            // mode that does not use one is a confused (or probing) request shape, refused outright
-            // rather than silently accepted with the material ignored. `CANONICAL_V1`/`ApiKeyOnly`
-            // are unaffected in practice — they are refused unconditionally below regardless — but
-            // `NoAuth` is: without this check, a stray signature header on an otherwise-open `NONE`
-            // hook would simply be ignored and the request would still succeed, which is "silently
-            // accepted" exactly where this codebase's posture elsewhere is "fail loud on the
-            // unexpected".
-            if matches!(target.auth_mode, AuthMode::ApiKeyOnly | AuthMode::NoAuth)
-                && signature_material_present(&headers, &target)
-            {
-                return Err(invocation_unauthorized());
+        Ok(res)
+    } else {
+        let identifier = identifier.ok_or_else(invocation_unauthorized)?;
+        let target = crate::api::support::resolve_hook(&state.db, identifier)
+            .await
+            .map_err(|_| invocation_unauthorized())?;
+
+        // Task 3 / defense in depth: a keyless caller presenting signature material against a
+        // mode that does not use one is a confused (or probing) request shape, refused outright
+        // rather than silently accepted with the material ignored. `CANONICAL_V1`/`ApiKeyOnly`
+        // are unaffected in practice — they are refused unconditionally below regardless — but
+        // `NoAuth` is: without this check, a stray signature header on an otherwise-open `NONE`
+        // hook would simply be ignored and the request would still succeed, which is "silently
+        // accepted" exactly where this codebase's posture elsewhere is "fail loud on the
+        // unexpected".
+        if matches!(target.auth_mode, AuthMode::ApiKeyOnly | AuthMode::NoAuth)
+            && signature_material_present(&headers, &target)
+        {
+            return Err(invocation_unauthorized());
+        }
+
+        match target.auth_mode {
+            AuthMode::CanonicalV1 | AuthMode::ApiKeyOnly => Err(invocation_unauthorized()),
+            AuthMode::NoAuth => {
+                if state.config.require_signed_requests {
+                    return Err(invocation_unauthorized());
+                }
+                req.extensions_mut().insert(ClientIp(client_ip));
+                Ok(next.run(req).await)
             }
+            AuthMode::HmacOnly => {
+                let header_name = target
+                    .signature_header
+                    .as_deref()
+                    .unwrap_or(HMAC_ONLY_DEFAULT_HEADER);
+                let prefix = target
+                    .signature_prefix
+                    .as_deref()
+                    .unwrap_or(SIGNATURE_PREFIX);
+                // Absence of the configured header looks identical to a missing `X-API-Key`
+                // everywhere else — see this function's doc comment on oracle discipline. Only
+                // once *some* signature material is presented do format/mismatch errors start
+                // being reported specifically.
+                let provided = headers
+                    .get(header_name)
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(invocation_unauthorized)?;
 
-            match target.auth_mode {
-                AuthMode::CanonicalV1 | AuthMode::ApiKeyOnly => Err(invocation_unauthorized()),
-                AuthMode::NoAuth => {
-                    if state.config.require_signed_requests {
-                        return Err(invocation_unauthorized());
-                    }
-                    req.extensions_mut().insert(ClientIp(client_ip));
-                    Ok(next.run(req).await)
-                }
-                AuthMode::HmacOnly => {
-                    let header_name =
-                        target.signature_header.as_deref().unwrap_or(HMAC_ONLY_DEFAULT_HEADER);
-                    let prefix = target.signature_prefix.as_deref().unwrap_or(SIGNATURE_PREFIX);
-                    // Absence of the configured header looks identical to a missing `X-API-Key`
-                    // everywhere else — see this function's doc comment on oracle discipline. Only
-                    // once *some* signature material is presented do format/mismatch errors start
-                    // being reported specifically.
-                    let provided = headers
-                        .get(header_name)
-                        .and_then(|h| h.to_str().ok())
-                        .ok_or_else(invocation_unauthorized)?;
+                let secret = recover_hook_secret(&state, &target)?;
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
+                    .await
+                    .map_err(|_| {
+                        AppError::InvalidInput("Request body too large to verify".to_owned())
+                    })?;
+                verify_signature_with_prefix(&secret, &bytes, provided, prefix)
+                    .map_err(|rejection| reject_signature(rejection, &target.name))?;
 
-                    let secret = recover_hook_secret(&state, &target)?;
-                    let (parts, body) = req.into_parts();
-                    let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES).await.map_err(
-                        |_| AppError::InvalidInput("Request body too large to verify".to_owned()),
-                    )?;
-                    verify_signature_with_prefix(&secret, &bytes, provided, prefix)
-                        .map_err(|rejection| reject_signature(rejection, &target.name))?;
-
-                    let mut req = Request::from_parts(parts, Body::from(bytes));
-                    req.extensions_mut().insert(ClientIp(client_ip));
-                    Ok(next.run(req).await)
-                }
+                let mut req = Request::from_parts(parts, Body::from(bytes));
+                req.extensions_mut().insert(ClientIp(client_ip));
+                Ok(next.run(req).await)
             }
         }
     }
@@ -723,8 +763,14 @@ mod tests {
 
     #[test]
     fn recognizes_every_shape_the_invocation_routes_actually_produce() {
-        assert_eq!(hook_identifier_from_path("/hooks/echo_hook/execute"), Some("echo_hook"));
-        assert_eq!(hook_identifier_from_path("/hooks/echo_hook/test"), Some("echo_hook"));
+        assert_eq!(
+            hook_identifier_from_path("/hooks/echo_hook/execute"),
+            Some("echo_hook")
+        );
+        assert_eq!(
+            hook_identifier_from_path("/hooks/echo_hook/test"),
+            Some("echo_hook")
+        );
         assert_eq!(hook_identifier_from_path("/echo_hook"), Some("echo_hook"));
         assert_eq!(
             hook_identifier_from_path("/hooks/9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d/execute"),
@@ -776,7 +822,10 @@ mod tests {
 
         // Malformed values are rejected rather than defaulting to "now".
         for malformed in ["", "not-a-number", "17e9", "1700000000.5", "-"] {
-            assert!(validate_timestamp(malformed, 300).is_err(), "{malformed:?} should be rejected");
+            assert!(
+                validate_timestamp(malformed, 300).is_err(),
+                "{malformed:?} should be rejected"
+            );
         }
     }
 
@@ -787,7 +836,10 @@ mod tests {
     ) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         if let Some(value) = timestamp {
-            headers.insert(TIMESTAMP_HEADER, value.parse().expect("a valid header value"));
+            headers.insert(
+                TIMESTAMP_HEADER,
+                value.parse().expect("a valid header value"),
+            );
         }
         if let Some(name) = signature_header {
             headers.insert(name, "sha256=00".parse().expect("a valid header value"));

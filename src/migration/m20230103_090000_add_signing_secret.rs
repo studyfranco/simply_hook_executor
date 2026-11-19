@@ -65,7 +65,12 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name("idx-api_keys-key_id").table(ApiKeys::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name("idx-api_keys-key_id")
+                    .table(ApiKeys::Table)
+                    .to_owned(),
+            )
             .await?;
         manager
             .alter_table(

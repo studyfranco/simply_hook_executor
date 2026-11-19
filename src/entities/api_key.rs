@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// A single-variant enum rather than removing `hmac_mode` outright: the column, and the `From`/
 /// `TryFrom` machinery `DeriveActiveEnum` generates for it, are still how the row round-trips through
-/// SeaORM, and a future second mode (if one is ever justified) has a type to extend rather than a
+/// `SeaORM`, and a future second mode (if one is ever justified) has a type to extend rather than a
 /// column to reintroduce. [`Model::canonical_template`] is the customization surface now — a key
 /// that needs its `CANONICAL_V1` signature computed over something other than the service-wide
 /// default template sets that instead of switching modes.
@@ -43,6 +43,10 @@ pub enum HmacMode {
 /// A single API key: its identity, global RBAC scopes, execution budget, and network binding rule.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "api_keys")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns"
+)]
 pub struct Model {
     /// Unique identifier for the API key.
     #[sea_orm(primary_key, auto_increment = false)]
@@ -72,6 +76,7 @@ pub struct Model {
     pub hmac_mode: HmacMode,
     /// Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`). An empty
     /// value means no CIDR restriction is enforced.
+    #[sea_orm(column_type = "Text", nullable)]
     pub bound_ips: Option<String>,
     /// Maximum number of hook executions this key may have running simultaneously. Enforced by a
     /// `tokio::sync::Semaphore` in [`crate::executor`]; exceeding it yields `429 Too Many Requests`.
@@ -106,6 +111,7 @@ pub struct Model {
     /// signature verification has actually been reviewed against; every other key is free to
     /// customize it (e.g. for compatibility with an existing signing client that already computes a
     /// different canonical shape).
+    #[sea_orm(column_type = "Text", nullable)]
     pub canonical_template: Option<String>,
 }
 

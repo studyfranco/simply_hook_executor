@@ -43,15 +43,18 @@ pub struct Model {
     /// `api::ssh::SshCredentialView` is the only shape this entity is ever exposed through on the
     /// wire, and it omits every field below.
     #[serde(skip_serializing)]
+    #[sea_orm(column_type = "Text", nullable)]
     pub encrypted_private_key: Option<String>,
     /// The private key's passphrase, sealed at rest with [`crate::crypto::SecretCipher`]. `None`
     /// both when `auth_type = PASSWORD` and when `auth_type = KEY` names an unencrypted key. Never
     /// serialized; see [`Self::encrypted_private_key`].
     #[serde(skip_serializing)]
+    #[sea_orm(column_type = "Text", nullable)]
     pub encrypted_passphrase: Option<String>,
     /// The login password, sealed at rest with [`crate::crypto::SecretCipher`]. Populated only when
     /// `auth_type = PASSWORD`. Never serialized; see [`Self::encrypted_private_key`].
     #[serde(skip_serializing)]
+    #[sea_orm(column_type = "Text", nullable)]
     pub encrypted_password: Option<String>,
     /// The key that created or owns this credential.
     pub owner_key_id: Option<Uuid>,

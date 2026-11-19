@@ -12,28 +12,25 @@ use axum::{
     response::IntoResponse,
 };
 use sea_orm::{
-    ColumnTrait, Condition, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, execution,
-    execution::ExecutionStatus, prelude::*,
-};
+use crate::entities::{api_key, execution, execution::ExecutionStatus, prelude::*};
 use crate::error::AppError;
+use crate::executor;
 use crate::extract::{StrictBytes, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
-use crate::executor;
 
 use super::DEFAULT_PAGE_LIMIT;
 use super::guards::{
-    execution_visible_hook_ids, may_read_execution, guard_execute, guard_manage,
-    guard_visibility,
+    execution_visible_hook_ids, guard_execute, guard_manage, guard_visibility, may_read_execution,
 };
-use super::support::{create_audit_log, extract_parameter_map, format_reference, load_parameters, resolve_hook};
+use super::support::{
+    create_audit_log, extract_parameter_map, format_reference, load_parameters, resolve_hook,
+};
 
 // ─────────────────────────────────────────────────────────────
 // Execution
@@ -153,7 +150,8 @@ pub(crate) async fn run_hook_request(
         )));
     }
 
-    let record = executor::execute_hook(&state, &hook_model, key.as_ref(), &resolved, caller_ip).await?;
+    let record =
+        executor::execute_hook(&state, &hook_model, key.as_ref(), &resolved, caller_ip).await?;
     let api_key_name = key.as_ref().map(|k| k.name.clone());
 
     // `200 OK` reports that the *request* was carried out; whether the script itself succeeded is
@@ -171,26 +169,40 @@ pub(crate) async fn run_hook_request(
 /// `key` is `Option` rather than mandatory — see [`run_hook_request`] — because this is one of the
 /// two `/api/hooks/{id}` routes (with `test`) that [`crate::middleware::invocation_auth_middleware`]
 /// may authorize without one.
-pub async fn execute_hook_endpoint(
+pub(crate) async fn execute_hook_endpoint(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body, client_ip.0).await
+    run_hook_request(
+        state,
+        key.map(|Extension(k)| k),
+        &identifier,
+        &body,
+        client_ip.0,
+    )
+    .await
 }
 
 /// Handles `POST /webhook/{identifier}` — the webhook-facing alias of the execute endpoint, for
 /// third-party senders that post their own flat JSON document to a fixed URL.
-pub async fn webhook_execute(
+pub(crate) async fn webhook_execute(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(identifier): StrictPath<String>,
     StrictBytes(body): StrictBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    run_hook_request(state, key.map(|Extension(k)| k), &identifier, &body, client_ip.0).await
+    run_hook_request(
+        state,
+        key.map(|Extension(k)| k),
+        &identifier,
+        &body,
+        client_ip.0,
+    )
+    .await
 }
 
 /// Dry-run preview returned by `POST /api/hooks/{id}/test`.
@@ -222,7 +234,7 @@ pub struct TestHookResponse {
 ///
 /// `key` is `Option`, like [`execute_hook_endpoint`]: [`crate::middleware::invocation_auth_middleware`]
 /// may authorize a keyless caller through the target hook's `auth_mode`.
-pub async fn test_hook(
+pub(crate) async fn test_hook(
     State(state): State<AppState>,
     key: Option<Extension<api_key::Model>>,
     StrictPath(identifier): StrictPath<String>,
@@ -246,10 +258,11 @@ pub async fn test_hook(
     // still missing. A hook *with* an `args_template` referencing that same missing parameter
     // fails here too — `plan` becomes `None` — but `blocking_reason` below always prefers the
     // `missing_required` message when both fired, since it names the actual root cause.
-    let (plan, template_error) = match executor::build_command_plan(&hook_model, &resolved, &state.config) {
-        Ok(plan) => (Some(plan), None),
-        Err(e) => (None, Some(e.detail)),
-    };
+    let (plan, template_error) =
+        match executor::build_command_plan(&hook_model, &resolved, &state.config) {
+            Ok(plan) => (Some(plan), None),
+            Err(e) => (None, Some(e.detail)),
+        };
 
     let blocking_reason = if !hook_model.is_active {
         Some(format!(
@@ -310,7 +323,7 @@ pub struct ExecutionQuery {
     pub api_key: Option<String>,
     /// Only executions at or after this instant. RFC 3339, matching `audit::AuditLogQuery::since`.
     pub since: Option<String>,
-    /// Only executions strictly before this instant. RFC 3339, matching `audit::AuditLogQuery::until`.
+    /// Only executions at or before this instant. RFC 3339, matching `audit::AuditLogQuery::until`.
     pub until: Option<String>,
     /// Pagination limit. Ignored when [`ExecutionQuery::per_page`] is also present — see
     /// [`resolve_pagination`].
@@ -318,7 +331,7 @@ pub struct ExecutionQuery {
     /// Pagination offset. Ignored when [`ExecutionQuery::page`] is also present.
     pub offset: Option<u64>,
     /// 1-indexed page number, an alternative to [`ExecutionQuery::offset`] for a caller that thinks
-    /// in pages rather than a raw row offset (the WebUI's own pagination controls). Takes
+    /// in pages rather than a raw row offset (the `WebUI`'s own pagination controls). Takes
     /// precedence over `offset` when both are present; `1` if absent while
     /// [`ExecutionQuery::per_page`] is.
     pub page: Option<u64>,
@@ -356,14 +369,25 @@ const MAX_PAGINATION_VALUE: u64 = i64::MAX as u64;
 /// row count is not an error case to special-case: `LIMIT`/`OFFSET` beyond a table's size is
 /// ordinary, portable SQL that already returns zero rows, which is exactly the clean, empty `200`
 /// this function's callers want for an out-of-range page.
-pub(crate) fn resolve_pagination(page: Option<u64>, per_page: Option<u64>, limit: Option<u64>, offset: Option<u64>) -> (u64, u64, u64, u64) {
+pub(crate) fn resolve_pagination(
+    page: Option<u64>,
+    per_page: Option<u64>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> (u64, u64, u64, u64) {
     if page.is_some() || per_page.is_some() {
-        let per_page = per_page.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGINATION_VALUE);
+        let per_page = per_page
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGINATION_VALUE);
         let page = page.unwrap_or(1).max(1);
-        let offset = (page - 1).saturating_mul(per_page).min(MAX_PAGINATION_VALUE);
+        let offset = (page - 1)
+            .saturating_mul(per_page)
+            .min(MAX_PAGINATION_VALUE);
         (per_page, offset, page, per_page)
     } else {
-        let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGINATION_VALUE);
+        let limit = limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGINATION_VALUE);
         let offset = offset.unwrap_or(0).min(MAX_PAGINATION_VALUE);
         (limit, offset, offset / limit + 1, limit)
     }
@@ -392,12 +416,15 @@ pub(crate) async fn resolve_api_key_filter(
     if let Ok(id) = Uuid::parse_str(raw) {
         return Ok(vec![id]);
     }
-    let matches = ApiKey::find().filter(api_key::Column::Name.contains(raw)).all(db).await?;
+    let matches = ApiKey::find()
+        .filter(api_key::Column::Name.contains(raw))
+        .all(db)
+        .await?;
     Ok(matches.into_iter().map(|k| k.id).collect())
 }
 
 /// Handles `GET /api/executions` — newest-first history, scoped to the caller's hooks.
-pub async fn list_executions(
+pub(crate) async fn list_executions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictQuery(query): StrictQuery<ExecutionQuery>,
@@ -435,10 +462,14 @@ pub async fn list_executions(
         q = q.filter(execution::Column::ApiKeyId.is_in(ids));
     }
     if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(execution::Column::Timestamp.gte(crate::api::support::parse_instant("since", since)?));
+        q = q.filter(
+            execution::Column::Timestamp.gte(crate::api::support::parse_instant("since", since)?),
+        );
     }
     if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(execution::Column::Timestamp.lt(crate::api::support::parse_instant("until", until)?));
+        q = q.filter(
+            execution::Column::Timestamp.lte(crate::api::support::parse_instant("until", until)?),
+        );
     }
 
     let (limit, offset, page, per_page) =
@@ -458,7 +489,10 @@ pub async fn list_executions(
 
     // One batch lookup for every acting key named across this page, rather than one query per row —
     // the same shape `guards::execution_visible_hook_ids` already uses for its own IN-list.
-    let key_ids: Vec<Uuid> = rows.iter().filter_map(|(model, _)| model.api_key_id).collect();
+    let key_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|(model, _)| model.api_key_id)
+        .collect();
     let key_names: std::collections::HashMap<Uuid, String> = if key_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -474,13 +508,16 @@ pub async fn list_executions(
     let views = rows
         .into_iter()
         .map(|(model, hook_model)| {
-            let hook_name = hook_model.map(|h| h.name).unwrap_or_else(|| "(deleted)".to_owned());
+            let hook_name = hook_model.map_or_else(|| "(deleted)".to_owned(), |h| h.name);
             let api_key_name = model.api_key_id.and_then(|id| key_names.get(&id).cloned());
             ExecutionView::new(model, hook_name, api_key_name)
         })
         .collect::<Vec<_>>();
 
-    Ok((pagination_headers(total_count, page, per_page, total_pages)?, Json(views)))
+    Ok((
+        pagination_headers(total_count, page, per_page, total_pages)?,
+        Json(views),
+    ))
 }
 
 /// Builds the `X-Total-Count`/`X-Page`/`X-Per-Page`/`X-Total-Pages` response headers pagination
@@ -516,12 +553,15 @@ fn pagination_headers(
 }
 
 /// Handles `GET /api/executions/{id}` — one execution with its full captured output.
-pub async fn get_execution(
+pub(crate) async fn get_execution(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let model = Execution::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     // §4, third scope. `404` rather than `403` per oracle discipline: a record the caller may not
     // read must be byte-identical to one that was never written, or the endpoint reports how much
     // history exists to someone entitled to none of it.
@@ -532,8 +572,7 @@ pub async fn get_execution(
     let hook_name = Hook::find_by_id(model.hook_id)
         .one(&state.db)
         .await?
-        .map(|h| h.name)
-        .unwrap_or_else(|| "(deleted)".to_owned());
+        .map_or_else(|| "(deleted)".to_owned(), |h| h.name);
     let api_key_name = match model.api_key_id {
         Some(id) => ApiKey::find_by_id(id).one(&state.db).await?.map(|k| k.name),
         None => None,
@@ -543,19 +582,24 @@ pub async fn get_execution(
 }
 
 /// Handles `DELETE /api/executions/{id}` — removes a single history entry.
-pub async fn delete_execution(
+pub(crate) async fn delete_execution(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model = Execution::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let model = Execution::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     // The parent hook is loaded rather than passed by id because authority over an execution record
     // is decided partly by who owns that hook. A row pointing at a hook that no longer exists is
     // unreachable through any supported path — hard deletion drops the history with the hook — so
     // treating it as absent is the honest answer rather than a case to invent a policy for.
-    let hook_model =
-        Hook::find_by_id(model.hook_id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let hook_model = Hook::find_by_id(model.hook_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     // Deleting history is a management action over the hook, not merely an execute-level one.
     // Note this is deliberately *stricter* than reading it: `can_view_execution` buys visibility of
     // the record, never the right to destroy it. An auditor is not a redactor.
@@ -602,7 +646,7 @@ pub struct PurgeQuery {
 ///
 /// Master-only: this deletes history across every hook in the system, which no scoped key should
 /// be able to do regardless of its per-hook grants.
-pub async fn purge_executions(
+pub(crate) async fn purge_executions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -614,7 +658,9 @@ pub async fn purge_executions(
         ));
     }
 
-    let days = query.older_than_days.unwrap_or(state.config.log_retention_days);
+    let days = query
+        .older_than_days
+        .unwrap_or(state.config.log_retention_days);
     if days < 0 {
         return Err(AppError::InvalidInput(
             "older_than_days must not be negative".to_owned(),
@@ -629,11 +675,15 @@ pub async fn purge_executions(
         client_ip.0,
         "EXECUTION_PURGE",
         None,
-        Some(format!("Purged {purged} execution(s) older than {days} day(s)")),
+        Some(format!(
+            "Purged {purged} execution(s) older than {days} day(s)"
+        )),
     )
     .await?;
 
-    Ok(Json(serde_json::json!({ "purged": purged, "older_than_days": days })))
+    Ok(Json(
+        serde_json::json!({ "purged": purged, "older_than_days": days }),
+    ))
 }
 
 #[cfg(test)]
@@ -642,8 +692,14 @@ mod tests {
 
     #[test]
     fn parses_status_filters_case_insensitively() {
-        assert_eq!(parse_status("success").expect("valid"), ExecutionStatus::Success);
-        assert_eq!(parse_status("TIMEOUT").expect("valid"), ExecutionStatus::Timeout);
+        assert_eq!(
+            parse_status("success").expect("valid"),
+            ExecutionStatus::Success
+        );
+        assert_eq!(
+            parse_status("TIMEOUT").expect("valid"),
+            ExecutionStatus::Timeout
+        );
         assert!(parse_status("bogus").is_err());
     }
 
@@ -652,16 +708,23 @@ mod tests {
         // A `page`/`per_page` pair whose product genuinely overflows `u64` — reachable from a
         // single caller-supplied query string with no special crafting beyond two large numbers,
         // since `page`/`per_page` are parsed independently and neither on its own exceeds `u64`.
-        let (limit, offset, _page, per_page) = resolve_pagination(Some(u64::MAX / 2), Some(4), None, None);
+        let (limit, offset, _page, per_page) =
+            resolve_pagination(Some(u64::MAX / 2), Some(4), None, None);
         assert_eq!(limit, per_page);
         // Whatever the exact clamp, it must land on a value every supported backend's driver can
         // actually bind as a signed 64-bit LIMIT/OFFSET without erroring — never past `i64::MAX`.
-        assert!(offset <= i64::MAX as u64, "offset {offset} exceeds i64::MAX");
+        assert!(
+            i64::try_from(offset).is_ok(),
+            "offset {offset} exceeds i64::MAX"
+        );
 
         // The legacy `limit`/`offset` spelling has its own overflow shape: `offset / limit + 1`
         // with `offset` near `u64::MAX`.
         let (limit2, offset2, page2, _) = resolve_pagination(None, None, Some(1), Some(u64::MAX));
-        assert!(offset2 <= i64::MAX as u64, "offset {offset2} exceeds i64::MAX");
+        assert!(
+            i64::try_from(offset2).is_ok(),
+            "offset {offset2} exceeds i64::MAX"
+        );
         assert!(page2 >= 1);
         assert_eq!(limit2, 1);
     }

@@ -14,7 +14,7 @@
 //!
 //! An earlier audit entry in `AGENT_NOTES.MD` asserted that this service was in exactly that state,
 //! on the reasoning that `src/db.rs` set `journal_mode` and `busy_timeout` and nothing else.
-//! **That conclusion was wrong.** SQLx enables foreign keys on every SQLite connection it opens, so
+//! **That conclusion was wrong.** `SQLx` enables foreign keys on every SQLite connection it opens, so
 //! the constraints have been enforced the whole time. The pragma is now declared explicitly in
 //! [`simply_hook_executor::db::connect`] — not as a repair, but so that a security-relevant setting
 //! stops depending on a dependency's default that could be revised in a point release, silently.
@@ -36,8 +36,7 @@
 // does not call are unused *here* while having real callers next door. The crate-wide convention is
 // to allow it at the import rather than inside `common`, which keeps `common`'s own no-blanket-allow
 // rule intact.
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use common::*;
 use sea_orm::{
@@ -120,15 +119,34 @@ async fn deleting_a_hook_cascades_to_permissions_parameters_and_executions() {
     assert_eq!(count_params_for_hook(&db, doomed).await, 1);
     assert_eq!(count_executions_for_hook(&db, doomed).await, 1);
 
-    Hook::delete_by_id(doomed).exec(&db).await.expect("the hook row is removed");
+    Hook::delete_by_id(doomed)
+        .exec(&db)
+        .await
+        .expect("the hook row is removed");
 
-    assert_eq!(count_perms_for_hook(&db, doomed).await, 0, "grants must cascade");
-    assert_eq!(count_params_for_hook(&db, doomed).await, 0, "parameters must cascade");
-    assert_eq!(count_executions_for_hook(&db, doomed).await, 0, "history must cascade");
+    assert_eq!(
+        count_perms_for_hook(&db, doomed).await,
+        0,
+        "grants must cascade"
+    );
+    assert_eq!(
+        count_params_for_hook(&db, doomed).await,
+        0,
+        "parameters must cascade"
+    );
+    assert_eq!(
+        count_executions_for_hook(&db, doomed).await,
+        0,
+        "history must cascade"
+    );
 
     // The cascade is scoped to the deleted row. A cascade that reached the sibling hook would be a
     // far worse bug than one that reached nothing, and only a second hook can detect it.
-    assert_eq!(count_perms_for_hook(&db, survivor).await, 1, "an unrelated hook is untouched");
+    assert_eq!(
+        count_perms_for_hook(&db, survivor).await,
+        1,
+        "an unrelated hook is untouched"
+    );
     assert_eq!(count_params_for_hook(&db, survivor).await, 1);
     assert_eq!(count_executions_for_hook(&db, survivor).await, 1);
 }
@@ -154,9 +172,16 @@ async fn deleting_a_key_cascades_grants_but_only_nulls_execution_and_audit_attri
 
     assert_eq!(count_perms_for_key(&db, doomed_key).await, 1);
 
-    ApiKey::delete_by_id(doomed_key).exec(&db).await.expect("the key row is removed");
+    ApiKey::delete_by_id(doomed_key)
+        .exec(&db)
+        .await
+        .expect("the key row is removed");
 
-    assert_eq!(count_perms_for_key(&db, doomed_key).await, 0, "grants must cascade");
+    assert_eq!(
+        count_perms_for_key(&db, doomed_key).await,
+        0,
+        "grants must cascade"
+    );
     assert_eq!(
         count_perms_for_key(&db, other_key).await,
         1,
@@ -169,8 +194,14 @@ async fn deleting_a_key_cascades_grants_but_only_nulls_execution_and_audit_attri
         .await
         .expect("querying executions succeeds")
         .expect("the execution record must survive its key's deletion");
-    assert_eq!(surviving_execution.api_key_id, None, "attribution is nulled, not the row deleted");
-    assert_eq!(surviving_execution.hook_id, hook_id, "and the rest of the record is intact");
+    assert_eq!(
+        surviving_execution.api_key_id, None,
+        "attribution is nulled, not the row deleted"
+    );
+    assert_eq!(
+        surviving_execution.hook_id, hook_id,
+        "and the rest of the record is intact"
+    );
 
     let surviving_audit = AuditLog::find_by_id(audit_id)
         .one(&db)
@@ -179,7 +210,10 @@ async fn deleting_a_key_cascades_grants_but_only_nulls_execution_and_audit_attri
         .expect("the audit entry must survive its key's deletion");
     assert_eq!(surviving_audit.api_key_id, None);
     assert_eq!(
-        (surviving_audit.api_key_name.as_str(), surviving_audit.api_key_prefix.as_str()),
+        (
+            surviving_audit.api_key_name.as_str(),
+            surviving_audit.api_key_prefix.as_str()
+        ),
         ("Doomed Key", "dead1234"),
         "the denormalized name and prefix are a point-in-time snapshot and are never nulled — they \
          are what keeps the trail legible after the FK is cleared"
@@ -271,9 +305,21 @@ async fn purging_a_trashed_hook_leaves_no_orphaned_children() {
     assert_eq!(purged, 1, "the trashed hook is old enough to be purged");
 
     assert_eq!(Hook::find().count(&db).await.expect("count"), 0);
-    assert_eq!(count_perms_for_hook(&db, hook_id).await, 0, "no orphaned grants");
-    assert_eq!(count_params_for_hook(&db, hook_id).await, 0, "no orphaned parameters");
-    assert_eq!(count_executions_for_hook(&db, hook_id).await, 0, "no orphaned history");
+    assert_eq!(
+        count_perms_for_hook(&db, hook_id).await,
+        0,
+        "no orphaned grants"
+    );
+    assert_eq!(
+        count_params_for_hook(&db, hook_id).await,
+        0,
+        "no orphaned parameters"
+    );
+    assert_eq!(
+        count_executions_for_hook(&db, hook_id).await,
+        0,
+        "no orphaned history"
+    );
 }
 
 /// `api_keys.parent_key_id` and `hooks.owner_key_id` carry **no** foreign key, on purpose.
@@ -297,7 +343,10 @@ async fn key_lineage_and_ownership_columns_are_unconstrained_by_design() {
 
     // Deleting the owner directly — bypassing the §6 handler, which is the only thing that would
     // have refused — succeeds, and leaves the references dangling rather than cascading.
-    ApiKey::delete_by_id(owner).exec(&db).await.expect("no FK blocks this");
+    ApiKey::delete_by_id(owner)
+        .exec(&db)
+        .await
+        .expect("no FK blocks this");
 
     let orphaned_hook = Hook::find_by_id(hook_id)
         .one(&db)

@@ -1,7 +1,7 @@
 //! `simply_hook_executor` daemon entry point: database bootstrap, master key provisioning, HTTP
 //! server, and graceful shutdown.
 
-use std::net::SocketAddr;
+use std::{fmt::Write as _, io::Write as _, net::SocketAddr};
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -42,8 +42,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
     tracing::info!("Received shutdown signal.");
 }
@@ -65,6 +65,8 @@ async fn bootstrap_master_key(
     cipher: &crypto::SecretCipher,
     initial_master_key: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    const W: usize = 82;
+
     use entities::{api_key, prelude::ApiKey};
 
     let existing_master = ApiKey::find()
@@ -132,7 +134,6 @@ async fn bootstrap_master_key(
 
     model.insert(db).await?;
 
-    const W: usize = 82;
     let border = "═".repeat(W);
     let body: String = [
         format!("X-API-Key      : {plaintext_key}"),
@@ -143,8 +144,10 @@ async fn bootstrap_master_key(
         "They will NOT be shown again — store them securely!".to_owned(),
     ]
     .iter()
-    .map(|row| format!("║ {row:<W$} ║\n"))
-    .collect();
+    .fold(String::new(), |mut body, row| {
+        let _ = writeln!(body, "║ {row:<W$} ║");
+        body
+    });
 
     tracing::info!(
         "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
@@ -153,11 +156,55 @@ async fn bootstrap_master_key(
 
     // tracing's fmt subscriber buffers writes; a reader tailing the redirected log right after
     // this point could otherwise see a truncated or missing banner for a short window.
-    use std::io::Write;
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
 
     Ok(())
+}
+
+/// Startup canary for `SIGNING_SECRET_KEY`: proves the configured key decrypts stored secrets at rest.
+async fn verify_encryption_key(
+    db: &DatabaseConnection,
+    cipher: &crypto::SecretCipher,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crypto::{KeyCanary, check_key_canary};
+    use entities::{api_key, prelude::ApiKey};
+
+    let sample = match ApiKey::find()
+        .filter(api_key::Column::SigningSecret.starts_with("v1.xchacha20poly1305."))
+        .one(db)
+        .await?
+    {
+        Some(row) => row.signing_secret,
+        None => ApiKey::find()
+            .filter(api_key::Column::SigningSecret.is_not_null())
+            .one(db)
+            .await?
+            .and_then(|key| key.signing_secret),
+    };
+
+    match check_key_canary(cipher, sample.as_deref()) {
+        Ok(KeyCanary::Verified) => {
+            tracing::info!(
+                "Encryption key canary passed: stored signing secrets open with the configured key."
+            );
+            Ok(())
+        }
+        Ok(KeyCanary::NoSealedSecrets) => {
+            tracing::info!(
+                "Encryption key canary skipped: no sealed signing secret is stored yet."
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                "Refusing to start: a stored signing secret could not be decrypted with the \
+                 configured encryption key ({e}). Restore the previous key or rotate affected \
+                 secrets before retrying."
+            );
+            Err(Box::new(e))
+        }
+    }
 }
 
 /// Resolves every `TRUSTED_PROXIES` hostname at startup, and schedules one re-check if any failed.
@@ -255,9 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fatal when the variable is set and malformed; absence is the documented zero-config path and
     // is not an error. See [`config::validate_initial_master_key`] for why those two differ.
     let initial_key_raw = config::get_secret_or_env("INITIAL_MASTER_KEY");
-    let initial_master_key = match config::validate_initial_master_key(
-        initial_key_raw.as_deref(),
-    ) {
+    let initial_master_key = match config::validate_initial_master_key(initial_key_raw.as_deref()) {
         Ok(key) => key,
         Err(e) => {
             tracing::error!("{e}");
@@ -287,21 +332,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Preparing database (migrations, then the application pool)...");
     let db: DatabaseConnection = db::migrate_and_connect(&db_url, &config).await?;
 
-    // Explicitly non-fatal, and the `if let` rather than `?` is the point. These are *performance*
-    // pragmas: WAL removes reader/writer contention and the busy timeout absorbs writer collisions,
-    // but the daemon is entirely correct without either. Refusing to boot over one — on a
-    // filesystem that will not support WAL, or an in-memory database that legitimately cannot — is
-    // trading a real outage for a theoretical slowdown. The failure is logged loudly instead.
-    if let Err(e) = db::apply_sqlite_pragmas(&db).await {
-        tracing::warn!(
-            "Could not apply the SQLite concurrency pragmas: {e}. Starting anyway — expect \
-             reduced write concurrency, but correctness is unaffected."
-        );
-    }
-    if let Err(e) = db::run_sqlite_optimize(&db).await {
-        tracing::warn!("Could not run SQLite optimization: {e}");
-    }
-
     // Built before the bootstrap key is minted, since that key's signing secret is sealed with it.
     // A malformed SIGNING_SECRET_KEY stops startup here rather than silently degrading to writing
     // signing secrets in the clear.
@@ -317,6 +347,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     bootstrap_master_key(&db, &cipher, initial_master_key.as_deref()).await?;
+
+    verify_encryption_key(&db, &cipher).await?;
 
     prime_trusted_proxies(&config.trusted_proxies);
 

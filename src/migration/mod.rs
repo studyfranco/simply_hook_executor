@@ -20,6 +20,7 @@ mod m20260928_090000_add_ssh_infrastructure;
 mod m20261109_000000_ssh_target_rbac_and_hook_deactivation;
 mod m20261109_000001_add_performance_indexes;
 mod m20261110_090000_add_performance_and_foreign_key_indexes;
+mod m20261119_000000_unify_variable_columns_to_text;
 
 /// The ordered set of all schema migrations for `simply_hook_executor`.
 pub struct Migrator;
@@ -46,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261109_000000_ssh_target_rbac_and_hook_deactivation::Migration),
             Box::new(m20261109_000001_add_performance_indexes::Migration),
             Box::new(m20261110_090000_add_performance_and_foreign_key_indexes::Migration),
+            Box::new(m20261119_000000_unify_variable_columns_to_text::Migration),
         ]
     }
 }

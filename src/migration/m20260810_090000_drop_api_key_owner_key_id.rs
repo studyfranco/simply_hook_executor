@@ -81,7 +81,12 @@ impl MigrationTrait for Migration {
     /// works on the backend the tests happen to use is a migration that fails in production.
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_index(Index::drop().name(OWNER_INDEX).table(ApiKeys::Table).to_owned())
+            .drop_index(
+                Index::drop()
+                    .name(OWNER_INDEX)
+                    .table(ApiKeys::Table)
+                    .to_owned(),
+            )
             .await?;
 
         manager

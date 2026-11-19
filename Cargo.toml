@@ -3,6 +3,14 @@ name = "simply_hook_executor"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -36,10 +44,6 @@ dotenvy = "0.15"
 # naming that type requires the crate as a direct dependency even though it arrives via SeaORM
 # anyway. Deleting it as "obviously superseded by tracing" breaks the build in `src/main.rs`.
 log = "0.4"
-# Used solely for `killpg(2)` when a hook exceeds its timeout: `tokio::process::Child::kill()`
-# only signals the direct child, which would leave orphaned grandchildren behind. Already in the
-# dependency tree via tokio on Unix, so this adds no new compilation.
-libc = "0.2"
 # Encryption-at-rest for `api_keys.signing_secret`. HMAC verification needs the secret back in
 # plaintext to recompute a signature, so — unlike `key_hash` — it cannot be hashed. XChaCha20-Poly1305
 # (pure Rust, no C toolchain) keeps a database-only compromise from yielding forgeable signatures.
@@ -74,6 +78,12 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # breaking changes under a caret requirement — `ParserReturn::errors` became `diagnostics`, `labels`
 # went from `Option<Vec<_>>` to a slice, `offset()` widened to `u32`. A syntax checker that stops the
 # build for reasons unrelated to syntax is worse than no checker, so this one does not float.
-oxc_allocator = "0.158"
-oxc_parser = "0.158"
-oxc_span = "0.158"
+oxc_allocator = "=0.158.0"
+oxc_parser = "=0.158.0"
+oxc_span = "=0.158.0"
+
+regex = "1"
+
+[target.'cfg(unix)'.dev-dependencies]
+# Test fixture for the real session boundary without the util-linux setsid executable.
+rustix = { version = "1", features = ["process"] }

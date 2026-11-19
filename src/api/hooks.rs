@@ -12,8 +12,8 @@ use axum::{
 };
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait,
-    QueryFilter, QueryOrder, SqlErr, sea_query::OnConflict,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, SqlErr, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,22 +23,20 @@ use crate::entities::{
     hook_parameter, prelude::*,
 };
 use crate::error::AppError;
+use crate::executor;
 use crate::extract::{StrictJson, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
-use crate::executor;
 
 use super::executions::PurgeQuery;
 use super::guards::{
     guard_dispatch_configuration, guard_lifecycle_authority, guard_manage,
-    guard_master_for_deleted_view, guard_master_for_privileged_hook,
-    guard_ssh_target_usage, guard_visibility, hook_permission, normalize_run_as_user,
-    visible_hook_ids,
+    guard_master_for_deleted_view, guard_master_for_privileged_hook, guard_ssh_target_usage,
+    guard_visibility, hook_permission, normalize_run_as_user, visible_hook_ids,
 };
 use super::support::{
-    create_audit_log, describe_privilege, format_reference, load_parameters,
-    resolve_hook, resolve_hook_including_deleted, validate_hook_name, validate_ssh_dispatch,
-    validate_timeout,
+    create_audit_log, describe_privilege, format_reference, load_parameters, resolve_hook,
+    resolve_hook_including_deleted, validate_hook_name, validate_ssh_dispatch, validate_timeout,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -181,6 +179,24 @@ pub struct UpdateHookPayload {
     pub is_active: Option<bool>,
 }
 
+/// Flags serialized as top-level fields on the enclosing response.
+#[derive(Serialize)]
+pub struct HookLifecycleFlags {
+    /// `can_manage`, which is the right to edit its content.
+    pub is_owner: bool,
+    /// Whether the hook is in the trash. Only ever `true` in a master's `include_deleted` view.
+    pub is_deleted: bool,
+}
+
+/// Flags serialized as top-level fields on the enclosing response.
+#[derive(Serialize)]
+pub struct HookPermissionFlags {
+    /// Whether the requesting key may execute this hook.
+    pub can_execute: bool,
+    /// Whether the requesting key may manage this hook.
+    pub can_manage: bool,
+}
+
 /// A hook plus its parameter contract and the caller's effective rights over it.
 #[derive(Serialize)]
 pub struct HookDetail {
@@ -200,20 +216,18 @@ pub struct HookDetail {
     /// predates ownership (lifecycle authority then rests with master alone).
     pub owner_key_id: Option<Uuid>,
     /// Whether *this caller* may delete or rename the hook — master, or its owner. Distinct from
-    /// `can_manage`, which is the right to edit its content.
-    pub is_owner: bool,
-    /// Whether the hook is in the trash. Only ever `true` in a master's `include_deleted` view.
-    pub is_deleted: bool,
+    /// Ownership and deletion state.
+    #[serde(flatten)]
+    pub lifecycle: HookLifecycleFlags,
     /// When it was trashed, if it was.
     pub deleted_at: Option<chrono::NaiveDateTime>,
     /// The `api_keys.id` of whoever trashed it, if it was.
     pub deleted_by: Option<String>,
     /// Declared parameters, in the order used for positional CLI arguments.
     pub parameters: Vec<hook_parameter::Model>,
-    /// Whether the requesting key may execute this hook.
-    pub can_execute: bool,
-    /// Whether the requesting key may manage this hook.
-    pub can_manage: bool,
+    /// Execution and management permissions.
+    #[serde(flatten)]
+    pub permissions: HookPermissionFlags,
     /// Creation timestamp.
     pub created_at: chrono::NaiveDateTime,
     /// Last-update timestamp.
@@ -248,7 +262,7 @@ pub struct HookDetail {
     ///
     /// A path, not a full URL: this server has no reliable way to know its own externally-visible
     /// scheme and host (a reverse proxy routinely rewrites both — see `AGENT.MD`'s "two distinct
-    /// API base paths" note on the WebUI's own signing-path override), so guessing one here would
+    /// API base paths" note on the `WebUI`'s own signing-path override), so guessing one here would
     /// be wrong exactly the deployments most likely to need this field printed somewhere. The
     /// caller combines this with whatever base it already knows is correct for itself.
     pub webhook_path: String,
@@ -272,7 +286,10 @@ fn percent_encode_path_segment(name: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out
@@ -297,13 +314,17 @@ pub(crate) fn build_hook_detail_from_parts(
         default_timeout_seconds: model.default_timeout_seconds,
         run_as_user: model.run_as_user,
         owner_key_id: model.owner_key_id,
-        is_owner,
-        is_deleted: model.is_deleted,
+        lifecycle: HookLifecycleFlags {
+            is_owner,
+            is_deleted: model.is_deleted,
+        },
         deleted_at: model.deleted_at,
         deleted_by: model.deleted_by,
         parameters,
-        can_execute,
-        can_manage,
+        permissions: HookPermissionFlags {
+            can_execute,
+            can_manage,
+        },
         created_at: model.created_at,
         updated_at: model.updated_at,
         auth_mode: model.auth_mode,
@@ -335,11 +356,16 @@ pub(crate) async fn build_hook_detail(
     } else {
         hook_permission(db, key.id, model.id)
             .await?
-            .map(|p| (p.can_execute, p.can_manage))
-            .unwrap_or((false, false))
+            .map_or((false, false), |p| (p.can_execute, p.can_manage))
     };
 
-    Ok(build_hook_detail_from_parts(key, model, parameters, can_execute, can_manage))
+    Ok(build_hook_detail_from_parts(
+        key,
+        model,
+        parameters,
+        can_execute,
+        can_manage,
+    ))
 }
 
 /// Validates and seals a hook's `HMAC_ONLY` secret for storage, and rejects an `HMAC_ONLY` mode
@@ -364,13 +390,10 @@ fn validate_and_seal_hmac_secret(
             }
             Ok(None)
         }
-        Some(raw) => cipher
-            .seal(raw)
-            .map(Some)
-            .map_err(|e| {
-                tracing::error!("Failed to seal a hook's hmac_secret: {e}");
-                AppError::Internal
-            }),
+        Some(raw) => cipher.seal(raw).map(Some).map_err(|e| {
+            tracing::error!("Failed to seal a hook's hmac_secret: {e}");
+            AppError::Internal
+        }),
         None => {
             if effective_mode == AuthMode::HmacOnly && existing_sealed.is_none() {
                 return Err(AppError::InvalidInput(
@@ -503,7 +526,7 @@ pub(crate) async fn grant_full_hook_permission(
 }
 
 /// Handles `POST /api/hooks` — declares a new hook (and, optionally, its parameters).
-pub async fn create_hook(
+pub(crate) async fn create_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -549,14 +572,7 @@ pub async fn create_hook(
     // Validated before the hook row is written, so a bad parameter can't leave a half-created
     // hook behind.
     let declared = payload.parameters.unwrap_or_default();
-    for param in &declared {
-        if !executor::is_valid_param_key(&param.param_key) {
-            return Err(AppError::InvalidInput(format!(
-                "Invalid param_key '{}': must match [A-Za-z_][A-Za-z0-9_]*",
-                param.param_key
-            )));
-        }
-    }
+    validate_parameter_keys(&declared)?;
 
     let auth_mode = payload.auth_mode.unwrap_or_default();
     let sealed_hmac_secret = validate_and_seal_hmac_secret(
@@ -619,7 +635,52 @@ pub async fn create_hook(
         }),
     };
 
-    if let Err(err) = Hook::insert(model).exec(&state.db).await {
+    insert_hook_with_parameters(&state.db, id, model, &name, declared).await?;
+    grant_full_hook_permission(&state.db, key.id, id).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "HOOK_CREATE",
+        Some(name.clone()),
+        Some(format!(
+            "Created hook {} -> {} ({})",
+            format_reference(&name, id),
+            payload.script_path,
+            describe_privilege(run_as_user.as_deref())
+        )),
+    )
+    .await?;
+
+    let created = Hook::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::Internal)?;
+    Ok(Json(build_hook_detail(&state.db, &key, created).await?))
+}
+
+fn validate_parameter_keys(declared: &[ParameterInput]) -> Result<(), AppError> {
+    for param in declared {
+        if !executor::is_valid_param_key(&param.param_key) {
+            return Err(AppError::InvalidInput(format!(
+                "Invalid param_key '{}': must match [A-Za-z_][A-Za-z0-9_]*",
+                param.param_key
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn insert_hook_with_parameters(
+    db: &DatabaseConnection,
+    id: Uuid,
+    model: hook::ActiveModel,
+    name: &str,
+    declared: Vec<ParameterInput>,
+) -> Result<(), AppError> {
+    if let Err(err) = Hook::insert(model).exec(db).await {
         if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
             // `hooks.name` stays unique across live *and* trashed rows: a partial unique index is
             // the one way to scope it, and the syntax differs per backend, which `AGENT.MD` forbids.
@@ -627,9 +688,9 @@ pub async fn create_hook(
             // because "already exists" for a hook the caller just deleted and cannot see is a
             // genuinely baffling error to receive.
             let trashed = Hook::find()
-                .filter(hook::Column::Name.eq(name.clone()))
+                .filter(hook::Column::Name.eq(name.to_owned()))
                 .filter(hook::Column::IsDeleted.eq(true))
-                .one(&state.db)
+                .one(db)
                 .await?;
             return Err(AppError::Conflict(match trashed {
                 Some(_) => format!(
@@ -652,7 +713,7 @@ pub async fn create_hook(
             is_required: Set(param.is_required.unwrap_or(true)),
             created_at: Set(Utc::now().naive_utc()),
         };
-        if let Err(err) = HookParameter::insert(param_model).exec(&state.db).await {
+        if let Err(err) = HookParameter::insert(param_model).exec(db).await {
             if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
                 return Err(AppError::Conflict(format!(
                     "Duplicate parameter '{}' for this hook",
@@ -663,25 +724,7 @@ pub async fn create_hook(
         }
     }
 
-    grant_full_hook_permission(&state.db, key.id, id).await?;
-
-    create_audit_log(
-        &state.db,
-        &key,
-        client_ip.0,
-        "HOOK_CREATE",
-        Some(name.clone()),
-        Some(format!(
-            "Created hook {} -> {} ({})",
-            format_reference(&name, id),
-            payload.script_path,
-            describe_privilege(run_as_user.as_deref())
-        )),
-    )
-    .await?;
-
-    let created = Hook::find_by_id(id).one(&state.db).await?.ok_or(AppError::Internal)?;
-    Ok(Json(build_hook_detail(&state.db, &key, created).await?))
+    Ok(())
 }
 
 /// Query parameters for the hook listing.
@@ -696,7 +739,7 @@ pub struct ListHooksQuery {
 ///
 /// Soft-deleted hooks are omitted unless a master asks for them with `?include_deleted=true`, so the
 /// default view is exactly what an operator expects "the hooks" to mean.
-pub async fn list_hooks(
+pub(crate) async fn list_hooks(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictQuery(params): StrictQuery<ListHooksQuery>,
@@ -757,7 +800,10 @@ pub async fn list_hooks(
         let (can_execute, can_manage) = if key.is_master {
             (true, true)
         } else {
-            permissions_by_hook.get(&hook_id).copied().unwrap_or((false, false))
+            permissions_by_hook
+                .get(&hook_id)
+                .copied()
+                .unwrap_or((false, false))
         };
         details.push(build_hook_detail_from_parts(
             &key,
@@ -774,7 +820,7 @@ pub async fn list_hooks(
 ///
 /// A soft-deleted hook is a `404` unless a master asks for it with `?include_deleted=true`, which is
 /// how the trash view drills into a row before restoring it.
-pub async fn get_hook(
+pub(crate) async fn get_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictPath(identifier): StrictPath<String>,
@@ -793,7 +839,7 @@ pub async fn get_hook(
 }
 
 /// Handles `PUT /api/hooks/{identifier}` — updates a hook's definition in place.
-pub async fn update_hook(
+pub(crate) async fn update_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -801,7 +847,57 @@ pub async fn update_hook(
     StrictJson(payload): StrictJson<UpdateHookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let model = resolve_hook(&state.db, &identifier).await?;
-    guard_manage(&state.db, &key, &model).await?;
+    let authorization = authorize_hook_update(&state, &key, &model, &payload).await?;
+    let fields = validate_hook_update(
+        &state,
+        &key,
+        &model,
+        &payload,
+        authorization.touches_dispatch,
+    )
+    .await?;
+    let hook_id = model.id;
+    let (active, changes) = apply_hook_update(model, payload, authorization, fields)?;
+    let updated = match active.update(&state.db).await {
+        Ok(updated) => updated,
+        Err(err) if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
+            return Err(AppError::Conflict(
+                "Another hook already uses that name".to_owned(),
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "HOOK_UPDATE",
+        Some(updated.name.clone()),
+        Some(format!(
+            "Updated hook {} [{}]",
+            format_reference(&updated.name, hook_id),
+            changes.join(", ")
+        )),
+    )
+    .await?;
+
+    Ok(Json(build_hook_detail(&state.db, &key, updated).await?))
+}
+
+struct HookUpdateAuthorization {
+    touches_dispatch: bool,
+    requested_run_as_user: Option<String>,
+    requested_owner: Option<Uuid>,
+}
+
+async fn authorize_hook_update(
+    state: &AppState,
+    key: &api_key::Model,
+    model: &hook::Model,
+    payload: &UpdateHookPayload,
+) -> Result<HookUpdateAuthorization, AppError> {
+    guard_manage(&state.db, key, model).await?;
     // RBAC_MODEL.md's Dispatch configuration clause governs `script_path` and `run_as_user` by R2
     // *in full*, with no ownership exception — a narrower rule than `guard_manage`'s own, which
     // lets the owner through on ownership alone. Checked as its own step, before validation, so an
@@ -818,26 +914,23 @@ pub async fn update_hook(
         || payload.execution_type.is_some()
         || payload.ssh_target_id.is_some();
     if touches_dispatch_configuration {
-        guard_dispatch_configuration(&state.db, &key, &model).await?;
+        guard_dispatch_configuration(&state.db, key, model).await?;
     }
     // A hook that already runs elevated is master-only to touch *at all*, not merely master-only to
     // elevate. `script_path`, the timeout, and the name all decide what executes with the borrowed
     // privileges, so guarding one field while leaving the rest writable protected nothing.
-    guard_master_for_privileged_hook(&key, &model, "modify")?;
+    guard_master_for_privileged_hook(key, model, "modify")?;
 
     // Checked immediately after authorization and before any field validation, for the same reason
     // as in `create_hook`: an escalation attempt must surface as `403`, never be masked by a `400`
     // about some other field in the same payload.
-    let requested_run_as_user = match payload.run_as_user.as_deref() {
-        Some(raw) => Some(normalize_run_as_user(&key, Some(raw))?),
-        None => None,
-    };
+    let requested_run_as_user = normalize_run_as_user(key, payload.run_as_user.as_deref())?;
 
     // §3: renaming is a lifecycle action, not an edit. This service resolves hooks by name on
     // `/webhook/{identifier}` and in grant payloads, so a rename silently breaks every caller
     // pointed at the old one — which is a change to the resource's identity, not its content.
     if payload.name.is_some() {
-        guard_lifecycle_authority(&key, &model, "rename")?;
+        guard_lifecycle_authority(key, model, "rename")?;
     }
 
     // §3: only master reassigns ownership.
@@ -865,6 +958,28 @@ pub async fn update_hook(
         None => None,
     };
 
+    Ok(HookUpdateAuthorization {
+        touches_dispatch: touches_dispatch_configuration,
+        requested_run_as_user,
+        requested_owner,
+    })
+}
+
+struct ValidatedHookUpdate {
+    effective_execution_type: HookExecutionType,
+    effective_ssh_target_id: Option<Uuid>,
+    sealed_hmac_secret: Option<String>,
+    effective_sample_payload_json: Option<String>,
+    effective_args_template: Option<String>,
+}
+
+async fn validate_hook_update(
+    state: &AppState,
+    key: &api_key::Model,
+    model: &hook::Model,
+    payload: &UpdateHookPayload,
+    touches_dispatch: bool,
+) -> Result<ValidatedHookUpdate, AppError> {
     if let Some(timeout) = payload.default_timeout_seconds {
         validate_timeout(timeout)?;
     }
@@ -879,7 +994,7 @@ pub async fn update_hook(
         HookExecutionType::Ssh => payload.ssh_target_id.or(model.ssh_target_id),
     };
     let effective_script_path = payload.script_path.as_deref().unwrap_or(&model.script_path);
-    if touches_dispatch_configuration {
+    if touches_dispatch {
         validate_ssh_dispatch(
             &state.db,
             effective_execution_type,
@@ -888,10 +1003,11 @@ pub async fn update_hook(
             &state.config.allowed_script_roots,
         )
         .await?;
-        if let (HookExecutionType::Ssh, Some(target_id)) = (effective_execution_type, effective_ssh_target_id)
+        if let (HookExecutionType::Ssh, Some(target_id)) =
+            (effective_execution_type, effective_ssh_target_id)
             && (payload.ssh_target_id.is_some() || payload.execution_type.is_some())
         {
-            guard_ssh_target_usage(&state.db, &key, target_id).await?;
+            guard_ssh_target_usage(&state.db, key, target_id).await?;
         }
     }
 
@@ -921,12 +1037,44 @@ pub async fn update_hook(
         Some(raw) => Some(raw.clone()),
         None => model.args_template.clone(),
     };
-    let declared_keys: Vec<String> =
-        load_parameters(&state.db, model.id).await?.into_iter().map(|p| p.param_key).collect();
-    validate_sample_payload_matches_parameters(effective_sample_payload_json.as_deref(), &declared_keys)?;
+    let declared_keys: Vec<String> = load_parameters(&state.db, model.id)
+        .await?
+        .into_iter()
+        .map(|p| p.param_key)
+        .collect();
+    validate_sample_payload_matches_parameters(
+        effective_sample_payload_json.as_deref(),
+        &declared_keys,
+    )?;
     validate_args_template_matches_parameters(effective_args_template.as_deref(), &declared_keys)?;
 
-    let hook_id = model.id;
+    Ok(ValidatedHookUpdate {
+        effective_execution_type,
+        effective_ssh_target_id,
+        sealed_hmac_secret,
+        effective_sample_payload_json,
+        effective_args_template,
+    })
+}
+
+fn apply_hook_update(
+    model: hook::Model,
+    payload: UpdateHookPayload,
+    authorization: HookUpdateAuthorization,
+    fields: ValidatedHookUpdate,
+) -> Result<(hook::ActiveModel, Vec<String>), AppError> {
+    let HookUpdateAuthorization {
+        requested_owner,
+        requested_run_as_user,
+        ..
+    } = authorization;
+    let ValidatedHookUpdate {
+        effective_execution_type,
+        effective_ssh_target_id,
+        sealed_hmac_secret,
+        effective_sample_payload_json,
+        effective_args_template,
+    } = fields;
     let was_active = model.is_active;
     let mut changes: Vec<String> = Vec::new();
     let mut active: hook::ActiveModel = model.into();
@@ -953,11 +1101,11 @@ pub async fn update_hook(
         changes.push(format!("default_timeout_seconds={timeout}"));
         active.default_timeout_seconds = Set(timeout);
     }
-    if let Some(normalized) = requested_run_as_user {
+    if payload.run_as_user.is_some() {
         // Present-but-blank is a deliberate "drop elevation", distinct from the field being
         // absent, which leaves the current setting alone.
-        changes.push(describe_privilege(normalized.as_deref()));
-        active.run_as_user = Set(normalized);
+        changes.push(describe_privilege(requested_run_as_user.as_deref()));
+        active.run_as_user = Set(requested_run_as_user);
     }
     if let Some(mode) = payload.auth_mode {
         changes.push(format!("auth_mode={mode:?}"));
@@ -972,15 +1120,27 @@ pub async fn update_hook(
     active.hmac_secret = Set(sealed_hmac_secret);
     if let Some(header) = payload.signature_header {
         changes.push(format!("signature_header={header}"));
-        active.signature_header = Set(if header.is_empty() { None } else { Some(header) });
+        active.signature_header = Set(if header.is_empty() {
+            None
+        } else {
+            Some(header)
+        });
     }
     if let Some(prefix) = payload.signature_prefix {
         changes.push(format!("signature_prefix={prefix}"));
-        active.signature_prefix = Set(if prefix.is_empty() { None } else { Some(prefix) });
+        active.signature_prefix = Set(if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        });
     }
     if let Some(template) = payload.canonical_template {
         changes.push("canonical_template".to_owned());
-        active.canonical_template = Set(if template.is_empty() { None } else { Some(template) });
+        active.canonical_template = Set(if template.is_empty() {
+            None
+        } else {
+            Some(template)
+        });
     }
     if payload.sample_payload_json.is_some() {
         changes.push("sample_payload_json".to_owned());
@@ -993,17 +1153,35 @@ pub async fn update_hook(
     if payload.execution_type.is_some() || payload.ssh_target_id.is_some() {
         changes.push(format!(
             "execution_type={effective_execution_type:?} ssh_target_id={}",
-            effective_ssh_target_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_owned())
+            effective_ssh_target_id.map_or_else(|| "-".to_owned(), |id| id.to_string())
         ));
         active.execution_type = Set(effective_execution_type);
         active.ssh_target_id = Set(effective_ssh_target_id);
     }
-    if payload.is_active == Some(true)
-        || (!was_active
-            && (payload.ssh_target_id.is_some()
-                || payload.execution_type == Some(HookExecutionType::Local))
-            && payload.is_active != Some(false))
-    {
+    apply_hook_activation(
+        &mut active,
+        &mut changes,
+        payload.is_active,
+        payload.ssh_target_id.is_some() || payload.execution_type == Some(HookExecutionType::Local),
+        was_active,
+        effective_execution_type,
+        effective_ssh_target_id,
+    )?;
+    active.updated_at = Set(Utc::now().naive_utc());
+
+    Ok((active, changes))
+}
+
+fn apply_hook_activation(
+    active: &mut hook::ActiveModel,
+    changes: &mut Vec<String>,
+    requested: Option<bool>,
+    restores_dispatch: bool,
+    was_active: bool,
+    effective_execution_type: HookExecutionType,
+    effective_ssh_target_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    if requested == Some(true) || (!was_active && restores_dispatch && requested != Some(false)) {
         if effective_execution_type == HookExecutionType::Ssh && effective_ssh_target_id.is_none() {
             return Err(AppError::InvalidInput(
                 "Cannot activate an SSH hook without an SSH target".to_owned(),
@@ -1012,38 +1190,12 @@ pub async fn update_hook(
         active.is_active = Set(true);
         active.disabled_reason = Set(None);
         changes.push("reactivated".to_owned());
-    } else if payload.is_active == Some(false) {
+    } else if requested == Some(false) {
         active.is_active = Set(false);
         active.disabled_reason = Set(Some("Deactivated by user".to_owned()));
         changes.push("deactivated".to_owned());
     }
-    active.updated_at = Set(Utc::now().naive_utc());
-
-    let updated = match active.update(&state.db).await {
-        Ok(updated) => updated,
-        Err(err) if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
-            return Err(AppError::Conflict(
-                "Another hook already uses that name".to_owned(),
-            ));
-        }
-        Err(err) => return Err(err.into()),
-    };
-
-    create_audit_log(
-        &state.db,
-        &key,
-        client_ip.0,
-        "HOOK_UPDATE",
-        Some(updated.name.clone()),
-        Some(format!(
-            "Updated hook {} [{}]",
-            format_reference(&updated.name, hook_id),
-            changes.join(", ")
-        )),
-    )
-    .await?;
-
-    Ok(Json(build_hook_detail(&state.db, &key, updated).await?))
+    Ok(())
 }
 
 /// Query parameters for `DELETE /api/hooks/{identifier}`.
@@ -1062,7 +1214,7 @@ pub struct DeleteHookQuery {
 /// the one that has to be asked for explicitly rather than the one you get by mistyping a UUID.
 /// `?hard=true` is master-only for the same reason: irreversibly destroying an audit trail is not
 /// something a scoped `can_manage` grant should be able to do.
-pub async fn delete_hook(
+pub(crate) async fn delete_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1129,14 +1281,23 @@ pub async fn delete_hook(
     // moment later.
     let now = Utc::now().naive_utc();
     let soft_deleted = Hook::update_many()
-        .col_expr(hook::Column::IsDeleted, sea_orm::sea_query::Expr::value(true))
-        .col_expr(hook::Column::DeletedAt, sea_orm::sea_query::Expr::value(Some(now)))
+        .col_expr(
+            hook::Column::IsDeleted,
+            sea_orm::sea_query::Expr::value(true),
+        )
+        .col_expr(
+            hook::Column::DeletedAt,
+            sea_orm::sea_query::Expr::value(Some(now)),
+        )
         // Stored as text so the attribution outlives the acting key.
         .col_expr(
             hook::Column::DeletedBy,
             sea_orm::sea_query::Expr::value(Some(key.id.to_string())),
         )
-        .col_expr(hook::Column::UpdatedAt, sea_orm::sea_query::Expr::value(now))
+        .col_expr(
+            hook::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
         .filter(hook::Column::Id.eq(model.id))
         .filter(hook::Column::IsDeleted.eq(false))
         .exec(&state.db)
@@ -1167,7 +1328,7 @@ pub async fn delete_hook(
 /// Master-only. A trashed hook keeps its `script_path` and `run_as_user`, so restoring one puts a
 /// previously-removed definition — potentially a privileged one — back into service; that is a
 /// decision for the same authority that can create such a hook in the first place.
-pub async fn restore_hook(
+pub(crate) async fn restore_hook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1208,7 +1369,10 @@ pub async fn restore_hook(
     )
     .await?;
 
-    let restored = Hook::find_by_id(hook_id).one(&state.db).await?.ok_or(AppError::Internal)?;
+    let restored = Hook::find_by_id(hook_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::Internal)?;
     Ok(Json(build_hook_detail(&state.db, &key, restored).await?))
 }
 
@@ -1218,7 +1382,7 @@ pub async fn restore_hook(
 /// Master-only, and irreversible: it discards each purged hook's execution history along with the
 /// row. Runs the same sweep as the background worker, so an operator reclaiming space immediately
 /// gets exactly the behaviour that would have happened on its own schedule.
-pub async fn purge_deleted_hooks(
+pub(crate) async fn purge_deleted_hooks(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1253,7 +1417,9 @@ pub async fn purge_deleted_hooks(
     )
     .await?;
 
-    Ok(Json(serde_json::json!({ "purged": purged, "older_than_days": days })))
+    Ok(Json(
+        serde_json::json!({ "purged": purged, "older_than_days": days }),
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1274,7 +1440,7 @@ pub struct UpdateParameterPayload {
 }
 
 /// Handles `GET /api/hooks/{identifier}/parameters`.
-pub async fn list_hook_parameters(
+pub(crate) async fn list_hook_parameters(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictPath(identifier): StrictPath<String>,
@@ -1285,7 +1451,7 @@ pub async fn list_hook_parameters(
 }
 
 /// Handles `POST /api/hooks/{identifier}/parameters` — declares one parameter.
-pub async fn create_hook_parameter(
+pub(crate) async fn create_hook_parameter(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1348,7 +1514,7 @@ pub async fn create_hook_parameter(
 }
 
 /// Handles `PUT /api/hooks/{identifier}/parameters/{param_id}`.
-pub async fn update_hook_parameter(
+pub(crate) async fn update_hook_parameter(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1374,9 +1540,15 @@ pub async fn update_hook_parameter(
     // the *current* full parameter set against the hook's stored `args_template`/
     // `sample_payload_json` rather than only ever being validated from `create_hook`/`update_hook`,
     // so this stays correct with no further change if a future revision ever makes the key editable.
-    let declared_keys: Vec<String> =
-        load_parameters(&state.db, model.id).await?.into_iter().map(|p| p.param_key).collect();
-    validate_sample_payload_matches_parameters(model.sample_payload_json.as_deref(), &declared_keys)?;
+    let declared_keys: Vec<String> = load_parameters(&state.db, model.id)
+        .await?
+        .into_iter()
+        .map(|p| p.param_key)
+        .collect();
+    validate_sample_payload_matches_parameters(
+        model.sample_payload_json.as_deref(),
+        &declared_keys,
+    )?;
     validate_args_template_matches_parameters(model.args_template.as_deref(), &declared_keys)?;
 
     let param_key = param.param_key.clone();
@@ -1409,7 +1581,7 @@ pub async fn update_hook_parameter(
 }
 
 /// Handles `DELETE /api/hooks/{identifier}/parameters/{param_id}`.
-pub async fn delete_hook_parameter(
+pub(crate) async fn delete_hook_parameter(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1443,7 +1615,9 @@ pub async fn delete_hook_parameter(
         .collect();
     validate_args_template_matches_parameters(model.args_template.as_deref(), &remaining_keys)?;
 
-    HookParameter::delete_by_id(param_id).exec(&state.db).await?;
+    HookParameter::delete_by_id(param_id)
+        .exec(&state.db)
+        .await?;
 
     create_audit_log(
         &state.db,
@@ -1468,8 +1642,14 @@ mod tests {
     #[test]
     fn percent_encode_path_segment_leaves_ordinary_identifiers_untouched() {
         assert_eq!(percent_encode_path_segment("ban_ip"), "ban_ip");
-        assert_eq!(percent_encode_path_segment("nftables-ban.v2"), "nftables-ban.v2");
-        assert_eq!(percent_encode_path_segment("Deploy_Prod_2026"), "Deploy_Prod_2026");
+        assert_eq!(
+            percent_encode_path_segment("nftables-ban.v2"),
+            "nftables-ban.v2"
+        );
+        assert_eq!(
+            percent_encode_path_segment("Deploy_Prod_2026"),
+            "Deploy_Prod_2026"
+        );
     }
 
     #[test]

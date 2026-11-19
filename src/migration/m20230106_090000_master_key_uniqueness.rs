@@ -37,23 +37,26 @@
 //! operator's judgement, not a schema change's — and refusing to start is the honest outcome.
 //! Recovery is to demote or delete the extra row directly and restart.
 
-use sea_orm::{ConnectionTrait, DatabaseBackend};
+use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-/// Name of the derived marker column. Deliberately absent from `api_key::Model`: SeaORM builds
-/// explicit column lists from the entity, so an undeclared column is invisible to every query and
-/// can never appear in an `INSERT` — which is required, since the engine rejects writes to a
-/// generated column.
-const MARKER_COLUMN: &str = "master_marker";
+/// Table and generated-column identifiers for `api_keys.master_marker`.
+#[derive(DeriveIden)]
+enum ApiKeys {
+    Table,
+    MasterMarker,
+}
+
 /// Name of the unique index that does the actual enforcing.
 const MARKER_INDEX: &str = "idx_api_keys_master_marker";
 
 impl Migration {
-    /// The `ALTER TABLE` that adds the derived marker, in this backend's dialect.
-    fn add_marker_column(backend: DatabaseBackend) -> String {
+    /// The `SeaQuery` `ALTER TABLE` statement that adds the derived marker, in this backend's
+    /// dialect.
+    fn add_marker_column_stmt(backend: DatabaseBackend) -> TableAlterStatement {
         // `CASE WHEN is_master THEN 1 ELSE NULL END` reads identically on all three engines:
         // PostgreSQL evaluates a native boolean, MySQL and SQLite a truthy integer.
         let expression = "CASE WHEN is_master THEN 1 ELSE NULL END";
@@ -65,35 +68,58 @@ impl Migration {
             // accepts both, and VIRTUAL avoids rewriting the table.
             _ => "VIRTUAL",
         };
-        format!(
-            "ALTER TABLE api_keys ADD COLUMN {MARKER_COLUMN} INTEGER \
-             GENERATED ALWAYS AS ({expression}) {storage}"
-        )
+        Table::alter()
+            .table(ApiKeys::Table)
+            .add_column(
+                ColumnDef::new(ApiKeys::MasterMarker)
+                    .integer()
+                    .extra(format!("GENERATED ALWAYS AS ({expression}) {storage}")),
+            )
+            .to_owned()
     }
 }
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        let backend = db.get_database_backend();
+        let backend = manager.get_database_backend();
 
-        db.execute_unprepared(&Migration::add_marker_column(backend)).await?;
-        db.execute_unprepared(&format!(
-            "CREATE UNIQUE INDEX {MARKER_INDEX} ON api_keys ({MARKER_COLUMN})"
-        ))
-        .await?;
+        manager
+            .alter_table(Self::add_marker_column_stmt(backend))
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name(MARKER_INDEX)
+                    .table(ApiKeys::Table)
+                    .col(ApiKeys::MasterMarker)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-
         // Index first: SQLite refuses `DROP COLUMN` on a column that participates in an index, and
         // dropping the index before the column it covers is correct everywhere else too.
-        db.execute_unprepared(&format!("DROP INDEX {MARKER_INDEX}")).await?;
-        db.execute_unprepared(&format!("ALTER TABLE api_keys DROP COLUMN {MARKER_COLUMN}")).await?;
+        manager
+            .drop_index(
+                Index::drop()
+                    .name(MARKER_INDEX)
+                    .table(ApiKeys::Table)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeys::Table)
+                    .drop_column(ApiKeys::MasterMarker)
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }
@@ -102,6 +128,19 @@ impl MigrationTrait for Migration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, SqliteQueryBuilder};
+
+    const MARKER_COLUMN: &str = "master_marker";
+
+    fn render_add_marker(backend: DatabaseBackend) -> String {
+        let stmt = Migration::add_marker_column_stmt(backend);
+        match backend {
+            DatabaseBackend::Postgres => stmt.to_string(PostgresQueryBuilder),
+            DatabaseBackend::Sqlite => stmt.to_string(SqliteQueryBuilder),
+            DatabaseBackend::MySql => stmt.to_string(MysqlQueryBuilder),
+            _ => unreachable!("unsupported SeaORM database backend"),
+        }
+    }
 
     /// PostgreSQL is the one backend that cannot take `VIRTUAL`, and SQLite is the one that cannot
     /// take `STORED` on an added column. Getting the pair backwards would fail only against a real
@@ -109,15 +148,15 @@ mod tests {
     #[test]
     fn each_backend_gets_the_only_storage_class_it_accepts() {
         assert!(
-            Migration::add_marker_column(DatabaseBackend::Postgres).ends_with("STORED"),
+            render_add_marker(DatabaseBackend::Postgres).ends_with("STORED"),
             "PostgreSQL supports only STORED generated columns before version 18"
         );
         assert!(
-            Migration::add_marker_column(DatabaseBackend::Sqlite).ends_with("VIRTUAL"),
+            render_add_marker(DatabaseBackend::Sqlite).ends_with("VIRTUAL"),
             "SQLite supports only VIRTUAL for a generated column added via ALTER TABLE"
         );
         assert!(
-            Migration::add_marker_column(DatabaseBackend::MySql).ends_with("VIRTUAL"),
+            render_add_marker(DatabaseBackend::MySql).ends_with("VIRTUAL"),
             "MySQL accepts both; VIRTUAL avoids rewriting the table"
         );
     }
@@ -127,11 +166,16 @@ mod tests {
     /// writing `is_master = true` while leaving the marker NULL.
     #[test]
     fn the_marker_is_derived_from_is_master_on_every_backend() {
-        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite, DatabaseBackend::MySql]
-        {
-            let ddl = Migration::add_marker_column(backend);
+        for backend in [
+            DatabaseBackend::Postgres,
+            DatabaseBackend::Sqlite,
+            DatabaseBackend::MySql,
+        ] {
+            let ddl = render_add_marker(backend);
             assert!(
-                ddl.contains("GENERATED ALWAYS AS") && ddl.contains("is_master"),
+                ddl.contains(MARKER_COLUMN)
+                    && ddl.contains("GENERATED ALWAYS AS")
+                    && ddl.contains("is_master"),
                 "{backend:?} marker must be generated from is_master, got: {ddl}"
             );
         }

@@ -40,10 +40,7 @@ pub struct Migration;
 /// SQLite accepts exactly one alteration per statement — batching them panics in `sea-query`'s
 /// SQLite backend rather than failing at the database — and the daemon defaults to SQLite. One
 /// statement per column is also the only form portable across all three supported backends.
-async fn add_column(
-    manager: &SchemaManager<'_>,
-    column: ColumnDef,
-) -> Result<(), DbErr> {
+async fn add_column(manager: &SchemaManager<'_>, column: ColumnDef) -> Result<(), DbErr> {
     manager
         .alter_table(
             Table::alter()
@@ -71,11 +68,26 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         add_column(
             manager,
-            ColumnDef::new(Hooks::IsDeleted).boolean().not_null().default(false).to_owned(),
+            ColumnDef::new(Hooks::IsDeleted)
+                .boolean()
+                .not_null()
+                .default(false)
+                .to_owned(),
         )
         .await?;
-        add_column(manager, ColumnDef::new(Hooks::DeletedAt).date_time().null().to_owned()).await?;
-        add_column(manager, ColumnDef::new(Hooks::DeletedBy).text().null().to_owned()).await
+        add_column(
+            manager,
+            ColumnDef::new(Hooks::DeletedAt)
+                .date_time()
+                .null()
+                .to_owned(),
+        )
+        .await?;
+        add_column(
+            manager,
+            ColumnDef::new(Hooks::DeletedBy).text().null().to_owned(),
+        )
+        .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {

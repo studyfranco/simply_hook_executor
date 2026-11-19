@@ -1,9 +1,5 @@
 //! Shared fixtures for the integration test suite: in-memory databases, key/hook seeding, request
 //! construction, and disposable executable scripts.
-//!
-//! Deliberately has no `#![allow(dead_code)]`: the suite lives in a single integration test
-//! binary, so every helper here has a real caller and an unused one is a genuine finding rather
-//! than an artifact of per-file compilation.
 
 use std::sync::Arc;
 
@@ -16,7 +12,9 @@ use sea_orm_migration::MigratorTrait;
 use simply_hook_executor::{
     config::{RuntimeConfig, TrustedProxies},
     crypto::SecretCipher,
-    entities::{api_key, api_key::HmacMode, api_key_hook_permission, execution, hook, hook_parameter},
+    entities::{
+        api_key, api_key::HmacMode, api_key_hook_permission, execution, hook, hook_parameter,
+    },
     migration,
     state::AppState,
 };
@@ -24,6 +22,9 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 /// Creates a migrated, isolated in-memory database.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn setup_test_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:")
         .await
@@ -39,6 +40,7 @@ pub async fn setup_test_db() -> DatabaseConnection {
 /// `PATH` is the only passthrough variable, which pins two things at once: hook scripts can still
 /// find `/bin/sh` helpers, and any *other* variable observed inside a child process is a genuine
 /// isolation leak rather than test-harness noise.
+#[must_use]
 pub fn test_config() -> Arc<RuntimeConfig> {
     Arc::new(RuntimeConfig {
         allowed_env_vars: vec!["PATH".to_owned()],
@@ -65,11 +67,13 @@ pub fn test_config() -> Arc<RuntimeConfig> {
 /// The cipher used by most tests: unencrypted storage, so a seeded signing secret can be written
 /// directly. Encryption itself is covered by `crypto`'s own unit tests and by
 /// [`test_state_with_cipher`].
+#[must_use]
 pub fn test_cipher() -> Arc<SecretCipher> {
     Arc::new(SecretCipher::Plaintext)
 }
 
 /// Builds application state around a database handle.
+#[must_use]
 pub fn test_state(db: &DatabaseConnection) -> AppState {
     AppState::new(db.clone(), test_config(), test_cipher())
 }
@@ -79,6 +83,7 @@ pub fn test_state(db: &DatabaseConnection) -> AppState {
 /// This is the posture the auth-before-authz ordering matters most under: with signing mandatory, a
 /// caller holding only a stolen bearer key genuinely cannot authenticate, so what it can still
 /// *learn* from the response code is the whole question.
+#[must_use]
 pub fn test_state_requiring_signatures(db: &DatabaseConnection) -> AppState {
     AppState::new(
         db.clone(),
@@ -91,6 +96,7 @@ pub fn test_state_requiring_signatures(db: &DatabaseConnection) -> AppState {
 }
 
 /// Builds application state whose hook scripts are confined to `roots`.
+#[must_use]
 pub fn test_state_with_roots(db: &DatabaseConnection, roots: Vec<std::path::PathBuf>) -> AppState {
     AppState::new(
         db.clone(),
@@ -107,6 +113,10 @@ pub fn test_state_with_roots(db: &DatabaseConnection, roots: Vec<std::path::Path
 /// `with_connect_info` simulates a `127.0.0.1` peer, so passing `"127.0.0.1"` here is what puts a
 /// test on the "behind a trusted reverse proxy" path. Entries are the raw `TRUSTED_PROXIES`
 /// spelling — addresses, CIDRs, or hostnames — so a test can exercise name resolution too.
+///
+/// # Panics
+/// Panics if the supplied proxy specification is invalid.
+#[must_use]
 pub fn test_state_with_trusted_proxies(db: &DatabaseConnection, proxies: &[&str]) -> AppState {
     AppState::new(
         db.clone(),
@@ -120,6 +130,7 @@ pub fn test_state_with_trusted_proxies(db: &DatabaseConnection, proxies: &[&str]
 }
 
 /// Builds application state with a specific secret cipher.
+#[must_use]
 pub fn test_state_with_cipher(db: &DatabaseConnection, cipher: Arc<SecretCipher>) -> AppState {
     AppState::new(db.clone(), test_config(), cipher)
 }
@@ -128,25 +139,43 @@ pub fn test_state_with_cipher(db: &DatabaseConnection, cipher: Arc<SecretCipher>
 ///
 /// Running the suite as root defeats every filesystem permission check (root bypasses `x` bits),
 /// so tests that depend on a denial must skip rather than fail in that environment.
+#[must_use]
 pub fn permissions_are_enforced_for_this_user(denied_path: &str) -> bool {
     std::fs::metadata(denied_path).is_err()
 }
 
 /// The global scopes a seeded key should hold.
+/// The test key's position in the global hierarchy.
+#[derive(Clone, Copy, Default)]
+pub enum KeyRole {
+    /// An ordinary scoped key.
+    #[default]
+    Scoped,
+    /// The master key.
+    Master,
+}
+
+/// Global rights and execution budget of a fixture API key.
 #[derive(Clone, Copy, Default)]
 pub struct KeyScopes {
-    pub is_master: bool,
+    /// Whether the fixture is master or scoped.
+    pub role: KeyRole,
+    /// Whether the key can manage keys.
     pub can_manage_keys: bool,
+    /// Whether the key can create hooks.
     pub can_manage_hooks: bool,
+    /// Whether the key can manage SSH resources.
     pub can_manage_ssh: bool,
+    /// Number of concurrent jobs the key may run.
     pub max_concurrent_jobs: i32,
 }
 
 impl KeyScopes {
     /// A master key.
+    #[must_use]
     pub fn master() -> Self {
         Self {
-            is_master: true,
+            role: KeyRole::Master,
             can_manage_keys: true,
             can_manage_hooks: true,
             can_manage_ssh: true,
@@ -155,8 +184,12 @@ impl KeyScopes {
     }
 
     /// A scoped key with no global rights.
+    #[must_use]
     pub fn plain() -> Self {
-        Self { max_concurrent_jobs: 10, ..Self::default() }
+        Self {
+            max_concurrent_jobs: 10,
+            ..Self::default()
+        }
     }
 
     /// A scoped key allowed to create hooks.
@@ -165,14 +198,23 @@ impl KeyScopes {
     /// resource-*creation* right, and creation rights "are never implied by `can_manage_keys` or by
     /// resource management rights" — nor do they imply either. A key seeded this way may define a
     /// hook and will never afterwards be able to edit it; see [`Self::parent`].
+    #[must_use]
     pub fn hook_manager() -> Self {
-        Self { can_manage_hooks: true, max_concurrent_jobs: 10, ..Self::default() }
+        Self {
+            can_manage_hooks: true,
+            max_concurrent_jobs: 10,
+            ..Self::default()
+        }
     }
 
     /// A scoped key allowed to manage SSH credentials and targets.
-    #[allow(dead_code)]
+    #[must_use]
     pub fn ssh_manager() -> Self {
-        Self { can_manage_ssh: true, max_concurrent_jobs: 10, ..Self::default() }
+        Self {
+            can_manage_ssh: true,
+            max_concurrent_jobs: 10,
+            ..Self::default()
+        }
     }
 
     /// A **Parent** key: `can_manage_keys`, and nothing else global.
@@ -181,8 +223,13 @@ impl KeyScopes {
     /// [`grant`] to seed the only non-master shape that may manage a specific hook — §1's Tiers
     /// matrix says a Daughter "may manage resources: **Never**", so a manage row without this flag
     /// buys operational rights over the hook and no authority over its definition.
+    #[must_use]
     pub fn parent() -> Self {
-        Self { can_manage_keys: true, max_concurrent_jobs: 10, ..Self::default() }
+        Self {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Self::default()
+        }
     }
 
     /// A Parent that may **also** create hooks — `can_manage_keys` and `can_manage_hooks` together.
@@ -191,6 +238,7 @@ impl KeyScopes {
     /// Creation takes `can_manage_hooks`; every later edit takes the R2 conjunction, whose global
     /// half is `can_manage_keys`. Neither right implies the other (§1), so a key that does the whole
     /// job holds both explicitly. Both are Master-granted only, under R4.
+    #[must_use]
     pub fn parent_hook_manager() -> Self {
         Self {
             can_manage_keys: true,
@@ -201,6 +249,7 @@ impl KeyScopes {
     }
 
     /// Overrides the concurrency budget.
+    #[must_use]
     pub fn with_jobs(mut self, jobs: i32) -> Self {
         self.max_concurrent_jobs = jobs;
         self
@@ -247,6 +296,9 @@ pub async fn insert_key_full(
 }
 
 /// Inserts an API key pinned to a specific signature verification mode.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn insert_key_with_mode(
     db: &DatabaseConnection,
     name: &str,
@@ -275,7 +327,7 @@ pub async fn insert_key_with_mode(
         canonical_template: Set(None),
         bound_ips: Set(Some(bound_ips.to_owned())),
         max_concurrent_jobs: Set(scopes.max_concurrent_jobs.max(1)),
-        is_master: Set(scopes.is_master),
+        is_master: Set(matches!(scopes.role, KeyRole::Master)),
         // Seeded keys are lineage-less by default: R3 says lineage confers no authority, so a NULL
         // parent must never change how a key behaves. Tests that care about the subtree set it
         // explicitly via [`set_parent`].
@@ -290,13 +342,21 @@ pub async fn insert_key_with_mode(
     .await
     .expect("seeding an API key succeeds");
 
-    SeededKey { id, plaintext, key_id, signing_secret }
+    SeededKey {
+        id,
+        plaintext,
+        key_id,
+        signing_secret,
+    }
 }
 
 /// Inserts an API key with a custom `canonical_template` override. Only meaningful for a
 /// non-`can_manage_keys` key — `guard_canonical_v1_for_key_management` refuses this combination
 /// through the API, and a test seeding it directly against a `can_manage_keys` key would be testing
 /// a state the API can never actually produce.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn insert_key_with_template(
     db: &DatabaseConnection,
     name: &str,
@@ -323,6 +383,9 @@ pub async fn insert_key_with_template(
 /// `RBAC_MODEL.md` §4 scopes *visibility* by subtree, and a key created through the API records its
 /// creator automatically — so a test whose actors would really be parent and daughter has to say
 /// so, or it is testing a shape no deployment produces.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn set_parent(db: &DatabaseConnection, child: Uuid, parent: Uuid) {
     let mut active: api_key::ActiveModel = api_key::Entity::find_by_id(child)
         .one(db)
@@ -335,19 +398,34 @@ pub async fn set_parent(db: &DatabaseConnection, child: Uuid, parent: Uuid) {
 }
 
 /// The current Unix timestamp, as a client would stamp a request.
+#[must_use]
 pub fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
 /// Computes an `X-Signature-256` value over the canonical
 /// `METHOD \n PATH_AND_QUERY \n TIMESTAMP \n RAW_BODY` string.
-pub fn sign_request(signing_secret: &str, method: &str, path: &str, timestamp: i64, body: &str) -> String {
-    sign_request_bytes(signing_secret, format!("{method}\n{path}\n{timestamp}\n{body}").as_bytes())
+#[must_use]
+pub fn sign_request(
+    signing_secret: &str,
+    method: &str,
+    path: &str,
+    timestamp: i64,
+    body: &str,
+) -> String {
+    sign_request_bytes(
+        signing_secret,
+        format!("{method}\n{path}\n{timestamp}\n{body}").as_bytes(),
+    )
 }
 
 /// As [`sign_request`], but over an already-assembled byte string — for tests computing a
 /// signature against a **custom** `canonical_template`, where the four components are not
 /// newline-joined.
+///
+/// # Panics
+/// Panics if the fixture signature cannot be computed.
+#[must_use]
 pub fn sign_request_bytes(signing_secret: &str, base: &[u8]) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
@@ -360,11 +438,22 @@ pub fn sign_request_bytes(signing_secret: &str, base: &[u8]) -> String {
 ///
 /// `X-API-Key` is the only identifying header: it is how every caller — dashboard, script, or
 /// third-party webhook sender — resolves to a key record.
-pub fn signed_request(method: &str, uri: &str, api_key: &str, signing_secret: &str, body: &str) -> Request<Body> {
+#[must_use]
+pub fn signed_request(
+    method: &str,
+    uri: &str,
+    api_key: &str,
+    signing_secret: &str,
+    body: &str,
+) -> Request<Body> {
     signed_request_at(method, uri, api_key, signing_secret, body, now_timestamp())
 }
 
 /// As [`signed_request`], but stamped at an explicit time so replay-window behavior is testable.
+///
+/// # Panics
+/// Panics if the request fixture contains an invalid method, URI, or header.
+#[must_use]
 pub fn signed_request_at(
     method: &str,
     uri: &str,
@@ -380,7 +469,10 @@ pub fn signed_request_at(
             .header("X-API-Key", api_key)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", timestamp.to_string())
-            .header("X-Signature-256", sign_request(signing_secret, method, uri, timestamp, body)),
+            .header(
+                "X-Signature-256",
+                sign_request(signing_secret, method, uri, timestamp, body),
+            ),
     )
     .body(Body::from(body.to_owned()))
     .expect("request builds")
@@ -390,9 +482,10 @@ pub fn signed_request_at(
 /// second per call. `HashMap<Uuid, Digest>`-based replay protection rejects a *second* use of an
 /// identical signature, and repeated calls with the same key against the same route inside one test
 /// can otherwise land in the same wall-clock second — a real collision, not a test artifact, since
-/// two genuinely different actions producing the same signature is exactly what CANONICAL_V1 is
+/// two genuinely different actions producing the same signature is exactly what `CANONICAL_V1` is
 /// supposed to make impossible. Ticking backwards rather than forwards keeps every timestamp inside
 /// the signature max-age window for the whole test, however many calls it makes.
+#[must_use]
 pub fn signing_clock() -> i64 {
     now_timestamp() + 1
 }
@@ -419,11 +512,22 @@ pub async fn signed_send(
 ) -> TestResponse {
     *clock -= 1;
     let body_str = body.map(|v| v.to_string()).unwrap_or_default();
-    let req = signed_request_at(method, uri, &key.plaintext, &key.signing_secret, &body_str, *clock);
+    let req = signed_request_at(
+        method,
+        uri,
+        &key.plaintext,
+        &key.signing_secret,
+        &body_str,
+        *clock,
+    );
     send(app, req).await
 }
 
-/// Computes a BODY_ONLY signature: HMAC over the raw body alone, with no canonical prefix.
+/// Computes a `BODY_ONLY` signature: HMAC over the raw body alone, with no canonical prefix.
+///
+/// # Panics
+/// Panics if the fixture signature cannot be computed.
+#[must_use]
 pub fn sign_body_only(signing_secret: &str, body: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes())
@@ -433,6 +537,10 @@ pub fn sign_body_only(signing_secret: &str, body: &str) -> String {
 }
 
 /// Builds a bearer-authenticated request that additionally carries a valid signature.
+///
+/// # Panics
+/// Panics if the request fixture contains an invalid method, URI, or header.
+#[must_use]
 pub fn signed_bearer_request(
     method: &str,
     uri: &str,
@@ -448,7 +556,10 @@ pub fn signed_bearer_request(
             .header("X-API-Key", api_key)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", timestamp.to_string())
-            .header("X-Signature-256", sign_request(signing_secret, method, uri, timestamp, body)),
+            .header(
+                "X-Signature-256",
+                sign_request(signing_secret, method, uri, timestamp, body),
+            ),
     )
     .body(Body::from(body.to_owned()))
     .expect("request builds")
@@ -491,6 +602,9 @@ pub async fn insert_hook_owned_by(
 }
 
 /// The full hook seeder the three wrappers above delegate to.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn insert_hook_full(
     db: &DatabaseConnection,
     name: &str,
@@ -539,6 +653,9 @@ pub async fn insert_hook_full(
 /// Backdating is the only way to exercise the 92-day purge without waiting a quarter:
 /// `hooks.deleted_at` is written by the handler at deletion time, so an age has to be seeded
 /// directly — the same approach [`insert_execution_aged`] takes for log retention.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn insert_hook_deleted_days_ago(
     db: &DatabaseConnection,
     name: &str,
@@ -586,11 +703,20 @@ pub async fn insert_hook_deleted_days_ago(
 ///
 /// The point of soft delete is that the row survives while the API pretends it does not, so proving
 /// that needs a path to the database the handlers do not mediate.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn fetch_hook_row(db: &DatabaseConnection, id: Uuid) -> Option<hook::Model> {
-    hook::Entity::find_by_id(id).one(db).await.expect("querying hooks succeeds")
+    hook::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .expect("querying hooks succeeds")
 }
 
 /// Declares a parameter on a hook.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn insert_parameter(
     db: &DatabaseConnection,
     hook_id: Uuid,
@@ -618,11 +744,10 @@ pub async fn insert_parameter(
 ///
 /// Backdating is the only way to exercise retention without waiting: `executions.timestamp` is
 /// written by the engine at execution time, so an age has to be seeded directly.
-pub async fn insert_execution_aged(
-    db: &DatabaseConnection,
-    hook_id: Uuid,
-    age_days: i64,
-) -> Uuid {
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
+pub async fn insert_execution_aged(db: &DatabaseConnection, hook_id: Uuid, age_days: i64) -> Uuid {
     let id = Uuid::new_v4();
     execution::ActiveModel {
         id: Set(id),
@@ -644,6 +769,9 @@ pub async fn insert_execution_aged(
 }
 
 /// Counts the execution rows currently stored.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn execution_count(db: &DatabaseConnection) -> u64 {
     use sea_orm::PaginatorTrait;
     execution::Entity::find()
@@ -686,6 +814,9 @@ pub async fn grant(
 }
 
 /// Grants a key an arbitrary combination of all three hook verbs.
+///
+/// # Panics
+/// Panics if the test database cannot complete the fixture operation.
 pub async fn grant_full(
     db: &DatabaseConnection,
     key_id: Uuid,
@@ -717,7 +848,16 @@ pub fn with_connect_info(builder: axum::http::request::Builder) -> axum::http::r
 }
 
 /// Builds a JSON request carrying an API key.
-pub fn json_request(method: &str, uri: &str, key: &str, body: Option<serde_json::Value>) -> Request<Body> {
+///
+/// # Panics
+/// Panics if the request fixture contains an invalid method, URI, or header.
+#[must_use]
+pub fn json_request(
+    method: &str,
+    uri: &str,
+    key: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
     let builder = with_connect_info(
         Request::builder()
             .method(method)
@@ -736,6 +876,10 @@ pub fn json_request(method: &str, uri: &str, key: &str, body: Option<serde_json:
 ///
 /// Distinct from [`json_request`], which takes a `serde_json::Value`: the payload-limit tests need
 /// to put megabytes of bytes on the wire without first materializing them as a JSON tree.
+///
+/// # Panics
+/// Panics if the request fixture contains an invalid method, URI, or header.
+#[must_use]
 pub fn raw_request(method: &str, uri: &str, key: &str, body: Vec<u8>) -> Request<Body> {
     with_connect_info(
         Request::builder()
@@ -750,7 +894,9 @@ pub fn raw_request(method: &str, uri: &str, key: &str, body: Vec<u8>) -> Request
 
 /// The status, headers, and decoded JSON body of a response.
 pub struct TestResponse {
+    /// HTTP response status.
     pub status: StatusCode,
+    /// Parsed response body.
     pub json: serde_json::Value,
     /// The `Content-Type` header, if any.
     ///
@@ -768,6 +914,10 @@ pub struct TestResponse {
 
 impl TestResponse {
     /// Reads a field from the response body, panicking with a useful message when absent.
+    ///
+    /// # Panics
+    /// Panics if the expected response field or header is absent or invalid.
+    #[must_use]
     pub fn field(&self, key: &str) -> &serde_json::Value {
         self.json
             .get(key)
@@ -775,12 +925,17 @@ impl TestResponse {
     }
 
     /// Reads a string field.
+    #[must_use]
     pub fn string(&self, key: &str) -> String {
         self.field(key).as_str().unwrap_or_default().to_owned()
     }
 
     /// Reads a response header as a `&str`, panicking with a useful message when absent or not
     /// valid UTF-8 (every header this codebase sets is a plain ASCII value).
+    ///
+    /// # Panics
+    /// Panics if the expected response field or header is absent or invalid.
+    #[must_use]
     pub fn header(&self, name: &str) -> &str {
         self.headers
             .get(name)
@@ -794,6 +949,9 @@ impl TestResponse {
 ///
 /// An empty body decodes as JSON `null` rather than erroring, so `204 No Content` responses can be
 /// asserted on with the same helper as everything else.
+///
+/// # Panics
+/// Panics if the router or response body cannot be read.
 pub async fn send(app: &axum::Router, request: Request<Body>) -> TestResponse {
     let response = app
         .clone()
@@ -815,7 +973,13 @@ pub async fn send(app: &axum::Router, request: Request<Body>) -> TestResponse {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     };
     let raw = String::from_utf8_lossy(&bytes).into_owned();
-    TestResponse { status, json, content_type, raw, headers }
+    TestResponse {
+        status,
+        json,
+        content_type,
+        raw,
+        headers,
+    }
 }
 
 /// A temporary directory holding executable test scripts, removed on drop.
@@ -823,15 +987,30 @@ pub struct ScriptDir {
     path: std::path::PathBuf,
 }
 
+impl Default for ScriptDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScriptDir {
     /// Creates a fresh, uniquely-named directory under the system temp dir.
+    ///
+    /// # Panics
+    /// Panics if the filesystem fixture cannot be created.
+    #[must_use]
     pub fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("simply_hook_executor_test_{}", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("simply_hook_executor_test_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("temp directory is creatable");
         Self { path }
     }
 
     /// Writes an executable `/bin/sh` script and returns its absolute path.
+    ///
+    /// # Panics
+    /// Panics if the filesystem fixture cannot be created.
+    #[must_use]
     pub fn write_script(&self, name: &str, body: &str) -> String {
         let path = self.path.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script is writable");
@@ -847,11 +1026,13 @@ impl ScriptDir {
     }
 
     /// An absolute path inside this directory that no file occupies yet.
+    #[must_use]
     pub fn path_for(&self, name: &str) -> String {
         self.path.join(name).to_string_lossy().into_owned()
     }
 
     /// This directory's own absolute path — used as an `ALLOWED_SCRIPT_ROOTS` entry.
+    #[must_use]
     pub fn root(&self) -> std::path::PathBuf {
         self.path.clone()
     }
@@ -860,6 +1041,10 @@ impl ScriptDir {
     ///
     /// Unlike [`ScriptDir::write_script`] this does not force `0o755`, which is the point: it is
     /// how the suite produces a script that exists and is readable but carries no execute bit.
+    ///
+    /// # Panics
+    /// Panics if the filesystem fixture cannot be created.
+    #[must_use]
     pub fn write_with_mode(&self, name: &str, body: &str, mode: u32) -> String {
         let path = self.path.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("file is writable");
@@ -875,6 +1060,10 @@ impl ScriptDir {
     }
 
     /// Creates a sub-directory, returning its absolute path.
+    ///
+    /// # Panics
+    /// Panics if the filesystem fixture cannot be created.
+    #[must_use]
     pub fn make_dir(&self, name: &str) -> String {
         let path = self.path.join(name);
         std::fs::create_dir_all(&path).expect("directory is creatable");
@@ -883,6 +1072,10 @@ impl ScriptDir {
 
     /// Symlinks `link_name` inside this directory to `target`, returning the link's path.
     #[cfg(unix)]
+    ///
+    /// # Panics
+    /// Panics if the filesystem fixture cannot be created.
+    #[must_use]
     pub fn symlink_to(&self, link_name: &str, target: &str) -> String {
         let link = self.path.join(link_name);
         std::os::unix::fs::symlink(target, &link).expect("symlink is creatable");

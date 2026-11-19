@@ -913,10 +913,6 @@ class HookExecutorClient {
             || (p.hook_permissions || []).some(h => h.can_manage);
 
         // Keep header clean and aligned with Simply IP Vault: tier badge, Refresh, Logout.
-        const badge = document.getElementById('identity-badge');
-        if (badge) {
-            badge.classList.add('hidden');
-        }
 
         const tier = p.is_master ? 'master' : (p.can_manage_keys ? 'parent' : 'daughter');
         const banner = document.getElementById('current-key-tier');
@@ -933,6 +929,18 @@ class HookExecutorClient {
         const btnOpenCreateKey = document.getElementById('btn-open-create-key');
         if (btnOpenCreateKey) {
             btnOpenCreateKey.style.display = (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
+        }
+        const btnOpenManageRights = document.getElementById('btn-open-manage-rights');
+        if (btnOpenManageRights) {
+            btnOpenManageRights.style.display = (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
+        }
+        const btnOpenCreateSshCred = document.getElementById('btn-open-create-ssh-credential');
+        if (btnOpenCreateSshCred) {
+            btnOpenCreateSshCred.style.display = (p.is_master || p.can_manage_ssh) ? 'inline-block' : 'none';
+        }
+        const btnOpenCreateSshTarget = document.getElementById('btn-open-create-ssh-target');
+        if (btnOpenCreateSshTarget) {
+            btnOpenCreateSshTarget.style.display = (p.is_master || p.can_manage_ssh) ? 'inline-block' : 'none';
         }
 
         // Hooks & Runner: anyone who can create hooks, or manage at least one existing hook.
@@ -1592,9 +1600,9 @@ class HookExecutorClient {
                     <td class="text-sm">${formatDuration(e.duration_ms)}</td>
                     <td class="font-mono text-sm">${e.caller_ip ? escapeHtml(e.caller_ip) : '<span class="text-muted">–</span>'}</td>
                     <td>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openExecutionModal('${e.id}')">View</button>
-                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteExecution('${e.id}')">Delete</button>
+                        <div class="row-actions-group">
+                            <button type="button" class="btn btn-sm btn-secondary" data-action="open-execution" data-execution-id="${escapeHtml(e.id)}">View</button>
+                            <button type="button" class="btn btn-sm btn-danger" data-action="delete-execution" data-execution-id="${escapeHtml(e.id)}">Delete</button>
                         </div>
                     </td>
                 </tr>
@@ -2054,10 +2062,10 @@ class HookExecutorClient {
                         <td class="text-sm">${h.parameters.length}</td>
                         <td class="text-muted text-sm">–</td>
                         <td>
-                            <div class="flex gap-2">
-                                <button class="btn btn-sm btn-secondary" onclick="window.app.restoreHook('${h.id}')" ${isMaster ? '' : 'disabled'}
+                            <div class="row-actions-group">
+                                <button type="button" class="btn btn-sm btn-secondary" data-action="restore-hook" data-hook-id="${escapeHtml(h.id)}" ${isMaster ? '' : 'disabled'}
                                     title="${isMaster ? 'Restore this hook out of the trash' : 'Master keys only'}">Restore</button>
-                                <button class="btn btn-sm btn-danger" onclick="window.app.hardDeleteHook('${h.id}')" ${isMaster ? '' : 'disabled'}
+                                <button type="button" class="btn btn-sm btn-danger" data-action="purge-hook" data-hook-id="${escapeHtml(h.id)}" ${isMaster ? '' : 'disabled'}
                                     title="${isMaster ? 'Permanently drop this hook and its full history — cannot be undone' : 'Master keys only'}">Purge</button>
                             </div>
                         </td>
@@ -2091,7 +2099,7 @@ class HookExecutorClient {
                     <td class="hook-name-cell">
                         <strong>${escapeHtml(h.name)}</strong>
                         ${!h.is_active ? `<span class="badge badge-timeout" title="${escapeHtml(h.disabled_reason || 'Hook is deactivated')}">Deactivated</span>` : ''}
-                        <button type="button" class="btn-icon-inline" onclick="window.app.copyHookWebhookUrl('${h.id}')"
+                        <button type="button" class="btn-icon-inline" data-action="copy-hook-url" data-hook-id="${escapeHtml(h.id)}"
                             title="Copy this hook's execution URL (${escapeHtml(h.webhook_path)})" aria-label="Copy execution URL">🔗</button>
                     </td>
                     <td class="font-mono text-sm truncate">${escapeHtml(h.script_path)}</td>
@@ -2101,13 +2109,13 @@ class HookExecutorClient {
                     <td class="text-sm">${h.parameters.length}</td>
                     <td><div class="scope-badges">${rights}</div></td>
                     <td>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm btn-primary" onclick="window.app.openRunHookModal('${h.id}')" ${canRun ? '' : 'disabled'}
+                        <div class="row-actions-group">
+                            <button type="button" class="btn btn-sm btn-primary" data-action="run-hook" data-hook-id="${escapeHtml(h.id)}" ${canRun ? '' : 'disabled'}
                                 title="${escapeHtml(runTitle)}">Run</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.showHookLogs('${h.id}')">Logs</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openParamsModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Parameters</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditHookModal('${h.id}')" ${editable ? '' : 'disabled'} title="${editHint}">Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteHook('${h.id}')" ${deletable ? '' : 'disabled'} title="${deleteHint}">Delete</button>
+                            <button type="button" class="btn btn-sm btn-secondary" data-action="logs-hook" data-hook-id="${escapeHtml(h.id)}">Logs</button>
+                            <button type="button" class="btn btn-sm btn-secondary" data-action="params-hook" data-hook-id="${escapeHtml(h.id)}" ${editable ? '' : 'disabled'} title="${editHint}">Parameters</button>
+                            <button type="button" class="btn btn-sm btn-secondary" data-action="edit-hook" data-hook-id="${escapeHtml(h.id)}" ${editable ? '' : 'disabled'} title="${editHint}">Edit</button>
+                            <button type="button" class="btn btn-sm btn-danger" data-action="delete-hook" data-hook-id="${escapeHtml(h.id)}" ${deletable ? '' : 'disabled'} title="${deleteHint}">Delete</button>
                         </div>
                     </td>
                 </tr>
@@ -2525,9 +2533,9 @@ class HookExecutorClient {
                 <td>${p.is_required ? '<span class="badge badge-scope">Required</span>' : '<span class="text-muted text-sm">Optional</span>'}</td>
                 <td class="text-sm">${escapeHtml(p.description || '–')}</td>
                 <td>
-                    <div class="flex gap-2">
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.editParameter('${hook.id}', '${p.id}')">Edit</button>
-                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteParameter('${hook.id}', '${p.id}')">Delete</button>
+                    <div class="row-actions-group">
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="edit-param" data-hook-id="${escapeHtml(hook.id)}" data-param-id="${escapeHtml(p.id)}">Edit</button>
+                        <button type="button" class="btn btn-sm btn-danger" data-action="delete-param" data-hook-id="${escapeHtml(hook.id)}" data-param-id="${escapeHtml(p.id)}">Delete</button>
                     </div>
                 </td>
             </tr>
@@ -2683,7 +2691,7 @@ class HookExecutorClient {
                         } else if (!valid) {
                             action = `<span class="text-muted text-sm" title="Must match [A-Za-z_][A-Za-z0-9_]*">Invalid key name</span>`;
                         } else {
-                            action = `<button type="button" class="btn btn-sm btn-primary" onclick="window.app.addParameterFromExtractor(${JSON.stringify(key)}, ${JSON.stringify(String(value))})">Add</button>`;
+                            action = `<button type="button" class="btn btn-sm btn-primary" data-action="add-extracted-param" data-param-key="${escapeHtml(key)}" data-sample-value="${escapeHtml(String(value))}">Add</button>`;
                         }
                         return `
                         <tr>
@@ -2735,9 +2743,19 @@ class HookExecutorClient {
             tbody.innerHTML = this.state.apiKeys.map(k => {
                 const tier = k.is_master ? 'master' : k.can_manage_keys ? 'parent' : 'daughter';
                 const tierLabel = tier.toUpperCase();
+                const actions = k.is_master
+                    ? `
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="edit-key" data-key-id="${escapeHtml(k.id)}">Edit Bound IPs</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="lineage-key" data-key-id="${escapeHtml(k.id)}" title="Show this key's parent/child lineage">Lineage</button>`
+                    : `
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="edit-key" data-key-id="${escapeHtml(k.id)}">Edit</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="lineage-key" data-key-id="${escapeHtml(k.id)}" title="Show this key's parent/child lineage">Lineage</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="regenerate-key" data-key-id="${escapeHtml(k.id)}" title="Replace the X-API-Key bearer credential only; the signing secret is unchanged">Regenerate Key</button>
+                        <button type="button" class="btn btn-sm btn-secondary" data-action="regenerate-secret" data-key-id="${escapeHtml(k.id)}" title="Replace the HMAC signing secret only; the bearer key is unchanged">Regenerate Secret</button>
+                        <button type="button" class="btn btn-sm btn-danger" data-action="delete-key" data-key-id="${escapeHtml(k.id)}">Delete</button>`;
                 return `
                 <tr>
-                    <td><input type="checkbox" class="row-select" data-id="${k.id}"></td>
+                    <td>${k.is_master ? '' : `<input type="checkbox" class="row-select" data-id="${k.id}">`}</td>
                     <td><strong>${escapeHtml(k.name)}</strong><div class="text-muted text-sm font-mono">${escapeHtml(k.prefix)}...</div></td>
                     <td><span class="badge badge-tier badge-${tier}">${tierLabel}</span></td>
                     <td>${this.hmacModeBadge(k)}</td>
@@ -2745,16 +2763,9 @@ class HookExecutorClient {
                     <td class="text-sm">${k.max_concurrent_jobs}</td>
                     <td>${this.renderKeyScopes(k)}</td>
                     <td class="row-actions">
-                        <div class="flex gap-2" style="flex-wrap:nowrap;">
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openLineageDrawer('${k.id}')" title="Show this key's parent/child lineage">Lineage</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKey('${k.id}')" title="Replace the X-API-Key bearer credential only; the signing secret is unchanged">Regenerate Key</button>
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateSecret('${k.id}')" title="Replace the HMAC signing secret only; the bearer key is unchanged">Regenerate Secret</button>
-                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>
-                        </div>
+                        <div class="row-actions-group">${actions}</div>
                     </td>
-                </tr>
-            `;
+                </tr>`;
             }).join('');
         }
 
@@ -2850,7 +2861,7 @@ class HookExecutorClient {
                 p.can_view_execution ? 'V' : ''
             ].filter(Boolean).join('') || 'none';
             return `<span class="badge badge-group" title="${escapeHtml(p.hook_name)}: ${rights}">${escapeHtml(p.hook_name)}: ${rights}
-                <button type="button" class="badge-revoke" title="Revoke this hook permission" onclick="window.app.revokeHookPermission('${k.id}', '${p.hook_id}')">&times;</button>
+                <button type="button" class="badge-revoke" title="Revoke this hook permission" data-action="revoke-hook-permission" data-key-id="${escapeHtml(k.id)}" data-hook-id="${escapeHtml(p.hook_id)}">&times;</button>
             </span>`;
         });
 
@@ -2924,11 +2935,11 @@ class HookExecutorClient {
     // conditional on the field actually being present, not assumed.
     revealCredentials(title, res) {
         const field = (label, value, isFirst) => `
-            <div style="display:flex;justify-content:space-between;align-items:center;${isFirst ? '' : 'margin-top:0.75rem;'}">
-                <p class="key-reveal-label" style="margin:0;">${escapeHtml(label)}</p>
-                <button type="button" class="btn btn-secondary btn-sm" onclick="navigator.clipboard?.writeText('${escapeHtml(value)}'); this.textContent = 'Copied!'; setTimeout(() => this.textContent = 'Copy', 1500);" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+            <div class="key-reveal-header${isFirst ? '' : ' mt-2'}">
+                <p class="key-reveal-label">${escapeHtml(label)}</p>
+                <button type="button" class="btn btn-secondary btn-sm copy-compact-btn" data-action="copy-reveal-value">Copy</button>
             </div>
-            <code class="key-reveal-value" style="margin-top:0.35rem;">${escapeHtml(value)}</code>`;
+            <code class="key-reveal-value">${escapeHtml(value)}</code>`;
 
         const rows = [];
         if (res.plaintext_key) rows.push(field('API Key (Save this now — shown only once):', res.plaintext_key, rows.length === 0));
@@ -2963,6 +2974,7 @@ class HookExecutorClient {
         try {
             await this.apiFetch(`/keys/${keyId}/permissions`, { method: 'POST', body: JSON.stringify(payload) });
             this.showToast('Hook rights assigned', 'success');
+            document.getElementById('manage-rights-modal')?.classList.add('hidden');
             document.getElementById('form-manage-rights').reset();
             // `form.reset()` restores a plain `<input>` to its HTML-attribute default, but the hook
             // combobox's hidden value was set by `SearchableSelect.select()` via a bare `.value =`
@@ -3024,13 +3036,32 @@ class HookExecutorClient {
         }
 
         this.applyGlobalScopeGuard();
+        const editingMaster = Boolean(k.is_master);
+        ['edit-key-name', 'edit-key-max-jobs', 'edit-key-canonical-template'].forEach(fieldId => {
+            const el = document.getElementById(fieldId);
+            if (el) el.disabled = editingMaster;
+        });
+        if (editingMaster) {
+            ['edit-key-can-manage-keys', 'edit-key-can-manage-hooks', 'edit-key-can-manage-ssh'].forEach(scopeId => {
+                const input = document.getElementById(scopeId);
+                if (input) input.disabled = true;
+            });
+            if (note) {
+                note.classList.remove('hidden');
+                note.textContent = 'The Master key only allows editing Bound IPs; name, limits, template, and scopes are immutable.';
+            }
+        }
         document.getElementById('edit-key-modal').classList.remove('hidden');
     }
 
     async submitEditKey(e) {
         e.preventDefault();
         const id = document.getElementById('edit-key-id').value;
-        const payload = {
+        const target = (this.state.apiKeys || []).find(k => k.id === id);
+        const payload = (target && target.is_master) ? {
+            // The Master key accepts `bound_ips` alone; any other field is refused with 403.
+            bound_ips: document.getElementById('edit-key-bound-ips').value
+        } : {
             name: document.getElementById('edit-key-name').value,
             bound_ips: document.getElementById('edit-key-bound-ips').value,
             max_concurrent_jobs: parseInt(document.getElementById('edit-key-max-jobs').value, 10),
@@ -3044,7 +3075,7 @@ class HookExecutorClient {
         // backend refuses a *request* for a global scope, and re-sending the value a key already
         // holds is still a request. Editing a Parent key's name would otherwise 403 on the scope it
         // already had, which looks like the rename being forbidden.
-        if (this.state.profile && this.state.profile.is_master) {
+        if (!(target && target.is_master) && this.state.profile && this.state.profile.is_master) {
             payload.can_manage_keys = document.getElementById('edit-key-can-manage-keys').checked;
             payload.can_manage_hooks = document.getElementById('edit-key-can-manage-hooks').checked;
             payload.can_manage_ssh = document.getElementById('edit-key-can-manage-ssh').checked;
@@ -3162,9 +3193,9 @@ class HookExecutorClient {
                     <td class="text-sm">${this.sshSecretsConfiguredLabel(c)}</td>
                     <td class="text-sm">${escapeHtml(new Date(c.created_at + 'Z').toLocaleString())}</td>
                     <td>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.openEditSshCredentialModal('${c.id}')">Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="window.app.deleteSshCredential('${c.id}')">Delete</button>
+                        <div class="row-actions-group">
+                            <button type="button" class="btn btn-sm btn-secondary" data-action="edit-ssh-credential" data-cred-id="${escapeHtml(c.id)}">Edit</button>
+                            <button type="button" class="btn btn-sm btn-danger" data-action="delete-ssh-credential" data-cred-id="${escapeHtml(c.id)}">Delete</button>
                         </div>
                     </td>
                 </tr>
@@ -3219,6 +3250,7 @@ class HookExecutorClient {
         try {
             await this.apiFetch('/ssh-credentials', { method: 'POST', body: JSON.stringify(payload) });
             this.showToast('SSH credential created', 'success');
+            document.getElementById('create-ssh-credential-modal')?.classList.add('hidden');
             document.getElementById('form-create-ssh-credential').reset();
             this.syncSshCredentialAuthFields('ssh-credential');
             this.loadSshCredentials();
@@ -3312,11 +3344,11 @@ class HookExecutorClient {
                         : '<span class="badge badge-timeout" title="No connection can succeed until a fingerprint is fetched and pinned">Not pinned</span>'}</td>
                     <td class="text-sm">${escapeHtml(new Date(t.created_at + 'Z').toLocaleString())}</td>
                     <td>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm btn-secondary" onclick="window.app.testSshTargetConnection('${t.id}')">Test Connection</button>
-                            ${canManageTarget ? `<button class="btn btn-sm btn-secondary" onclick="window.app.openTargetPermissionsModal('${t.id}')">Permissions</button>` : ''}
-                            ${canManageTarget ? `<button class="btn btn-sm btn-secondary" onclick="window.app.openEditSshTargetModal('${t.id}')">Edit</button>` : ''}
-                            ${canManageTarget ? `<button class="btn btn-sm btn-danger" onclick="window.app.deleteSshTarget('${t.id}')">Delete</button>` : ''}
+                        <div class="row-actions-group">
+                            <button type="button" class="btn btn-sm btn-secondary" data-action="test-ssh-target" data-target-id="${escapeHtml(t.id)}">Test Connection</button>
+                            ${canManageTarget ? `<button type="button" class="btn btn-sm btn-secondary" data-action="perms-ssh-target" data-target-id="${escapeHtml(t.id)}">Permissions</button>` : ''}
+                            ${canManageTarget ? `<button type="button" class="btn btn-sm btn-secondary" data-action="edit-ssh-target" data-target-id="${escapeHtml(t.id)}">Edit</button>` : ''}
+                            ${canManageTarget ? `<button type="button" class="btn btn-sm btn-danger" data-action="delete-ssh-target" data-target-id="${escapeHtml(t.id)}">Delete</button>` : ''}
                         </div>
                     </td>
                 </tr>
@@ -3379,6 +3411,7 @@ class HookExecutorClient {
         try {
             await this.apiFetch('/ssh-targets', { method: 'POST', body: JSON.stringify(payload) });
             this.showToast('SSH target created', 'success');
+            document.getElementById('create-ssh-target-modal')?.classList.add('hidden');
             document.getElementById('form-create-ssh-target').reset();
             document.getElementById('ssh-target-port').value = 22;
             this.loadSshTargets();
@@ -3485,7 +3518,7 @@ class HookExecutorClient {
                     <td><span class="badge badge-scope">Use in Hook</span></td>
                     <td class="text-sm">${escapeHtml(new Date(p.created_at + 'Z').toLocaleString())}</td>
                     <td>
-                        <button type="button" class="btn btn-sm btn-danger" onclick="window.app.revokeTargetPermission('${targetId}', '${p.api_key_id}')">Revoke</button>
+                        <button type="button" class="btn btn-sm btn-danger" data-action="revoke-target-permission" data-target-id="${escapeHtml(targetId)}" data-key-id="${escapeHtml(p.api_key_id)}">Revoke</button>
                     </td>
                 </tr>
             `).join('');
@@ -3801,6 +3834,10 @@ class HookExecutorClient {
                 document.getElementById('form-create-apikey')?.reset();
             }
         });
+        document.getElementById('create-key-close-x')?.addEventListener('click', () => {
+            document.getElementById('create-key-modal')?.classList.add('hidden');
+            document.getElementById('form-create-apikey')?.reset();
+        });
         window.addEventListener('scroll', () => {
             document.getElementById('top-bar')?.classList.toggle('stuck', window.scrollY > 4);
         }, { passive: true });
@@ -3809,15 +3846,58 @@ class HookExecutorClient {
         document.getElementById('apikey-generate-signing-secret').addEventListener('change', () => this.syncApiKeySigningFields());
         this.syncApiKeySigningFields();
         document.getElementById('form-manage-rights').addEventListener('submit', (e) => this.manageKeyRights(e));
+        const resetManageRightsModal = () => {
+            document.getElementById('manage-rights-modal')?.classList.add('hidden');
+            document.getElementById('form-manage-rights')?.reset();
+            const hookHidden = document.getElementById('manage-rights-hook');
+            if (hookHidden) hookHidden.value = '';
+            const hookSearch = document.getElementById('manage-rights-hook-search');
+            if (hookSearch) hookSearch.value = '';
+            const execBox = document.getElementById('manage-rights-execute');
+            if (execBox) execBox.checked = true;
+        };
+        document.getElementById('btn-open-manage-rights')?.addEventListener('click', () => {
+            document.getElementById('manage-rights-modal')?.classList.remove('hidden');
+            document.getElementById('manage-rights-key')?.focus();
+        });
+        document.getElementById('btn-cancel-manage-rights')?.addEventListener('click', resetManageRightsModal);
+        document.getElementById('manage-rights-close-x')?.addEventListener('click', resetManageRightsModal);
+        document.getElementById('manage-rights-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'manage-rights-modal') resetManageRightsModal();
+        });
         document.getElementById('form-edit-key').addEventListener('submit', (e) => this.submitEditKey(e));
         document.getElementById('edit-key-cancel').addEventListener('click', () => {
             document.getElementById('edit-key-modal').classList.add('hidden');
         });
+        document.getElementById('edit-key-close-x')?.addEventListener('click', () => {
+            document.getElementById('edit-key-modal')?.classList.add('hidden');
+        });
+        document.getElementById('edit-key-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'edit-key-modal') e.target.classList.add('hidden');
+        });
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
         });
+        document.getElementById('secret-reveal-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'secret-reveal-modal') e.target.classList.add('hidden');
+        });
 
         // SSH Infrastructure
+        const closeCreateSshCredModal = () => {
+            document.getElementById('create-ssh-credential-modal')?.classList.add('hidden');
+            document.getElementById('form-create-ssh-credential')?.reset();
+            this.syncSshCredentialAuthFields('ssh-credential');
+        };
+        document.getElementById('btn-open-create-ssh-credential')?.addEventListener('click', () => {
+            this.syncSshCredentialAuthFields('ssh-credential');
+            document.getElementById('create-ssh-credential-modal')?.classList.remove('hidden');
+            document.getElementById('ssh-credential-name')?.focus();
+        });
+        document.getElementById('btn-cancel-create-ssh-credential')?.addEventListener('click', closeCreateSshCredModal);
+        document.getElementById('create-ssh-credential-close-x')?.addEventListener('click', closeCreateSshCredModal);
+        document.getElementById('create-ssh-credential-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'create-ssh-credential-modal') closeCreateSshCredModal();
+        });
         document.getElementById('form-create-ssh-credential').addEventListener('submit', (e) => this.createSshCredential(e));
         document.getElementById('ssh-credential-auth-type').addEventListener('change', () => this.syncSshCredentialAuthFields('ssh-credential'));
         this.syncSshCredentialAuthFields('ssh-credential');
@@ -3826,13 +3906,41 @@ class HookExecutorClient {
         document.getElementById('edit-ssh-credential-cancel').addEventListener('click', () => {
             document.getElementById('edit-ssh-credential-modal').classList.add('hidden');
         });
+        document.getElementById('edit-ssh-credential-close-x')?.addEventListener('click', () => {
+            document.getElementById('edit-ssh-credential-modal')?.classList.add('hidden');
+        });
+        document.getElementById('edit-ssh-credential-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'edit-ssh-credential-modal') e.target.classList.add('hidden');
+        });
 
+        const closeCreateSshTargetModal = () => {
+            document.getElementById('create-ssh-target-modal')?.classList.add('hidden');
+            document.getElementById('form-create-ssh-target')?.reset();
+            const portInput = document.getElementById('ssh-target-port');
+            if (portInput) portInput.value = 22;
+        };
+        document.getElementById('btn-open-create-ssh-target')?.addEventListener('click', () => {
+            this.populateSshCredentialSelects();
+            document.getElementById('create-ssh-target-modal')?.classList.remove('hidden');
+            document.getElementById('ssh-target-name')?.focus();
+        });
+        document.getElementById('btn-cancel-create-ssh-target')?.addEventListener('click', closeCreateSshTargetModal);
+        document.getElementById('create-ssh-target-close-x')?.addEventListener('click', closeCreateSshTargetModal);
+        document.getElementById('create-ssh-target-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'create-ssh-target-modal') closeCreateSshTargetModal();
+        });
         document.getElementById('form-create-ssh-target').addEventListener('submit', (e) => this.createSshTarget(e));
         document.getElementById('ssh-target-fetch-fingerprint-btn').addEventListener('click', () => this.fetchSshFingerprint('ssh-target'));
         document.getElementById('form-edit-ssh-target').addEventListener('submit', (e) => this.submitEditSshTarget(e));
         document.getElementById('edit-ssh-target-fetch-fingerprint-btn').addEventListener('click', () => this.fetchSshFingerprint('edit-ssh-target'));
         document.getElementById('edit-ssh-target-cancel').addEventListener('click', () => {
             document.getElementById('edit-ssh-target-modal').classList.add('hidden');
+        });
+        document.getElementById('edit-ssh-target-close-x')?.addEventListener('click', () => {
+            document.getElementById('edit-ssh-target-modal')?.classList.add('hidden');
+        });
+        document.getElementById('edit-ssh-target-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'edit-ssh-target-modal') e.target.classList.add('hidden');
         });
 
         document.getElementById('form-grant-target-permission').addEventListener('submit', (e) => this.grantTargetPermission(e));
@@ -3869,6 +3977,107 @@ class HookExecutorClient {
             await this.auditCache.nextPage();
             this.renderAuditLogsTable();
             this.updateAuditPaginationUI();
+        });
+
+        // Delegated action handlers for dynamically rendered rows, modals, and reveal buttons.
+        const delegateAction = (containerId, handler) => {
+            document.getElementById(containerId)?.addEventListener('click', (e) => {
+                const btn = e.target.closest('button[data-action]');
+                if (!btn || btn.disabled) return;
+                handler(btn);
+            });
+        };
+
+        delegateAction('executions-table-body', (btn) => {
+            if (btn.dataset.action === 'open-execution') {
+                this.openExecutionModal(btn.dataset.executionId);
+            } else if (btn.dataset.action === 'delete-execution') {
+                this.deleteExecution(btn.dataset.executionId);
+            }
+        });
+        delegateAction('hooks-table-body', (btn) => {
+            const hookId = btn.dataset.hookId;
+            switch (btn.dataset.action) {
+                case 'restore-hook': this.restoreHook(hookId); break;
+                case 'purge-hook': this.hardDeleteHook(hookId); break;
+                case 'copy-hook-url': this.copyHookWebhookUrl(hookId); break;
+                case 'run-hook': this.openRunHookModal(hookId); break;
+                case 'logs-hook': this.showHookLogs(hookId); break;
+                case 'params-hook': this.openParamsModal(hookId); break;
+                case 'edit-hook': this.openEditHookModal(hookId); break;
+                case 'delete-hook': this.deleteHook(hookId); break;
+            }
+        });
+        delegateAction('params-table-body', (btn) => {
+            if (btn.dataset.action === 'edit-param') {
+                this.editParameter(btn.dataset.hookId, btn.dataset.paramId);
+            } else if (btn.dataset.action === 'delete-param') {
+                this.deleteParameter(btn.dataset.hookId, btn.dataset.paramId);
+            }
+        });
+        delegateAction('json-extractor-results', (btn) => {
+            if (btn.dataset.action === 'add-extracted-param') {
+                this.addParameterFromExtractor(btn.dataset.paramKey, btn.dataset.sampleValue);
+            }
+        });
+        const handleKeyRowOrBadgeAction = (btn) => {
+            const keyId = btn.dataset.keyId;
+            switch (btn.dataset.action) {
+                case 'edit-key': this.openEditKeyModal(keyId); break;
+                case 'lineage-key': this.openLineageDrawer(keyId); break;
+                case 'regenerate-key': this.regenerateKey(keyId); break;
+                case 'regenerate-secret': this.regenerateSecret(keyId); break;
+                case 'delete-key': this.deleteKey(keyId); break;
+                case 'revoke-hook-permission':
+                    this.revokeHookPermission(keyId, btn.dataset.hookId);
+                    break;
+            }
+        };
+        delegateAction('apikeys-table-body', handleKeyRowOrBadgeAction);
+        delegateAction('key-lineage-body', handleKeyRowOrBadgeAction);
+        delegateAction('secret-reveal-body', async (btn) => {
+            if (btn.dataset.action !== 'copy-reveal-value') return;
+            const codeEl = btn.closest('.key-reveal-header')?.nextElementSibling;
+            const value = codeEl?.textContent || '';
+            if (!value) return;
+            try {
+                if (!navigator.clipboard) throw new Error('clipboard unavailable');
+                await navigator.clipboard.writeText(value);
+                const orig = btn.dataset.originalLabel || btn.textContent;
+                btn.dataset.originalLabel = orig;
+                btn.textContent = 'Copied!';
+                setTimeout(() => { btn.textContent = orig; }, 1500);
+            } catch {
+                if (codeEl) {
+                    const range = document.createRange();
+                    range.selectNodeContents(codeEl);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }
+                this.showToast('Clipboard unavailable — value selected, press Ctrl+C', 'error');
+            }
+        });
+        delegateAction('ssh-credentials-table-body', (btn) => {
+            if (btn.dataset.action === 'edit-ssh-credential') {
+                this.openEditSshCredentialModal(btn.dataset.credId);
+            } else if (btn.dataset.action === 'delete-ssh-credential') {
+                this.deleteSshCredential(btn.dataset.credId);
+            }
+        });
+        delegateAction('ssh-targets-table-body', (btn) => {
+            const targetId = btn.dataset.targetId;
+            switch (btn.dataset.action) {
+                case 'test-ssh-target': this.testSshTargetConnection(targetId); break;
+                case 'perms-ssh-target': this.openTargetPermissionsModal(targetId); break;
+                case 'edit-ssh-target': this.openEditSshTargetModal(targetId); break;
+                case 'delete-ssh-target': this.deleteSshTarget(targetId); break;
+            }
+        });
+        delegateAction('target-permissions-table-body', (btn) => {
+            if (btn.dataset.action === 'revoke-target-permission') {
+                this.revokeTargetPermission(btn.dataset.targetId, btn.dataset.keyId);
+            }
         });
     }
 }

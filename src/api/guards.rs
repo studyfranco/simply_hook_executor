@@ -562,7 +562,10 @@ pub(crate) fn guard_master_to_administer(
 ///
 /// Regeneration remains possible, deliberately out of band: delete the row directly in the
 /// database and restart, and [`crate::main`] mints a fresh master against the empty table.
-pub(crate) fn refuse_master_lifecycle_action(target: &api_key::Model, action: &str) -> Result<(), AppError> {
+pub(crate) fn refuse_master_lifecycle_action(
+    target: &api_key::Model,
+    action: &str,
+) -> Result<(), AppError> {
     if !target.is_master {
         return Ok(());
     }
@@ -630,7 +633,12 @@ pub(crate) fn guard_master_self_edit_is_bound_ips_only(
         .into_iter()
         .find(|(_, present)| *present)
         .map(|(field, _)| field)
-        .or_else(|| payload.canonical_template.is_some().then_some("canonical_template"));
+        .or_else(|| {
+            payload
+                .canonical_template
+                .is_some()
+                .then_some("canonical_template")
+        });
 
     let Some(field) = requested else {
         return Ok(());
@@ -759,7 +767,10 @@ pub(crate) async fn guard_hook_manage_conjunction(
     hook_id: Uuid,
 ) -> Result<api_key_hook_permission::Model, AppError> {
     // Callers handle `is_master` before reaching here: master holds no rows and needs none.
-    debug_assert!(!key.is_master, "master bypasses R2 and must be short-circuited by the caller");
+    debug_assert!(
+        !key.is_master,
+        "master bypasses R2 and must be short-circuited by the caller"
+    );
 
     // Which half is missing decides the *status*, and §4 is why. A caller with no row at all cannot
     // see this hook, so it must receive what a nonexistent hook id produces. A caller that holds a
@@ -881,8 +892,9 @@ pub(crate) fn is_permission_reduction(
     requested_manage: bool,
     requested_view_execution: bool,
 ) -> bool {
-    let (had_execute, had_manage, had_view) = existing
-        .map_or((false, false, false), |p| (p.can_execute, p.can_manage, p.can_view_execution));
+    let (had_execute, had_manage, had_view) = existing.map_or((false, false, false), |p| {
+        (p.can_execute, p.can_manage, p.can_view_execution)
+    });
     // Named rather than folded into one expression: "this write grants a verb the target did not
     // have" is the concept R1 is about, and it should be readable as such at the call site of the
     // negation.
@@ -945,7 +957,11 @@ pub(crate) async fn guard_delegated_hook_grant(
     let overreach = [
         ("can_execute", requested_execute, held.can_execute),
         ("can_manage", requested_manage, held.can_manage),
-        ("can_view_execution", requested_view_execution, held.can_view_execution),
+        (
+            "can_view_execution",
+            requested_view_execution,
+            held.can_view_execution,
+        ),
     ]
     .into_iter()
     .find(|(_, wanted, holds)| *wanted && !*holds);
@@ -995,7 +1011,7 @@ pub(crate) async fn guard_ssh_target_usage(
         .one(db)
         .await?;
 
-    if perm.map(|p| p.can_use_in_hook).unwrap_or(false) {
+    if perm.is_some_and(|p| p.can_use_in_hook) {
         return Ok(());
     }
 
@@ -1049,18 +1065,53 @@ mod tests {
         // Turning a verb on that the target did not have is a grant, in every combination.
         assert!(!is_permission_reduction(None, true, false, false));
         assert!(!is_permission_reduction(None, false, true, false));
-        assert!(!is_permission_reduction(Some(&row(true, false)), true, true, false));
-        assert!(!is_permission_reduction(Some(&row(false, true)), true, true, false));
+        assert!(!is_permission_reduction(
+            Some(&row(true, false)),
+            true,
+            true,
+            false
+        ));
+        assert!(!is_permission_reduction(
+            Some(&row(false, true)),
+            true,
+            true,
+            false
+        ));
 
         // Turning verbs off, in any combination, is a reduction.
-        assert!(is_permission_reduction(Some(&row(true, true)), false, false, false));
-        assert!(is_permission_reduction(Some(&row(true, true)), true, false, false));
-        assert!(is_permission_reduction(Some(&row(true, true)), false, true, false));
+        assert!(is_permission_reduction(
+            Some(&row(true, true)),
+            false,
+            false,
+            false
+        ));
+        assert!(is_permission_reduction(
+            Some(&row(true, true)),
+            true,
+            false,
+            false
+        ));
+        assert!(is_permission_reduction(
+            Some(&row(true, true)),
+            false,
+            true,
+            false
+        ));
 
         // Re-asserting exactly what the target already holds changes nothing, so it cannot be an
         // escalation and must not demand a grant's proof of authority.
-        assert!(is_permission_reduction(Some(&row(true, true)), true, true, false));
-        assert!(is_permission_reduction(Some(&row(false, true)), false, true, false));
+        assert!(is_permission_reduction(
+            Some(&row(true, true)),
+            true,
+            true,
+            false
+        ));
+        assert!(is_permission_reduction(
+            Some(&row(false, true)),
+            false,
+            true,
+            false
+        ));
 
         // An all-`false` write where no row exists is the same end state as no row at all.
         assert!(is_permission_reduction(None, false, false, false));
@@ -1068,7 +1119,12 @@ mod tests {
         // A mixed write — one verb up, one down — is a grant. The reduction of the other verb does
         // not pay for the escalation, and treating "net less authority" as a reduction would let a
         // caller trade `can_execute` for `can_manage` without holding it.
-        assert!(!is_permission_reduction(Some(&row(true, false)), false, true, false));
+        assert!(!is_permission_reduction(
+            Some(&row(true, false)),
+            false,
+            true,
+            false
+        ));
     }
 
     /// `can_view_execution` is a verb like the others, and the classifier must treat it as one.
@@ -1082,16 +1138,41 @@ mod tests {
     fn granting_history_access_is_a_grant_even_when_another_verb_is_surrendered() {
         // Turning it on where it was not held is a grant.
         assert!(!is_permission_reduction(None, false, false, true));
-        assert!(!is_permission_reduction(Some(&view_row(true, true, false)), true, true, true));
+        assert!(!is_permission_reduction(
+            Some(&view_row(true, true, false)),
+            true,
+            true,
+            true
+        ));
 
         // The trade: execute surrendered, history acquired. Still a grant.
-        assert!(!is_permission_reduction(Some(&view_row(true, false, false)), false, false, true));
+        assert!(!is_permission_reduction(
+            Some(&view_row(true, false, false)),
+            false,
+            false,
+            true
+        ));
 
         // Turning it off is a reduction, and re-asserting it is a no-op.
-        assert!(is_permission_reduction(Some(&view_row(false, false, true)), false, false, false));
-        assert!(is_permission_reduction(Some(&view_row(false, false, true)), false, false, true));
+        assert!(is_permission_reduction(
+            Some(&view_row(false, false, true)),
+            false,
+            false,
+            false
+        ));
+        assert!(is_permission_reduction(
+            Some(&view_row(false, false, true)),
+            false,
+            false,
+            true
+        ));
 
         // A row that holds only history, asked for only history, is unchanged.
-        assert!(is_permission_reduction(Some(&view_row(true, true, true)), true, true, true));
+        assert!(is_permission_reduction(
+            Some(&view_row(true, true, true)),
+            true,
+            true,
+            true
+        ));
     }
 }

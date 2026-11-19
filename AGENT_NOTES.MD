@@ -1074,9 +1074,10 @@ found nothing to do.
 new process group**. It is, by POSIX definition, no longer a member of the group being signalled, so
 `killpg` cannot reach it — not through a bug, but because the identifier being signalled no longer
 names it. `a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill` **asserts the
-escape happens**, and E2E §28 does the same. Both run an in-group grandchild and a `setsid`
-grandchild under a single execution — same kill, same timing, same machine — and assert the first
-dies while the second survives.
+escape happens**, and E2E §28 does the same. The integration test joins two child processes to
+the running hook's group and uses `setsid(2)` in one of them before triggering the timeout. It
+reaps both children and checks that only the process in the original group was killed. E2E §28
+makes the same comparison with two grandchildren of the hook.
 
 Asserting a limitation as a passing test is a deliberate choice. The alternative is a test suite that
 is silent about the boundary, which leaves an operator believing in isolation the daemon does not
@@ -5740,22 +5741,14 @@ duplicate tests are created" is the rule that caught it.
 | Two deletes of one resource at once | `simply_ip_exporter::two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed` | `two_concurrent_deletes_of_the_same_hook_do_not_both_report_success` |
 | Contended writes with an **exact** final row count | `simply_ip_vault::test_concurrent_batch_writes_under_wal` | `concurrent_writers_queue_cleanly_and_the_row_count_is_exact` |
 | Malformed body / path / query as contract tests | `simply_ip_exporter`'s three "normal error envelope" tests | `malformed_input_is_refused_and_reported_on_every_extractor` |
-| `#[ignore]` + **asserted** precondition instead of a silent skip | `simply_ip_sync/tests/live_feed_ingestion_tests.rs` | The sudo and setsid tests |
 | Counted, reported `skip()` | `simply_ip_sync/scripts/test_e2e.sh` | `skip()` + `SKIP_COUNT` in the summary |
 | `check_not_contains` | `simply_ip_exporter/scripts/test_e2e.sh` | Helper + a real use on `/api/settings` |
 | `tempfile` as a dev-dependency | All three | Added, with the rationale in `Cargo.toml` |
 
-**The unifying idea in the last three is one rule: a test that does nothing must not report the same
-green as a test that ran.** Three of our tests used to `return` early when `sudo`, `setsid`, or root
-permissions made them unobservable, reporting PASS while asserting nothing — worst on the host that
-lacked the dependency, which is the host where someone would want to know. `simply_ip_sync` states
-the rule outright in its live-feed header. The two tool-dependent tests are now `#[ignore]`d with the
-precondition **asserted** rather than guarded, so `cargo test` no longer claims that coverage and
-`cargo test -- --ignored` fails loudly on a host that cannot provide it. The root-permission guard
-stays as-is: it is about the runner's identity, not an optional dependency, and the test still
-asserts plenty when non-root.
-
-`cargo test -- --ignored` previously ran **zero** tests — a gate that passed vacuously. It now runs 2.
+The sudo and session tests now run in the default suite. The sudo test checks the command plan
+and captures the arguments delivered to a local stand-in for sudo. The session test calls
+`setsid(2)` directly in a child process. Source hygiene forbids ignored test attributes in
+`src/` and `tests/`.
 
 ## 3. A defect the adopted tests found
 
@@ -7916,3 +7909,34 @@ this suite predates the feature and exercises none of its new routes; it is a re
 everything else, not new-feature coverage) · `./scripts/verify_convergence.sh` **18 converged, 1 known
 divergence (pre-existing, unrelated), 0 drifted** — `RBAC_MODEL.md` remains byte-identical, confirmed
 untouched by this feature.
+
+# Clippy Pedantic and source hygiene
+
+Kept both Clippy groups enabled and moved the missing-documentation lint to the
+manifest. The API-key SeaORM entity carries the sole lint expectation. Response
+DTOs group related flags with Serde flattening to preserve the dashboard's JSON
+contract. Hook updates retain authorization before payload validation, and
+bearer authentication still verifies the signature before checking the source
+network.
+
+The source hygiene suite checks the manifest, production Rust, and dashboard
+regressions. Its two raw SQL exceptions cover SQLite connection pragmas in
+`src/db.rs` and generated-column DDL in the master-key uniqueness migration.
+A real SQLite writer-lock test verifies the HTTP 503 error mapping.
+
+# Wave 1 — 100% SeaORM, `.text()` Unification & UX Modal Alignment
+
+Peer sync before inspecting `example/simply_ip_vault/static/*`: `git -C example/simply_ip_vault pull --ff-only` fast-forwarded to `3aba7dd`.
+
+1. **Zero raw SQL across `src/` (Chantier 1):**
+   - `src/db.rs`: removed `apply_sqlite_pragmas` and `run_sqlite_optimize` (and their calls in `src/main.rs`), keeping all SQLite session pragmas (`foreign_keys`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `temp_store=MEMORY`, `mmap_size`, `cache_size`, `analysis_limit`) declared in `SqliteConnectOptions` via `sqlite_connect_options`. Rewrote `db::tests` to assert `SqliteConnectOptions`, on-disk WAL files, SQLite header bytes `18..20 == [2, 2]`, and SeaORM foreign-key enforcement without raw SQL.
+   - `src/error.rs`: replaced `execute_unprepared` in `sqlite_writer_lock_maps_to_503` with SeaQuery `Table::create`, `Query::insert`, and `SqliteConnectOptions::busy_timeout(Duration::ZERO)`.
+   - `src/migration/m20230106_090000_master_key_uniqueness.rs`: replaced raw DDL `execute_unprepared` calls with pure SeaQuery `Table::alter().add_column(ColumnDef::new(ApiKeys::MasterMarker).integer().extra(...))`, `Index::create()`, `Index::drop()`, and `Table::alter().drop_column(...)`.
+   - `tests/source_hygiene.rs`: emptied `RAW_SQL_ALLOWED`, expanded raw-SQL checks across all of `src/` (including `src/migration/` and `#[cfg(test)]`), added `query_raw` matching alongside `query_*_raw`, and permitted only literal `"SELECT 1"` if ever used.
+2. **Unified `.text()` column types:**
+   - Added SQLite-safe additive migration `src/migration/m20261119_000000_unify_variable_columns_to_text.rs` (no-op on SQLite where `VARCHAR` already uses unlimited `TEXT` affinity and `MODIFY COLUMN` is unsupported; widens `hooks.{script_path, run_as_user, signature_header, signature_prefix}` and `ssh_targets.{host, username, host_key_fingerprint}` to `.text()` on PostgreSQL/MySQL) and added `#[sea_orm(column_type = "Text", ...)]` annotations on entity models (`api_key`, `hook`, `hook_parameter`, `audit_log`, `ssh_credential`, `ssh_target`) and updated `SCHEMA.MD`.
+3. **UX Modals-Above-Lists & Secret Reveal Parity (Chantier 3):**
+   - Codified the global UX standard in `AGENT.MD` (header Add/Create buttons above lists, widened `>= 720px` `#383e45` modals with `#17191b` inputs, 1-line ellipsis secret reveal, red `.badge-scope-master`, clean `Global Rights` spacing, uniform Audit Logs, `data-action` delegation).
+   - Moved `form#form-manage-rights` into `#manage-rights-modal` (triggered by `+ Assign Hook Rights` in `#tab-keys` header), `form#form-create-ssh-credential` into `#create-ssh-credential-modal` (`+ Add SSH Credential` in SSH Credentials header), and `form#form-create-ssh-target` into `#create-ssh-target-modal` (`+ Add SSH Target` in SSH Targets header).
+   - Widened form and reveal modals (`>= 720px`), set `#383e45` modal card surface with `#17191b` inputs, constrained `.key-reveal` / `.key-reveal-value` for 1-line ellipsis reveal, added `Global Rights` labeling/spacing, and synced Audit Logs datalist/scrolling classes.
+

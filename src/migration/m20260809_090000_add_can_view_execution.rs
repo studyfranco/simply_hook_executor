@@ -54,7 +54,7 @@ use sea_orm_migration::prelude::*;
 /// The permission-table identifiers this migration touches.
 ///
 /// Re-declared locally rather than imported from the initial-schema migration so that module can
-/// stay private; `DeriveIden` maps the variants to the same snake_case names, so they address the
+/// stay private; `DeriveIden` maps the variants to the same `snake_case` names, so they address the
 /// same table and column.
 #[derive(DeriveIden)]
 enum ApiKeyHookPermissions {

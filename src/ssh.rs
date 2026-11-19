@@ -33,6 +33,7 @@
 //!   where a hook's first real execution is also the first time its target's host key is seen, which
 //!   is what a TOFU-at-connect-time policy would mean in practice.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,7 @@ use crate::executor::{CommandPlan, ExecutionOutcome, elapsed_ms};
 /// result is inert to the remote shell no matter what `s` contains: no character inside a
 /// single-quoted string is special to any POSIX-family shell, including another single quote (which
 /// is exactly why it has to be closed-escaped-reopened rather than escaped in place).
+#[must_use]
 pub fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -97,7 +99,10 @@ pub struct SshConnectionSpec {
 /// dropped as soon as the connection attempt that consumes it finishes.
 enum SshAuthMaterial {
     /// Private key material, and its passphrase if the key itself is encrypted.
-    Key { private_key: String, passphrase: Option<String> },
+    Key {
+        private_key: String,
+        passphrase: Option<String>,
+    },
     /// A plain login password.
     Password { password: String },
 }
@@ -112,6 +117,9 @@ impl SshConnectionSpec {
     /// daemon's `SIGNING_SECRET_KEY` no longer matches what wrote the row), so both map to
     /// [`AppError::Internal`], mirroring `middleware::recover_hook_secret`'s identical judgment call
     /// for the same reason: neither is the caller's mistake to be told about as a `400`.
+    ///
+    /// # Errors
+    /// Rejects unpinned targets, inconsistent credentials, and secrets that fail to decrypt.
     pub fn from_target_and_credential(
         cipher: &SecretCipher,
         target: &ssh_target::Model,
@@ -158,7 +166,10 @@ impl SshConnectionSpec {
                     Some(stored) => Some(open(stored, "passphrase")?),
                     None => None,
                 };
-                SshAuthMaterial::Key { private_key, passphrase }
+                SshAuthMaterial::Key {
+                    private_key,
+                    passphrase,
+                }
             }
             ssh_credential::SshAuthType::Password => {
                 let stored = credential.encrypted_password.as_deref().ok_or_else(|| {
@@ -168,7 +179,9 @@ impl SshConnectionSpec {
                     );
                     AppError::Internal
                 })?;
-                SshAuthMaterial::Password { password: open(stored, "password")? }
+                SshAuthMaterial::Password {
+                    password: open(stored, "password")?,
+                }
             }
         };
 
@@ -206,17 +219,19 @@ struct HostKeyPinning {
 impl client::Handler for HostKeyPinning {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
-    ) -> Result<bool, Self::Error> {
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         let PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
             // A certificate-authenticated host has no bare-key fingerprint to compare against this
             // deployment's TOFU model (`ssh_targets.host_key_fingerprint`), so it is refused rather
             // than silently trusted on some other basis.
-            return Ok(false);
+            return std::future::ready(Ok(false));
         };
-        Ok(key.fingerprint(HashAlg::Sha256).to_string() == self.expected_fingerprint)
+        std::future::ready(Ok(
+            key.fingerprint(HashAlg::Sha256).to_string() == self.expected_fingerprint
+        ))
     }
 }
 
@@ -227,7 +242,9 @@ async fn connect_authenticated(
     spec: &SshConnectionSpec,
 ) -> Result<client::Handle<HostKeyPinning>, SshRunError> {
     let config = Arc::new(client::Config::default());
-    let handler = HostKeyPinning { expected_fingerprint: spec.host_key_fingerprint.clone() };
+    let handler = HostKeyPinning {
+        expected_fingerprint: spec.host_key_fingerprint.clone(),
+    };
 
     let mut session =
         client::connect(config, (spec.host.as_str(), spec.port), handler).await.map_err(|e| {
@@ -245,9 +262,14 @@ async fn connect_authenticated(
 
     let auth_result = match &spec.auth {
         SshAuthMaterial::Password { password } => {
-            session.authenticate_password(spec.username.clone(), password.clone()).await
+            session
+                .authenticate_password(spec.username.clone(), password.clone())
+                .await
         }
-        SshAuthMaterial::Key { private_key, passphrase } => {
+        SshAuthMaterial::Key {
+            private_key,
+            passphrase,
+        } => {
             let key = decode_secret_key(private_key, passphrase.as_deref()).map_err(|e| {
                 SshRunError(format!("the stored private key could not be parsed: {e}"))
             })?;
@@ -255,7 +277,9 @@ async fn connect_authenticated(
             // instead of the legacy SHA-1 one `None` would select; every other key type ignores
             // this parameter entirely (`PrivateKeyWithHashAlg::new`'s own doc comment).
             let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-            session.authenticate_publickey(spec.username.clone(), key_with_hash).await
+            session
+                .authenticate_publickey(spec.username.clone(), key_with_hash)
+                .await
         }
     };
 
@@ -274,19 +298,29 @@ async fn connect_authenticated(
 
 /// Verifies that `spec` is fully usable — reachable, host key pinned correctly, credential
 /// accepted — without running anything. Backs `POST /api/ssh-targets/{id}/test-connection`.
-pub async fn test_connection(spec: &SshConnectionSpec, timeout: Duration) -> Result<(), SshRunError> {
-    let session = tokio::time::timeout(timeout, connect_authenticated(spec)).await.map_err(|_| {
-        SshRunError(format!(
-            "connecting to '{}:{}' as '{}' did not complete within {}s",
-            spec.host,
-            spec.port,
-            spec.username,
-            timeout.as_secs()
-        ))
-    })??;
+///
+/// # Errors
+/// Returns an error if connecting, verifying the pinned host key, or authenticating fails.
+pub async fn test_connection(
+    spec: &SshConnectionSpec,
+    timeout: Duration,
+) -> Result<(), SshRunError> {
+    let session = tokio::time::timeout(timeout, connect_authenticated(spec))
+        .await
+        .map_err(|_| {
+            SshRunError(format!(
+                "connecting to '{}:{}' as '{}' did not complete within {}s",
+                spec.host,
+                spec.port,
+                spec.username,
+                timeout.as_secs()
+            ))
+        })??;
     // Best-effort: the connection is about to be dropped either way, and nothing downstream reads
     // whether the server acknowledged a clean disconnect.
-    let _ = session.disconnect(Disconnect::ByApplication, "", "en").await;
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "en")
+        .await;
     Ok(())
 }
 
@@ -311,23 +345,26 @@ struct FingerprintLearner {
 impl client::Handler for FingerprintLearner {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
-    ) -> Result<bool, Self::Error> {
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         if let PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key {
             let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
             if let Ok(mut guard) = self.observed.lock() {
                 *guard = Some(fingerprint);
             }
         }
-        Ok(true)
+        std::future::ready(Ok(true))
     }
 }
 
 /// Connects to `host:port`, records the fingerprint of whatever host key it offers, and disconnects
 /// without authenticating. Backs `POST /api/ssh-targets/fetch-fingerprint` — the one operator-facing
 /// step in this deployment's TOFU model, explicitly separate from every hook execution path.
+///
+/// # Errors
+/// Returns an error if the handshake times out, fails, or supplies no bare host key.
 pub async fn fetch_host_key_fingerprint(
     host: &str,
     port: u16,
@@ -335,7 +372,9 @@ pub async fn fetch_host_key_fingerprint(
 ) -> Result<String, SshRunError> {
     let config = Arc::new(client::Config::default());
     let observed = Arc::new(Mutex::new(None));
-    let handler = FingerprintLearner { observed: Arc::clone(&observed) };
+    let handler = FingerprintLearner {
+        observed: Arc::clone(&observed),
+    };
 
     let session = tokio::time::timeout(timeout, client::connect(config, (host, port), handler))
         .await
@@ -347,8 +386,13 @@ pub async fn fetch_host_key_fingerprint(
         })?
         .map_err(|e| SshRunError(format!("could not connect to '{host}:{port}': {e}")))?;
 
-    let fingerprint = observed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-    let _ = session.disconnect(Disconnect::ByApplication, "", "en").await;
+    let fingerprint = observed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "en")
+        .await;
 
     fingerprint.ok_or_else(|| {
         SshRunError(format!(
@@ -461,7 +505,11 @@ pub async fn run_remote_process(
         if !stderr.is_empty() {
             stderr.push('\n');
         }
-        stderr.push_str(&format!("[ERROR] {doing} exceeded its {}s timeout", timeout.as_secs()));
+        let _ = write!(
+            stderr,
+            "[ERROR] {doing} exceeded its {}s timeout",
+            timeout.as_secs()
+        );
         ExecutionOutcome {
             status: ExecutionStatus::Timeout,
             exit_code: None,
@@ -476,19 +524,26 @@ pub async fn run_remote_process(
         Ok(Err(e)) => return failed(e.to_string()),
         Err(_) => {
             return timed_out(
-                &format!("Connecting to '{}@{}:{}'", spec.username, spec.host, spec.port),
+                &format!(
+                    "Connecting to '{}@{}:{}'",
+                    spec.username, spec.host, spec.port
+                ),
                 String::new(),
                 String::new(),
             );
         }
     };
 
-    let mut channel = match tokio::time::timeout(remaining(), session.channel_open_session()).await {
+    let mut channel = match tokio::time::timeout(remaining(), session.channel_open_session()).await
+    {
         Ok(Ok(channel)) => channel,
         Ok(Err(e)) => return failed(format!("could not open an SSH session channel: {e}")),
         Err(_) => {
             return timed_out(
-                &format!("Opening an SSH session channel to '{}:{}'", spec.host, spec.port),
+                &format!(
+                    "Opening an SSH session channel to '{}:{}'",
+                    spec.host, spec.port
+                ),
                 String::new(),
                 String::new(),
             );
@@ -501,53 +556,46 @@ pub async fn run_remote_process(
         Ok(Err(e)) => return failed(format!("could not start the remote command: {e}")),
         Err(_) => {
             return timed_out(
-                &format!("Starting the remote command on '{}:{}'", spec.host, spec.port),
+                &format!(
+                    "Starting the remote command on '{}:{}'",
+                    spec.host, spec.port
+                ),
                 String::new(),
                 String::new(),
             );
         }
     }
 
-    let mut stdout = CapturedStream::default();
-    let mut stderr = CapturedStream::default();
-    let mut exit_code: Option<i32> = None;
-
-    loop {
-        let msg = match tokio::time::timeout(remaining(), channel.wait()).await {
-            Ok(msg) => msg,
-            Err(_) => {
+    let (stdout, stderr, exit_code) =
+        match collect_remote_output(&mut channel, deadline, max_output_bytes).await {
+            Ok(output) => output,
+            Err((stdout, stderr)) => {
                 return timed_out(
-                    &format!("Executing the remote command on '{}:{}'", spec.host, spec.port),
-                    stdout.finish(),
-                    stderr.finish(),
+                    &format!(
+                        "Executing the remote command on '{}:{}'",
+                        spec.host, spec.port
+                    ),
+                    stdout,
+                    stderr,
                 );
             }
         };
-        match msg {
-            // `1` is `SSH_EXTENDED_DATA_STDERR`, the only extended-data type RFC 4254 §5.2 defines;
-            // anything else is silently dropped rather than misfiled into either stream.
-            Some(ChannelMsg::Data { data }) => stdout.push(&data, max_output_bytes),
-            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => stderr.push(&data, max_output_bytes),
-            Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
-            Some(ChannelMsg::ExitSignal { signal_name, error_message, .. }) => {
-                exit_code = signal_exit_code(&signal_name);
-                stderr.push(
-                    format!(
-                        "\n[remote process terminated by signal {signal_name:?}: {error_message}]\n"
-                    )
-                    .as_bytes(),
-                    max_output_bytes,
-                );
-            }
-            Some(ChannelMsg::Close) | None => break,
-            Some(_) => {}
-        }
-    }
 
     // Best-effort: the loop above only exits once the channel itself is done, so the underlying
     // connection has nothing further to do either way.
-    let _ = session.disconnect(Disconnect::ByApplication, "", "en").await;
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "en")
+        .await;
 
+    remote_outcome(started, stdout, stderr, exit_code)
+}
+
+fn remote_outcome(
+    started: Instant,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+    exit_code: Option<i32>,
+) -> ExecutionOutcome {
     let stdout = stdout.finish();
     let mut stderr = stderr.finish();
     let status = match exit_code {
@@ -564,7 +612,57 @@ pub async fn run_remote_process(
         }
     };
 
-    ExecutionOutcome { status, exit_code, stdout, stderr, duration_ms: elapsed_ms(started) }
+    ExecutionOutcome {
+        status,
+        exit_code,
+        stdout,
+        stderr,
+        duration_ms: elapsed_ms(started),
+    }
+}
+
+async fn collect_remote_output(
+    channel: &mut russh::Channel<client::Msg>,
+    deadline: Instant,
+    max_output_bytes: usize,
+) -> Result<(CapturedStream, CapturedStream, Option<i32>), (String, String)> {
+    let mut stdout = CapturedStream::default();
+    let mut stderr = CapturedStream::default();
+    let mut exit_code: Option<i32> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(msg) = tokio::time::timeout(remaining, channel.wait()).await else {
+            return Err((stdout.finish(), stderr.finish()));
+        };
+        match msg {
+            // `1` is `SSH_EXTENDED_DATA_STDERR`, the only extended-data type RFC 4254 §5.2 defines;
+            // anything else is silently dropped rather than misfiled into either stream.
+            Some(ChannelMsg::Data { data }) => stdout.push(&data, max_output_bytes),
+            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => stderr.push(&data, max_output_bytes),
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                exit_code = Some(i32::try_from(exit_status).unwrap_or(i32::MAX));
+            }
+            Some(ChannelMsg::ExitSignal {
+                signal_name,
+                error_message,
+                ..
+            }) => {
+                exit_code = signal_exit_code(&signal_name);
+                stderr.push(
+                    format!(
+                        "\n[remote process terminated by signal {signal_name:?}: {error_message}]\n"
+                    )
+                    .as_bytes(),
+                    max_output_bytes,
+                );
+            }
+            Some(ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+
+    Ok((stdout, stderr, exit_code))
 }
 
 #[cfg(test)]
@@ -576,7 +674,10 @@ mod tests {
         CommandPlan {
             program: program.to_owned(),
             args: args.iter().map(|s| (*s).to_owned()).collect(),
-            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
             run_as_user: None,
         }
     }
@@ -595,7 +696,14 @@ mod tests {
 
     #[test]
     fn neutralizes_shell_metacharacters() {
-        for hostile in ["$(rm -rf /)", "; rm -rf /", "`whoami`", "a && b", "a | b", "a\nb"] {
+        for hostile in [
+            "$(rm -rf /)",
+            "; rm -rf /",
+            "`whoami`",
+            "a && b",
+            "a | b",
+            "a\nb",
+        ] {
             let quoted = shell_quote(hostile);
             assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
             // Every character of the original survives verbatim inside the quoting, just wrapped —
@@ -606,7 +714,11 @@ mod tests {
 
     #[test]
     fn builds_env_prefixed_command_line() {
-        let plan = plan("/opt/hooks/deploy.sh", &["prod"], &[("HOOK_PARAM_TARGET", "prod")]);
+        let plan = plan(
+            "/opt/hooks/deploy.sh",
+            &["prod"],
+            &[("HOOK_PARAM_TARGET", "prod")],
+        );
         assert_eq!(
             build_remote_command(&plan),
             "env 'HOOK_PARAM_TARGET=prod' '/opt/hooks/deploy.sh' 'prod'"
@@ -630,14 +742,20 @@ mod tests {
     fn maps_common_signals_to_128_plus_signum() {
         assert_eq!(signal_exit_code(&russh::Sig::KILL), Some(137));
         assert_eq!(signal_exit_code(&russh::Sig::TERM), Some(143));
-        assert_eq!(signal_exit_code(&russh::Sig::Custom("WINCH".to_owned())), None);
+        assert_eq!(
+            signal_exit_code(&russh::Sig::Custom("WINCH".to_owned())),
+            None
+        );
     }
 
     #[test]
     fn captured_stream_truncates_at_limit() {
         let mut stream = CapturedStream::default();
         stream.push(b"hello", 3);
-        assert_eq!(stream.finish(), "hel\n[output truncated: exceeded MAX_OUTPUT_BYTES]");
+        assert_eq!(
+            stream.finish(),
+            "hel\n[output truncated: exceeded MAX_OUTPUT_BYTES]"
+        );
     }
 
     #[test]

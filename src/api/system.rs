@@ -63,13 +63,15 @@ pub struct SettingsResponse {
     pub api_key_count: u64,
     /// Total execution records currently retained.
     pub execution_count: u64,
+    /// Total security audit trail entries currently retained.
+    pub audit_log_count: u64,
 }
 
 /// Handles `GET /api/settings`.
 ///
 /// Master-only: `allowed_env_vars` describes what a hook's process inherits, which is exactly the
 /// kind of detail an attacker probing for an escape would want.
-pub async fn get_settings(
+pub(crate) async fn get_settings(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -105,5 +107,6 @@ pub async fn get_settings(
         hook_count: Hook::find().count(&state.db).await?,
         api_key_count: ApiKey::find().count(&state.db).await?,
         execution_count: Execution::find().count(&state.db).await?,
+        audit_log_count: AuditLog::find().count(&state.db).await?,
     }))
 }

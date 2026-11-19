@@ -1,5 +1,5 @@
 //! Adds `hooks.sample_payload_json`: an optional example of the JSON body a real caller sends this
-//! hook, used to drive the WebUI's live command preview and the JSON Payload Extractor, and to
+//! hook, used to drive the `WebUI`'s live command preview and the JSON Payload Extractor, and to
 //! validate that a hook's declared parameters actually name fields the sample contains.
 //!
 //! Nullable, and stays nullable indefinitely — every hook created before this migration has no

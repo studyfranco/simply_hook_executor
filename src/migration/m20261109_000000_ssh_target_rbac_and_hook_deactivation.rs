@@ -101,63 +101,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager
-            .create_table(
-                Table::create()
-                    .table(ApiKeySshTargetPermissions::Table)
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(ApiKeySshTargetPermissions::ApiKeyId)
-                            .uuid()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(ApiKeySshTargetPermissions::SshTargetId)
-                            .uuid()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(ApiKeySshTargetPermissions::CanUseInHook)
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(
-                        ColumnDef::new(ApiKeySshTargetPermissions::CreatedAt)
-                            .date_time()
-                            .not_null(),
-                    )
-                    .primary_key(
-                        Index::create()
-                            .name("pk_api_key_ssh_target_permissions")
-                            .col(ApiKeySshTargetPermissions::ApiKeyId)
-                            .col(ApiKeySshTargetPermissions::SshTargetId),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk-api_key_ssh_target_permissions-api_key_id")
-                            .from(
-                                ApiKeySshTargetPermissions::Table,
-                                ApiKeySshTargetPermissions::ApiKeyId,
-                            )
-                            .to(ApiKeys::Table, ApiKeys::Id)
-                            .on_delete(ForeignKeyAction::Cascade)
-                            .on_update(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk-api_key_ssh_target_permissions-ssh_target_id")
-                            .from(
-                                ApiKeySshTargetPermissions::Table,
-                                ApiKeySshTargetPermissions::SshTargetId,
-                            )
-                            .to(SshTargets::Table, SshTargets::Id)
-                            .on_delete(ForeignKeyAction::Cascade)
-                            .on_update(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await
+        create_target_permissions(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -215,4 +159,64 @@ impl MigrationTrait for Migration {
             )
             .await
     }
+}
+
+async fn create_target_permissions(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(ApiKeySshTargetPermissions::Table)
+                .if_not_exists()
+                .col(
+                    ColumnDef::new(ApiKeySshTargetPermissions::ApiKeyId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(ApiKeySshTargetPermissions::SshTargetId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(ApiKeySshTargetPermissions::CanUseInHook)
+                        .boolean()
+                        .not_null()
+                        .default(true),
+                )
+                .col(
+                    ColumnDef::new(ApiKeySshTargetPermissions::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .primary_key(
+                    Index::create()
+                        .name("pk_api_key_ssh_target_permissions")
+                        .col(ApiKeySshTargetPermissions::ApiKeyId)
+                        .col(ApiKeySshTargetPermissions::SshTargetId),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk-api_key_ssh_target_permissions-api_key_id")
+                        .from(
+                            ApiKeySshTargetPermissions::Table,
+                            ApiKeySshTargetPermissions::ApiKeyId,
+                        )
+                        .to(ApiKeys::Table, ApiKeys::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .on_update(ForeignKeyAction::Cascade),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk-api_key_ssh_target_permissions-ssh_target_id")
+                        .from(
+                            ApiKeySshTargetPermissions::Table,
+                            ApiKeySshTargetPermissions::SshTargetId,
+                        )
+                        .to(SshTargets::Table, SshTargets::Id)
+                        .on_delete(ForeignKeyAction::Cascade)
+                        .on_update(ForeignKeyAction::Cascade),
+                )
+                .to_owned(),
+        )
+        .await
 }

@@ -16,9 +16,11 @@ pub struct Model {
     /// `HOOK_PARAM_<UPPERCASED_KEY>`, hence restricted to `[A-Za-z_][A-Za-z0-9_]*` at write time.
     pub param_key: String,
     /// Human-readable description of the parameter.
+    #[sea_orm(column_type = "Text", nullable)]
     pub description: Option<String>,
     /// Value applied when the caller omits this parameter. `None` combined with
     /// `is_required = true` makes omission a `400 Bad Request`.
+    #[sea_orm(column_type = "Text", nullable)]
     pub default_value: Option<String>,
     /// Whether omitting this parameter (with no `default_value`) rejects the request.
     pub is_required: bool,

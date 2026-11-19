@@ -16,10 +16,12 @@ pub struct Model {
     #[sea_orm(unique)]
     pub name: String,
     /// Hostname or IP address to connect to.
+    #[sea_orm(column_type = "Text")]
     pub host: String,
     /// TCP port to connect to. Defaults to `22`.
     pub port: i32,
     /// The remote account to authenticate as.
+    #[sea_orm(column_type = "Text")]
     pub username: String,
     /// The credential this target authenticates with. Deleting a credential while a target still
     /// references it is refused (`ON DELETE RESTRICT`).
@@ -32,6 +34,7 @@ pub struct Model {
     /// target, or one whose offered host key does not match this value byte-for-byte, is refused —
     /// there is no trust-on-first-use fallback at execution time, since that would make the very
     /// first real hook run against a target the one connection nobody actually verified.
+    #[sea_orm(column_type = "Text", nullable)]
     pub host_key_fingerprint: Option<String>,
     /// The key that created or owns this target.
     pub owner_key_id: Option<Uuid>,

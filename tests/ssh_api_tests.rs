@@ -8,13 +8,7 @@
 //! SSH server are `tests/ssh_runner_integration_tests.rs`'s job; this file only ever reaches as far
 //! as building request/response shapes and database state.
 
-// Unlike the suite's other integration files, this one is narrowly scoped to the SSH management
-// routes and touches only a small slice of `common`'s exhaustive helper surface (the hook-execution,
-// signing, and script-fixture helpers exist for the other files) — `#[allow(dead_code)]` here is
-// about *this file's* usage, not a claim that any helper in `common` itself is unused across the
-// suite as a whole.
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use axum::http::StatusCode;
 use common::*;
@@ -59,7 +53,9 @@ async fn insert_target(db: &sea_orm::DatabaseConnection, name: &str, credential_
         port: Set(22),
         username: Set("deploy".to_owned()),
         credential_id: Set(credential_id),
-        host_key_fingerprint: Set(Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned())),
+        host_key_fingerprint: Set(Some(
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        )),
         owner_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -80,7 +76,9 @@ async fn ssh_credential_routes_require_authentication() {
     let app = create_app(test_state(&db));
 
     let request = with_connect_info(
-        axum::http::Request::builder().method("GET").uri("/api/ssh-credentials"),
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/ssh-credentials"),
     )
     .body(axum::body::Body::empty())
     .expect("request builds");
@@ -94,11 +92,19 @@ async fn ssh_credential_crud_is_master_only() {
     let (_id, non_master) = insert_key(&db, "daughter", "0.0.0.0/0", KeyScopes::plain()).await;
 
     for (method, uri, body) in [
-        ("POST", "/api/ssh-credentials", Some(json!({"name": "x", "auth_type": "PASSWORD", "password": "p"}))),
+        (
+            "POST",
+            "/api/ssh-credentials",
+            Some(json!({"name": "x", "auth_type": "PASSWORD", "password": "p"})),
+        ),
         ("GET", "/api/ssh-credentials", None),
     ] {
         let response = send(&app, json_request(method, uri, &non_master, body)).await;
-        assert_eq!(response.status, StatusCode::FORBIDDEN, "{method} {uri} should be master-only");
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} should be master-only"
+        );
     }
 }
 
@@ -131,8 +137,16 @@ async fn creates_a_key_credential_and_never_returns_the_secret() {
     assert_eq!(response.field("has_password"), false);
     // The raw text must never appear anywhere in the response body — not just absent under the
     // expected field names, in case a bug serialized it under a different one.
-    assert!(!response.raw.contains("fake"), "response leaked private key material: {}", response.raw);
-    assert!(!response.raw.contains("hunter2"), "response leaked the passphrase: {}", response.raw);
+    assert!(
+        !response.raw.contains("fake"),
+        "response leaked private key material: {}",
+        response.raw
+    );
+    assert!(
+        !response.raw.contains("hunter2"),
+        "response leaked the passphrase: {}",
+        response.raw
+    );
 }
 
 #[tokio::test]
@@ -197,7 +211,11 @@ async fn switching_auth_type_drops_the_other_modes_secret() {
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.field("auth_type"), "KEY");
     assert_eq!(response.field("has_private_key"), true);
-    assert_eq!(response.field("has_password"), false, "the old PASSWORD secret must not survive the switch");
+    assert_eq!(
+        response.field("has_password"),
+        false,
+        "the old PASSWORD secret must not survive the switch"
+    );
 }
 
 #[tokio::test]
@@ -228,9 +246,22 @@ async fn deleting_a_credential_still_used_by_a_target_is_refused() {
     let cred_id = insert_password_credential(&db, "in-use").await;
     insert_target(&db, "blocker", cred_id).await;
 
-    let response = send(&app, json_request("DELETE", &format!("/api/ssh-credentials/{cred_id}"), &master, None)).await;
+    let response = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/ssh-credentials/{cred_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::CONFLICT);
-    assert!(response.string("error").contains("blocker"), "error should name the blocking target: {}", response.raw);
+    assert!(
+        response.string("error").contains("blocker"),
+        "error should name the blocking target: {}",
+        response.raw
+    );
 }
 
 #[tokio::test]
@@ -240,7 +271,16 @@ async fn deleting_an_unused_credential_succeeds() {
     let (_id, master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
     let cred_id = insert_password_credential(&db, "unused").await;
 
-    let response = send(&app, json_request("DELETE", &format!("/api/ssh-credentials/{cred_id}"), &master, None)).await;
+    let response = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/ssh-credentials/{cred_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::NO_CONTENT);
 }
 
@@ -252,9 +292,14 @@ async fn deleting_an_unused_credential_succeeds() {
 async fn target_reads_are_open_to_can_manage_hooks_but_writes_are_not() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (_id, hook_manager) = insert_key(&db, "hook-manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    let (_id, hook_manager) =
+        insert_key(&db, "hook-manager", "0.0.0.0/0", KeyScopes::hook_manager()).await;
 
-    let list = send(&app, json_request("GET", "/api/ssh-targets", &hook_manager, None)).await;
+    let list = send(
+        &app,
+        json_request("GET", "/api/ssh-targets", &hook_manager, None),
+    )
+    .await;
     assert_eq!(list.status, StatusCode::OK);
 
     let create = send(
@@ -327,7 +372,9 @@ async fn target_creation_validates_port_and_credential_existence() {
             "POST",
             "/api/ssh-targets",
             &master,
-            Some(json!({"name": "b", "host": "h", "username": "u", "credential_id": Uuid::new_v4()})),
+            Some(
+                json!({"name": "b", "host": "h", "username": "u", "credential_id": Uuid::new_v4()}),
+            ),
         ),
     )
     .await;
@@ -377,7 +424,11 @@ async fn fetch_fingerprint_against_an_unreachable_host_reports_failure_as_200() 
     )
     .await;
 
-    assert_eq!(response.status, StatusCode::OK, "a probe's outcome is data, not an HTTP error");
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "a probe's outcome is data, not an HTTP error"
+    );
     assert_eq!(response.field("success"), false);
 }
 
@@ -408,11 +459,24 @@ async fn deleting_a_target_deactivates_referencing_hooks_instead_of_refusing() {
     let hook_id = create_hook.string("id");
 
     // Deleting the target must succeed (204 No Content) and cascade deactivation to the hook.
-    let response = send(&app, json_request("DELETE", &format!("/api/ssh-targets/{target_id}"), &master, None)).await;
+    let response = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/ssh-targets/{target_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::NO_CONTENT);
 
     // Verify hook is now deactivated
-    let get_hook = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    let get_hook = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
     assert_eq!(get_hook.status, StatusCode::OK);
     assert_eq!(get_hook.field("is_active"), false);
     assert!(get_hook.field("ssh_target_id").is_null());
@@ -504,7 +568,16 @@ async fn ssh_manager_can_create_and_manage_own_credentials_and_targets() {
     assert_eq!(target.field("can_use_in_hook"), true);
 
     // Manager B cannot see target-a without permission
-    let b_view = send(&app, json_request("GET", &format!("/api/ssh-targets/{target_id}"), &mgr_b, None)).await;
+    let b_view = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/ssh-targets/{target_id}"),
+            &mgr_b,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(b_view.status, StatusCode::NOT_FOUND);
 
     // Manager B cannot modify or delete Manager A's target
@@ -520,11 +593,29 @@ async fn ssh_manager_can_create_and_manage_own_credentials_and_targets() {
     .await;
     assert_eq!(b_update.status, StatusCode::FORBIDDEN);
 
-    let b_del = send(&app, json_request("DELETE", &format!("/api/ssh-targets/{target_id}"), &mgr_b, None)).await;
+    let b_del = send(
+        &app,
+        json_request(
+            "DELETE",
+            &format!("/api/ssh-targets/{target_id}"),
+            &mgr_b,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(b_del.status, StatusCode::FORBIDDEN);
 
     // Master can see and delete everything
-    let master_view = send(&app, json_request("GET", &format!("/api/ssh-targets/{target_id}"), &master, None)).await;
+    let master_view = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/ssh-targets/{target_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(master_view.status, StatusCode::OK);
     assert_eq!(master_view.field("is_owner"), true);
     assert_eq!(master_view.field("can_use_in_hook"), true);
@@ -535,42 +626,12 @@ async fn ssh_target_permissions_and_hook_creation_enforcement() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let (_master_id, _master) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
-    let (owner_id, owner_key) = insert_key(&db, "owner-ssh", "0.0.0.0/0", KeyScopes::ssh_manager()).await;
-    let (dev_id, dev_key) = insert_key(&db, "dev-hook", "0.0.0.0/0", KeyScopes::hook_manager()).await;
+    let (owner_id, owner_key) =
+        insert_key(&db, "owner-ssh", "0.0.0.0/0", KeyScopes::ssh_manager()).await;
+    let (dev_id, dev_key) =
+        insert_key(&db, "dev-hook", "0.0.0.0/0", KeyScopes::hook_manager()).await;
 
-    // Owner creates credential and target
-    let cred = send(
-        &app,
-        json_request(
-            "POST",
-            "/api/ssh-credentials",
-            &owner_key,
-            Some(json!({
-                "name": "owner-cred",
-                "auth_type": "PASSWORD",
-                "password": "pwd"
-            })),
-        ),
-    )
-    .await;
-    let cred_id = cred.string("id");
-
-    let target = send(
-        &app,
-        json_request(
-            "POST",
-            "/api/ssh-targets",
-            &owner_key,
-            Some(json!({
-                "name": "owner-target",
-                "host": "10.0.0.5",
-                "username": "user",
-                "credential_id": cred_id
-            })),
-        ),
-    )
-    .await;
-    let target_id = target.string("id");
+    let target_id = create_owned_ssh_target(&app, &owner_key).await;
 
     // Dev tries to create hook referencing Owner's target without permission -> 403 Forbidden
     let unauth_hook = send(
@@ -588,7 +649,12 @@ async fn ssh_target_permissions_and_hook_creation_enforcement() {
         ),
     )
     .await;
-    assert_eq!(unauth_hook.status, StatusCode::FORBIDDEN, "{}", unauth_hook.raw);
+    assert_eq!(
+        unauth_hook.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        unauth_hook.raw
+    );
 
     // Owner grants permission to Dev
     let grant = send(
@@ -609,7 +675,12 @@ async fn ssh_target_permissions_and_hook_creation_enforcement() {
     // List permissions as Owner
     let perms = send(
         &app,
-        json_request("GET", &format!("/api/ssh-targets/{target_id}/permissions"), &owner_key, None),
+        json_request(
+            "GET",
+            &format!("/api/ssh-targets/{target_id}/permissions"),
+            &owner_key,
+            None,
+        ),
     )
     .await;
     assert_eq!(perms.status, StatusCode::OK, "{}", perms.raw);
@@ -649,11 +720,52 @@ async fn ssh_target_permissions_and_hook_creation_enforcement() {
     // Check permissions list is now empty
     let perms_after = send(
         &app,
-        json_request("GET", &format!("/api/ssh-targets/{target_id}/permissions"), &owner_key, None),
+        json_request(
+            "GET",
+            &format!("/api/ssh-targets/{target_id}/permissions"),
+            &owner_key,
+            None,
+        ),
     )
     .await;
     assert_eq!(perms_after.json.as_array().expect("array").len(), 0);
     let _ = owner_id;
+}
+
+async fn create_owned_ssh_target(app: &axum::Router, owner_key: &str) -> String {
+    // Owner creates credential and target
+    let cred = send(
+        app,
+        json_request(
+            "POST",
+            "/api/ssh-credentials",
+            owner_key,
+            Some(json!({
+                "name": "owner-cred",
+                "auth_type": "PASSWORD",
+                "password": "pwd"
+            })),
+        ),
+    )
+    .await;
+    let cred_id = cred.string("id");
+
+    let target = send(
+        app,
+        json_request(
+            "POST",
+            "/api/ssh-targets",
+            owner_key,
+            Some(json!({
+                "name": "owner-target",
+                "host": "10.0.0.5",
+                "username": "user",
+                "credential_id": cred_id
+            })),
+        ),
+    )
+    .await;
+    target.string("id")
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -712,7 +824,11 @@ async fn local_hook_rejects_a_relative_script_path_but_ssh_hook_accepts_it() {
         ),
     )
     .await;
-    assert_eq!(local.status, StatusCode::BAD_REQUEST, "LOCAL requires an absolute, root-confined path");
+    assert_eq!(
+        local.status,
+        StatusCode::BAD_REQUEST,
+        "LOCAL requires an absolute, root-confined path"
+    );
 
     let remote = send(
         &app,
@@ -772,7 +888,11 @@ async fn switching_a_hook_back_to_local_clears_its_ssh_target() {
     .await;
     assert_eq!(updated.status, StatusCode::OK, "{}", updated.raw);
     assert_eq!(updated.field("execution_type"), "LOCAL");
-    assert!(updated.field("ssh_target_id").is_null(), "ssh_target_id must be cleared: {}", updated.raw);
+    assert!(
+        updated.field("ssh_target_id").is_null(),
+        "ssh_target_id must be cleared: {}",
+        updated.raw
+    );
 }
 
 #[tokio::test]
@@ -838,7 +958,12 @@ async fn deactivated_ssh_hook_cannot_be_executed_until_reactivated() {
     // 3. Delete target -> hook must become deactivated
     let del = send(
         &app,
-        json_request("DELETE", &format!("/api/ssh-targets/{target_id}"), &master, None),
+        json_request(
+            "DELETE",
+            &format!("/api/ssh-targets/{target_id}"),
+            &master,
+            None,
+        ),
     )
     .await;
     assert_eq!(del.status, StatusCode::NO_CONTENT);
@@ -850,7 +975,13 @@ async fn deactivated_ssh_hook_cannot_be_executed_until_reactivated() {
     )
     .await;
     assert_eq!(inspect.field("is_active"), false);
-    assert!(inspect.field("disabled_reason").as_str().unwrap().contains("SSH target"));
+    assert!(
+        inspect
+            .field("disabled_reason")
+            .as_str()
+            .unwrap()
+            .contains("SSH target")
+    );
 
     // 4. Executing the deactivated hook must fail with 400 Bad Request
     let exec = send(

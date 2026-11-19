@@ -25,12 +25,12 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 
 use crate::entities::{api_key, audit_log, prelude::*};
 use crate::error::AppError;
-use crate::extract::{StrictQuery};
+use crate::extract::StrictQuery;
 use crate::state::AppState;
 
 use super::DEFAULT_PAGE_LIMIT;
@@ -74,7 +74,7 @@ pub struct AuditLogQuery {
 /// master-only check rather than a §4 visibility filter — there is deliberately no "show me the
 /// entries about my own hooks" view, because the entries themselves name keys and targets the
 /// caller may not be permitted to know exist.
-pub async fn list_audit_logs(
+pub(crate) async fn list_audit_logs(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     StrictQuery(query): StrictQuery<AuditLogQuery>,
@@ -93,14 +93,24 @@ pub async fn list_audit_logs(
         q = q.filter(audit_log::Column::ClientIp.contains(client_ip));
     }
     if let Some(api_key_filter) = query.api_key.as_deref().filter(|s| !s.is_empty()) {
-        let ids = resolve_api_key_filter(&state.db, api_key_filter).await?;
-        q = q.filter(audit_log::Column::ApiKeyId.is_in(ids));
+        if let Ok(id) = uuid::Uuid::parse_str(api_key_filter) {
+            q = q.filter(audit_log::Column::ApiKeyId.eq(id));
+        } else {
+            let ids = resolve_api_key_filter(&state.db, api_key_filter).await?;
+            let mut cond = Condition::any()
+                .add(audit_log::Column::ApiKeyName.contains(api_key_filter))
+                .add(audit_log::Column::ApiKeyPrefix.contains(api_key_filter));
+            if !ids.is_empty() {
+                cond = cond.add(audit_log::Column::ApiKeyId.is_in(ids));
+            }
+            q = q.filter(cond);
+        }
     }
     if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
         q = q.filter(audit_log::Column::Timestamp.gte(parse_instant("since", since)?));
     }
     if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(audit_log::Column::Timestamp.lt(parse_instant("until", until)?));
+        q = q.filter(audit_log::Column::Timestamp.lte(parse_instant("until", until)?));
     }
 
     let logs = q

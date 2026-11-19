@@ -114,7 +114,13 @@ where
     C: IntoIden + 'static,
 {
     manager
-        .create_index(Index::create().name(name).table(table).col(column).to_owned())
+        .create_index(
+            Index::create()
+                .name(name)
+                .table(table)
+                .col(column)
+                .to_owned(),
+        )
         .await
 }
 
@@ -129,11 +135,27 @@ impl MigrationTrait for Migration {
         // paths search on." The subtree walk in §6 recurses on `parent_key_id` once per level, and
         // the inventory scans `hooks.owner_key_id` once per key in the subtree; both are
         // unindexed full scans without these.
-        create_index(manager, "idx_api_keys_parent_key_id", ApiKeys::Table, ApiKeys::ParentKeyId)
-            .await?;
-        create_index(manager, "idx_api_keys_owner_key_id", ApiKeys::Table, ApiKeys::OwnerKeyId)
-            .await?;
-        create_index(manager, "idx_hooks_owner_key_id", Hooks::Table, Hooks::OwnerKeyId).await
+        create_index(
+            manager,
+            "idx_api_keys_parent_key_id",
+            ApiKeys::Table,
+            ApiKeys::ParentKeyId,
+        )
+        .await?;
+        create_index(
+            manager,
+            "idx_api_keys_owner_key_id",
+            ApiKeys::Table,
+            ApiKeys::OwnerKeyId,
+        )
+        .await?;
+        create_index(
+            manager,
+            "idx_hooks_owner_key_id",
+            Hooks::Table,
+            Hooks::OwnerKeyId,
+        )
+        .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -142,7 +164,9 @@ impl MigrationTrait for Migration {
             ("idx_api_keys_owner_key_id", ApiKeys::Table.into_iden()),
             ("idx_api_keys_parent_key_id", ApiKeys::Table.into_iden()),
         ] {
-            manager.drop_index(Index::drop().name(name).table(table).to_owned()).await?;
+            manager
+                .drop_index(Index::drop().name(name).table(table).to_owned())
+                .await?;
         }
 
         for (table, column) in [

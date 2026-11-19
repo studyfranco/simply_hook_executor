@@ -30,8 +30,7 @@
 // not call are unused *here* while having real callers next door. The crate-wide convention is to
 // allow it at the import rather than inside `common`, which keeps `common`'s own no-blanket-allow
 // rule intact.
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use std::sync::Arc;
 
@@ -85,8 +84,16 @@ async fn two_concurrent_identical_signed_requests_only_one_succeeds() {
         )
     };
 
-    let first = { let app = Arc::clone(&app); let r = build(); tokio::spawn(async move { send(&app, r).await.status }) };
-    let second = { let app = Arc::clone(&app); let r = build(); tokio::spawn(async move { send(&app, r).await.status }) };
+    let first = {
+        let app = Arc::clone(&app);
+        let r = build();
+        tokio::spawn(async move { send(&app, r).await.status })
+    };
+    let second = {
+        let app = Arc::clone(&app);
+        let r = build();
+        tokio::spawn(async move { send(&app, r).await.status })
+    };
 
     let statuses = [
         first.await.expect("the first task did not panic"),
@@ -94,7 +101,10 @@ async fn two_concurrent_identical_signed_requests_only_one_succeeds() {
     ];
 
     let accepted = statuses.iter().filter(|s| **s == StatusCode::OK).count();
-    let refused = statuses.iter().filter(|s| **s == StatusCode::UNAUTHORIZED).count();
+    let refused = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
 
     assert_eq!(
         accepted, 1,
@@ -152,7 +162,9 @@ async fn two_concurrent_deletes_of_the_same_hook_do_not_both_report_success() {
     );
 
     // And the row is trashed exactly once, not double-counted anywhere.
-    let row = fetch_hook_row(&db, hook_id).await.expect("the row still exists — deletion is soft");
+    let row = fetch_hook_row(&db, hook_id)
+        .await
+        .expect("the row still exists — deletion is soft");
     assert!(row.is_deleted, "the hook is in the trash");
 
     // The sharper half, and the reason the status code alone is not enough. The row is idempotent —
@@ -187,11 +199,11 @@ async fn two_concurrent_deletes_of_the_same_hook_do_not_both_report_success() {
 /// `create_hook` handles a collision by catching the constraint violation rather than by checking
 /// first and inserting after. Under concurrency a check-then-insert interleaves two callers in that
 /// window, so the assertion is *exactly one* winner rather than "at least one".
+const WRITER_TASKS: usize = 8;
+const HOOKS_PER_WRITER: usize = 5;
+
 #[tokio::test]
 async fn concurrent_writers_queue_cleanly_and_the_row_count_is_exact() {
-    const TASKS: usize = 8;
-    const PER_TASK: usize = 5;
-
     let db = setup_test_db().await;
     let (master_id, master_key) = insert_key(&db, "Pool Master", "", KeyScopes::master()).await;
     let (_dir, script) = noop_script();
@@ -201,19 +213,22 @@ async fn concurrent_writers_queue_cleanly_and_the_row_count_is_exact() {
 
     // ── Phase 1: disjoint names ─────────────────────────────────────────────
     let mut disjoint = tokio::task::JoinSet::new();
-    for task in 0..TASKS {
+    for task in 0..WRITER_TASKS {
         let app = Arc::clone(&app);
         let key = master_key.clone();
         let path = script.clone();
         disjoint.spawn(async move {
-            let mut statuses = Vec::with_capacity(PER_TASK);
-            for i in 0..PER_TASK {
+            let mut statuses = Vec::with_capacity(HOOKS_PER_WRITER);
+            for i in 0..HOOKS_PER_WRITER {
                 let body = serde_json::json!({
                     "name": format!("conc_{task}_{i}"),
                     "script_path": path,
                 });
-                statuses
-                    .push(send(&app, json_request("POST", "/api/hooks", &key, Some(body))).await.status);
+                statuses.push(
+                    send(&app, json_request("POST", "/api/hooks", &key, Some(body)))
+                        .await
+                        .status,
+                );
             }
             (task, statuses)
         });
@@ -234,12 +249,16 @@ async fn concurrent_writers_queue_cleanly_and_the_row_count_is_exact() {
             created += 1;
         }
     }
-    assert_eq!(created, TASKS * PER_TASK, "every disjoint create succeeded");
+    assert_eq!(
+        created,
+        WRITER_TASKS * HOOKS_PER_WRITER,
+        "every disjoint create succeeded"
+    );
 
     let hooks = Hook::find().count(&db).await.expect("hooks are countable");
     assert_eq!(
-        hooks as usize,
-        TASKS * PER_TASK,
+        usize::try_from(hooks).expect("fixture count fits usize"),
+        WRITER_TASKS * HOOKS_PER_WRITER,
         "the database holds exactly the hooks that were accepted — a lost write leaves this short, \
          a double insert would have violated the unique index and failed a request above"
     );
@@ -247,22 +266,36 @@ async fn concurrent_writers_queue_cleanly_and_the_row_count_is_exact() {
     // Every accepted create also wrote an audit row. Attribution must not be what gets dropped when
     // the pool is busy: a trail that develops holes precisely under load is a trail you cannot use
     // to reconstruct an incident.
-    let audits = AuditLog::find().count(&db).await.expect("audit rows are countable");
+    let audits = AuditLog::find()
+        .count(&db)
+        .await
+        .expect("audit rows are countable");
     assert!(
-        audits as usize >= TASKS * PER_TASK,
+        usize::try_from(audits).expect("audit count fits usize") >= WRITER_TASKS * HOOKS_PER_WRITER,
         "expected at least one audit row per accepted create ({}), found {audits}",
-        TASKS * PER_TASK
+        WRITER_TASKS * HOOKS_PER_WRITER
     );
 
+    assert_one_contested_hook_wins(&db, &app, &master_key, &script).await;
+}
+
+async fn assert_one_contested_hook_wins(
+    db: &sea_orm::DatabaseConnection,
+    app: &Arc<axum::Router>,
+    master_key: &str,
+    script: &str,
+) {
     // ── Phase 2: one contested name ─────────────────────────────────────────
     let mut contested = tokio::task::JoinSet::new();
-    for _ in 0..TASKS {
-        let app = Arc::clone(&app);
-        let key = master_key.clone();
-        let path = script.clone();
+    for _ in 0..WRITER_TASKS {
+        let app = Arc::clone(app);
+        let key = master_key.to_owned();
+        let path = script.to_owned();
         contested.spawn(async move {
             let body = serde_json::json!({ "name": "contested", "script_path": path });
-            send(&app, json_request("POST", "/api/hooks", &key, Some(body))).await.status
+            send(&app, json_request("POST", "/api/hooks", &key, Some(body)))
+                .await
+                .status
         });
     }
 
@@ -285,14 +318,21 @@ async fn concurrent_writers_queue_cleanly_and_the_row_count_is_exact() {
          for the name and then inserts, with a window in between; zero means the winner's insert \
          was lost"
     );
-    assert_eq!(conflicts, TASKS - 1, "every other caller was told it was a conflict");
+    assert_eq!(
+        conflicts,
+        WRITER_TASKS - 1,
+        "every other caller was told it was a conflict"
+    );
 
     let contested_rows = Hook::find()
         .filter(hook::Column::Name.eq("contested"))
-        .count(&db)
+        .count(db)
         .await
         .expect("the contested hook is countable");
-    assert_eq!(contested_rows, 1, "the unique index left exactly one row behind");
+    assert_eq!(
+        contested_rows, 1,
+        "the unique index left exactly one row behind"
+    );
 }
 
 /// Asserts one refusal is a real `{"error": …}` JSON document, not merely a correct status.
@@ -308,7 +348,10 @@ fn assert_error_envelope(response: &TestResponse, expected: StatusCode, context:
         response.status, response.raw
     );
     assert_eq!(
-        response.content_type.as_deref().map(|ct| ct.starts_with("application/json")),
+        response
+            .content_type
+            .as_deref()
+            .map(|ct| ct.starts_with("application/json")),
         Some(true),
         "{context}: refusals must be served as application/json, got {:?} — a client picks its \
          parser from this header before it reads a byte of the body",
@@ -367,28 +410,58 @@ async fn malformed_input_is_refused_in_the_json_envelope_on_every_extractor() {
     let response = send(&app, broken_body).await;
     assert_error_envelope(&response, StatusCode::BAD_REQUEST, "malformed JSON body");
     assert!(
-        response.field("error").as_str().unwrap_or_default().to_lowercase().contains("json"),
+        response
+            .field("error")
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("json"),
         "the message should still name the problem — wrapping the shape must not withhold the \
          reason: {}",
         response.raw
     );
 
     // 2. `StrictPath` — a path parameter that cannot be a UUID.
-    let response = send(&app, json_request("GET", "/api/executions/not-a-uuid", &master_key, None)).await;
-    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "unparseable UUID path parameter");
+    let response = send(
+        &app,
+        json_request("GET", "/api/executions/not-a-uuid", &master_key, None),
+    )
+    .await;
+    assert_error_envelope(
+        &response,
+        StatusCode::BAD_REQUEST,
+        "unparseable UUID path parameter",
+    );
 
     // 3. `StrictPath` again, on a *tuple* path. Two-parameter routes deserialize through a different
     //    code path than single ones, so one working proves little about the other.
     let response = send(
         &app,
-        json_request("DELETE", "/api/hooks/probe/parameters/not-a-uuid", &master_key, None),
+        json_request(
+            "DELETE",
+            "/api/hooks/probe/parameters/not-a-uuid",
+            &master_key,
+            None,
+        ),
     )
     .await;
-    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "unparseable UUID in a tuple path");
+    assert_error_envelope(
+        &response,
+        StatusCode::BAD_REQUEST,
+        "unparseable UUID in a tuple path",
+    );
 
     // 4. `StrictQuery` — a query parameter of the wrong type.
-    let response = send(&app, json_request("GET", "/api/executions?limit=abc", &master_key, None)).await;
-    assert_error_envelope(&response, StatusCode::BAD_REQUEST, "non-numeric query parameter");
+    let response = send(
+        &app,
+        json_request("GET", "/api/executions?limit=abc", &master_key, None),
+    )
+    .await;
+    assert_error_envelope(
+        &response,
+        StatusCode::BAD_REQUEST,
+        "non-numeric query parameter",
+    );
 
     // 5. `StrictBytes` — the raw-body routes. Their rejection type is different again, and they are
     //    the endpoints most likely to receive a body worth rejecting.
@@ -401,13 +474,18 @@ async fn malformed_input_is_refused_in_the_json_envelope_on_every_extractor() {
     )
     .body(axum::body::Body::from(vec![
         b'a';
-        simply_hook_executor::MAX_REQUEST_BODY_BYTES + 1024
+        simply_hook_executor::MAX_REQUEST_BODY_BYTES
+            + 1024
     ]))
     .expect("the request builds");
     let response = send(&app, oversized).await;
     // Status is Axum's, not flattened: an oversized body is `413`, and demoting it to `400` would
     // lose the one piece of information that tells a client to send less rather than send different.
-    assert_error_envelope(&response, StatusCode::PAYLOAD_TOO_LARGE, "oversized raw body");
+    assert_error_envelope(
+        &response,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "oversized raw body",
+    );
 
     // 6. The service is unharmed by all of it — the point of the sweep. A rejection that poisoned
     //    shared state would show up here and nowhere else.

@@ -49,5 +49,8 @@ ENV PORT=3000
 ENV ALLOWED_ENV_VARS=PATH,LANG,TERM
 ENV LOG_RETENTION_DAYS=30
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf "http://127.0.0.1:${PORT:-3000}/health" || exit 1
+
 # Define command
 CMD ["simply_hook_executor"]

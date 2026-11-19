@@ -563,7 +563,7 @@ log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping neede
 # orchestrator assigns its IP), and it lets §30 prove name resolution works against a real DNS
 # lookup rather than a stub.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
-    ALLOWED_ENV_VARS="PATH" LOG_RETENTION_DAYS=30 \
+    ALLOWED_ENV_VARS="PATH" LOG_RETENTION_DAYS=30 SIGNATURE_MAX_AGE_SECONDS=300 \
     ALLOWED_SCRIPT_ROOTS="$HOOK_DIR" \
     TRUSTED_PROXIES="$BIND_HOST,localhost" \
     BIND_HOST="$BIND_HOST" PORT="$SERVER_PORT" \
@@ -1094,7 +1094,7 @@ if [ "$HAVE_OPENSSL" -eq 1 ]; then
     # No pipes: `grep -o | head -1` would SIGPIPE the upstream `grep` under `pipefail` and report a
     # successful scrape as a failed command.
     SIGNING_MASTER_KEY="$MASTER_KEY"
-    BANNER_SECRET_LINES=$(grep -oE 'Secret:   [0-9a-f]+' "$SERVER_LOG" || true)
+    BANNER_SECRET_LINES=$(grep -oE '(Signing secret :|Secret:  ) [0-9a-f]+' "$SERVER_LOG" || true)
     MASTER_SIGNING_SECRET=${BANNER_SECRET_LINES%%$'\n'*}
     MASTER_SIGNING_SECRET=${MASTER_SIGNING_SECRET##* }
     check_local "${#MASTER_SIGNING_SECRET}" "64" \
@@ -3255,8 +3255,8 @@ IMK_LOG="$WORK_DIR/imk_server.log"
 IMK_PORT=$((SERVER_PORT + 6))
 while port_in_use "$IMK_PORT"; do IMK_PORT=$((IMK_PORT + 1)); done
 
-# Three shapes, three different defects: too short, right width but not hex, and set-but-empty.
-for bad_key in "deadbeef" "zzzz0000000000000000000000000000000000000000000000000000000000zz" ""; do
+# Three shapes, three different defects: too short, right width but not hex, and off-by-one width (63 chars).
+for bad_key in "deadbeef" "zzzz0000000000000000000000000000000000000000000000000000000000zz" "000000000000000000000000000000000000000000000000000000000000000"; do
     rm -f "$IMK_DB"
     DATABASE_URL="sqlite://$IMK_DB?mode=rwc" RUST_LOG=info \
         BIND_HOST="$BIND_HOST" PORT="$IMK_PORT" INITIAL_MASTER_KEY="$bad_key" \
@@ -5104,6 +5104,338 @@ PYEOF
 else
     skip "§54 python argparse args_template check: python3 not found on PATH"
 fi
+
+# ── 55. Edge-Case / Boundary / Security E2E ──────────────────────────────────
+
+log_section "55. Edge-Case / Boundary / Security E2E"
+
+# 55a. Deleted-key audit snapshot search (by name AND by prefix) + inclusive `until` boundary.
+create_scoped_key "EphemeralKey" ',"can_manage_hooks":true'
+EPHEMERAL_KEY="$CREATED_KEY"
+EPHEMERAL_ID="$CREATED_ID"
+EPHEMERAL_PREFIX="${EPHEMERAL_KEY:0:8}"
+
+EPH_NOOP_SCRIPT=$(make_hook_script "ephemeral_audit_noop.sh" 'echo "ephemeral"')
+api_call POST "/api/hooks" "$EPHEMERAL_KEY" \
+    "$(jq -nc --arg p "$EPH_NOOP_SCRIPT" '{name:"ephemeral_audit_probe_hook",script_path:$p}')"
+check "200" "#55a EphemeralKey performs a mutating action (POST /api/hooks) recorded in audit_logs"
+EPH_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call DELETE "/api/hooks/$EPH_HOOK_ID" "$EPHEMERAL_KEY"
+check "204" "#55a EphemeralKey soft-deletes its probe hook (records HOOK_DELETE in audit_logs)"
+
+api_call DELETE "/api/hooks/$EPH_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "#55a Master hard-deletes the probe hook so EphemeralKey owns no resources"
+
+api_call DELETE "/api/keys/$EPHEMERAL_ID" "$MASTER_KEY"
+check "204" "#55a Master deletes EphemeralKey (ON DELETE SET NULL on audit_logs.api_key_id)"
+
+api_call GET "/api/audit-logs?api_key=EphemeralKey" "$MASTER_KEY"
+check "200" "#55a GET /api/audit-logs?api_key=EphemeralKey (by name) after key deletion"
+check_true 'length >= 2 and all(.[]; .api_key_name == "EphemeralKey" and .api_key_id == null)' \
+    "#55a deleted key's audit entries are still found by name snapshot with api_key_id=null"
+
+api_call GET "/api/audit-logs?api_key=$EPHEMERAL_PREFIX" "$MASTER_KEY"
+check "200" "#55a GET /api/audit-logs?api_key=<prefix> (by prefix) after key deletion"
+check_true "length >= 2 and all(.[]; .api_key_prefix == \"$EPHEMERAL_PREFIX\" and .api_key_name == \"EphemeralKey\")" \
+    "#55a deleted key's audit entries are still found by prefix snapshot"
+
+EPH_AUDIT_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
+EPH_AUDIT_TS=$(echo "$RESP_BODY" | jq -r '.[0].timestamp')
+EPH_AUDIT_RFC3339="${EPH_AUDIT_TS%Z}Z"
+api_call GET "/api/audit-logs?api_key=EphemeralKey&until=$EPH_AUDIT_RFC3339" "$MASTER_KEY"
+check "200" "#55a GET /api/audit-logs with exact until boundary succeeds"
+check_true "any(.[]; .id == \"$EPH_AUDIT_ID\")" \
+    "#55a /api/audit-logs 'until' boundary is inclusive (<= includes row at exact timestamp)"
+
+# 55b. Settings parity: GET /api/settings contains integer audit_log_count (>= 1).
+api_call GET "/api/settings" "$MASTER_KEY"
+check "200" "#55b GET /api/settings returns 200"
+check_true '(.audit_log_count | type == "number") and (.audit_log_count == (.audit_log_count | floor)) and (.audit_log_count >= 1)' \
+    "#55b GET /api/settings contains integer audit_log_count >= 1"
+
+# 55c. Process-group timeout isolation (kill_process_group sans unsafe).
+PG_PIDFILE="$WORK_DIR/pg_grandchild.pid"
+rm -f "$PG_PIDFILE"
+PG_TIMEOUT_SCRIPT=$(make_hook_script "pg_timeout_isolation.sh" "sleep 60 >/dev/null 2>&1 &
+echo \$! > \"$PG_PIDFILE\"
+sleep 60")
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$PG_TIMEOUT_SCRIPT" '{name:"pg_timeout_isolation_hook",script_path:$p,default_timeout_seconds:1}')"
+check "200" "#55c register hook spawning background child with default_timeout_seconds=1"
+PG_TIMEOUT_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/hooks/$PG_TIMEOUT_HOOK_ID/execute" "$MASTER_KEY" '{}'
+check "200" "#55c execute hook that times out after 1s"
+check_jq ".status" "TIMEOUT" "#55c execution times out cleanly (status=TIMEOUT)"
+check_jq ".exit_code" "137" "#55c execution records SIGKILL exit_code 137"
+
+GRANDCHILD_PID="$(tr -d ' \n\r' < "$PG_PIDFILE" 2>/dev/null || true)"
+if [ -n "$GRANDCHILD_PID" ] && [[ "$GRANDCHILD_PID" =~ ^[0-9]+$ ]]; then
+    check_local "recorded" "recorded" "#55c background child PID ($GRANDCHILD_PID) was written to pidfile"
+else
+    check_local "${GRANDCHILD_PID:-empty}" "recorded" "#55c background child PID was written to pidfile"
+fi
+
+for _ in $(seq 1 15); do
+    if [ -n "$GRANDCHILD_PID" ] && ! kill -0 "$GRANDCHILD_PID" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [ -n "$GRANDCHILD_PID" ] && ! kill -0 "$GRANDCHILD_PID" 2>/dev/null; then
+    check_local "dead" "dead" "#55c background grandchild process ($GRANDCHILD_PID) is dead (! kill -0) after timeout"
+else
+    [ -n "$GRANDCHILD_PID" ] && kill -9 "$GRANDCHILD_PID" 2>/dev/null || true
+    check_local "leaked" "dead" "#55c background grandchild process ($GRANDCHILD_PID) is dead (! kill -0) after timeout"
+fi
+
+api_call DELETE "/api/hooks/$PG_TIMEOUT_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "#55c clean up pg_timeout_isolation_hook"
+
+# 55d. Concurrency limit (max_concurrent_jobs = 1): limit enforcement (429) and clean recovery.
+CONC_READY_FILE="$WORK_DIR/conc_edge_started"
+rm -f "$CONC_READY_FILE"
+CONC_EDGE_SCRIPT=$(make_hook_script "conc_edge_hook.sh" "touch \"$CONC_READY_FILE\"
+sleep 2
+echo \"slot-released\"")
+
+api_call POST "/api/hooks" "$MASTER_KEY" \
+    "$(jq -nc --arg p "$CONC_EDGE_SCRIPT" '{name:"conc_edge_budget_hook",script_path:$p,default_timeout_seconds:15}')"
+check "200" "#55d register hook for max_concurrent_jobs=1 enforcement test"
+CONC_EDGE_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+create_scoped_key "EdgeConcurrencyOneKey" ',"max_concurrent_jobs":1'
+CONC_EDGE_KEY="$CREATED_KEY"
+CONC_EDGE_KEY_ID="$CREATED_ID"
+
+api_call POST "/api/keys/$CONC_EDGE_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"hook_id\":\"$CONC_EDGE_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+check "200" "#55d grant EdgeConcurrencyOneKey can_execute on conc_edge_budget_hook"
+
+curl -s -o "$WORK_DIR/conc_edge_bg_body" -w "%{http_code}" -X POST \
+    -H "X-API-Key: $CONC_EDGE_KEY" -H "Content-Type: application/json" -d '{}' \
+    "$BASE_URL/api/hooks/$CONC_EDGE_HOOK_ID/execute" > "$WORK_DIR/conc_edge_bg_status" &
+CONC_BG_PID=$!
+
+CONC_IN_FLIGHT=0
+for _ in $(seq 1 40); do
+    if [ -f "$CONC_READY_FILE" ]; then
+        CONC_IN_FLIGHT=1
+        break
+    fi
+    sleep 0.05
+done
+check_local "$CONC_IN_FLIGHT" "1" "#55d first hook run is in flight holding the sole concurrency slot"
+
+api_call POST "/api/hooks/$CONC_EDGE_HOOK_ID/execute" "$CONC_EDGE_KEY" '{}'
+check "429" "#55d concurrent hook run exceeding max_concurrent_jobs=1 is rejected with 429"
+
+wait "$CONC_BG_PID" 2>/dev/null || true
+check_local "$(cat "$WORK_DIR/conc_edge_bg_status" 2>/dev/null)" "200" \
+    "#55d first in-flight hook run completes with HTTP 200"
+
+api_call POST "/api/hooks/$CONC_EDGE_HOOK_ID/execute" "$CONC_EDGE_KEY" '{}'
+check "200" "#55d subsequent hook run succeeds after the in-flight job completes and releases its permit"
+check_jq ".status" "SUCCESS" "#55d recovery execution succeeds cleanly"
+check_stdout_contains "slot-released" "#55d recovery execution output matches expected stdout"
+
+api_call DELETE "/api/keys/$CONC_EDGE_KEY_ID" "$MASTER_KEY"
+check "204" "#55d clean up EdgeConcurrencyOneKey"
+api_call DELETE "/api/hooks/$CONC_EDGE_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "#55d clean up conc_edge_budget_hook"
+
+# ── 56. Storage, HMAC, Extractor & SSH Boundaries ──────────────────────────────
+
+log_section "56. Storage, HMAC, Extractor & SSH Boundaries"
+
+# Give the storage probes distinct endings and read them back through fresh database queries.
+BOUNDARY_IPS=$(jq -nr '[range(1; 33) | "198.51.100.\(.)/32"] + ["203.0.113.254/32"] | join(", ")')
+printf -v BOUNDARY_COMPONENT '%*s' 160 ''
+BOUNDARY_COMPONENT=${BOUNDARY_COMPONENT// /x}
+BOUNDARY_SCRIPT="$HOOK_DIR/$BOUNDARY_COMPONENT/${BOUNDARY_COMPONENT}y/run.sh"
+mkdir -p "$(dirname "$BOUNDARY_SCRIPT")"
+printf '#!/bin/sh\necho boundary-ok\n' > "$BOUNDARY_SCRIPT"
+chmod 755 "$BOUNDARY_SCRIPT"
+BOUNDARY_CANONICAL="$BOUNDARY_COMPONENT:${BOUNDARY_COMPONENT}y:{method}:{path}:{timestamp}:{body}"
+BOUNDARY_ARGS="$BOUNDARY_COMPONENT ${BOUNDARY_COMPONENT}z"
+BOUNDARY_HOOK_BODY=$(jq -nc --arg path "$BOUNDARY_SCRIPT" --arg canonical "$BOUNDARY_CANONICAL" \
+    --arg args "$BOUNDARY_ARGS" \
+    '{name:"section56_storage_hook",script_path:$path,canonical_template:$canonical,args_template:$args}')
+
+api_call POST "/api/keys" "$MASTER_KEY" \
+    "$(jq -nc --arg ips "$BOUNDARY_IPS" '{name:"Section 56 Storage Key",bound_ips:$ips,can_manage_hooks:true}')"
+check "200" "#56 create key with a bound_ips list over 300 characters"
+BOUNDARY_KEY_ID=$(jq -r '.id' <<< "$RESP_BODY")
+BOUNDARY_KEY=$(jq -r '.plaintext_key' <<< "$RESP_BODY")
+BOUNDARY_SECRET=$(jq -r '.signing_secret' <<< "$RESP_BODY")
+api_call GET "/api/keys" "$MASTER_KEY"
+check "200" "#56 read persisted key settings"
+check_jq ".[] | select(.id == \"$BOUNDARY_KEY_ID\") | .bound_ips" "$BOUNDARY_IPS" \
+    "#56 bound_ips round-trips verbatim"
+
+# The admin route preserves specific HMAC errors. Sign the original body, send a modified
+# body first, then prove the original still works and its differently cased digest is single-use.
+boundary_signed_create() {
+    local timestamp="$1" digest="$2" body="$3"
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w '%{http_code}' -X POST \
+        -H "X-API-Key: $BOUNDARY_KEY" -H 'X-Forwarded-For: 203.0.113.254' \
+        -H "X-Timestamp: $timestamp" -H "X-Signature-256: sha256=$digest" \
+        -H 'Content-Type: application/json' --data-binary "$body" "$BASE_URL/api/hooks")
+    RESP_BODY=$(cat "$RESP_BODY_FILE")
+    log "POST /api/hooks (signed) returned $RESP_STATUS"
+    print_response_body
+}
+
+if [ "$HAVE_OPENSSL" -eq 1 ]; then
+    BOUNDARY_TS=$(date +%s)
+    BOUNDARY_SIG=$(sign_canonical "$BOUNDARY_SECRET" POST /api/hooks "$BOUNDARY_TS" "$BOUNDARY_HOOK_BODY")
+    BOUNDARY_TAMPERED_BODY=$(jq -c '.args_template += " tampered"' <<< "$BOUNDARY_HOOK_BODY")
+    boundary_signed_create "$BOUNDARY_TS" "$BOUNDARY_SIG" "$BOUNDARY_TAMPERED_BODY"
+    check "401" "#56 reject a modified body with the original signature"
+    check_jq '.error' 'Invalid request signature' "#56 modified body fails signature verification"
+
+    boundary_signed_create "$BOUNDARY_TS" "$BOUNDARY_SIG" "$BOUNDARY_HOOK_BODY"
+    check "200" "#56 accept the original signed body"
+    BOUNDARY_HOOK_ID=$(jq -r '.id' <<< "$RESP_BODY")
+
+    BOUNDARY_SWAPPED_SIG=$(printf '%s' "$BOUNDARY_SIG" | tr 'a-fA-F' 'A-Fa-f')
+    check_local "$(if [[ "$BOUNDARY_SIG" != "$BOUNDARY_SWAPPED_SIG" ]]; then echo changed; fi)" \
+        "changed" "#56 hex case swap changes the digest spelling"
+    boundary_signed_create "$BOUNDARY_TS" "$BOUNDARY_SWAPPED_SIG" "$BOUNDARY_HOOK_BODY"
+    check "401" "#56 reject replay with the digest hex case swapped"
+    check_true '.error | contains("signature has already been used")' "#56 changed hex case triggers replay detection"
+
+    for BOUNDARY_OFFSET in -310 +310; do
+        BOUNDARY_SKEW_TS=$(($(date +%s) + BOUNDARY_OFFSET))
+        BOUNDARY_SKEW_SIG=$(sign_canonical "$BOUNDARY_SECRET" POST /api/hooks "$BOUNDARY_SKEW_TS" "$BOUNDARY_HOOK_BODY")
+        boundary_signed_create "$BOUNDARY_SKEW_TS" "$BOUNDARY_SKEW_SIG" "$BOUNDARY_HOOK_BODY"
+        check "401" "#56 reject a valid signature with ${BOUNDARY_OFFSET}s timestamp skew"
+        check_true '.error | contains("outside the permitted 300s window")' "#56 timestamp window caused the refusal"
+    done
+else
+    skip "§56 HMAC replay, skew and body checks: openssl not found on PATH"
+    api_call POST "/api/hooks" "$MASTER_KEY" "$BOUNDARY_HOOK_BODY"
+    check "200" "#56 create hook with long templates and script path"
+    BOUNDARY_HOOK_ID=$(jq -r '.id' <<< "$RESP_BODY")
+fi
+
+api_call GET "/api/hooks/$BOUNDARY_HOOK_ID" "$MASTER_KEY"
+check "200" "#56 read persisted hook settings"
+check_jq '.canonical_template' "$BOUNDARY_CANONICAL" "#56 canonical_template over 300 characters round-trips verbatim"
+check_jq '.args_template' "$BOUNDARY_ARGS" "#56 args_template over 300 characters round-trips verbatim"
+check_jq '.script_path' "$BOUNDARY_SCRIPT" "#56 script_path over 300 characters round-trips verbatim"
+
+envelope_call GET "/api/ssh-credentials/not-a-uuid" "$MASTER_KEY"
+check_envelope "400" "#56 malformed SSH credential UUID returns a JSON error"
+check_true '.error | type == "string" and length > 0' "#56 UUID error is a non-empty string"
+envelope_call POST "/api/hooks" "$MASTER_KEY" "$(jq -c '.unexpected_field = true' <<< "$BOUNDARY_HOOK_BODY")"
+check_envelope "422" "#56 unknown hook field returns a JSON error"
+check_true '.error | type == "string" and contains("unknown field") and contains("unexpected_field")' \
+    "#56 unknown field is named in the error"
+
+# A valid JSON object, exactly one byte over 3 MiB, exercises the typed JSON extractor.
+BOUNDARY_OVERSIZED="$WORK_DIR/section56_oversized.json"
+BOUNDARY_OVERSIZED_BYTES=$((3 * 1024 * 1024 + 1))
+jq -nj --argjson bytes "$BOUNDARY_OVERSIZED_BYTES" '"{}" + (" " * ($bytes - 2))' > "$BOUNDARY_OVERSIZED"
+check_local "$(wc -c < "$BOUNDARY_OVERSIZED" | tr -d '[:space:]')" "$BOUNDARY_OVERSIZED_BYTES" \
+    "#56 oversized JSON fixture is exactly one byte over the limit"
+envelope_call POST "/api/hooks" "$MASTER_KEY" "@$BOUNDARY_OVERSIZED"
+check_envelope "413" "#56 typed JSON body one byte over the limit returns a JSON error"
+check_true '.error | type == "string" and length > 0' "#56 oversized-body error is a non-empty string"
+
+BOUNDARY_CREDENTIAL_NAME="section56_ssh_credential"
+BOUNDARY_TARGET_NAME="section56_ssh_target"
+BOUNDARY_CREDENTIAL_BODY=$(jq -nc --arg name "$BOUNDARY_CREDENTIAL_NAME" \
+    '{name:$name,auth_type:"PASSWORD",password:"section56-fixture"}')
+api_call POST "/api/ssh-credentials" "$MASTER_KEY" "$(jq -c '.name = " "' <<< "$BOUNDARY_CREDENTIAL_BODY")"
+check "400" "#56 reject blank SSH credential name on create"
+check_true '.error | contains("name")' "#56 credential validation names the invalid field"
+api_call POST "/api/ssh-credentials" "$MASTER_KEY" "$BOUNDARY_CREDENTIAL_BODY"
+check "200" "#56 create SSH credential"
+BOUNDARY_CREDENTIAL_ID=$(jq -r '.id' <<< "$RESP_BODY")
+BOUNDARY_CREDENTIAL_PATH="/api/ssh-credentials/$BOUNDARY_CREDENTIAL_ID"
+api_call PUT "$BOUNDARY_CREDENTIAL_PATH" "$MASTER_KEY" '{"name":""}'
+check "400" "#56 reject empty SSH credential name on update"
+api_call PUT "$BOUNDARY_CREDENTIAL_PATH" "$MASTER_KEY" '{"password":"section56-replacement"}'
+check "200" "#56 update SSH credential"
+api_call GET "$BOUNDARY_CREDENTIAL_PATH" "$MASTER_KEY"
+check "200" "#56 read SSH credential after update"
+check_true ".name == \"$BOUNDARY_CREDENTIAL_NAME\" and .has_password == true and (has(\"password\") | not)" \
+    "#56 credential keeps its name and only exposes secret presence"
+
+BOUNDARY_TARGET_BODY=$(jq -nc --arg name "$BOUNDARY_TARGET_NAME" --arg credential "$BOUNDARY_CREDENTIAL_ID" \
+    '{name:$name,credential_id:$credential,host:"127.0.0.1",username:"section56"}')
+for BOUNDARY_INVALID_TARGET in '{"name":" "}' '{"port":0}' '{"port":65536}' '{"host_key_fingerprint":"SHA256:invalid!"}'; do
+    api_call POST "/api/ssh-targets" "$MASTER_KEY" \
+        "$(jq -c --argjson invalid "$BOUNDARY_INVALID_TARGET" '. + $invalid' <<< "$BOUNDARY_TARGET_BODY")"
+    check "400" "#56 reject SSH target create with $BOUNDARY_INVALID_TARGET"
+done
+
+api_call POST "/api/ssh-targets" "$MASTER_KEY" "$BOUNDARY_TARGET_BODY"
+check "200" "#56 create an unpinned SSH target"
+BOUNDARY_TARGET_ID=$(jq -r '.id' <<< "$RESP_BODY")
+BOUNDARY_TARGET_PATH="/api/ssh-targets/$BOUNDARY_TARGET_ID"
+for BOUNDARY_INVALID_TARGET in '{"name":""}' '{"port":0}' '{"port":65536}' '{"host_key_fingerprint":"SHA256:invalid!"}'; do
+    api_call PUT "$BOUNDARY_TARGET_PATH" "$MASTER_KEY" "$BOUNDARY_INVALID_TARGET"
+    check "400" "#56 reject SSH target update with $BOUNDARY_INVALID_TARGET"
+done
+api_call PUT "$BOUNDARY_TARGET_PATH" "$MASTER_KEY" '{"port":65535}'
+check "200" "#56 update SSH target to the maximum valid port"
+api_call GET "$BOUNDARY_TARGET_PATH" "$MASTER_KEY"
+check "200" "#56 read SSH target after update"
+check_true ".name == \"$BOUNDARY_TARGET_NAME\" and .port == 65535 and .host_key_fingerprint == null" \
+    "#56 target retains its name, valid port and unpinned state"
+
+api_call POST "$BOUNDARY_TARGET_PATH/test-connection" "$MASTER_KEY"
+check "200" "#56 unpinned target returns a connectivity result"
+check_true '.success == false and (.message | contains("no pinned host key fingerprint"))' \
+    "#56 missing host key pin prevents an SSH connection"
+api_call DELETE "$BOUNDARY_CREDENTIAL_PATH" "$MASTER_KEY"
+check "409" "#56 reject deletion of an SSH credential referenced by a target"
+check_true ".error | contains(\"$BOUNDARY_TARGET_NAME\")" "#56 conflict names the referencing target"
+
+api_call DELETE "$BOUNDARY_TARGET_PATH" "$MASTER_KEY"
+check "204" "#56 delete the SSH target"
+api_call DELETE "$BOUNDARY_CREDENTIAL_PATH" "$MASTER_KEY"
+check "204" "#56 delete the SSH credential after removing its target"
+for BOUNDARY_RESOURCE in CREDENTIAL TARGET; do
+    if [ "$BOUNDARY_RESOURCE" = CREDENTIAL ]; then
+        BOUNDARY_AUDIT_NAME="$BOUNDARY_CREDENTIAL_NAME"
+        BOUNDARY_AUDIT_ID="$BOUNDARY_CREDENTIAL_ID"
+    else
+        BOUNDARY_AUDIT_NAME="$BOUNDARY_TARGET_NAME"
+        BOUNDARY_AUDIT_ID="$BOUNDARY_TARGET_ID"
+    fi
+    for BOUNDARY_OPERATION in CREATE UPDATE DELETE; do
+        BOUNDARY_ACTION="SSH_${BOUNDARY_RESOURCE}_$BOUNDARY_OPERATION"
+        api_call GET "/api/audit-logs?action=$BOUNDARY_ACTION&limit=20" "$MASTER_KEY"
+        check "200" "#56 read $BOUNDARY_ACTION audit log"
+        check_true "[.[] | select(.action == \"$BOUNDARY_ACTION\" and .target_resource == \"$BOUNDARY_AUDIT_NAME\"
+            and (.details | contains(\"${BOUNDARY_AUDIT_ID:0:8}\")))] | length == 1" \
+            "#56 exactly one $BOUNDARY_ACTION entry identifies the test resource"
+    done
+done
+
+api_call DELETE "/api/hooks/$BOUNDARY_HOOK_ID?hard=true" "$MASTER_KEY"
+check "204" "#56 clean up the long storage hook"
+api_call DELETE "/api/keys/$BOUNDARY_KEY_ID" "$MASTER_KEY"
+check "204" "#56 clean up the storage key"
+rm -f "$BOUNDARY_OVERSIZED" "$BOUNDARY_SCRIPT"
+rmdir "$(dirname "$BOUNDARY_SCRIPT")" "$HOOK_DIR/$BOUNDARY_COMPONENT"
+check_local "$(if [[ ! -e "$BOUNDARY_OVERSIZED" && ! -e "$HOOK_DIR/$BOUNDARY_COMPONENT" ]]; then echo removed; fi)" \
+    "removed" "#56 temporary payload and script tree are cleaned up"
+
+# Scan both Rust trees for unsafe constructs, including declarations split across lines.
+BOUNDARY_UNSAFE_PATTERN='\bunsafe[[:space:]]*(\{|\(|\b(fn|impl|trait|extern)\b)'
+if command -v rg >/dev/null 2>&1; then
+    rg -n -U --no-ignore -g '*.rs' "$BOUNDARY_UNSAFE_PATTERN" "$PROJECT_ROOT/src" "$PROJECT_ROOT/tests"
+else
+    grep -rPnz --include='*.rs' "$BOUNDARY_UNSAFE_PATTERN" "$PROJECT_ROOT/src" "$PROJECT_ROOT/tests"
+fi
+check_local "$?" "1" "#56 no unsafe Rust constructs in src/ or tests/"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

@@ -16,15 +16,16 @@
 //! control rather than plumbing. See that module's header for the full reasoning.
 
 use chrono::Utc;
-use rand::RngExt;
 use ipnet::IpNet;
+use rand::RngExt;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::crypto::SecretCipher;
 use crate::entities::{
-    api_key, api_key::HmacMode, audit_log, hook, hook::HookExecutionType, hook_parameter, prelude::*,
+    api_key, api_key::HmacMode, audit_log, hook, hook::HookExecutionType, hook_parameter,
+    prelude::*,
 };
 use crate::error::AppError;
 
@@ -35,12 +36,14 @@ use super::{MAX_CONCURRENT_JOBS, MAX_TIMEOUT_SECONDS};
 // ─────────────────────────────────────────────────────────────
 
 /// Generates a random 32-byte hex key for API authentication.
+#[must_use]
 pub fn generate_random_key() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
 }
 
 /// Hashes an API key using SHA-256 for secure storage.
+#[must_use]
 pub fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
@@ -51,6 +54,7 @@ pub fn hash_key(key: &str) -> String {
 ///
 /// Non-secret by design: it is shown in the dashboard and appears in logs, so it only needs to be
 /// unique — it never authenticates anything. Callers identify themselves with `X-API-Key` alone.
+#[must_use]
 pub fn generate_key_id() -> String {
     let bytes: [u8; 16] = rand::rng().random();
     format!("shk_{}", hex::encode(bytes))
@@ -66,7 +70,9 @@ pub fn generate_key_id() -> String {
 /// here with the rest of the request plumbing, while the signing secret is the entropy every
 /// signature in the system rests on and belongs beside the HMAC that consumes it. This function is
 /// where the two meet, which is exactly what it is for.
-pub(crate) fn mint_signing_pair(cipher: &SecretCipher) -> Result<(String, String, String), AppError> {
+pub(crate) fn mint_signing_pair(
+    cipher: &SecretCipher,
+) -> Result<(String, String, String), AppError> {
     let key_id = generate_key_id();
     let signing_secret = crate::crypto::generate_signing_secret();
     let sealed = cipher.seal(&signing_secret).map_err(|e| {
@@ -90,11 +96,13 @@ pub(crate) fn format_reference(name: &str, id: Uuid) -> String {
 /// `since`/`until` filters, which parse and apply the range identically (`since` inclusive, `until`
 /// strictly exclusive).
 pub(crate) fn parse_instant(field: &str, raw: &str) -> Result<chrono::NaiveDateTime, AppError> {
-    chrono::DateTime::parse_from_rfc3339(raw).map(|dt| dt.to_utc().naive_utc()).map_err(|_| {
-        AppError::InvalidInput(format!(
-            "Invalid '{field}': expected an RFC 3339 timestamp, e.g. 2026-08-19T00:00:00Z"
-        ))
-    })
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.to_utc().naive_utc())
+        .map_err(|_| {
+            AppError::InvalidInput(format!(
+                "Invalid '{field}': expected an RFC 3339 timestamp, e.g. 2026-08-19T00:00:00Z"
+            ))
+        })
 }
 
 /// Writes an audit log entry.
@@ -278,7 +286,10 @@ pub(crate) fn validate_hook_name(name: &str) -> Result<(), AppError> {
     if name.is_empty() {
         return Err(AppError::InvalidInput("name is required".to_owned()));
     }
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')) {
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+    {
         return Err(AppError::InvalidInput(format!(
             "name {name:?} contains a character that is not URL-safe (hooks are invocable by name \
              at /webhook/{{name}}, so the name is also a URL path segment): only ASCII letters, \
@@ -359,7 +370,7 @@ pub(crate) fn validate_bound_ips(bound_ips: &str) -> Result<(), AppError> {
             continue;
         }
         let _: IpNet = parse_cidr_or_ip(trimmed)
-            .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {trimmed}")))?;
+            .map_err(|()| AppError::InvalidInput(format!("Invalid CIDR: {trimmed}")))?;
     }
     Ok(())
 }
@@ -423,12 +434,21 @@ mod tests {
         let wrapped = br#"{"parameters":{"target":"1.2.3.4"}}"#;
         let flat = br#"{"target":"1.2.3.4"}"#;
         let expected: serde_json::Map<String, serde_json::Value> =
-            [("target".to_owned(), serde_json::json!("1.2.3.4"))].into_iter().collect();
+            [("target".to_owned(), serde_json::json!("1.2.3.4"))]
+                .into_iter()
+                .collect();
 
-        assert_eq!(extract_parameter_map(wrapped).expect("wrapped shape"), expected);
+        assert_eq!(
+            extract_parameter_map(wrapped).expect("wrapped shape"),
+            expected
+        );
         assert_eq!(extract_parameter_map(flat).expect("flat shape"), expected);
         assert!(extract_parameter_map(b"").expect("empty body").is_empty());
-        assert!(extract_parameter_map(b"null").expect("null body").is_empty());
+        assert!(
+            extract_parameter_map(b"null")
+                .expect("null body")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -471,10 +491,24 @@ mod tests {
     #[test]
     fn validates_hook_names_against_the_url_safe_charset() {
         for name in ["ban.ip", "my_hook-1", "Hook123", "a", "1", "..--__~~"] {
-            assert!(validate_hook_name(name).is_ok(), "{name:?} should be accepted");
+            assert!(
+                validate_hook_name(name).is_ok(),
+                "{name:?} should be accepted"
+            );
         }
-        for name in ["ban/ip", "hook name", "hook%2Ftest", "hook?query", "hook#frag", "hook@host", ""] {
-            assert!(validate_hook_name(name).is_err(), "{name:?} should be refused");
+        for name in [
+            "ban/ip",
+            "hook name",
+            "hook%2Ftest",
+            "hook?query",
+            "hook#frag",
+            "hook@host",
+            "",
+        ] {
+            assert!(
+                validate_hook_name(name).is_err(),
+                "{name:?} should be refused"
+            );
         }
     }
 }

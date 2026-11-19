@@ -28,7 +28,12 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(Executions::Table)
-                    .add_column(ColumnDef::new(Executions::CallerIp).string().not_null().default(""))
+                    .add_column(
+                        ColumnDef::new(Executions::CallerIp)
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
                     .to_owned(),
             )
             .await

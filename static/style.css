@@ -28,6 +28,9 @@
     --transition-fast: 150ms ease;
     --transition-base: 200ms ease;
     --transition-slow: 300ms ease;
+
+    --container-padding-x: clamp(1rem, 2.5vw, 3rem);
+    --container-padding-y: 1.75rem;
 }
 
 /* ─── Reset & Base ──────────────────────────────────────── */
@@ -38,6 +41,11 @@
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+}
+
+html,
+body {
+    overflow-x: clip;
 }
 
 body {
@@ -61,7 +69,7 @@ body {
     max-width: min(2400px, 96vw);
     width: 100%;
     margin: 0 auto;
-    padding: 1.75rem clamp(1rem, 2.5vw, 3rem);
+    padding: var(--container-padding-y) var(--container-padding-x);
     transition: opacity var(--transition-slow), transform var(--transition-slow);
 }
 
@@ -81,11 +89,12 @@ body {
     width: 100vw;
     height: 100vh;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     background-color: var(--bg-main);
     z-index: 10000;
     padding: 1.5rem;
+    overflow-y: auto;
     transition: opacity var(--transition-slow), visibility var(--transition-slow);
 }
 
@@ -101,6 +110,7 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 2.5rem 2rem;
+    margin: auto;
     width: 100%;
     max-width: 420px;
     box-shadow: var(--shadow-lg);
@@ -255,6 +265,7 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 1.5rem;
+    min-width: 0;
     transition: border-color var(--transition-base);
 }
 
@@ -710,6 +721,10 @@ body {
     gap: 1.5rem;
 }
 
+.admin-grid > * {
+    min-width: 0;
+}
+
 .admin-section {
     overflow: hidden;
 }
@@ -725,6 +740,10 @@ body {
     background-color: rgba(28, 220, 154, 0.08);
     border: 1px solid rgba(28, 220, 154, 0.25);
     border-radius: var(--radius);
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
 }
 
 .key-reveal-label {
@@ -736,6 +755,9 @@ body {
 
 .key-reveal-value {
     display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
     font-family: var(--font-mono);
     font-size: 0.85rem;
     color: var(--text-main);
@@ -831,7 +853,8 @@ body {
     font-size: 0.7rem;
 }
 
-.badge-scope-master {
+.badge-scope-master,
+.scope-badges .badge-tier-master {
     background-color: rgba(231, 76, 60, 0.16);
     color: #ff7b6b;
     border: 1px solid rgba(231, 76, 60, 0.45);
@@ -1017,6 +1040,10 @@ body {
     margin-top: 0.5rem;
 }
 
+.mt-3 {
+    margin-top: 0.75rem;
+}
+
 .mt-4 {
     margin-top: 1rem;
 }
@@ -1035,8 +1062,9 @@ body {
 /* ─── Responsive ────────────────────────────────────────── */
 
 @media (max-width: 640px) {
-    .container {
-        padding: 1rem;
+    :root {
+        --container-padding-x: 1rem;
+        --container-padding-y: 1rem;
     }
 
     .header {
@@ -1232,7 +1260,9 @@ body {
 
 .modal-card {
     width: 100%;
-    max-width: clamp(520px, 46vw, 860px);
+    max-width: min(clamp(560px, 46vw, 860px), calc(100vw - 2rem));
+    background-color: #383e45;
+    border-color: #565b63;
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1507,14 +1537,14 @@ input[type="checkbox"]:indeterminate::after {
 
 .modal-card-wide {
     width: 100%;
-    max-width: min(1160px, calc(100vw - 3rem));
+    max-width: min(1160px, calc(100vw - 2rem));
     max-height: 90vh;
     overflow-y: auto;
 }
 
 .modal-card-form {
     width: 100%;
-    max-width: clamp(620px, 56vw, 960px);
+    max-width: min(clamp(720px, 58vw, 960px), calc(100vw - 2rem));
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
@@ -1523,7 +1553,7 @@ input[type="checkbox"]:indeterminate::after {
 #edit-hook-modal .modal-card-form,
 #run-hook-modal .modal-card-wide,
 #execution-detail-modal .modal-card-wide {
-    max-width: min(1200px, calc(100vw - 3rem));
+    max-width: min(1200px, calc(100vw - 2rem));
 }
 
 #tab-hooks .list-header .filters {
@@ -1531,13 +1561,17 @@ input[type="checkbox"]:indeterminate::after {
 }
 
 #secret-reveal-modal .modal-card {
-    max-width: clamp(580px, 48vw, 860px);
+    max-width: min(clamp(720px, 52vw, 900px), calc(100vw - 2rem));
 }
 
-#create-key-modal .form-actions,
-#edit-key-modal .form-actions,
-#secret-reveal-modal .form-actions {
-    justify-content: flex-start;
+#tab-audit .table-scroll {
+    flex: 1 1 auto;
+    max-height: none;
+    min-height: 12rem;
+}
+
+.table-scroll .data-table th {
+    box-shadow: inset 0 -2px 0 var(--border);
 }
 
 /* ─── Spacing Utilities ─────────────────────────────────── */
@@ -1860,8 +1894,8 @@ input[type="checkbox"]:indeterminate::after {
     top: 0;
     z-index: 30;
     background-color: var(--bg-main);
-    margin: -2rem -2rem 0;
-    padding: 2rem 2rem 0;
+    margin: calc(-1 * var(--container-padding-y)) calc(-1 * var(--container-padding-x)) 0;
+    padding: var(--container-padding-y) var(--container-padding-x) 0;
     transition: transform var(--transition-base), box-shadow var(--transition-base);
 }
 
@@ -1880,6 +1914,35 @@ input[type="checkbox"]:indeterminate::after {
 
 .list-header h2 {
     margin-bottom: 0;
+}
+
+/* Dark color-scheme & calendar icon contrast for datetime-local filters. */
+input[type="datetime-local"] {
+    color-scheme: dark;
+}
+
+input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+    filter: invert(0.8);
+    cursor: pointer;
+}
+
+.key-reveal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.35rem;
+}
+
+.key-reveal-header .key-reveal-label {
+    margin-bottom: 0;
+}
+
+.copy-compact-btn {
+    padding: 0.2rem 0.55rem;
+    font-size: 0.75rem;
+    line-height: 1.3;
+    flex: 0 0 auto;
 }
 
 /* ─── Key Tier Badges ──────────────────────────────────── */
@@ -1905,17 +1968,6 @@ input[type="checkbox"]:indeterminate::after {
     background-color: rgba(189, 195, 199, 0.1);
     color: var(--text-muted);
     border: 1px solid var(--border);
-}
-
-.btn-cancel {
-    background-color: var(--bg-surface);
-    color: var(--text-muted);
-    border-color: var(--border);
-}
-
-.btn-cancel:hover:not(:disabled) {
-    background-color: var(--border);
-    color: var(--text-main);
 }
 
 /* ─── Harmonized Audit Log Action Badges ─────────────────── */

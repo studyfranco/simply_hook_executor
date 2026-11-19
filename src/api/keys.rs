@@ -29,27 +29,24 @@ use axum::{
 };
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait,
-    QueryFilter, QueryOrder, sea_query::OnConflict,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
+    QueryOrder, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, api_key::HmacMode, api_key_hook_permission, hook, prelude::*,
-};
+use crate::entities::{api_key, api_key::HmacMode, api_key_hook_permission, hook, prelude::*};
 use crate::error::AppError;
 use crate::extract::{OptionalStrictJson, StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
-
 use super::guards::{
     guard_canonical_v1_for_key_management, guard_delegated_hook_grant,
-    has_permission_admin_standing, hook_permission, is_permission_reduction,
-    refuse_master_lifecycle_action, guard_hook_manage_conjunction,
-    guard_master_for_privileged_hook, guard_master_self_edit_is_bound_ips_only,
-    guard_master_to_administer, guard_master_to_grant_scopes,
+    guard_hook_manage_conjunction, guard_master_for_privileged_hook,
+    guard_master_self_edit_is_bound_ips_only, guard_master_to_administer,
+    guard_master_to_grant_scopes, has_permission_admin_standing, hook_permission,
+    is_permission_reduction, refuse_master_lifecycle_action,
 };
 use super::support::{
     create_audit_log, describe_hmac_mode, format_reference, generate_random_key, hash_key,
@@ -107,7 +104,10 @@ async fn descendant_key_ids(
             .map(|k| k.id)
             .collect();
 
-        frontier = children.into_iter().filter(|id| *id != root && seen.insert(*id)).collect();
+        frontier = children
+            .into_iter()
+            .filter(|id| *id != root && seen.insert(*id))
+            .collect();
     }
 
     Ok(seen.into_iter().collect())
@@ -147,7 +147,10 @@ async fn key_visibility(
     // Own subtree, transitively. Note this reads `parent_key_id` for *visibility scoping*, which is
     // the one use R3 explicitly sanctions — "`parent_key_id` exists solely for cascading deletion
     // and visibility scoping" — and never to decide whether an action is permitted.
-    if descendant_key_ids(db, caller.id).await?.contains(&target.id) {
+    if descendant_key_ids(db, caller.id)
+        .await?
+        .contains(&target.id)
+    {
         return Ok(Some(KeyVisibility::Full));
     }
 
@@ -182,17 +185,19 @@ async fn load_administrable_key(
     caller: &api_key::Model,
     id: Uuid,
 ) -> Result<api_key::Model, AppError> {
-    let target = ApiKey::find_by_id(id).one(db).await?.ok_or(AppError::NotFound)?;
-    match key_visibility(db, caller, &target).await? {
-        Some(KeyVisibility::Full) => Ok(target),
-        _ => {
-            tracing::warn!(
-                key = %caller.prefix,
-                target = %id,
-                "§4: key outside the caller's administrable scope; refused as nonexistent"
-            );
-            Err(AppError::NotFound)
-        }
+    let target = ApiKey::find_by_id(id)
+        .one(db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(KeyVisibility::Full) = key_visibility(db, caller, &target).await? {
+        Ok(target)
+    } else {
+        tracing::warn!(
+            key = %caller.prefix,
+            target = %id,
+            "§4: key outside the caller's administrable scope; refused as nonexistent"
+        );
+        Err(AppError::NotFound)
     }
 }
 
@@ -220,6 +225,17 @@ pub struct HookPermissionView {
     pub can_view_execution: bool,
 }
 
+/// Flags serialized as top-level fields on the enclosing response.
+#[derive(Serialize)]
+pub struct KeyManagementScopes {
+    /// Global key management scope.
+    pub can_manage_keys: bool,
+    /// Global hook creation scope.
+    pub can_manage_hooks: bool,
+    /// Global SSH management scope.
+    pub can_manage_ssh: bool,
+}
+
 /// Identity and permission payload returned to the client.
 #[derive(Serialize)]
 pub struct MeResponse {
@@ -242,12 +258,9 @@ pub struct MeResponse {
     pub max_concurrent_jobs: i32,
     /// Master status.
     pub is_master: bool,
-    /// Global key management scope.
-    pub can_manage_keys: bool,
-    /// Global hook creation scope.
-    pub can_manage_hooks: bool,
-    /// Global SSH management scope.
-    pub can_manage_ssh: bool,
+    /// Global management scopes.
+    #[serde(flatten)]
+    pub management_scopes: KeyManagementScopes,
     /// Granular per-hook permissions.
     pub hook_permissions: Vec<HookPermissionView>,
     /// Whether this deployment can actually reach a hook set to `auth_mode = NONE` keylessly — see
@@ -284,7 +297,7 @@ pub(crate) async fn load_hook_permissions(
 }
 
 /// Handles `GET /api/auth/me` — the identity and scope payload the SPA renders its tabs from.
-pub async fn get_me(
+pub(crate) async fn get_me(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -300,14 +313,15 @@ pub async fn get_me(
         bound_ips: key.bound_ips,
         max_concurrent_jobs: key.max_concurrent_jobs,
         is_master: key.is_master,
-        can_manage_keys: key.can_manage_keys,
-        can_manage_hooks: key.can_manage_hooks,
-        can_manage_ssh: key.can_manage_ssh,
+        management_scopes: KeyManagementScopes {
+            can_manage_keys: key.can_manage_keys,
+            can_manage_hooks: key.can_manage_hooks,
+            can_manage_ssh: key.can_manage_ssh,
+        },
         hook_permissions,
         keyless_hooks_allowed: !state.config.require_signed_requests,
     }))
 }
-
 
 // ─────────────────────────────────────────────────────────────
 // Admin CRUD — API keys
@@ -412,12 +426,9 @@ pub struct ApiKeySummary {
     pub max_concurrent_jobs: i32,
     /// Master flag.
     pub is_master: bool,
-    /// Global key-management scope.
-    pub can_manage_keys: bool,
-    /// Global hook-creation scope.
-    pub can_manage_hooks: bool,
-    /// Global SSH-management scope.
-    pub can_manage_ssh: bool,
+    /// Global management scopes.
+    #[serde(flatten)]
+    pub management_scopes: KeyManagementScopes,
     /// The key that created this one, for display only. `RBAC_MODEL.md` R3: "Rights are never
     /// derived from key lineage" — this is shown so an operator can see the key tree, never
     /// consulted by any guard. `None` for the bootstrap master and every key issued before lineage
@@ -466,7 +477,14 @@ pub(crate) async fn build_api_key_summary(
     model: api_key::Model,
 ) -> Result<ApiKeySummary, AppError> {
     let hook_permissions = load_hook_permissions(db, model.id).await?;
-    Ok(ApiKeySummary {
+    Ok(api_key_summary(model, hook_permissions))
+}
+
+fn api_key_summary(
+    model: api_key::Model,
+    hook_permissions: Vec<HookPermissionView>,
+) -> ApiKeySummary {
+    ApiKeySummary {
         id: model.id,
         name: model.name,
         prefix: model.prefix,
@@ -477,18 +495,19 @@ pub(crate) async fn build_api_key_summary(
         bound_ips: model.bound_ips,
         max_concurrent_jobs: model.max_concurrent_jobs,
         is_master: model.is_master,
-        can_manage_keys: model.can_manage_keys,
-        can_manage_hooks: model.can_manage_hooks,
-        can_manage_ssh: model.can_manage_ssh,
+        management_scopes: KeyManagementScopes {
+            can_manage_keys: model.can_manage_keys,
+            can_manage_hooks: model.can_manage_hooks,
+            can_manage_ssh: model.can_manage_ssh,
+        },
         parent_key_id: model.parent_key_id,
         created_at: model.created_at,
         hook_permissions,
-    })
+    }
 }
 
-
 /// Handles `POST /api/keys`.
-pub async fn create_api_key(
+pub(crate) async fn create_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -543,8 +562,11 @@ pub async fn create_api_key(
     // `None` all around for a bearer-only key — the same shape `key_id`'s doc comment already
     // describes for "keys issued before signing secrets existed", now reachable by request instead
     // of only by predating the feature.
-    let (key_id, signing_secret, sealed_secret) =
-        if wants_signing_pair { mint_signing_pair(&state.cipher).map(|(a, b, c)| (Some(a), Some(b), Some(c)))? } else { (None, None, None) };
+    let (key_id, signing_secret, sealed_secret) = if wants_signing_pair {
+        mint_signing_pair(&state.cipher).map(|(a, b, c)| (Some(a), Some(b), Some(c)))?
+    } else {
+        (None, None, None)
+    };
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
@@ -583,7 +605,11 @@ pub async fn create_api_key(
         Some(format!(
             "Created key {} ({})",
             format_reference(&payload.name, id),
-            if wants_signing_pair { describe_hmac_mode(hmac_mode).to_owned() } else { "bearer-only, no signing secret".to_owned() }
+            if wants_signing_pair {
+                describe_hmac_mode(hmac_mode).to_owned()
+            } else {
+                "bearer-only, no signing secret".to_owned()
+            }
         )),
     )
     .await?;
@@ -599,7 +625,7 @@ pub async fn create_api_key(
 }
 
 /// Handles `GET /api/keys`.
-pub async fn list_api_keys(
+pub(crate) async fn list_api_keys(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -611,7 +637,10 @@ pub async fn list_api_keys(
     // hook membership — for *every key in the deployment* to any `can_manage_keys` holder. One
     // shared hook was enough to read another parent's entire configuration, which is precisely the
     // "keyhole" §4 names.
-    let keys = ApiKey::find().order_by_asc(api_key::Column::CreatedAt).all(&state.db).await?;
+    let keys = ApiKey::find()
+        .order_by_asc(api_key::Column::CreatedAt)
+        .all(&state.db)
+        .await?;
     // Computed once for the whole listing rather than per key: the alternative is two extra queries
     // per row, and neither answer changes within a single request.
     let subtree = if key.is_master {
@@ -638,7 +667,12 @@ pub async fn list_api_keys(
 
     let target_key_ids: Vec<Uuid> = keys
         .iter()
-        .filter(|m| key.is_master || m.id == key.id || subtree.contains(&m.id) || shared_holders.contains(&m.id))
+        .filter(|m| {
+            key.is_master
+                || m.id == key.id
+                || subtree.contains(&m.id)
+                || shared_holders.contains(&m.id)
+        })
         .map(|m| m.id)
         .collect();
 
@@ -656,13 +690,16 @@ pub async fn list_api_keys(
         std::collections::HashMap::new();
     for (perm, hook) in all_perms {
         if let Some(h) = hook {
-            permissions_by_key.entry(perm.api_key_id).or_default().push(HookPermissionView {
-                hook_id: perm.hook_id,
-                hook_name: h.name,
-                can_execute: perm.can_execute,
-                can_manage: perm.can_manage,
-                can_view_execution: perm.can_view_execution,
-            });
+            permissions_by_key
+                .entry(perm.api_key_id)
+                .or_default()
+                .push(HookPermissionView {
+                    hook_id: perm.hook_id,
+                    hook_name: h.name,
+                    can_execute: perm.can_execute,
+                    can_manage: perm.can_manage,
+                    can_view_execution: perm.can_view_execution,
+                });
         }
     }
 
@@ -670,24 +707,10 @@ pub async fn list_api_keys(
     for model in keys {
         if key.is_master || model.id == key.id || subtree.contains(&model.id) {
             let hook_permissions = permissions_by_key.remove(&model.id).unwrap_or_default();
-            views.push(ApiKeyView::Full(Box::new(ApiKeySummary {
-                id: model.id,
-                name: model.name,
-                prefix: model.prefix,
-                key_id: model.key_id,
-                has_signing_secret: model.signing_secret.is_some(),
-                hmac_mode: model.hmac_mode,
-                canonical_template: model.canonical_template,
-                bound_ips: model.bound_ips,
-                max_concurrent_jobs: model.max_concurrent_jobs,
-                is_master: model.is_master,
-                can_manage_keys: model.can_manage_keys,
-                can_manage_hooks: model.can_manage_hooks,
-                can_manage_ssh: model.can_manage_ssh,
-                parent_key_id: model.parent_key_id,
-                created_at: model.created_at,
+            views.push(ApiKeyView::Full(Box::new(api_key_summary(
+                model,
                 hook_permissions,
-            })));
+            ))));
         } else if shared_holders.contains(&model.id) {
             let perms = permissions_by_key
                 .remove(&model.id)
@@ -741,7 +764,7 @@ pub struct UpdateApiKeyPayload {
 }
 
 /// Handles `PUT /api/keys/{id}`.
-pub async fn update_api_key(
+pub(crate) async fn update_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -805,7 +828,11 @@ pub async fn update_api_key(
         active.max_concurrent_jobs = Set(jobs);
     }
     if let Some(template) = payload.canonical_template {
-        active.canonical_template = Set(if template.is_empty() { None } else { Some(template) });
+        active.canonical_template = Set(if template.is_empty() {
+            None
+        } else {
+            Some(template)
+        });
     }
     if let Some(v) = payload.can_manage_keys {
         active.can_manage_keys = Set(v);
@@ -927,7 +954,10 @@ pub(crate) async fn collect_subtree_inventory(
         .all(db)
         .await?
         .into_iter()
-        .map(|k| DoomedKey { id: k.id, name: k.name })
+        .map(|k| DoomedKey {
+            id: k.id,
+            name: k.name,
+        })
         .collect();
 
     // Soft-deleted hooks are included on purpose. A hook in the trash is still recoverable and
@@ -952,6 +982,32 @@ pub(crate) async fn collect_subtree_inventory(
     Ok((subtree, doomed, inventory))
 }
 
+async fn validate_reassignments(
+    db: &sea_orm::DatabaseConnection,
+    subtree: &[Uuid],
+    resolutions: &std::collections::HashMap<Uuid, EntityResolution>,
+) -> Result<(), AppError> {
+    // Validate every reassignment *before* applying any of them, so a bad target in the middle of
+    // the map cannot leave the subtree half-resolved and half-deleted.
+    let doomed_ids: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
+    for (entity_id, resolution) in resolutions {
+        if let EntityResolution::Reassign { to } = resolution {
+            if doomed_ids.contains(to) {
+                return Err(AppError::InvalidInput(format!(
+                    "cannot reassign '{entity_id}' to '{to}': that key is inside the subtree being                      deleted"
+                )));
+            }
+            if ApiKey::find_by_id(*to).one(db).await?.is_none() {
+                return Err(AppError::InvalidInput(format!(
+                    "cannot reassign '{entity_id}' to '{to}': no such API key"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Handles `DELETE /api/keys/{id}` — cascading deletion with the §6 pre-flight inventory.
 ///
 /// # Two-step by design
@@ -971,14 +1027,13 @@ pub(crate) async fn collect_subtree_inventory(
 /// inventory it was shown, and something was created in between. Applying it would delete the keys
 /// and orphan whatever arrived late, which is precisely the outcome this whole mechanism exists to
 /// make impossible.
-pub async fn delete_api_key(
+pub(crate) async fn delete_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(id): StrictPath<Uuid>,
     OptionalStrictJson(payload): OptionalStrictJson<DeleteApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
@@ -999,14 +1054,20 @@ pub async fn delete_api_key(
     // A resolution naming something not in the inventory is a mistake worth surfacing rather than
     // ignoring: it usually means the caller is replaying a map built against a different subtree.
     let inventoried: std::collections::HashSet<Uuid> = inventory.iter().map(|e| e.id).collect();
-    if let Some(stray) = payload.resolutions.keys().find(|k| !inventoried.contains(k)) {
+    if let Some(stray) = payload
+        .resolutions
+        .keys()
+        .find(|k| !inventoried.contains(k))
+    {
         return Err(AppError::InvalidInput(format!(
             "resolution supplied for '{stray}', which this key subtree does not own"
         )));
     }
 
-    let unresolved: Vec<&OwnedEntity> =
-        inventory.iter().filter(|e| !payload.resolutions.contains_key(&e.id)).collect();
+    let unresolved: Vec<&OwnedEntity> = inventory
+        .iter()
+        .filter(|e| !payload.resolutions.contains_key(&e.id))
+        .collect();
     if !unresolved.is_empty() {
         tracing::info!(
             key = %key.prefix,
@@ -1042,23 +1103,7 @@ pub async fn delete_api_key(
         });
     }
 
-    // Validate every reassignment *before* applying any of them, so a bad target in the middle of
-    // the map cannot leave the subtree half-resolved and half-deleted.
-    let doomed_ids: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
-    for (entity_id, resolution) in &payload.resolutions {
-        if let EntityResolution::Reassign { to } = resolution {
-            if doomed_ids.contains(to) {
-                return Err(AppError::InvalidInput(format!(
-                    "cannot reassign '{entity_id}' to '{to}': that key is inside the subtree being                      deleted"
-                )));
-            }
-            if ApiKey::find_by_id(*to).one(&state.db).await?.is_none() {
-                return Err(AppError::InvalidInput(format!(
-                    "cannot reassign '{entity_id}' to '{to}': no such API key"
-                )));
-            }
-        }
-    }
+    validate_reassignments(&state.db, &subtree, &payload.resolutions).await?;
 
     let now = Utc::now().naive_utc();
     let mut deleted_hooks = 0usize;
@@ -1092,8 +1137,10 @@ pub async fn delete_api_key(
     // The cascade itself. Permission rows follow via the schema's existing `ON DELETE CASCADE`, and
     // `executions.api_key_id` is `ON DELETE SET NULL`, so run history survives its author — which
     // is what makes the audit trail worth keeping.
-    let result =
-        ApiKey::delete_many().filter(api_key::Column::Id.is_in(subtree.clone())).exec(&state.db).await?;
+    let result = ApiKey::delete_many()
+        .filter(api_key::Column::Id.is_in(subtree.clone()))
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
@@ -1129,7 +1176,7 @@ pub struct RotateKeyResponse {
 
 /// Handles `POST /api/keys/{id}/rotate` — issues a new secret, immediately invalidating the old
 /// one (its hash is overwritten, not kept alongside).
-pub async fn rotate_api_key(
+pub(crate) async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1200,7 +1247,7 @@ pub struct RegenerateKeyResponse {
 /// "this key may be compromised, replace everything" are different incidents with different blast
 /// radii, and forcing the wider one every time either happens means re-provisioning every
 /// integration that relies on the (unaffected) signing secret for no reason.
-pub async fn regenerate_key(
+pub(crate) async fn regenerate_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1265,7 +1312,7 @@ pub struct RegenerateSecretResponse {
 /// [`crate::api::support::mint_signing_pair`] was introduced, and giving this one endpoint a
 /// different rule would be a special case with no benefit: `key_id` is a display identifier, not a
 /// credential, so nothing depends on it surviving a secret regeneration.
-pub async fn regenerate_secret(
+pub(crate) async fn regenerate_secret(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1301,7 +1348,11 @@ pub async fn regenerate_secret(
     )
     .await?;
 
-    Ok(Json(RegenerateSecretResponse { id, key_id, signing_secret }))
+    Ok(Json(RegenerateSecretResponse {
+        id,
+        key_id,
+        signing_secret,
+    }))
 }
 
 /// Input for granting a key rights over a hook.
@@ -1333,7 +1384,7 @@ pub struct HookPermInput {
 }
 
 /// Handles `POST /api/keys/{id}/permissions` — grants or updates one key's rights over one hook.
-pub async fn update_key_hook_permissions(
+pub(crate) async fn update_key_hook_permissions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1354,8 +1405,14 @@ pub async fn update_key_hook_permissions(
     // scope exists so a parent managing a hook can see who else holds rights on it, and R6 lets it
     // revoke them. Administering the key *entity* still needs full visibility
     // ([`load_administrable_key`]); this is administering one row of a hook it manages.
-    let target_key = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    if key_visibility(&state.db, &key, &target_key).await?.is_none() {
+    let target_key = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if key_visibility(&state.db, &key, &target_key)
+        .await?
+        .is_none()
+    {
         return Err(AppError::NotFound);
     }
     if target_key.is_master {
@@ -1429,10 +1486,34 @@ pub async fn update_key_hook_permissions(
         guard_master_for_privileged_hook(&key, &hook_model, "grant permissions on")?;
     }
 
+    upsert_hook_permission(&state.db, id, hook_model.id, &payload).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "KEY_PERM_UPDATE",
+        Some(hook_model.name.clone()),
+        Some(format!(
+            "Updated permissions for key {}",
+            format_reference(&target_key.name, id)
+        )),
+    )
+    .await?;
+
+    Ok(axum::http::StatusCode::OK)
+}
+
+async fn upsert_hook_permission(
+    db: &sea_orm::DatabaseConnection,
+    id: Uuid,
+    hook_id: Uuid,
+    payload: &HookPermInput,
+) -> Result<(), AppError> {
     let perm = api_key_hook_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(id),
-        hook_id: Set(hook_model.id),
+        hook_id: Set(hook_id),
         can_execute: Set(payload.can_execute),
         can_manage: Set(payload.can_manage),
         can_view_execution: Set(payload.can_view_execution),
@@ -1455,28 +1536,15 @@ pub async fn update_key_hook_permissions(
             ])
             .to_owned(),
         )
-        .exec_without_returning(&state.db)
+        .exec_without_returning(db)
         .await?;
 
-    create_audit_log(
-        &state.db,
-        &key,
-        client_ip.0,
-        "KEY_PERM_UPDATE",
-        Some(hook_model.name.clone()),
-        Some(format!(
-            "Updated permissions for key {}",
-            format_reference(&target_key.name, id)
-        )),
-    )
-    .await?;
-
-    Ok(axum::http::StatusCode::OK)
+    Ok(())
 }
 
 /// Handles `DELETE /api/keys/{id}/permissions/{hook_identifier}` — removes a key's grant over one
 /// hook. The identifier may be the hook's UUID or its name.
-pub async fn revoke_key_hook_permission(
+pub(crate) async fn revoke_key_hook_permission(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
@@ -1519,7 +1587,10 @@ pub async fn revoke_key_hook_permission(
         return Err(AppError::NotFound);
     }
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     create_audit_log(
         &state.db,
         &key,

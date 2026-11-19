@@ -60,29 +60,29 @@ pub mod system;
 // Grouped by module rather than alphabetically so a reader can see at a glance which domain owns
 // which route. `src/lib.rs` refers to all of these unqualified as `api::name`.
 
-pub use executions::{
+pub(crate) use audit::list_audit_logs;
+pub(crate) use executions::{
     delete_execution, execute_hook_endpoint, get_execution, list_executions, purge_executions,
     test_hook, webhook_execute,
 };
-pub use hooks::{
+pub(crate) use health::{health_check, readiness_check};
+pub(crate) use hooks::{
     create_hook, create_hook_parameter, delete_hook, delete_hook_parameter, get_hook,
     list_hook_parameters, list_hooks, purge_deleted_hooks, restore_hook, update_hook,
     update_hook_parameter,
 };
-pub use keys::{
+pub(crate) use keys::{
     create_api_key, delete_api_key, get_me, list_api_keys, regenerate_key, regenerate_secret,
     revoke_key_hook_permission, rotate_api_key, update_api_key, update_key_hook_permissions,
 };
-pub use audit::list_audit_logs;
-pub use health::{health_check, readiness_check};
-pub use ssh::{
+pub(crate) use ssh::{
     create_ssh_credential, create_ssh_target, delete_ssh_credential, delete_ssh_target,
     fetch_ssh_host_fingerprint, get_ssh_credential, get_ssh_target, grant_ssh_target_permission,
     list_ssh_credentials, list_ssh_target_permissions, list_ssh_targets,
     revoke_ssh_target_permission, test_ssh_target_connection, update_ssh_credential,
     update_ssh_target,
 };
-pub use system::get_settings;
+pub(crate) use system::get_settings;
 
 // The credential primitives are public because the test suite mints keys directly against the
 // database — `tests/common/mod.rs` hashes a plaintext exactly as the service would, which is the

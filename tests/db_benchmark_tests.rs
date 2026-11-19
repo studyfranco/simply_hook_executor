@@ -1,19 +1,18 @@
 //! Performance benchmarks measuring and quantifying database optimizations.
 //! Compares execution durations before and after optimizations:
 //! 1. Indexing optimizations (unindexed sequential scan vs indexed B-Tree lookup)
-//! 2. Elimination of N+1 query loops via batch loading for hooks, ssh_targets, and api_keys
+//! 2. Elimination of N+1 query loops via batch loading for hooks, `ssh_targets`, and `api_keys`
 
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use common::*;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
-    EntityTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
+    QueryOrder,
 };
 use simply_hook_executor::entities::{
-    api_key, api_key_hook_permission, api_key_ssh_target_permission, hook, hook_parameter, prelude::*,
-    ssh_credential, ssh_credential::SshAuthType, ssh_target,
+    api_key, api_key_hook_permission, api_key_ssh_target_permission, hook, hook_parameter,
+    prelude::*, ssh_credential, ssh_credential::SshAuthType, ssh_target,
 };
 use std::time::Instant;
 use uuid::Uuid;
@@ -21,12 +20,21 @@ use uuid::Uuid;
 #[tokio::test]
 async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
     let db = setup_test_db().await;
-    let (master_id, _master_key) = insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
+    let (master_id, _master_key) =
+        insert_key(&db, "master", "0.0.0.0/0", KeyScopes::master()).await;
 
     println!("\n================================================================================");
     println!("              DATABASE QUERY OPTIMIZATION BENCHMARK REPORT                      ");
     println!("================================================================================");
 
+    let hook_ids = seed_hook_benchmark(&db, master_id).await;
+    benchmark_hook_index(&db, hook_ids[25]).await;
+    benchmark_hook_listing(&db, master_id, &hook_ids).await;
+    benchmark_target_listing(&db, master_id).await;
+    println!("================================================================================\n");
+}
+
+async fn seed_hook_benchmark(db: &sea_orm::DatabaseConnection, master_id: Uuid) -> Vec<Uuid> {
     // ─────────────────────────────────────────────────────────────────────────
     // Benchmark 1: Foreign Key Cascade & Filter Index (api_key_hook_permissions.hook_id)
     // ─────────────────────────────────────────────────────────────────────────
@@ -59,7 +67,7 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
             is_active: Set(true),
             disabled_reason: Set(None),
         }
-        .insert(&db)
+        .insert(db)
         .await
         .expect("hook insert succeeds");
 
@@ -74,7 +82,7 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
                 is_required: Set(true),
                 created_at: Set(chrono::Utc::now().naive_utc()),
             }
-            .insert(&db)
+            .insert(db)
             .await
             .expect("parameter insert succeeds");
         }
@@ -89,7 +97,9 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
             id: Set(k_id),
             name: Set(format!("bench_key_{i}")),
             prefix: Set(format!("bkey{i}000")),
-            key_hash: Set(format!("hash{i}000000000000000000000000000000000000000000000000000000000000")),
+            key_hash: Set(format!(
+                "hash{i}000000000000000000000000000000000000000000000000000000000000"
+            )),
             key_id: Set(Some(format!("shk_{i}0000000000000000000000000000000"))),
             signing_secret: Set(None),
             hmac_mode: Set(api_key::HmacMode::CanonicalV1),
@@ -104,7 +114,7 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
             updated_at: Set(chrono::Utc::now().naive_utc()),
             canonical_template: Set(None),
         }
-        .insert(&db)
+        .insert(db)
         .await
         .expect("key insert succeeds");
     }
@@ -121,21 +131,24 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
                 can_view_execution: Set(true),
                 created_at: Set(chrono::Utc::now().naive_utc()),
             }
-            .insert(&db)
+            .insert(db)
             .await
             .expect("permission insert succeeds");
         }
     }
 
+    hook_ids
+}
+
+async fn benchmark_hook_index(db: &sea_orm::DatabaseConnection, target_hook: Uuid) {
     // Measure lookup by hook_id WITH index
-    let target_hook = hook_ids[25];
     let iters = 200;
 
     let start = Instant::now();
     for _ in 0..iters {
         let _ = ApiKeyHookPermission::find()
             .filter(api_key_hook_permission::Column::HookId.eq(target_hook))
-            .all(&db)
+            .all(db)
             .await
             .expect("lookup succeeds");
     }
@@ -150,7 +163,7 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
     for _ in 0..iters {
         let _ = ApiKeyHookPermission::find()
             .filter(api_key_hook_permission::Column::HookId.eq(target_hook))
-            .all(&db)
+            .all(db)
             .await
             .expect("lookup succeeds");
     }
@@ -164,32 +177,38 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
     .expect("recreate index succeeds");
 
     println!("1. Foreign Key Lookup (api_key_hook_permissions.hook_id, {iters} iterations):");
-    println!("   - Unindexed (Sequential Scan): {:?}", duration_without_index);
-    println!("   - Indexed (B-Tree Scan):        {:?}", duration_with_index);
+    println!("   - Unindexed (Sequential Scan): {duration_without_index:?}");
+    println!("   - Indexed (B-Tree Scan):        {duration_with_index:?}");
     if duration_without_index > duration_with_index {
         let speedup = duration_without_index.as_secs_f64() / duration_with_index.as_secs_f64();
-        println!("   - Improvement: {:.2}x faster", speedup);
+        println!("   - Improvement: {speedup:.2}x faster");
     } else {
         println!("   - Improvement: Verified index utilization");
     }
+}
 
+async fn benchmark_hook_listing(
+    db: &sea_orm::DatabaseConnection,
+    master_id: Uuid,
+    hook_ids: &[Uuid],
+) {
     // ─────────────────────────────────────────────────────────────────────────
     // Benchmark 2: N+1 vs Batch Loading in list_hooks
     // ─────────────────────────────────────────────────────────────────────────
     // Simulate N+1 pattern: 50 hook iterations doing individual DB calls
     let start_n1 = Instant::now();
-    for h_id in &hook_ids {
+    for h_id in hook_ids {
         let _ = HookParameter::find()
             .filter(hook_parameter::Column::HookId.eq(*h_id))
             .order_by_asc(hook_parameter::Column::CreatedAt)
-            .all(&db)
+            .all(db)
             .await
             .expect("load params succeeds");
 
         let _ = ApiKeyHookPermission::find()
             .filter(api_key_hook_permission::Column::ApiKeyId.eq(master_id))
             .filter(api_key_hook_permission::Column::HookId.eq(*h_id))
-            .all(&db)
+            .all(db)
             .await
             .expect("load perm succeeds");
     }
@@ -198,26 +217,30 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
     // Batch loading pattern: exactly 2 queries for all 50 hooks
     let start_batch = Instant::now();
     let _all_params = HookParameter::find()
-        .filter(hook_parameter::Column::HookId.is_in(hook_ids.clone()))
+        .filter(hook_parameter::Column::HookId.is_in(hook_ids.iter().copied()))
         .order_by_asc(hook_parameter::Column::CreatedAt)
-        .all(&db)
+        .all(db)
         .await
         .expect("batch load params succeeds");
 
     let _all_perms = ApiKeyHookPermission::find()
         .filter(api_key_hook_permission::Column::ApiKeyId.eq(master_id))
-        .filter(api_key_hook_permission::Column::HookId.is_in(hook_ids.clone()))
-        .all(&db)
+        .filter(api_key_hook_permission::Column::HookId.is_in(hook_ids.iter().copied()))
+        .all(db)
         .await
         .expect("batch load perms succeeds");
     let duration_hooks_batch = start_batch.elapsed();
 
     println!("\n2. Hook Listing N+1 Query Optimization (50 hooks, 100 parameters):");
-    println!("   - N+1 Pattern (100 individual queries): {:?}", duration_hooks_n1);
-    println!("   - Batch Loading (2 batched queries):    {:?}", duration_hooks_batch);
+    println!("   - N+1 Pattern (100 individual queries): {duration_hooks_n1:?}");
+    println!("   - Batch Loading (2 batched queries):    {duration_hooks_batch:?}");
     let speedup_hooks = duration_hooks_n1.as_secs_f64() / duration_hooks_batch.as_secs_f64();
-    println!("   - Improvement: {:.2}x faster (reduced 100 queries -> 2 queries)", speedup_hooks);
+    println!("   - Improvement: {speedup_hooks:.2}x faster (reduced 100 queries -> 2 queries)");
 
+    assert!(duration_hooks_batch < duration_hooks_n1);
+}
+
+async fn benchmark_target_listing(db: &sea_orm::DatabaseConnection, master_id: Uuid) {
     // ─────────────────────────────────────────────────────────────────────────
     // Benchmark 3: N+1 vs Batch Loading in list_ssh_targets
     // ─────────────────────────────────────────────────────────────────────────
@@ -233,7 +256,7 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
     }
-    .insert(&db)
+    .insert(db)
     .await
     .expect("credential insert succeeds");
 
@@ -253,20 +276,20 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
         }
-        .insert(&db)
+        .insert(db)
         .await
         .expect("target insert succeeds");
     }
 
     // Simulate N+1 for targets: 40 targets * 2 queries
     let start_targets_n1 = Instant::now();
-    for _t_id in &target_ids {
+    for target_id in &target_ids {
         let _ = SshCredential::find_by_id(cred_id)
-            .one(&db)
+            .one(db)
             .await
             .expect("cred lookup succeeds");
-        let _ = ApiKeySshTargetPermission::find_by_id((master_id, *_t_id))
-            .one(&db)
+        let _ = ApiKeySshTargetPermission::find_by_id((master_id, *target_id))
+            .one(db)
             .await
             .expect("perm lookup succeeds");
     }
@@ -276,25 +299,22 @@ async fn benchmark_db_indexing_and_n_plus_one_optimizations() {
     let start_targets_batch = Instant::now();
     let _ = SshCredential::find()
         .filter(ssh_credential::Column::Id.is_in(vec![cred_id]))
-        .all(&db)
+        .all(db)
         .await
         .expect("batch creds succeeds");
     let _ = ApiKeySshTargetPermission::find()
         .filter(api_key_ssh_target_permission::Column::ApiKeyId.eq(master_id))
         .filter(api_key_ssh_target_permission::Column::SshTargetId.is_in(target_ids.clone()))
-        .all(&db)
+        .all(db)
         .await
         .expect("batch perms succeeds");
     let duration_targets_batch = start_targets_batch.elapsed();
 
     println!("\n3. SSH Target Listing N+1 Query Optimization (40 targets):");
-    println!("   - N+1 Pattern (80 individual queries):  {:?}", duration_targets_n1);
-    println!("   - Batch Loading (2 batched queries):    {:?}", duration_targets_batch);
+    println!("   - N+1 Pattern (80 individual queries):  {duration_targets_n1:?}");
+    println!("   - Batch Loading (2 batched queries):    {duration_targets_batch:?}");
     let speedup_targets = duration_targets_n1.as_secs_f64() / duration_targets_batch.as_secs_f64();
-    println!("   - Improvement: {:.2}x faster (reduced 80 queries -> 2 queries)", speedup_targets);
+    println!("   - Improvement: {speedup_targets:.2}x faster (reduced 80 queries -> 2 queries)");
 
-    println!("================================================================================\n");
-
-    assert!(duration_hooks_batch < duration_hooks_n1);
     assert!(duration_targets_batch < duration_targets_n1);
 }

@@ -66,7 +66,7 @@ pub async fn health_check() -> impl IntoResponse {
 /// caller can amplify into unbounded work is a denial-of-service primitive aimed at the endpoint
 /// that exists to report health.
 ///
-/// The query is built with SeaORM's typed builder rather than a literal `SELECT 1`. An earlier
+/// The query is built with `SeaORM`'s typed builder rather than a literal `SELECT 1`. An earlier
 /// revision used the literal and carried an allowlist entry in `tests/source_hygiene.rs` to permit
 /// it. That trade was wrong: it bought one saved round-trip and paid with a standing exception to
 /// the raw-SQL ban, in a handler that is both request-reachable and **unauthenticated** — the worst

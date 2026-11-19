@@ -46,6 +46,7 @@ impl AppState {
     /// one correct value for it and no caller should be choosing another: a guard whose memory is
     /// shorter than the timestamp window would leave a gap where a signature is too new to be
     /// rejected as stale and too old to be remembered as used.
+    #[must_use]
     pub fn new(
         db: DatabaseConnection,
         config: Arc<RuntimeConfig>,
@@ -73,6 +74,7 @@ impl AppState {
     /// order to assert that a key claiming mastery it was not pinned with is refused. That situation
     /// cannot be constructed through the ordinary path by design — resolution only ever pins a row
     /// that genuinely is the sole Master — so it has to be injectable.
+    #[must_use]
     pub fn with_pinned_master(mut self, master_key_id: uuid::Uuid) -> Self {
         self.master_pin = Arc::new(MasterPin::pinned_to(master_key_id));
         self

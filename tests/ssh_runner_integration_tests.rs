@@ -42,8 +42,16 @@ impl server::Server for TestServer {
 impl server::Handler for TestServer {
     type Error = russh::Error;
 
-    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
-        Ok(if password == &*self.expected_password { Auth::Accept } else { Auth::reject() })
+    fn auth_password(
+        &mut self,
+        _user: &str,
+        password: &str,
+    ) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
+        std::future::ready(Ok(if password == &*self.expected_password {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        }))
     }
 
     async fn channel_open_session(
@@ -56,26 +64,28 @@ impl server::Handler for TestServer {
         Ok(())
     }
 
-    async fn exec_request(
+    fn exec_request(
         &mut self,
         channel: ChannelId,
         _data: &[u8],
         session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
-        session.data(channel, b"hello-stdout\n".to_vec())?;
-        session.extended_data(channel, 1, b"hello-stderr\n".to_vec())?;
-        session.exit_status_request(channel, 0)?;
-        session.eof(channel)?;
-        session.close(channel)?;
-        Ok(())
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        std::future::ready((|| {
+            session.channel_success(channel)?;
+            session.data(channel, b"hello-stdout\n".to_vec())?;
+            session.extended_data(channel, 1, b"hello-stderr\n".to_vec())?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        })())
     }
 }
 
 /// Starts a [`TestServer`] on an ephemeral loopback port and returns `(port, host_key_fingerprint)`.
 async fn spawn_test_server(expected_password: &str) -> (u16, String) {
-    let host_key =
-        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("Ed25519 key generation succeeds");
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+        .expect("Ed25519 key generation succeeds");
     let fingerprint = host_key.fingerprint(HashAlg::Sha256).to_string();
 
     let config = Arc::new(server::Config {
@@ -88,11 +98,17 @@ async fn spawn_test_server(expected_password: &str) -> (u16, String) {
         ..Default::default()
     });
 
-    let listener =
-        tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("binds an ephemeral loopback port");
-    let port = listener.local_addr().expect("a bound listener has a local address").port();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("binds an ephemeral loopback port");
+    let port = listener
+        .local_addr()
+        .expect("a bound listener has a local address")
+        .port();
 
-    let mut server = TestServer { expected_password: Arc::from(expected_password) };
+    let mut server = TestServer {
+        expected_password: Arc::from(expected_password),
+    };
     tokio::spawn(async move {
         // Errors here (e.g. the listener being dropped when the test's runtime shuts down) are
         // expected background noise once the owning test has finished with it, not a fatal test
@@ -114,7 +130,11 @@ fn password_credential(password: &str) -> ssh_credential::Model {
         auth_type: ssh_credential::SshAuthType::Password,
         encrypted_private_key: None,
         encrypted_passphrase: None,
-        encrypted_password: Some(SecretCipher::Plaintext.seal(password).expect("plaintext sealing never fails")),
+        encrypted_password: Some(
+            SecretCipher::Plaintext
+                .seal(password)
+                .expect("plaintext sealing never fails"),
+        ),
         owner_key_id: None,
         created_at: now,
         updated_at: now,
@@ -151,15 +171,28 @@ async fn run_remote_process_captures_stdout_stderr_and_exit_status() {
     let (port, fingerprint) = spawn_test_server("correct-horse-battery-staple").await;
     let credential = password_credential("correct-horse-battery-staple");
     let target = target(credential.id, port, Some(&fingerprint));
-    let spec = SshConnectionSpec::from_target_and_credential(&SecretCipher::Plaintext, &target, &credential)
-        .expect("a fully-pinned target with a matching credential builds a spec");
+    let spec = SshConnectionSpec::from_target_and_credential(
+        &SecretCipher::Plaintext,
+        &target,
+        &credential,
+    )
+    .expect("a fully-pinned target with a matching credential builds a spec");
 
-    let outcome = ssh::run_remote_process(&spec, &trivial_plan(), Duration::from_secs(5), 64 * 1024).await;
+    let outcome =
+        ssh::run_remote_process(&spec, &trivial_plan(), Duration::from_secs(5), 64 * 1024).await;
 
     assert_eq!(outcome.status, ExecutionStatus::Success);
     assert_eq!(outcome.exit_code, Some(0));
-    assert!(outcome.stdout.contains("hello-stdout"), "stdout was: {}", outcome.stdout);
-    assert!(outcome.stderr.contains("hello-stderr"), "stderr was: {}", outcome.stderr);
+    assert!(
+        outcome.stdout.contains("hello-stdout"),
+        "stdout was: {}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stderr.contains("hello-stderr"),
+        "stderr was: {}",
+        outcome.stderr
+    );
 }
 
 #[tokio::test]
@@ -167,10 +200,15 @@ async fn run_remote_process_fails_closed_on_wrong_password() {
     let (port, fingerprint) = spawn_test_server("the-real-password").await;
     let credential = password_credential("a-completely-wrong-password");
     let target = target(credential.id, port, Some(&fingerprint));
-    let spec = SshConnectionSpec::from_target_and_credential(&SecretCipher::Plaintext, &target, &credential)
-        .expect("building a spec does not itself attempt authentication");
+    let spec = SshConnectionSpec::from_target_and_credential(
+        &SecretCipher::Plaintext,
+        &target,
+        &credential,
+    )
+    .expect("building a spec does not itself attempt authentication");
 
-    let outcome = ssh::run_remote_process(&spec, &trivial_plan(), Duration::from_secs(5), 64 * 1024).await;
+    let outcome =
+        ssh::run_remote_process(&spec, &trivial_plan(), Duration::from_secs(5), 64 * 1024).await;
 
     assert_eq!(outcome.status, ExecutionStatus::Failed);
     assert!(outcome.exit_code.is_none());
@@ -189,10 +227,15 @@ async fn run_remote_process_fails_closed_on_host_key_mismatch() {
     // `HostKeyPinning` exists to refuse, not a malformed-input case.
     let wrong_fingerprint = "SHA256:0000000000000000000000000000000000000000A";
     let target = target(credential.id, port, Some(wrong_fingerprint));
-    let spec = SshConnectionSpec::from_target_and_credential(&SecretCipher::Plaintext, &target, &credential)
-        .expect("building a spec does not itself verify the host key");
+    let spec = SshConnectionSpec::from_target_and_credential(
+        &SecretCipher::Plaintext,
+        &target,
+        &credential,
+    )
+    .expect("building a spec does not itself verify the host key");
 
-    let outcome = ssh::run_remote_process(&spec, &trivial_plan(), Duration::from_secs(5), 64 * 1024).await;
+    let outcome =
+        ssh::run_remote_process(&spec, &trivial_plan(), Duration::from_secs(5), 64 * 1024).await;
 
     assert_eq!(outcome.status, ExecutionStatus::Failed);
     assert!(
@@ -212,8 +255,15 @@ async fn run_remote_process_refuses_an_unpinned_target_without_connecting() {
     let credential = password_credential("correct-horse-battery-staple");
     let target = target(credential.id, port, None);
 
-    let result = SshConnectionSpec::from_target_and_credential(&SecretCipher::Plaintext, &target, &credential);
-    assert!(result.is_err(), "an unpinned target must not yield a usable connection spec");
+    let result = SshConnectionSpec::from_target_and_credential(
+        &SecretCipher::Plaintext,
+        &target,
+        &credential,
+    );
+    assert!(
+        result.is_err(),
+        "an unpinned target must not yield a usable connection spec"
+    );
 }
 
 #[tokio::test]
@@ -221,17 +271,32 @@ async fn test_connection_reports_success_and_failure_as_data_not_errors() {
     let (port, fingerprint) = spawn_test_server("correct-horse-battery-staple").await;
     let credential = password_credential("correct-horse-battery-staple");
     let good_target = target(credential.id, port, Some(&fingerprint));
-    let spec = SshConnectionSpec::from_target_and_credential(&SecretCipher::Plaintext, &good_target, &credential)
-        .expect("spec builds");
+    let spec = SshConnectionSpec::from_target_and_credential(
+        &SecretCipher::Plaintext,
+        &good_target,
+        &credential,
+    )
+    .expect("spec builds");
 
-    assert!(ssh::test_connection(&spec, Duration::from_secs(5)).await.is_ok());
+    assert!(
+        ssh::test_connection(&spec, Duration::from_secs(5))
+            .await
+            .is_ok()
+    );
 
     let wrong_credential = password_credential("not-the-password");
     let wrong_target = target(wrong_credential.id, port, Some(&fingerprint));
-    let wrong_spec =
-        SshConnectionSpec::from_target_and_credential(&SecretCipher::Plaintext, &wrong_target, &wrong_credential)
-            .expect("spec builds even for a credential the server will reject");
-    assert!(ssh::test_connection(&wrong_spec, Duration::from_secs(5)).await.is_err());
+    let wrong_spec = SshConnectionSpec::from_target_and_credential(
+        &SecretCipher::Plaintext,
+        &wrong_target,
+        &wrong_credential,
+    )
+    .expect("spec builds even for a credential the server will reject");
+    assert!(
+        ssh::test_connection(&wrong_spec, Duration::from_secs(5))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

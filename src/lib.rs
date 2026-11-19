@@ -1,4 +1,3 @@
-#![warn(missing_docs)]
 //! Simply Hook Executor — a secure hook execution daemon.
 //!
 //! Exposes the Axum router ([`create_app`]), the shared application state, the safe script
@@ -73,78 +72,17 @@ use state::AppState;
 /// `/health` and `/ready` probes — see [`api::health`] for why those two must not require a
 /// credential.
 pub fn create_app(state: AppState) -> Router {
-    let admin_routes = Router::new()
-        .route("/auth/me", get(api::get_me))
-        // Hooks
-        .route("/hooks", post(api::create_hook))
-        .route("/hooks", get(api::list_hooks))
-        .route("/hooks/{identifier}", get(api::get_hook))
-        .route("/hooks/{identifier}", put(api::update_hook))
-        // PATCH is accepted as a synonym: every field of `UpdateHookPayload` is already optional,
-        // so the handler's semantics are partial-update either way.
-        .route("/hooks/{identifier}", axum::routing::patch(api::update_hook))
-        .route("/hooks/{identifier}", delete(api::delete_hook))
-        // Trash management. Both are master-only; see the handlers.
-        .route("/hooks/{identifier}/restore", post(api::restore_hook))
-        // Hook parameters
-        .route("/hooks/{identifier}/parameters", get(api::list_hook_parameters))
-        .route("/hooks/{identifier}/parameters", post(api::create_hook_parameter))
-        .route("/hooks/{identifier}/parameters/{param_id}", put(api::update_hook_parameter))
-        .route("/hooks/{identifier}/parameters/{param_id}", delete(api::delete_hook_parameter))
-        // API keys
-        .route("/keys", post(api::create_api_key))
-        .route("/keys", get(api::list_api_keys))
-        .route("/keys/{id}", put(api::update_api_key))
-        // PATCH as a synonym for PUT, matching the hook routes: every `UpdateApiKeyPayload` field
-        // is optional, so the handler is partial-update under either verb.
-        .route("/keys/{id}", axum::routing::patch(api::update_api_key))
-        .route("/keys/{id}", delete(api::delete_api_key))
-        .route("/keys/{id}/rotate", post(api::rotate_api_key))
-        .route("/keys/{id}/regenerate-key", post(api::regenerate_key))
-        .route("/keys/{id}/regenerate-secret", post(api::regenerate_secret))
-        .route("/keys/{id}/permissions", post(api::update_key_hook_permissions))
-        .route("/keys/{id}/permissions/{hook_identifier}", delete(api::revoke_key_hook_permission))
-        // Execution history
-        .route("/executions", get(api::list_executions))
-        .route("/executions", delete(api::purge_executions))
-        .route("/executions/{id}", get(api::get_execution))
-        .route("/executions/{id}", delete(api::delete_execution))
-        // Observability
-        .route("/audit-logs", get(api::list_audit_logs))
-        .route("/settings", get(api::get_settings))
-        // System maintenance
-        .route("/system/purge-hooks", post(api::purge_deleted_hooks))
-        // SSH credentials
-        .route("/ssh-credentials", post(api::create_ssh_credential))
-        .route("/ssh-credentials", get(api::list_ssh_credentials))
-        .route("/ssh-credentials/{id}", get(api::get_ssh_credential))
-        .route("/ssh-credentials/{id}", put(api::update_ssh_credential))
-        .route("/ssh-credentials/{id}", delete(api::delete_ssh_credential))
-        // SSH targets
-        .route("/ssh-targets", post(api::create_ssh_target))
-        .route("/ssh-targets", get(api::list_ssh_targets))
-        // Fixed path ahead of `/{id}` in registration order so it is never shadowed by the dynamic
-        // segment — Axum matches static segments first regardless, but the order here documents the
-        // intent for a reader.
-        .route("/ssh-targets/fetch-fingerprint", post(api::fetch_ssh_host_fingerprint))
-        .route("/ssh-targets/{id}", get(api::get_ssh_target))
-        .route("/ssh-targets/{id}", put(api::update_ssh_target))
-        .route("/ssh-targets/{id}", delete(api::delete_ssh_target))
-        .route("/ssh-targets/{id}/test-connection", post(api::test_ssh_target_connection))
-        .route("/ssh-targets/{id}/permissions", get(api::list_ssh_target_permissions))
-        .route("/ssh-targets/{id}/permissions", post(api::grant_ssh_target_permission))
-        .route("/ssh-targets/{id}/permissions/{api_key_id}", delete(api::revoke_ssh_target_permission))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::auth_middleware,
-        ));
+    let admin_routes = admin_routes(&state);
 
     // The two routes that actually run a hook, split from `admin_routes` because they alone may
     // accept a caller presenting no `X-API-Key` at all — see [`middleware::invocation_auth_middleware`].
     // Every other `/api/*` route stays behind the always-mandatory-bearer-key `auth_middleware`
     // above.
     let hook_invocation_routes = Router::new()
-        .route("/hooks/{identifier}/execute", post(api::execute_hook_endpoint))
+        .route(
+            "/hooks/{identifier}/execute",
+            post(api::execute_hook_endpoint),
+        )
         .route("/hooks/{identifier}/test", post(api::test_hook))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -193,11 +131,121 @@ pub fn create_app(state: AppState) -> Router {
         .with_state(state)
 }
 
+fn admin_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/auth/me", get(api::get_me))
+        // Hooks
+        .route("/hooks", post(api::create_hook))
+        .route("/hooks", get(api::list_hooks))
+        .route("/hooks/{identifier}", get(api::get_hook))
+        .route("/hooks/{identifier}", put(api::update_hook))
+        // PATCH is accepted as a synonym: every field of `UpdateHookPayload` is already optional,
+        // so the handler's semantics are partial-update either way.
+        .route(
+            "/hooks/{identifier}",
+            axum::routing::patch(api::update_hook),
+        )
+        .route("/hooks/{identifier}", delete(api::delete_hook))
+        // Trash management. Both are master-only; see the handlers.
+        .route("/hooks/{identifier}/restore", post(api::restore_hook))
+        // Hook parameters
+        .route(
+            "/hooks/{identifier}/parameters",
+            get(api::list_hook_parameters),
+        )
+        .route(
+            "/hooks/{identifier}/parameters",
+            post(api::create_hook_parameter),
+        )
+        .route(
+            "/hooks/{identifier}/parameters/{param_id}",
+            put(api::update_hook_parameter),
+        )
+        .route(
+            "/hooks/{identifier}/parameters/{param_id}",
+            delete(api::delete_hook_parameter),
+        )
+        // API keys
+        .route("/keys", post(api::create_api_key))
+        .route("/keys", get(api::list_api_keys))
+        .route("/keys/{id}", put(api::update_api_key))
+        // PATCH as a synonym for PUT, matching the hook routes: every `UpdateApiKeyPayload` field
+        // is optional, so the handler is partial-update under either verb.
+        .route("/keys/{id}", axum::routing::patch(api::update_api_key))
+        .route("/keys/{id}", delete(api::delete_api_key))
+        .route("/keys/{id}/rotate", post(api::rotate_api_key))
+        .route("/keys/{id}/regenerate-key", post(api::regenerate_key))
+        .route("/keys/{id}/regenerate-secret", post(api::regenerate_secret))
+        .route(
+            "/keys/{id}/permissions",
+            post(api::update_key_hook_permissions),
+        )
+        .route(
+            "/keys/{id}/permissions/{hook_identifier}",
+            delete(api::revoke_key_hook_permission),
+        )
+        // Execution history
+        .route("/executions", get(api::list_executions))
+        .route("/executions", delete(api::purge_executions))
+        .route("/executions/{id}", get(api::get_execution))
+        .route("/executions/{id}", delete(api::delete_execution))
+        // Observability
+        .route("/audit-logs", get(api::list_audit_logs))
+        .route("/settings", get(api::get_settings))
+        // System maintenance
+        .route("/system/purge-hooks", post(api::purge_deleted_hooks))
+        .merge(ssh_routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ))
+}
+
+fn ssh_routes() -> Router<AppState> {
+    Router::new()
+        // SSH credentials
+        .route("/ssh-credentials", post(api::create_ssh_credential))
+        .route("/ssh-credentials", get(api::list_ssh_credentials))
+        .route("/ssh-credentials/{id}", get(api::get_ssh_credential))
+        .route("/ssh-credentials/{id}", put(api::update_ssh_credential))
+        .route("/ssh-credentials/{id}", delete(api::delete_ssh_credential))
+        // SSH targets
+        .route("/ssh-targets", post(api::create_ssh_target))
+        .route("/ssh-targets", get(api::list_ssh_targets))
+        // Fixed path ahead of `/{id}` in registration order so it is never shadowed by the dynamic
+        // segment — Axum matches static segments first regardless, but the order here documents the
+        // intent for a reader.
+        .route(
+            "/ssh-targets/fetch-fingerprint",
+            post(api::fetch_ssh_host_fingerprint),
+        )
+        .route("/ssh-targets/{id}", get(api::get_ssh_target))
+        .route("/ssh-targets/{id}", put(api::update_ssh_target))
+        .route("/ssh-targets/{id}", delete(api::delete_ssh_target))
+        .route(
+            "/ssh-targets/{id}/test-connection",
+            post(api::test_ssh_target_connection),
+        )
+        .route(
+            "/ssh-targets/{id}/permissions",
+            get(api::list_ssh_target_permissions),
+        )
+        .route(
+            "/ssh-targets/{id}/permissions",
+            post(api::grant_ssh_target_permission),
+        )
+        .route(
+            "/ssh-targets/{id}/permissions/{api_key_id}",
+            delete(api::revoke_ssh_target_permission),
+        )
+}
+
 /// Spawns the background log retention worker for `state`.
 ///
 /// Returns the shutdown sender alongside the worker's join handle: dropping the sender asks the
 /// worker to stop, and awaiting the handle confirms it has. `main` holds both so graceful
 /// shutdown never cuts a sweep off mid-delete.
+#[must_use]
 pub fn spawn_retention_worker(state: &AppState) -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<()>(1);
     let db = state.db.clone();

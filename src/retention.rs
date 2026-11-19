@@ -35,6 +35,9 @@ pub const DEFAULT_DELETED_HOOK_RETENTION_DAYS: i64 = 92;
 ///
 /// A non-positive `retention_days` disables purging and is a no-op, so an operator can keep
 /// history forever by setting `LOG_RETENTION_DAYS=0` without also having to disable the worker.
+///
+/// # Errors
+/// Returns an error if the database rejects a query or write.
 pub async fn purge_expired_executions(
     db: &DatabaseConnection,
     retention_days: i64,
@@ -70,6 +73,9 @@ pub async fn purge_expired_executions(
 /// invariant held elsewhere in the code (or on a reader recalling how `NULL` compares) is the wrong
 /// trade for a few bytes of SQL. `is_deleted = true AND deleted_at IS NOT NULL AND deleted_at <
 /// threshold` says what it means without anyone having to reason it out.
+///
+/// # Errors
+/// Returns an error if the database rejects a query or write.
 pub async fn purge_expired_deleted_hooks(
     db: &DatabaseConnection,
     retention_days: i64,

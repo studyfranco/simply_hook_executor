@@ -121,8 +121,9 @@ impl ReplayGuard {
     /// A non-positive or absurd window is clamped into range rather than trusted: this value comes
     /// from `SIGNATURE_MAX_AGE_SECONDS`, and a typo there must not be able to switch replay
     /// protection off or turn the map into an unbounded allocation.
+    #[must_use]
     pub fn new(window_seconds: i64) -> Self {
-        let window = Duration::from_secs(window_seconds.clamp(1, 3600) as u64);
+        let window = Duration::from_secs(window_seconds.clamp(1, 3600).unsigned_abs());
         let prune_interval = window / PRUNE_INTERVAL_DIVISOR;
         let capacity_backoff = window / CAPACITY_BACKOFF_DIVISOR;
         let now = Instant::now();
@@ -165,7 +166,10 @@ impl ReplayGuard {
             return false;
         };
 
-        let id = SignatureId { key_id, digest: digest.to_vec() };
+        let id = SignatureId {
+            key_id,
+            digest: digest.to_vec(),
+        };
         match seen.get(&id) {
             // An entry that has outlived the window is stale bookkeeping the sweep has not reached
             // yet, not a replay — its timestamp could no longer pass the window check anyway.
@@ -197,7 +201,7 @@ impl ReplayGuard {
     /// out of release builds rather than left as public surface no caller uses.
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
+        self.seen.lock().map_or(0, |seen| seen.len())
     }
 
     /// Drops expired entries when a sweep is due, or when the map has reached its ceiling.
@@ -210,7 +214,10 @@ impl ReplayGuard {
     /// The two locks are taken strictly one after the other, never nested, so this cannot deadlock
     /// against [`ReplayGuard::check_and_record`].
     fn prune_if_due(&self, now: Instant) {
-        let over_capacity = self.seen.lock().is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
+        let over_capacity = self
+            .seen
+            .lock()
+            .is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
 
         {
             let Ok(mut schedule) = self.schedule.lock() else {
@@ -261,9 +268,18 @@ mod tests {
         let guard = ReplayGuard::new(300);
         let key = Uuid::new_v4();
 
-        assert!(guard.check_and_record(key, &digest(1)), "first use is the legitimate request");
-        assert!(!guard.check_and_record(key, &digest(1)), "the same signature is a replay");
-        assert!(!guard.check_and_record(key, &digest(1)), "and stays one on every later attempt");
+        assert!(
+            guard.check_and_record(key, &digest(1)),
+            "first use is the legitimate request"
+        );
+        assert!(
+            !guard.check_and_record(key, &digest(1)),
+            "the same signature is a replay"
+        );
+        assert!(
+            !guard.check_and_record(key, &digest(1)),
+            "and stays one on every later attempt"
+        );
     }
 
     #[test]
@@ -273,7 +289,10 @@ mod tests {
         let other_key = Uuid::new_v4();
 
         assert!(guard.check_and_record(key, &digest(1)));
-        assert!(guard.check_and_record(key, &digest(2)), "a different signature is not a replay");
+        assert!(
+            guard.check_and_record(key, &digest(2)),
+            "a different signature is not a replay"
+        );
         // The same digest under a different key must not be mistaken for reuse — otherwise one
         // tenant's traffic could deny another's.
         assert!(guard.check_and_record(other_key, &digest(1)));
@@ -293,8 +312,15 @@ mod tests {
 
         // Accepted again: the original is now outside the window, where the timestamp check owns
         // the rejection instead.
-        assert!(guard.check_and_record(key, &digest(1)), "an expired entry is not a replay");
-        assert_eq!(guard.tracked(), 1, "the sweep released the expired entry rather than stacking");
+        assert!(
+            guard.check_and_record(key, &digest(1)),
+            "an expired entry is not a replay"
+        );
+        assert_eq!(
+            guard.tracked(),
+            1,
+            "the sweep released the expired entry rather than stacking"
+        );
     }
 
     /// Saturation must never flush the map.
@@ -314,7 +340,13 @@ mod tests {
             let mut seen = guard.seen.lock().expect("a fresh mutex is not poisoned");
             let expires_at = Instant::now() + Duration::from_secs(300);
             for n in 0..MAX_TRACKED_SIGNATURES {
-                seen.insert(SignatureId { key_id: key, digest: n.to_le_bytes().to_vec() }, expires_at);
+                seen.insert(
+                    SignatureId {
+                        key_id: key,
+                        digest: n.to_le_bytes().to_vec(),
+                    },
+                    expires_at,
+                );
             }
         }
         assert_eq!(guard.tracked(), MAX_TRACKED_SIGNATURES);
@@ -331,7 +363,10 @@ mod tests {
             !guard.check_and_record(key, 0usize.to_le_bytes().as_ref()),
             "capacity pressure must never make an already-used signature replayable"
         );
-        assert!(!guard.check_and_record(key, &digest(0xFF)), "the new entry is enforced too");
+        assert!(
+            !guard.check_and_record(key, &digest(0xFF)),
+            "the new entry is enforced too"
+        );
     }
 
     /// The backoff itself: a saturated guard whose entries are all live must not retain on every
@@ -351,7 +386,13 @@ mod tests {
             let mut seen = guard.seen.lock().expect("a fresh mutex is not poisoned");
             let expires_at = Instant::now() + Duration::from_secs(300);
             for n in 0..MAX_TRACKED_SIGNATURES {
-                seen.insert(SignatureId { key_id: key, digest: n.to_le_bytes().to_vec() }, expires_at);
+                seen.insert(
+                    SignatureId {
+                        key_id: key,
+                        digest: n.to_le_bytes().to_vec(),
+                    },
+                    expires_at,
+                );
             }
         }
 
@@ -360,7 +401,11 @@ mod tests {
         assert!(guard.check_and_record(key, &digest(0xF0)));
 
         let now = Instant::now();
-        let scheduled = guard.schedule.lock().expect("a fresh mutex is not poisoned").next_capacity;
+        let scheduled = guard
+            .schedule
+            .lock()
+            .expect("a fresh mutex is not poisoned")
+            .next_capacity;
         assert!(
             scheduled > now,
             "a capacity sweep must push the next one into the future, not leave it due"
@@ -375,9 +420,19 @@ mod tests {
         // cheap rather than each paying for its own full scan. Each uses a distinct digest so every
         // iteration is a genuine acceptance against a still-saturated map.
         for n in 0xF1u8..0xF6 {
-            assert!(guard.check_and_record(key, &digest(n)), "still accepting new signatures");
-            let again = guard.schedule.lock().expect("a fresh mutex is not poisoned").next_capacity;
-            assert_eq!(again, scheduled, "a request inside the backoff must not re-arm the sweep");
+            assert!(
+                guard.check_and_record(key, &digest(n)),
+                "still accepting new signatures"
+            );
+            let again = guard
+                .schedule
+                .lock()
+                .expect("a fresh mutex is not poisoned")
+                .next_capacity;
+            assert_eq!(
+                again, scheduled,
+                "a request inside the backoff must not re-arm the sweep"
+            );
         }
     }
 
@@ -392,7 +447,13 @@ mod tests {
             let mut seen = guard.seen.lock().expect("a fresh mutex is not poisoned");
             let expires_at = Instant::now() + Duration::from_secs(300);
             for n in 0..MAX_TRACKED_SIGNATURES {
-                seen.insert(SignatureId { key_id: key, digest: n.to_le_bytes().to_vec() }, expires_at);
+                seen.insert(
+                    SignatureId {
+                        key_id: key,
+                        digest: n.to_le_bytes().to_vec(),
+                    },
+                    expires_at,
+                );
             }
         }
         assert_eq!(guard.tracked(), MAX_TRACKED_SIGNATURES);
@@ -400,7 +461,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(301)).await;
         assert!(guard.check_and_record(key, &digest(1)));
 
-        assert_eq!(guard.tracked(), 1, "the sweep reclaimed the whole saturated map");
+        assert_eq!(
+            guard.tracked(),
+            1,
+            "the sweep reclaimed the whole saturated map"
+        );
     }
 
     /// A misconfigured `SIGNATURE_MAX_AGE_SECONDS` must not be able to disable the guard.

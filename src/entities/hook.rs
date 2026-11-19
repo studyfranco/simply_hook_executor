@@ -94,9 +94,11 @@ pub struct Model {
     #[sea_orm(unique)]
     pub name: String,
     /// Optional summary of what the hook script does.
+    #[sea_orm(column_type = "Text", nullable)]
     pub description: Option<String>,
     /// Absolute filesystem path to the executable (e.g. `/usr/local/bin/ban.sh`). Never passed
     /// through a shell — see [`crate::executor`].
+    #[sea_orm(column_type = "Text")]
     pub script_path: String,
     /// Maximum allowed runtime, in seconds, before the process group is `SIGKILL`ed.
     pub default_timeout_seconds: i32,
@@ -105,6 +107,7 @@ pub struct Model {
     /// `None` (or empty) runs the script directly under the daemon's own user. A value runs it
     /// through `sudo -n -u <user> --`, so what is actually permitted remains governed by
     /// `sudoers` — this field can request elevation, never grant it.
+    #[sea_orm(column_type = "Text", nullable)]
     pub run_as_user: Option<String>,
     /// The key answerable for this hook: **the only non-master identity that may delete or rename
     /// it** (`RBAC_MODEL.md` §3).
@@ -131,6 +134,7 @@ pub struct Model {
     ///
     /// Deliberately not a foreign key: attribution must outlive the acting key, which an FK would
     /// either cascade away or block from ever being deleted.
+    #[sea_orm(column_type = "Text", nullable)]
     pub deleted_by: Option<String>,
     /// Hook creation timestamp.
     pub created_at: DateTime,
@@ -147,14 +151,17 @@ pub struct Model {
     /// safe-view type standing between the entity and the wire, so the field itself carries the
     /// omission.
     #[serde(skip_serializing)]
+    #[sea_orm(column_type = "Text", nullable)]
     pub hmac_secret: Option<String>,
     /// Header an `HMAC_ONLY` sender's signature arrives on. `None` means the built-in default,
     /// `X-Signature-256` — apply the default at the point of use
     /// ([`crate::middleware::HMAC_ONLY_DEFAULT_HEADER`]), not by writing the literal into every row,
     /// so changing the default later does not require a data migration.
+    #[sea_orm(column_type = "Text", nullable)]
     pub signature_header: Option<String>,
     /// Prefix stripped from an `HMAC_ONLY` signature before hex-decoding it. `None` means the
     /// built-in default, `sha256=` ([`crate::crypto::SIGNATURE_PREFIX`]).
+    #[sea_orm(column_type = "Text", nullable)]
     pub signature_prefix: Option<String>,
     /// Override of the `CANONICAL_V1` canonical string template, consulted only when a *keyed*
     /// caller invokes a hook whose [`AuthMode`] is [`AuthMode::CanonicalV1`]. `None` means the
@@ -163,12 +170,14 @@ pub struct Model {
     /// `{timestamp}`, `{body}`; substitution is textual, so an unrecognized `{...}` is left in the
     /// signed material verbatim rather than rejected — a template is data the operator controls, not
     /// something this service validates the shape of beyond that.
+    #[sea_orm(column_type = "Text", nullable)]
     pub canonical_template: Option<String>,
     /// An example of the JSON body a real caller sends this hook — free-form, not schema-validated
-    /// beyond being well-formed JSON. Drives the WebUI's live command preview and JSON Payload
+    /// beyond being well-formed JSON. Drives the `WebUI`'s live command preview and JSON Payload
     /// Extractor, and — only when both this and at least one declared parameter exist — is checked
     /// at creation/update time (`api::hooks::validate_sample_payload_matches_parameters`) so a
     /// parameter contract cannot silently drift from the shape callers actually send.
+    #[sea_orm(column_type = "Text", nullable)]
     pub sample_payload_json: Option<String>,
     /// An optional argument-vector template, tokenized on whitespace at execution time with each
     /// token's `$var`/`${var}` references substituted from resolved parameter values (see
@@ -179,6 +188,7 @@ pub struct Model {
     /// `api::hooks::validate_args_template_matches_parameters`, the same allowlist discipline
     /// `sample_payload_json` applies. Never passed through a shell: substitution produces complete
     /// `argv` entries, not a string that gets re-parsed.
+    #[sea_orm(column_type = "Text", nullable)]
     pub args_template: Option<String>,
     /// Where this hook's script executes. See [`HookExecutionType`].
     pub execution_type: HookExecutionType,
@@ -189,6 +199,7 @@ pub struct Model {
     /// Whether this hook is active and permitted to run.
     pub is_active: bool,
     /// Human-readable explanation if this hook is deactivated.
+    #[sea_orm(column_type = "Text", nullable)]
     pub disabled_reason: Option<String>,
 }
 

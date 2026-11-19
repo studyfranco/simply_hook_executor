@@ -145,14 +145,32 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(SshCredentials::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(SshCredentials::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(SshCredentials::Name).string().not_null().unique_key())
+                    .col(
+                        ColumnDef::new(SshCredentials::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(SshCredentials::Name)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
                     .col(ColumnDef::new(SshCredentials::AuthType).string().not_null())
                     .col(ColumnDef::new(SshCredentials::EncryptedPrivateKey).text())
                     .col(ColumnDef::new(SshCredentials::EncryptedPassphrase).text())
                     .col(ColumnDef::new(SshCredentials::EncryptedPassword).text())
-                    .col(ColumnDef::new(SshCredentials::CreatedAt).date_time().not_null())
-                    .col(ColumnDef::new(SshCredentials::UpdatedAt).date_time().not_null())
+                    .col(
+                        ColumnDef::new(SshCredentials::CreatedAt)
+                            .date_time()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SshCredentials::UpdatedAt)
+                            .date_time()
+                            .not_null(),
+                    )
                     .to_owned(),
             )
             .await?;
@@ -162,10 +180,25 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(SshTargets::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(SshTargets::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(SshTargets::Name).string().not_null().unique_key())
+                    .col(
+                        ColumnDef::new(SshTargets::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(SshTargets::Name)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
                     .col(ColumnDef::new(SshTargets::Host).string().not_null())
-                    .col(ColumnDef::new(SshTargets::Port).integer().not_null().default(22))
+                    .col(
+                        ColumnDef::new(SshTargets::Port)
+                            .integer()
+                            .not_null()
+                            .default(22),
+                    )
                     .col(ColumnDef::new(SshTargets::Username).string().not_null())
                     .col(ColumnDef::new(SshTargets::CredentialId).uuid().not_null())
                     .col(ColumnDef::new(SshTargets::HostKeyFingerprint).string())
@@ -198,47 +231,64 @@ impl MigrationTrait for Migration {
                 Table::alter()
                     .table(Hooks::Table)
                     .add_column(
-                        ColumnDef::new(Hooks::ExecutionType).string().not_null().default("LOCAL"),
+                        ColumnDef::new(Hooks::ExecutionType)
+                            .string()
+                            .not_null()
+                            .default("LOCAL"),
                     )
                     .to_owned(),
             )
             .await?;
 
-        // No `.foreign_key(...)` here — see this module's own doc comment on why `hooks.ssh_target_id`
-        // cannot carry a DDL `REFERENCES` clause under SQLite, unlike `ssh_targets.credential_id`
-        // above (declared inline on that table's own `Table::create()`, which every backend accepts).
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Hooks::Table)
-                    .add_column(ColumnDef::new(Hooks::SshTargetId).uuid())
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx-hooks-ssh_target_id")
-                    .table(Hooks::Table)
-                    .col(Hooks::SshTargetId)
-                    .to_owned(),
-            )
-            .await
+        add_hook_dispatch_columns(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .alter_table(
-                Table::alter().table(Hooks::Table).drop_column(Hooks::SshTargetId).to_owned(),
+                Table::alter()
+                    .table(Hooks::Table)
+                    .drop_column(Hooks::SshTargetId)
+                    .to_owned(),
             )
             .await?;
         manager
             .alter_table(
-                Table::alter().table(Hooks::Table).drop_column(Hooks::ExecutionType).to_owned(),
+                Table::alter()
+                    .table(Hooks::Table)
+                    .drop_column(Hooks::ExecutionType)
+                    .to_owned(),
             )
             .await?;
-        manager.drop_table(Table::drop().table(SshTargets::Table).to_owned()).await?;
-        manager.drop_table(Table::drop().table(SshCredentials::Table).to_owned()).await
+        manager
+            .drop_table(Table::drop().table(SshTargets::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(SshCredentials::Table).to_owned())
+            .await
     }
+}
+
+async fn add_hook_dispatch_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // No `.foreign_key(...)` here — see this module's own doc comment on why `hooks.ssh_target_id`
+    // cannot carry a DDL `REFERENCES` clause under SQLite, unlike `ssh_targets.credential_id`
+    // above (declared inline on that table's own `Table::create()`, which every backend accepts).
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Hooks::Table)
+                .add_column(ColumnDef::new(Hooks::SshTargetId).uuid())
+                .to_owned(),
+        )
+        .await?;
+
+    manager
+        .create_index(
+            Index::create()
+                .name("idx-hooks-ssh_target_id")
+                .table(Hooks::Table)
+                .col(Hooks::SshTargetId)
+                .to_owned(),
+        )
+        .await
 }

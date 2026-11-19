@@ -13,8 +13,7 @@
 // does not call are unused *here* while having real callers next door. The crate-wide convention is
 // to allow it at the import rather than inside `common`, which keeps `common`'s own no-blanket-allow
 // rule intact.
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -75,7 +74,10 @@ async fn liveness_reports_a_constant_document() {
     // Exactly two fields. Asserted as a count rather than by listing absences, so a field added
     // later — a version, a hostname, an uptime — trips this test and has to be justified rather
     // than arriving unnoticed on a public endpoint.
-    let object = response.json.as_object().expect("the body is a JSON object");
+    let object = response
+        .json
+        .as_object()
+        .expect("the body is a JSON object");
     assert_eq!(
         object.len(),
         2,
@@ -154,7 +156,10 @@ async fn liveness_still_answers_when_the_database_is_gone() {
 
     // Readiness has genuinely noticed, so the assertion below is independence rather than a
     // database that never actually went away.
-    assert_eq!(send(&app, anonymous("/ready")).await.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        send(&app, anonymous("/ready")).await.status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 
     let response = send(&app, anonymous("/health")).await;
     assert_eq!(
@@ -178,7 +183,10 @@ async fn a_bogus_api_key_neither_helps_nor_hinders_a_probe() {
 
     for uri in ["/health", "/ready"] {
         let request = with_connect_info(
-            Request::builder().method("GET").uri(uri).header("X-API-Key", "not-a-real-key"),
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("X-API-Key", "not-a-real-key"),
         )
         .body(Body::empty())
         .expect("building the request succeeds");
@@ -201,7 +209,12 @@ async fn adding_the_probes_did_not_open_the_authenticated_tree() {
     let db = setup_test_db().await;
     let app = simply_hook_executor::create_app(test_state(&db));
 
-    for uri in ["/api/hooks", "/api/keys", "/api/settings", "/api/audit-logs"] {
+    for uri in [
+        "/api/hooks",
+        "/api/keys",
+        "/api/settings",
+        "/api/audit-logs",
+    ] {
         assert_eq!(
             send(&app, anonymous(uri)).await.status,
             StatusCode::UNAUTHORIZED,
@@ -244,5 +257,8 @@ async fn readiness_reports_unavailable_when_no_master_is_pinned() {
 
     // Liveness is unaffected — an unpinned master is not a reason to restart the container, and
     // restarting would not pin it either.
-    assert_eq!(send(&app, anonymous("/health")).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, anonymous("/health")).await.status,
+        StatusCode::OK
+    );
 }

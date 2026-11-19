@@ -28,6 +28,7 @@ pub struct Model {
     /// The affected resource's name or identifier, when applicable.
     pub target_resource: Option<String>,
     /// Additional context, e.g. the fields that changed.
+    #[sea_orm(column_type = "Text", nullable)]
     pub details: Option<String>,
     /// Event timestamp (UTC).
     pub timestamp: DateTime,

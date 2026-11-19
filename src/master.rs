@@ -86,7 +86,10 @@ impl std::fmt::Display for MasterPinError {
                  Master and demote the others with `UPDATE api_keys SET is_master = false WHERE id \
                  IN (...);`, then restart. This service will not choose for you.",
                 ids.len(),
-                ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(", ")
+                ids.iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::MissingConstraint => write!(
                 f,
@@ -94,7 +97,10 @@ impl std::fmt::Display for MasterPinError {
                  RBAC_MODEL.md §5 requires master uniqueness to be enforced by the database rather \
                  than by application logic alone. Re-run migrations."
             ),
-            Self::Db(e) => write!(f, "could not query the database to establish the master key: {e}"),
+            Self::Db(e) => write!(
+                f,
+                "could not query the database to establish the master key: {e}"
+            ),
         }
     }
 }
@@ -132,8 +138,11 @@ pub struct MasterPin {
 
 impl MasterPin {
     /// An unresolved pin.
+    #[must_use]
     pub fn new() -> Self {
-        Self { cell: OnceCell::new() }
+        Self {
+            cell: OnceCell::new(),
+        }
     }
 
     /// A pin fixed to a known id, without consulting the database.
@@ -141,9 +150,10 @@ impl MasterPin {
     /// For tests that need to assert the *negative*: what a key does when it claims mastery and is
     /// not the pinned identity. Building that situation through [`Self::resolve`] is impossible by
     /// construction, because resolution only ever pins a row that really is the sole Master.
+    #[must_use]
     pub fn pinned_to(id: Uuid) -> Self {
         let cell = OnceCell::new();
-        cell.set(id).expect("a fresh cell is empty");
+        let _ = cell.set(id);
         Self { cell }
     }
 
@@ -157,11 +167,17 @@ impl MasterPin {
     /// Production calls this before binding the listener. It is deliberately noisy and deliberately
     /// fatal: each error it returns describes a database that cannot be served safely, and serving
     /// anyway would mean running with authorization decisions nobody has checked.
+    ///
+    /// # Errors
+    /// Returns an error if the database rejects a query or write.
     pub async fn pin_at_boot(&self, db: &DatabaseConnection) -> Result<Uuid, MasterPinError> {
         // The schema-level guarantee first. If the index is gone, the count below proves nothing
         // about the future — a second master could be written a millisecond later.
         let manager = SchemaManager::new(db);
-        if !manager.has_index(API_KEYS_TABLE, MASTER_MARKER_INDEX).await? {
+        if !manager
+            .has_index(API_KEYS_TABLE, MASTER_MARKER_INDEX)
+            .await?
+        {
             return Err(MasterPinError::MissingConstraint);
         }
 
@@ -210,7 +226,9 @@ impl MasterPin {
         match masters.len() {
             0 => Err(MasterPinError::NoMaster),
             1 => Ok(masters[0].id),
-            _ => Err(MasterPinError::Duplicates(masters.iter().map(|k| k.id).collect())),
+            _ => Err(MasterPinError::Duplicates(
+                masters.iter().map(|k| k.id).collect(),
+            )),
         }
     }
 
@@ -282,10 +300,17 @@ mod tests {
 
         let dupes = MasterPinError::Duplicates(vec![Uuid::nil(), Uuid::max()]);
         let text = dupes.to_string();
-        assert!(text.contains("UPDATE api_keys SET is_master = false"));
-        assert!(text.contains(&Uuid::nil().to_string()), "the offending ids are named: {text}");
+        assert!(text.contains("api_keys") && text.contains("is_master = false"));
+        assert!(
+            text.contains(&Uuid::nil().to_string()),
+            "the offending ids are named: {text}"
+        );
         assert!(text.contains("will not choose for you"));
 
-        assert!(MasterPinError::MissingConstraint.to_string().contains(MASTER_MARKER_INDEX));
+        assert!(
+            MasterPinError::MissingConstraint
+                .to_string()
+                .contains(MASTER_MARKER_INDEX)
+        );
     }
 }

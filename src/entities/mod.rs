@@ -1,4 +1,4 @@
-//! SeaORM entity definitions mirroring the tables described in `SCHEMA.MD`.
+//! `SeaORM` entity definitions mirroring the tables described in `SCHEMA.MD`.
 
 /// Re-exports of every entity type, for ergonomic `use crate::entities::prelude::*` imports.
 pub mod prelude;

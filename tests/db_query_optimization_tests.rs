@@ -1,7 +1,6 @@
 //! Tests validating database indexes, query optimization, and batching.
 
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use axum::http::StatusCode;
 use common::*;
@@ -22,8 +21,14 @@ async fn all_performance_and_foreign_key_indexes_exist() {
     let manager = SchemaManager::new(&db);
 
     let expected_indexes = [
-        ("api_key_hook_permissions", "idx_api_key_hook_permissions_hook_id"),
-        ("api_key_ssh_target_permissions", "idx_api_key_ssh_target_permissions_ssh_target_id"),
+        (
+            "api_key_hook_permissions",
+            "idx_api_key_hook_permissions_hook_id",
+        ),
+        (
+            "api_key_ssh_target_permissions",
+            "idx_api_key_ssh_target_permissions_ssh_target_id",
+        ),
         ("ssh_credentials", "idx_ssh_credentials_owner_key_id"),
         ("ssh_credentials", "idx_ssh_credentials_created_at"),
         ("ssh_targets", "idx_ssh_targets_owner_key_id"),
@@ -161,7 +166,11 @@ async fn list_ssh_targets_batch_loads_credentials_and_permissions() {
     }
 
     // Call GET /api/ssh-targets as master
-    let resp = send(&app, json_request("GET", "/api/ssh-targets", &master_key, None)).await;
+    let resp = send(
+        &app,
+        json_request("GET", "/api/ssh-targets", &master_key, None),
+    )
+    .await;
     assert_eq!(resp.status, StatusCode::OK);
 
     let targets = resp.json.as_array().expect("array response");
@@ -217,7 +226,9 @@ async fn list_api_keys_batch_loads_permissions() {
             id: Set(key_id),
             name: Set(format!("daughter_key_{i}")),
             prefix: Set(format!("dkey{i}000")),
-            key_hash: Set(format!("hash{i}000000000000000000000000000000000000000000000000000000000000")),
+            key_hash: Set(format!(
+                "hash{i}000000000000000000000000000000000000000000000000000000000000"
+            )),
             key_id: Set(Some(format!("shk_{i}0000000000000000000000000000000"))),
             signing_secret: Set(None),
             hmac_mode: Set(api_key::HmacMode::CanonicalV1),

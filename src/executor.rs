@@ -69,6 +69,7 @@ pub struct ResolvedParameters {
 
 impl ResolvedParameters {
     /// Serializes the resolved values as a JSON object for `executions.parameters_json`.
+    #[must_use]
     pub fn to_json_string(&self) -> String {
         let map: serde_json::Map<String, serde_json::Value> = self
             .values
@@ -82,6 +83,7 @@ impl ResolvedParameters {
 /// Whether `key` is usable as the suffix of a `HOOK_PARAM_<KEY>` environment variable, i.e.
 /// matches `[A-Za-z_][A-Za-z0-9_]*`. Enforced when a parameter is *declared* so that no
 /// unusable contract can ever be stored, rather than failing later at execution time.
+#[must_use]
 pub fn is_valid_param_key(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
@@ -124,6 +126,9 @@ fn coerce_param_value(key: &str, value: &serde_json::Value) -> Result<Option<Str
 /// Unknown keys are rejected rather than ignored: a hook's contract is also its allowlist, and
 /// silently dropping an unrecognized parameter would let a caller believe they had influenced an
 /// execution that in fact ignored them.
+///
+/// # Errors
+/// Rejects unknown keys, missing required values, and values that cannot be passed as scalars.
 pub fn resolve_parameters(
     declared: &[hook_parameter::Model],
     supplied: &serde_json::Map<String, serde_json::Value>,
@@ -131,7 +136,7 @@ pub fn resolve_parameters(
     let mut unknown: Vec<&str> = supplied
         .keys()
         .filter(|k| !declared.iter().any(|d| &&d.param_key == k))
-        .map(|k| k.as_str())
+        .map(std::string::String::as_str)
         .collect();
     if !unknown.is_empty() {
         unknown.sort_unstable();
@@ -199,6 +204,9 @@ pub fn effective_run_as_user(run_as_user: Option<&str>) -> Option<&str> {
 /// it. Restricting to the POSIX-portable username shape (`[A-Za-z_][A-Za-z0-9_-]*`, plus a
 /// trailing `$` for Samba machine accounts) makes an argument that starts with `-` unrepresentable
 /// by construction, rather than relying on sudo's own parsing to be defensive.
+///
+/// # Errors
+/// Rejects usernames that do not match the supported POSIX account name format.
 pub fn validate_run_as_user(run_as_user: &str) -> Result<(), ScriptError> {
     let user = run_as_user.trim();
 
@@ -228,7 +236,10 @@ pub fn validate_run_as_user(run_as_user: &str) -> Result<(), ScriptError> {
         Some((&'$', rest)) => (rest, true),
         _ => (body.as_slice(), false),
     };
-    if !body.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-') {
+    if !body
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+    {
         return invalid("may only contain ASCII letters, digits, '_' and '-'");
     }
 
@@ -259,6 +270,7 @@ fn is_ident_char(c: char) -> bool {
 /// not be able to make a hook reference a parameter it never declared), and
 /// [`resolve_args_template`] below re-derives the same names at request time to know which
 /// resolved values it needs.
+#[must_use]
 pub fn extract_template_variable_names(template: &str) -> Vec<String> {
     let chars: Vec<char> = template.chars().collect();
     let mut names = Vec::new();
@@ -304,7 +316,10 @@ pub fn extract_template_variable_names(template: &str) -> Vec<String> {
 /// the operator controls the template, but the value came from the caller.
 fn substitute_token(token: &str, lookup: &HashMap<&str, &str>) -> Result<String, ScriptError> {
     let reject = |detail: String| {
-        Err(ScriptError::new(ScriptRejection::ArgsTemplateSubstitution, detail))
+        Err(ScriptError::new(
+            ScriptRejection::ArgsTemplateSubstitution,
+            detail,
+        ))
     };
 
     let chars: Vec<char> = token.chars().collect();
@@ -341,14 +356,11 @@ fn substitute_token(token: &str, lookup: &HashMap<&str, &str>) -> Result<String,
             continue;
         };
 
-        let value = match lookup.get(name.as_str()) {
-            Some(v) => v,
-            None => {
-                return reject(format!(
-                    "args_template references '${name}' in '{token}', which has no resolved value \
+        let Some(value) = lookup.get(name.as_str()) else {
+            return reject(format!(
+                "args_template references '${name}' in '{token}', which has no resolved value \
                      (not supplied and no default)"
-                ));
-            }
+            ));
         };
         if let Some(bad) = ARGS_TEMPLATE_FORBIDDEN.iter().find(|f| value.contains(*f)) {
             return reject(format!(
@@ -367,9 +379,15 @@ fn resolve_args_template(
     template: &str,
     resolved: &ResolvedParameters,
 ) -> Result<Vec<String>, ScriptError> {
-    let lookup: HashMap<&str, &str> =
-        resolved.values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    template.split_whitespace().map(|token| substitute_token(token, &lookup)).collect()
+    let lookup: HashMap<&str, &str> = resolved
+        .values
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    template
+        .split_whitespace()
+        .map(|token| substitute_token(token, &lookup))
+        .collect()
 }
 
 /// Builds the [`CommandPlan`] for a hook and a set of resolved parameters.
@@ -396,6 +414,9 @@ fn resolve_args_template(
 ///   blocking on a password prompt that nothing can ever answer.
 /// - `--` terminates sudo's own option parsing, so a script path or parameter beginning with `-`
 ///   is passed through as data rather than absorbed as a sudo flag.
+///
+/// # Errors
+/// Rejects argument templates that cannot resolve every reference safely.
 pub fn build_command_plan(
     hook: &hook::Model,
     resolved: &ResolvedParameters,
@@ -414,7 +435,10 @@ pub fn build_command_plan(
     // Injected parameters land last, so a HOOK_PARAM_* name can never be shadowed by a
     // same-named passthrough variable.
     for (key, value) in &resolved.values {
-        env.insert(format!("{PARAM_ENV_PREFIX}{}", key.to_uppercase()), value.clone());
+        env.insert(
+            format!("{PARAM_ENV_PREFIX}{}", key.to_uppercase()),
+            value.clone(),
+        );
     }
 
     let run_as_user = effective_run_as_user(hook.run_as_user.as_deref());
@@ -433,7 +457,12 @@ pub fn build_command_plan(
         None => (hook.script_path.clone(), Vec::new()),
     };
 
-    match hook.args_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    match hook
+        .args_template
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         Some(template) => args.extend(resolve_args_template(template, resolved)?),
         None => args.extend(resolved.values.iter().map(|(_, v)| v.clone())),
     }
@@ -521,12 +550,20 @@ fn diagnostic(script_path: &str, cause: &str, remedy: &str) -> String {
 /// `ls -n` / `stat` will show when an operator goes looking.
 #[cfg(unix)]
 fn process_identity() -> String {
-    // SAFETY: `geteuid`/`getegid` take no arguments, cannot fail, and only read this process's
-    // own credentials.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    match std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) {
-        Ok(name) if !name.is_empty() => format!("'{name}' (uid={uid} gid={gid})"),
-        _ => format!("uid={uid} gid={gid}"),
+    use std::os::unix::fs::MetadataExt;
+    let ids = std::fs::metadata("/proc/self")
+        .ok()
+        .map(|meta| (meta.uid(), meta.gid()));
+    match (
+        std::env::var("USER").or_else(|_| std::env::var("LOGNAME")),
+        ids,
+    ) {
+        (Ok(name), Some((uid, gid))) if !name.is_empty() => {
+            format!("'{name}' (uid={uid} gid={gid})")
+        }
+        (Ok(name), None) if !name.is_empty() => format!("'{name}'"),
+        (_, Some((uid, gid))) => format!("uid={uid} gid={gid}"),
+        _ => "the service account".to_owned(),
     }
 }
 
@@ -640,6 +677,9 @@ fn describe_roots(roots: &[std::path::PathBuf]) -> String {
 /// Performs the *physical* containment check as well: the path is canonicalized first, so a
 /// symlink planted inside an allowed root that points at `/bin/sh` or `/etc/shadow` is caught here
 /// even though its literal path passed [`validate_script_path`] at definition time.
+///
+/// # Errors
+/// Rejects inaccessible, non-executable, or out-of-root scripts.
 pub fn ensure_executable(
     script_path: &str,
     allowed_roots: &[std::path::PathBuf],
@@ -648,7 +688,8 @@ pub fn ensure_executable(
 
     // `canonicalize` resolves symlinks and `.` segments, and reports ENOENT/EACCES precisely —
     // it is both the existence probe and the input to the containment check.
-    let canonical = std::fs::canonicalize(path).map_err(|e| classify_io_error(script_path, &e, false))?;
+    let canonical =
+        std::fs::canonicalize(path).map_err(|e| classify_io_error(script_path, &e, false))?;
 
     if !is_within_roots(&canonical, allowed_roots) {
         return Err(ScriptError::new(
@@ -698,7 +739,10 @@ pub fn ensure_executable(
                 ScriptRejection::NotExecutable,
                 diagnostic(
                     script_path,
-                    &format!("the file exists but has no execute bit set (mode {:04o})", mode & 0o7777),
+                    &format!(
+                        "the file exists but has no execute bit set (mode {:04o})",
+                        mode & 0o7777
+                    ),
                     &format!(
                         "Run 'chmod +x {script_path}' and ensure {} owns it or matches its group.",
                         process_identity()
@@ -720,9 +764,7 @@ fn ensure_sudo_available(run_as_user: &str) -> Result<(), ScriptError> {
     let sudo_error = |cause: &str, remedy: &str| {
         ScriptError::new(
             ScriptRejection::SudoUnavailable,
-            format!(
-                "[ERROR] Cannot run this hook as '{run_as_user}': {cause}. {remedy}"
-            ),
+            format!("[ERROR] Cannot run this hook as '{run_as_user}': {cause}. {remedy}"),
         )
     };
 
@@ -755,6 +797,9 @@ fn ensure_sudo_available(run_as_user: &str) -> Result<(), ScriptError> {
 ///
 /// Order matters. A hook whose `run_as_user` is malformed is rejected before the filesystem is
 /// touched, so a bad account name can never be reported as a confusing path problem.
+///
+/// # Errors
+/// Rejects invalid privilege configuration, unavailable sudo, and unrunnable scripts.
 pub fn ensure_runnable(hook: &hook::Model, config: &RuntimeConfig) -> Result<(), ScriptError> {
     if let Some(user) = effective_run_as_user(hook.run_as_user.as_deref()) {
         validate_run_as_user(user)?;
@@ -771,6 +816,9 @@ pub fn ensure_runnable(hook: &hook::Model, config: &RuntimeConfig) -> Result<(),
 /// lexically inside a permitted root — but the file need not exist yet, since hooks are routinely
 /// declared before the script is deployed alongside them. Symlink resolution therefore cannot
 /// happen here; [`ensure_executable`] repeats the containment check physically at execution time.
+///
+/// # Errors
+/// Rejects relative paths, traversal, NUL bytes, and paths outside the configured roots.
 pub fn validate_script_path(
     script_path: &str,
     allowed_roots: &[std::path::PathBuf],
@@ -794,7 +842,10 @@ pub fn validate_script_path(
         ));
     }
 
-    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(ScriptError::new(
             ScriptRejection::MalformedPath,
             format!("script_path must not contain '..' traversal segments (got '{script_path}')"),
@@ -861,6 +912,9 @@ fn looks_like_env_assignment(s: &str) -> bool {
 ///   no `--` end-of-options marker to force the distinction explicitly), so a `script_path` that
 ///   happened to match it would silently become one more variable assignment instead of the program
 ///   actually being invoked.
+///
+/// # Errors
+/// Rejects blank commands, NUL bytes, and commands shaped like environment assignments.
 pub fn validate_remote_command(script_path: &str) -> Result<(), ScriptError> {
     if script_path.trim().is_empty() {
         return Err(ScriptError::new(
@@ -912,6 +966,7 @@ pub struct ConcurrencyLimiter {
 
 impl ConcurrencyLimiter {
     /// Creates an empty limiter.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -920,11 +975,14 @@ impl ConcurrencyLimiter {
     ///
     /// The returned permit must be held for the lifetime of the sub-process; dropping it frees
     /// the slot. Returns [`AppError::TooManyRequests`] when the key is already at its limit.
+    ///
+    /// # Errors
+    /// Returns an error if the execution budget has been exhausted.
     pub fn try_acquire(&self, key: &api_key::Model) -> Result<OwnedSemaphorePermit, AppError> {
         // At least one slot always exists: a key stored with 0 (or a negative value) would
         // otherwise be permanently unable to execute anything, which is a configuration mistake
         // rather than a policy anyone sets deliberately.
-        let permits = key.max_concurrent_jobs.max(1) as usize;
+        let permits = usize::try_from(key.max_concurrent_jobs.max(1)).unwrap_or(usize::MAX);
 
         let semaphore = {
             let mut budgets = lock(&self.budgets);
@@ -984,7 +1042,9 @@ struct CapturedStream {
 /// or a map of semaphores, both of which stay perfectly usable. Recovering keeps the daemon
 /// serving instead of turning one panicked task into a permanently broken endpoint.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Drains a pipe into `sink`, retaining at most `limit` bytes.
@@ -1033,13 +1093,9 @@ fn finish_stream(sink: &Mutex<CapturedStream>) -> String {
 /// process group at spawn time, so this can never reach the daemon or any unrelated process.
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
-    let pgid = pid as libc::pid_t;
-    // SAFETY: `killpg` is async-signal-safe and takes only scalars. `pgid` is the pid of a child
-    // this process spawned with `process_group(0)`, making it the leader of its own group, so the
-    // signal is confined to that group's members.
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
-    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
 }
 
 #[cfg(not(unix))]
@@ -1050,19 +1106,19 @@ fn kill_process_group(_pid: u32) {
 
 /// Maps a finished [`std::process::ExitStatus`] to a recorded exit code, translating a fatal
 /// signal into the conventional `128 + signum` (matching what a shell would report).
-fn exit_code_of(status: &std::process::ExitStatus) -> Option<i32> {
+fn exit_code_of(status: std::process::ExitStatus) -> Option<i32> {
     status.code().or_else(|| signal_exit_code(status))
 }
 
 /// The `128 + signum` form of a signalled process's exit, where the platform has signals.
 #[cfg(unix)]
-fn signal_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+fn signal_exit_code(status: std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     status.signal().map(|sig| 128 + sig)
 }
 
 #[cfg(not(unix))]
-fn signal_exit_code(_status: &std::process::ExitStatus) -> Option<i32> {
+fn signal_exit_code(_status: std::process::ExitStatus) -> Option<i32> {
     None
 }
 
@@ -1136,7 +1192,7 @@ pub async fn run_process(
     let pid = child.id();
     let (status, exit_code) = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(exit)) => {
-            let code = exit_code_of(&exit);
+            let code = exit_code_of(exit);
             let status = if exit.success() {
                 ExecutionStatus::Success
             } else {
@@ -1158,7 +1214,7 @@ pub async fn run_process(
                 tracing::error!("Failed to kill timed-out hook process: {e}");
             }
             let code = match child.wait().await {
-                Ok(exit) => exit_code_of(&exit),
+                Ok(exit) => exit_code_of(exit),
                 Err(_) => None,
             };
             (ExecutionStatus::Timeout, code)
@@ -1194,7 +1250,7 @@ pub(crate) fn elapsed_ms(started: Instant) -> i32 {
 /// Order of operations is deliberate: validate the script, *then* reserve a concurrency slot,
 /// then execute. A hook with a broken `script_path` therefore cannot consume a caller's execution
 /// budget, and the permit is held until the sub-process has fully exited.
-pub async fn execute_hook(
+pub(crate) async fn execute_hook(
     state: &AppState,
     hook: &hook::Model,
     key: Option<&api_key::Model>,
@@ -1211,7 +1267,7 @@ pub async fn execute_hook(
             hook.name
         )));
     }
-    let key_prefix = key.map(|k| k.prefix.as_str()).unwrap_or("(keyless)");
+    let key_prefix = key.map_or("(keyless)", |k| k.prefix.as_str());
 
     // The local filesystem pre-flight (existence, execute bit, containment, sudo availability) has
     // no remote counterpart this daemon could check without already having connected — an SSH-mode
@@ -1260,16 +1316,15 @@ pub async fn execute_hook(
     );
 
     let outcome = match hook.execution_type {
-        hook::HookExecutionType::Local => run_process(&plan, timeout, state.config.max_output_bytes).await,
+        hook::HookExecutionType::Local => {
+            run_process(&plan, timeout, state.config.max_output_bytes).await
+        }
         hook::HookExecutionType::Ssh => {
             // `hook.ssh_target_id` is guaranteed `Some` here: `api::hooks::validate_ssh_dispatch`
             // refuses to ever store `execution_type = SSH` without one.
-            let target_id = match hook.ssh_target_id {
-                Some(id) => id,
-                None => {
-                    tracing::error!(hook = %hook.name, "SSH hook has no ssh_target_id");
-                    return Err(AppError::Internal);
-                }
+            let Some(target_id) = hook.ssh_target_id else {
+                tracing::error!(hook = %hook.name, "SSH hook has no ssh_target_id");
+                return Err(AppError::Internal);
             };
             let target = crate::entities::prelude::SshTarget::find_by_id(target_id)
                 .one(&state.db)
@@ -1289,9 +1344,18 @@ pub async fn execute_hook(
             // queries above have already returned their connections to the pool by this point
             // (each `.one(&state.db).await` holds one only for its own duration), so no connection
             // is held open across the handshake/execution window that follows.
-            let connection_spec =
-                crate::ssh::SshConnectionSpec::from_target_and_credential(&state.cipher, &target, &credential)?;
-            crate::ssh::run_remote_process(&connection_spec, &plan, timeout, state.config.max_output_bytes).await
+            let connection_spec = crate::ssh::SshConnectionSpec::from_target_and_credential(
+                &state.cipher,
+                &target,
+                &credential,
+            )?;
+            crate::ssh::run_remote_process(
+                &connection_spec,
+                &plan,
+                timeout,
+                state.config.max_output_bytes,
+            )
+            .await
         }
     };
 
@@ -1338,7 +1402,10 @@ mod tests {
     }
 
     fn supplied(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
-        pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -1362,11 +1429,17 @@ mod tests {
 
         let resolved = resolve_parameters(&declared, &supplied(&[])).expect("no unknown keys");
         assert_eq!(resolved.missing_required, vec!["target"]);
-        assert_eq!(resolved.values, vec![("reason".to_owned(), "unspecified".to_owned())]);
+        assert_eq!(
+            resolved.values,
+            vec![("reason".to_owned(), "unspecified".to_owned())]
+        );
 
         let resolved = resolve_parameters(
             &declared,
-            &supplied(&[("target", serde_json::json!("1.2.3.4")), ("reason", serde_json::json!("abuse"))]),
+            &supplied(&[
+                ("target", serde_json::json!("1.2.3.4")),
+                ("reason", serde_json::json!("abuse")),
+            ]),
         )
         .expect("no unknown keys");
         assert!(resolved.missing_required.is_empty());
@@ -1387,12 +1460,18 @@ mod tests {
             .expect_err("unknown key must be rejected");
         assert!(matches!(err, AppError::InvalidInput(_)));
 
-        let err = resolve_parameters(&declared, &supplied(&[("target", serde_json::json!(["a"]))]))
-            .expect_err("array value must be rejected");
+        let err = resolve_parameters(
+            &declared,
+            &supplied(&[("target", serde_json::json!(["a"]))]),
+        )
+        .expect_err("array value must be rejected");
         assert!(matches!(err, AppError::InvalidInput(_)));
 
-        let err = resolve_parameters(&declared, &supplied(&[("target", serde_json::json!("a\0b"))]))
-            .expect_err("NUL byte must be rejected");
+        let err = resolve_parameters(
+            &declared,
+            &supplied(&[("target", serde_json::json!("a\0b"))]),
+        )
+        .expect_err("NUL byte must be rejected");
         assert!(matches!(err, AppError::InvalidInput(_)));
     }
 
@@ -1476,9 +1555,21 @@ mod tests {
         assert_eq!(plan.program, "/usr/local/bin/demo.sh");
         assert_eq!(plan.args, vec!["203.0.113.7", "abuse"]);
         assert_eq!(plan.run_as_user, None);
-        assert_eq!(plan.env.get("HOOK_PARAM_TARGET_ADDRESS").map(String::as_str), Some("203.0.113.7"));
-        assert_eq!(plan.env.get("HOOK_PARAM_REASON").map(String::as_str), Some("abuse"));
-        assert_eq!(plan.env.len(), 2, "no host variables leak in with an empty allowlist");
+        assert_eq!(
+            plan.env
+                .get("HOOK_PARAM_TARGET_ADDRESS")
+                .map(String::as_str),
+            Some("203.0.113.7")
+        );
+        assert_eq!(
+            plan.env.get("HOOK_PARAM_REASON").map(String::as_str),
+            Some("abuse")
+        );
+        assert_eq!(
+            plan.env.len(),
+            2,
+            "no host variables leak in with an empty allowlist"
+        );
     }
 
     #[test]
@@ -1500,19 +1591,43 @@ mod tests {
         // attacker-influenceable, then the script and its positional parameters.
         assert_eq!(
             plan.args,
-            vec!["-n", "-u", "root", "--", "/usr/local/bin/demo.sh", "203.0.113.7", "abuse"]
+            vec![
+                "-n",
+                "-u",
+                "root",
+                "--",
+                "/usr/local/bin/demo.sh",
+                "203.0.113.7",
+                "abuse"
+            ]
         );
         assert_eq!(plan.run_as_user.as_deref(), Some("root"));
 
         // `--` must sit immediately before the script path, so nothing after it can be parsed as
         // a sudo option.
-        let separator = plan.args.iter().position(|a| a == "--").expect("the -- separator is present");
+        let separator = plan
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("the -- separator is present");
         assert_eq!(plan.args[separator + 1], "/usr/local/bin/demo.sh");
 
         // Environment injection is identical to the unprivileged path.
-        assert_eq!(plan.env.get("HOOK_PARAM_TARGET_ADDRESS").map(String::as_str), Some("203.0.113.7"));
-        assert_eq!(plan.env.get("HOOK_PARAM_REASON").map(String::as_str), Some("abuse"));
-        assert_eq!(plan.env.len(), 2, "no host variables leak in with an empty allowlist");
+        assert_eq!(
+            plan.env
+                .get("HOOK_PARAM_TARGET_ADDRESS")
+                .map(String::as_str),
+            Some("203.0.113.7")
+        );
+        assert_eq!(
+            plan.env.get("HOOK_PARAM_REASON").map(String::as_str),
+            Some("abuse")
+        );
+        assert_eq!(
+            plan.env.len(),
+            2,
+            "no host variables leak in with an empty allowlist"
+        );
     }
 
     #[test]
@@ -1521,7 +1636,10 @@ mod tests {
         for blank in ["", "   ", "\t"] {
             let plan = build_command_plan(&demo_hook(Some(blank)), &resolved, &isolated_config())
                 .expect("no args_template: infallible");
-            assert_eq!(plan.program, "/usr/local/bin/demo.sh", "{blank:?} must not trigger sudo");
+            assert_eq!(
+                plan.program, "/usr/local/bin/demo.sh",
+                "{blank:?} must not trigger sudo"
+            );
             assert!(plan.args.is_empty());
             assert_eq!(plan.run_as_user, None);
         }
@@ -1529,9 +1647,16 @@ mod tests {
 
     #[test]
     fn plan_trims_surrounding_whitespace_from_run_as_user() {
-        let plan = build_command_plan(&demo_hook(Some("  postgres  ")), &ResolvedParameters::default(), &isolated_config())
-            .expect("no args_template: infallible");
-        assert_eq!(plan.args, vec!["-n", "-u", "postgres", "--", "/usr/local/bin/demo.sh"]);
+        let plan = build_command_plan(
+            &demo_hook(Some("  postgres  ")),
+            &ResolvedParameters::default(),
+            &isolated_config(),
+        )
+        .expect("no args_template: infallible");
+        assert_eq!(
+            plan.args,
+            vec!["-n", "-u", "postgres", "--", "/usr/local/bin/demo.sh"]
+        );
         assert_eq!(plan.run_as_user.as_deref(), Some("postgres"));
     }
 
@@ -1546,9 +1671,20 @@ mod tests {
         let plan = build_command_plan(&demo_hook(Some("root")), &resolved, &isolated_config())
             .expect("no args_template: infallible");
 
-        let separator = plan.args.iter().position(|a| a == "--").expect("the -- separator is present");
-        let hostile = plan.args.iter().position(|a| a == "--login").expect("the value is present");
-        assert!(hostile > separator, "a option-shaped value must sit after the separator");
+        let separator = plan
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("the -- separator is present");
+        let hostile = plan
+            .args
+            .iter()
+            .position(|a| a == "--login")
+            .expect("the value is present");
+        assert!(
+            hostile > separator,
+            "a option-shaped value must sit after the separator"
+        );
     }
 
     #[test]
@@ -1577,7 +1713,10 @@ mod tests {
             .expect("every referenced variable resolves");
         assert_eq!(plan.args, vec!["add", "bad_ip", "10.12.8.93:443"]);
         // Env injection still happens regardless of the template.
-        assert_eq!(plan.env.get("HOOK_PARAM_TARGET_IP").map(String::as_str), Some("10.12.8.93"));
+        assert_eq!(
+            plan.env.get("HOOK_PARAM_TARGET_IP").map(String::as_str),
+            Some("10.12.8.93")
+        );
     }
 
     #[test]
@@ -1607,7 +1746,11 @@ mod tests {
             };
             let err = build_command_plan(&hook, &resolved, &isolated_config())
                 .expect_err(&format!("{name} must be rejected"));
-            assert_eq!(err.rejection, ScriptRejection::ArgsTemplateSubstitution, "for {name}");
+            assert_eq!(
+                err.rejection,
+                ScriptRejection::ArgsTemplateSubstitution,
+                "for {name}"
+            );
         }
     }
 
@@ -1628,17 +1771,42 @@ mod tests {
 
     #[test]
     fn validates_run_as_user_against_option_injection() {
-        for valid in ["root", "postgres", "_svc", "deploy-bot", "user_1", "machine$"] {
-            assert!(validate_run_as_user(valid).is_ok(), "{valid} should be accepted");
+        for valid in [
+            "root",
+            "postgres",
+            "_svc",
+            "deploy-bot",
+            "user_1",
+            "machine$",
+        ] {
+            assert!(
+                validate_run_as_user(valid).is_ok(),
+                "{valid} should be accepted"
+            );
         }
 
         // The leading-dash cases are the option-injection attempts this exists to stop.
         for invalid in [
-            "-i", "--login", "-u", "", "   ", "root user", "root;id", "root\0", "root/../x",
-            "1user", "user$name", "üser", "root\n-i",
+            "-i",
+            "--login",
+            "-u",
+            "",
+            "   ",
+            "root user",
+            "root;id",
+            "root\0",
+            "root/../x",
+            "1user",
+            "user$name",
+            "üser",
+            "root\n-i",
         ] {
             let err = validate_run_as_user(invalid).expect_err("{invalid} should be rejected");
-            assert_eq!(err.rejection, ScriptRejection::InvalidRunAsUser, "for {invalid:?}");
+            assert_eq!(
+                err.rejection,
+                ScriptRejection::InvalidRunAsUser,
+                "for {invalid:?}"
+            );
         }
 
         // Length cap.
@@ -1669,13 +1837,20 @@ mod tests {
         ] {
             let err = validate_script_path(traversal, &unrestricted)
                 .expect_err("{traversal} must be rejected");
-            assert_eq!(err.rejection, ScriptRejection::MalformedPath, "for {traversal}");
+            assert_eq!(
+                err.rejection,
+                ScriptRejection::MalformedPath,
+                "for {traversal}"
+            );
         }
     }
 
     #[test]
     fn confines_script_paths_to_allowed_roots() {
-        let roots = [std::path::PathBuf::from("/opt/hooks"), std::path::PathBuf::from("/usr/local/bin")];
+        let roots = [
+            std::path::PathBuf::from("/opt/hooks"),
+            std::path::PathBuf::from("/usr/local/bin"),
+        ];
 
         assert!(validate_script_path("/opt/hooks/deploy.sh", &roots).is_ok());
         assert!(validate_script_path("/opt/hooks/nested/deploy.sh", &roots).is_ok());
@@ -1684,8 +1859,13 @@ mod tests {
         assert!(validate_script_path("/opt/./hooks/deploy.sh", &roots).is_ok());
 
         for outside in ["/etc/shadow", "/bin/sh", "/opt/other/x.sh", "/tmp/evil.sh"] {
-            let err = validate_script_path(outside, &roots).expect_err("{outside} must be rejected");
-            assert_eq!(err.rejection, ScriptRejection::OutsideAllowedRoots, "for {outside}");
+            let err =
+                validate_script_path(outside, &roots).expect_err("{outside} must be rejected");
+            assert_eq!(
+                err.rejection,
+                ScriptRejection::OutsideAllowedRoots,
+                "for {outside}"
+            );
         }
 
         // Component-wise, not string-prefix: a sibling directory sharing a name prefix is outside.
@@ -1697,7 +1877,10 @@ mod tests {
     #[test]
     fn empty_root_list_disables_confinement() {
         let unrestricted: [std::path::PathBuf; 0] = [];
-        assert!(is_within_roots(std::path::Path::new("/anywhere/at/all"), &unrestricted));
+        assert!(is_within_roots(
+            std::path::Path::new("/anywhere/at/all"),
+            &unrestricted
+        ));
         assert!(validate_script_path("/anywhere/at/all.sh", &unrestricted).is_ok());
     }
 
@@ -1717,7 +1900,11 @@ mod tests {
             false,
         );
         assert_eq!(not_found.rejection, ScriptRejection::NotFound);
-        assert!(not_found.detail.starts_with("[ERROR] Cannot execute '/opt/hooks/missing.sh':"));
+        assert!(
+            not_found
+                .detail
+                .starts_with("[ERROR] Cannot execute '/opt/hooks/missing.sh':")
+        );
         assert!(not_found.detail.contains("ENOENT"));
 
         let denied = classify_io_error(
@@ -1750,7 +1937,9 @@ mod tests {
     #[test]
     fn script_errors_surface_as_bad_request() {
         let error = ScriptError::new(ScriptRejection::NotFound, "[ERROR] boom".to_owned());
-        assert!(matches!(AppError::from(error), AppError::InvalidInput(msg) if msg == "[ERROR] boom"));
+        assert!(
+            matches!(AppError::from(error), AppError::InvalidInput(msg) if msg == "[ERROR] boom")
+        );
     }
 
     #[test]

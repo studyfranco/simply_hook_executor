@@ -3,7 +3,7 @@
 //! throttling (429), and execution timeouts — plus the security properties the execution engine
 //! is responsible for (no shell, cleared environment, process-group kill).
 
-mod common;
+pub mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,9 +15,12 @@ use sea_orm::{
 };
 use serde_json::json;
 use simply_hook_executor::{
-    config::RuntimeConfig, create_app,
+    config::RuntimeConfig,
+    create_app,
     entities::{api_key, prelude::ApiKey, prelude::Execution},
-    retention::purge_expired_executions, spawn_retention_worker, state::AppState,
+    retention::purge_expired_executions,
+    spawn_retention_worker,
+    state::AppState,
 };
 use uuid::Uuid;
 
@@ -42,12 +45,21 @@ async fn missing_or_invalid_api_key_is_rejected() {
         .expect("request builds");
     assert_eq!(send(&app, request).await.status, StatusCode::UNAUTHORIZED);
 
-    let response = send(&app, json_request("GET", "/api/hooks", "not-a-real-key", None)).await;
+    let response = send(
+        &app,
+        json_request("GET", "/api/hooks", "not-a-real-key", None),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
 }
 
 /// Builds a GET request carrying an API key and a forwarding header.
-fn forwarded_request(uri: &str, key: &str, header: &str, value: &str) -> axum::http::Request<axum::body::Body> {
+fn forwarded_request(
+    uri: &str,
+    key: &str,
+    header: &str,
+    value: &str,
+) -> axum::http::Request<axum::body::Body> {
     with_connect_info(
         axum::http::Request::builder()
             .uri(uri)
@@ -71,7 +83,12 @@ async fn bound_cidr_is_enforced_against_the_resolved_client_ip() {
     assert_eq!(response.status, StatusCode::FORBIDDEN);
 
     // A matching forwarded hop is accepted — the rightmost entry is the one the proxy appended.
-    let request = forwarded_request("/api/hooks", &key, "X-Forwarded-For", "10.0.0.1, 192.168.1.1");
+    let request = forwarded_request(
+        "/api/hooks",
+        &key,
+        "X-Forwarded-For",
+        "10.0.0.1, 192.168.1.1",
+    );
     assert_eq!(send(&app, request).await.status, StatusCode::OK);
 
     // X-Real-IP is honoured from a trusted proxy too.
@@ -115,18 +132,27 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
     };
 
     // A bearer key plus a correct signature: the signature adds body integrity on top.
-    assert_eq!(send(&app, bearer_and_signature(&signature, &body)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, bearer_and_signature(&signature, &body))
+            .await
+            .status,
+        StatusCode::OK
+    );
 
     // Same signature, altered body: rejected.
     let tampered = json!({ "parameters": { "x": "1" } }).to_string();
     assert_eq!(
-        send(&app, bearer_and_signature(&signature, &tampered)).await.status,
+        send(&app, bearer_and_signature(&signature, &tampered))
+            .await
+            .status,
         StatusCode::UNAUTHORIZED
     );
 
     // Malformed signature header: rejected.
     assert_eq!(
-        send(&app, bearer_and_signature("sha256=deadbeef", &body)).await.status,
+        send(&app, bearer_and_signature("sha256=deadbeef", &body))
+            .await
+            .status,
         StatusCode::UNAUTHORIZED
     );
 
@@ -134,7 +160,9 @@ async fn hmac_signature_is_verified_over_the_raw_body() {
     // itself must no longer authenticate.
     let wrong_key_material = sign_request(&signer.plaintext, "POST", &uri, timestamp, &body);
     assert_eq!(
-        send(&app, bearer_and_signature(&wrong_key_material, &body)).await.status,
+        send(&app, bearer_and_signature(&wrong_key_material, &body))
+            .await
+            .status,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -157,7 +185,13 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
     // A signed request identified by X-API-Key.
     let response = send(
         &app,
-        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &body),
+        signed_request(
+            "POST",
+            uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &body,
+        ),
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
@@ -172,7 +206,10 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
             .header("X-API-Key", &sender.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", timestamp.to_string())
-            .header("X-Signature-256", sign_request("not-the-secret", "POST", uri, timestamp, &body)),
+            .header(
+                "X-Signature-256",
+                sign_request("not-the-secret", "POST", uri, timestamp, &body),
+            ),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -181,7 +218,12 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
     // With the bearer key present and no signature, the key itself is the credential, so the
     // request is accepted. (`REQUIRE_SIGNED_REQUESTS` is what makes signing compulsory; that is
     // covered by its own test.)
-    let unsigned = json_request("POST", uri, &sender.plaintext, Some(json!({ "target": "1.2.3.4" })));
+    let unsigned = json_request(
+        "POST",
+        uri,
+        &sender.plaintext,
+        Some(json!({ "target": "1.2.3.4" })),
+    );
     assert_eq!(send(&app, unsigned).await.status, StatusCode::OK);
 
     // The public key_id is *not* a credential: presenting it in place of the API key — under its
@@ -193,7 +235,10 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
             .header("X-Key-Id", &sender.key_id)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", timestamp.to_string())
-            .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, timestamp, &body)),
+            .header(
+                "X-Signature-256",
+                sign_request(&sender.signing_secret, "POST", uri, timestamp, &body),
+            ),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -204,7 +249,8 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
         "the retired X-Key-Id header must not resolve a key"
     );
 
-    let key_id_as_bearer = signed_request("POST", uri, &sender.key_id, &sender.signing_secret, &body);
+    let key_id_as_bearer =
+        signed_request("POST", uri, &sender.key_id, &sender.signing_secret, &body);
     assert_eq!(
         send(&app, key_id_as_bearer).await.status,
         StatusCode::UNAUTHORIZED,
@@ -213,7 +259,10 @@ async fn x_api_key_is_the_only_header_that_resolves_a_key_record() {
 
     // A missing key is refused with a message naming the one header that works.
     let anonymous = with_connect_info(
-        axum::http::Request::builder().method("POST").uri(uri).header("Content-Type", "application/json"),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "application/json"),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -247,10 +296,21 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
     for offset in [0, -240, 240, -120, 120] {
         let response = send(
             &app,
-            signed_request_at("POST", uri, &sender.plaintext, &sender.signing_secret, &body, now + offset),
+            signed_request_at(
+                "POST",
+                uri,
+                &sender.plaintext,
+                &sender.signing_secret,
+                &body,
+                now + offset,
+            ),
         )
         .await;
-        assert_eq!(response.status, StatusCode::OK, "offset {offset}s should be inside the window");
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "offset {offset}s should be inside the window"
+        );
     }
 
     // Outside it, in both directions. A stale capture is the replay case; a forward-dated request
@@ -258,7 +318,14 @@ async fn the_anti_replay_window_rejects_stale_and_future_timestamps() {
     for offset in [-360, -3600, -86_400, 360, 3600] {
         let response = send(
             &app,
-            signed_request_at("POST", uri, &sender.plaintext, &sender.signing_secret, &body, now + offset),
+            signed_request_at(
+                "POST",
+                uri,
+                &sender.plaintext,
+                &sender.signing_secret,
+                &body,
+                now + offset,
+            ),
         )
         .await;
         assert_eq!(
@@ -303,14 +370,31 @@ async fn a_replayed_signature_on_an_admin_route_names_itself_precisely() {
     let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
 
     let timestamp = now_timestamp();
-    let first = signed_request_at("GET", "/api/executions", &master.plaintext, &master.signing_secret, "", timestamp);
+    let first = signed_request_at(
+        "GET",
+        "/api/executions",
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+        timestamp,
+    );
     assert_eq!(send(&app, first).await.status, StatusCode::OK);
 
     // The identical request, signature and all, sent again.
-    let replayed = signed_request_at("GET", "/api/executions", &master.plaintext, &master.signing_secret, "", timestamp);
+    let replayed = signed_request_at(
+        "GET",
+        "/api/executions",
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+        timestamp,
+    );
     let response = send(&app, replayed).await;
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(response.string("error"), "This signature has already been used; sign a fresh request");
+    assert_eq!(
+        response.string("error"),
+        "This signature has already been used; sign a fresh request"
+    );
 }
 
 #[tokio::test]
@@ -336,7 +420,10 @@ async fn signed_requests_require_a_well_formed_timestamp_header() {
             .uri(uri)
             .header("X-API-Key", &sender.plaintext)
             .header("Content-Type", "application/json")
-            .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, now, &body)),
+            .header(
+                "X-Signature-256",
+                sign_request(&sender.signing_secret, "POST", uri, now, &body),
+            ),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -354,7 +441,10 @@ async fn signed_requests_require_a_well_formed_timestamp_header() {
                 .header("X-API-Key", &sender.plaintext)
                 .header("Content-Type", "application/json")
                 .header("X-Timestamp", malformed)
-                .header("X-Signature-256", sign_request(&sender.signing_secret, "POST", uri, now, &body)),
+                .header(
+                    "X-Signature-256",
+                    sign_request(&sender.signing_secret, "POST", uri, now, &body),
+                ),
         )
         .body(axum::body::Body::from(body.clone()))
         .expect("request builds");
@@ -380,25 +470,55 @@ async fn signatures_cover_every_http_method_and_the_query_string() {
 
     // GET, POST, PUT, PATCH and DELETE all sign the same way — this mirrors what the SPA does for
     // every request it makes.
-    let get = signed_bearer_request("GET", "/api/hooks", &master.plaintext, &master.signing_secret, "");
+    let get = signed_bearer_request(
+        "GET",
+        "/api/hooks",
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+    );
     assert_eq!(send(&app, get).await.status, StatusCode::OK);
 
     let post_body = json!({ "name": "signed_created", "script_path": script }).to_string();
-    let post = signed_bearer_request("POST", "/api/hooks", &master.plaintext, &master.signing_secret, &post_body);
+    let post = signed_bearer_request(
+        "POST",
+        "/api/hooks",
+        &master.plaintext,
+        &master.signing_secret,
+        &post_body,
+    );
     let created = send(&app, post).await;
     assert_eq!(created.status, StatusCode::OK);
 
     let put_uri = format!("/api/hooks/{hook_id}");
     let put_body = json!({ "description": "signed update" }).to_string();
-    let put = signed_bearer_request("PUT", &put_uri, &master.plaintext, &master.signing_secret, &put_body);
+    let put = signed_bearer_request(
+        "PUT",
+        &put_uri,
+        &master.plaintext,
+        &master.signing_secret,
+        &put_body,
+    );
     assert_eq!(send(&app, put).await.status, StatusCode::OK);
 
-    let patch = signed_bearer_request("PATCH", &put_uri, &master.plaintext, &master.signing_secret, &put_body);
+    let patch = signed_bearer_request(
+        "PATCH",
+        &put_uri,
+        &master.plaintext,
+        &master.signing_secret,
+        &put_body,
+    );
     assert_eq!(send(&app, patch).await.status, StatusCode::OK);
 
     // A GET whose query string is covered: re-signing for a different query must not validate.
     let listing_uri = "/api/executions?limit=5";
-    let listing = signed_bearer_request("GET", listing_uri, &master.plaintext, &master.signing_secret, "");
+    let listing = signed_bearer_request(
+        "GET",
+        listing_uri,
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+    );
     assert_eq!(send(&app, listing).await.status, StatusCode::OK);
 
     let timestamp = now_timestamp();
@@ -423,7 +543,13 @@ async fn signatures_cover_every_http_method_and_the_query_string() {
     );
 
     let delete_uri = format!("/api/hooks/{}", created.string("id"));
-    let delete = signed_bearer_request("DELETE", &delete_uri, &master.plaintext, &master.signing_secret, "");
+    let delete = signed_bearer_request(
+        "DELETE",
+        &delete_uri,
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+    );
     assert_eq!(send(&app, delete).await.status, StatusCode::NO_CONTENT);
 
     // A signature minted for the DELETE must not be replayable against a different hook.
@@ -434,11 +560,17 @@ async fn signatures_cover_every_http_method_and_the_query_string() {
             .uri(&put_uri)
             .header("X-API-Key", &master.plaintext)
             .header("X-Timestamp", ts.to_string())
-            .header("X-Signature-256", sign_request(&master.signing_secret, "DELETE", &delete_uri, ts, "")),
+            .header(
+                "X-Signature-256",
+                sign_request(&master.signing_secret, "DELETE", &delete_uri, ts, ""),
+            ),
     )
     .body(axum::body::Body::empty())
     .expect("request builds");
-    assert_eq!(send(&app, cross_route).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, cross_route).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -460,31 +592,62 @@ async fn require_signed_requests_makes_the_protocol_mandatory() {
     let hook_id = insert_hook(&db, "mandatory_hook", &script, 30).await;
 
     // A valid bearer key on its own is no longer sufficient.
-    let unsigned = send(&app, json_request("GET", "/api/hooks", &master.plaintext, None)).await;
+    let unsigned = send(
+        &app,
+        json_request("GET", "/api/hooks", &master.plaintext, None),
+    )
+    .await;
     assert_eq!(unsigned.status, StatusCode::UNAUTHORIZED);
     assert!(unsigned.string("error").contains("must be signed"));
 
     // The same request, signed, succeeds.
-    let signed = signed_bearer_request("GET", "/api/hooks", &master.plaintext, &master.signing_secret, "");
+    let signed = signed_bearer_request(
+        "GET",
+        "/api/hooks",
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+    );
     assert_eq!(send(&app, signed).await.status, StatusCode::OK);
 
     // Enforcement is global, not per-route: execution and the webhook alias are covered too.
     let exec_uri = format!("/api/hooks/{hook_id}/execute");
     assert_eq!(
-        send(&app, json_request("POST", &exec_uri, &master.plaintext, None)).await.status,
+        send(
+            &app,
+            json_request("POST", &exec_uri, &master.plaintext, None)
+        )
+        .await
+        .status,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        send(&app, json_request("GET", "/api/settings", &master.plaintext, None)).await.status,
+        send(
+            &app,
+            json_request("GET", "/api/settings", &master.plaintext, None)
+        )
+        .await
+        .status,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        send(&app, json_request("GET", "/api/keys", &master.plaintext, None)).await.status,
+        send(
+            &app,
+            json_request("GET", "/api/keys", &master.plaintext, None)
+        )
+        .await
+        .status,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(execution_count(&db).await, 0);
 
-    let signed_exec = signed_bearer_request("POST", &exec_uri, &master.plaintext, &master.signing_secret, "");
+    let signed_exec = signed_bearer_request(
+        "POST",
+        &exec_uri,
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+    );
     assert_eq!(send(&app, signed_exec).await.status, StatusCode::OK);
 }
 
@@ -503,7 +666,14 @@ async fn x_hub_signature_256_is_never_honoured_at_the_key_level() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let strict = insert_key_with_mode(&db, "Strict", "0.0.0.0/0", KeyScopes::plain(), HmacMode::CanonicalV1).await;
+    let strict = insert_key_with_mode(
+        &db,
+        "Strict",
+        "0.0.0.0/0",
+        KeyScopes::plain(),
+        HmacMode::CanonicalV1,
+    )
+    .await;
     let hook_id = insert_hook(&db, "strict_hook", &script, 30).await;
     grant(&db, strict.id, hook_id, true, false).await;
 
@@ -519,7 +689,10 @@ async fn x_hub_signature_256_is_never_honoured_at_the_key_level() {
             .uri(uri)
             .header("X-API-Key", &strict.plaintext)
             .header("Content-Type", "application/json")
-            .header("X-Hub-Signature-256", sign_body_only(&strict.signing_secret, &body)),
+            .header(
+                "X-Hub-Signature-256",
+                sign_body_only(&strict.signing_secret, &body),
+            ),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -532,7 +705,10 @@ async fn x_hub_signature_256_is_never_honoured_at_the_key_level() {
     // header contributed nothing.
     let strict_app = create_app(AppState::new(
         db.clone(),
-        Arc::new(RuntimeConfig { require_signed_requests: true, ..(*test_config()).clone() }),
+        Arc::new(RuntimeConfig {
+            require_signed_requests: true,
+            ..(*test_config()).clone()
+        }),
         test_cipher(),
     ));
     let hub_only_again = with_connect_info(
@@ -541,7 +717,10 @@ async fn x_hub_signature_256_is_never_honoured_at_the_key_level() {
             .uri(uri)
             .header("X-API-Key", &strict.plaintext)
             .header("Content-Type", "application/json")
-            .header("X-Hub-Signature-256", sign_body_only(&strict.signing_secret, &body)),
+            .header(
+                "X-Hub-Signature-256",
+                sign_body_only(&strict.signing_secret, &body),
+            ),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
@@ -558,14 +737,26 @@ async fn x_hub_signature_256_is_never_honoured_at_the_key_level() {
             .header("X-API-Key", &strict.plaintext)
             .header("Content-Type", "application/json")
             .header("X-Timestamp", now_timestamp().to_string())
-            .header("X-Signature-256", sign_body_only(&strict.signing_secret, &body)),
+            .header(
+                "X-Signature-256",
+                sign_body_only(&strict.signing_secret, &body),
+            ),
     )
     .body(axum::body::Body::from(body.clone()))
     .expect("request builds");
-    assert_eq!(send(&app, body_only_sig).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, body_only_sig).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // The canonical signature works, confirming the key itself is fine.
-    let canonical = signed_request("POST", uri, &strict.plaintext, &strict.signing_secret, &body);
+    let canonical = signed_request(
+        "POST",
+        uri,
+        &strict.plaintext,
+        &strict.signing_secret,
+        &body,
+    );
     assert_eq!(send(&app, canonical).await.status, StatusCode::OK);
 }
 
@@ -578,7 +769,12 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
     // Omitted -> the (only) default.
     let defaulted = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "defaulted", "bound_ips": "0.0.0.0/0" }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "defaulted", "bound_ips": "0.0.0.0/0" })),
+        ),
     )
     .await;
     assert_eq!(defaulted.status, StatusCode::OK);
@@ -586,7 +782,10 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
 
     let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
     let rows = listed.json.as_array().cloned().unwrap_or_default();
-    let defaulted_row = rows.iter().find(|k| k["id"] == json!(defaulted_id)).expect("the key is listed");
+    let defaulted_row = rows
+        .iter()
+        .find(|k| k["id"] == json!(defaulted_id))
+        .expect("the key is listed");
     assert_eq!(defaulted_row["hmac_mode"], json!("CANONICAL_V1"));
 
     // Explicitly requested at creation is equally fine — there is nothing else to choose from, but
@@ -648,11 +847,25 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
     // type is what is being asserted, not that the endpoint has become unusable.
     let ordinary_update = send(
         &app,
-        json_request("PUT", &format!("/api/keys/{defaulted_id}"), &master, Some(json!({ "name": "renamed" }))),
+        json_request(
+            "PUT",
+            &format!("/api/keys/{defaulted_id}"),
+            &master,
+            Some(json!({ "name": "renamed" })),
+        ),
     )
     .await;
-    assert_eq!(ordinary_update.status, StatusCode::OK, "an update that never mentions hmac_mode still works: {}", ordinary_update.raw);
-    assert_eq!(ordinary_update.field("hmac_mode"), &json!("CANONICAL_V1"), "and update_api_key's own response still reports the untouched mode");
+    assert_eq!(
+        ordinary_update.status,
+        StatusCode::OK,
+        "an update that never mentions hmac_mode still works: {}",
+        ordinary_update.raw
+    );
+    assert_eq!(
+        ordinary_update.field("hmac_mode"),
+        &json!("CANONICAL_V1"),
+        "and update_api_key's own response still reports the untouched mode"
+    );
 
     // The key's own identity endpoint reports its mode, which is what the SPA signs with.
     let me = send(&app, json_request("GET", "/api/auth/me", &master, None)).await;
@@ -670,8 +883,12 @@ async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
 
     // Stop just before the hmac_mode migration: this is what a database from the previous release
     // looks like.
-    Migrator::up(&db, Some(3)).await.expect("earlier migrations apply");
-    Migrator::up(&db, None).await.expect("the hmac_mode migration applies to an existing schema");
+    Migrator::up(&db, Some(3))
+        .await
+        .expect("earlier migrations apply");
+    Migrator::up(&db, None)
+        .await
+        .expect("the hmac_mode migration applies to an existing schema");
 
     // An existing row must come out on the *strict* mode. Defaulting an upgrade to BODY_ONLY would
     // silently strip replay protection from every deployed key.
@@ -683,7 +900,9 @@ async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
         .expect("the key exists");
     assert_eq!(stored.hmac_mode, HmacMode::CanonicalV1);
 
-    Migrator::up(&db, None).await.expect("migrations are idempotent");
+    Migrator::up(&db, None)
+        .await
+        .expect("migrations are idempotent");
 }
 
 /// `m20260819_141730_consolidate_hmac_modes`'s data fix: a row still holding the literal string
@@ -707,7 +926,9 @@ async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
     // exist on this schema yet, so the row is seeded with a raw `ActiveModel` rather than
     // `insert_key_full` (which would set that column and fail against a table that lacks it) —
     // matching exactly what a row written before this migration shipped actually looked like.
-    Migrator::up(&db, Some(10)).await.expect("earlier migrations apply");
+    Migrator::up(&db, Some(10))
+        .await
+        .expect("earlier migrations apply");
     let id = Uuid::new_v4();
     let plaintext = simply_hook_executor::api::generate_random_key();
     let now = chrono::Utc::now().naive_utc();
@@ -737,13 +958,18 @@ async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
     // (already-updated) Rust `HmacMode` type at the SQL layer, since it now has nowhere to put
     // that variant.
     api_key::Entity::update_many()
-        .col_expr(api_key::Column::HmacMode, sea_orm::sea_query::Expr::value("BODY_ONLY"))
+        .col_expr(
+            api_key::Column::HmacMode,
+            sea_orm::sea_query::Expr::value("BODY_ONLY"),
+        )
         .filter(api_key::Column::Id.eq(id))
         .exec(&db)
         .await
         .expect("seeding a legacy BODY_ONLY row succeeds");
 
-    Migrator::up(&db, None).await.expect("the consolidation migration applies");
+    Migrator::up(&db, None)
+        .await
+        .expect("the consolidation migration applies");
 
     let stored = simply_hook_executor::entities::prelude::ApiKey::find_by_id(id)
         .one(&db)
@@ -758,7 +984,9 @@ async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
 
     // A brand new key created after the upgrade still defaults correctly, unaffected by the data
     // fix having run.
-    let fresh_id = insert_key_full(&db, "Fresh", "0.0.0.0/0", KeyScopes::plain()).await.id;
+    let fresh_id = insert_key_full(&db, "Fresh", "0.0.0.0/0", KeyScopes::plain())
+        .await
+        .id;
     let fresh = simply_hook_executor::entities::prelude::ApiKey::find_by_id(fresh_id)
         .one(&db)
         .await
@@ -817,7 +1045,11 @@ async fn signature_rejection_leaks_no_oracle_about_the_correct_digest() {
     let mut responses = Vec::new();
     for (label, hex_digest) in &variants {
         let response = send(&app, attempt(format!("sha256={hex_digest}"))).await;
-        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{label} must be rejected");
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "{label} must be rejected"
+        );
         responses.push((label, response.status, response.string("error")));
     }
 
@@ -826,8 +1058,14 @@ async fn signature_rejection_leaks_no_oracle_about_the_correct_digest() {
     // bytes were compared.
     let (_, first_status, first_error) = &responses[0];
     for (label, status, error) in &responses {
-        assert_eq!(status, first_status, "{label}: status differs from the other rejections");
-        assert_eq!(error, first_error, "{label}: error message differs from the other rejections");
+        assert_eq!(
+            status, first_status,
+            "{label}: status differs from the other rejections"
+        );
+        assert_eq!(
+            error, first_error,
+            "{label}: error message differs from the other rejections"
+        );
     }
     // Task 2's uniform 401 for invocation routes — every authentication failure here, not only a
     // signature mismatch, collapses into this one body.
@@ -864,7 +1102,14 @@ async fn a_stale_signature_is_refused_regardless_of_key() {
     // Ten minutes in the past — comfortably outside the 300s window in either direction.
     let ten_minutes_ago = now_timestamp() - 600;
 
-    let stale = signed_request_at("POST", uri, &key.plaintext, &key.signing_secret, &body, ten_minutes_ago);
+    let stale = signed_request_at(
+        "POST",
+        uri,
+        &key.plaintext,
+        &key.signing_secret,
+        &body,
+        ten_minutes_ago,
+    );
     let response = send(&app, stale).await;
     // The message is not asserted: this is a webhook-invocation route, and Task 2 collapses every
     // authentication failure there into one fixed body (`middleware::invocation_unauthorized`). The
@@ -875,7 +1120,11 @@ async fn a_stale_signature_is_refused_regardless_of_key() {
     // The same key with a fresh timestamp works, so the rejection above is about age, not the key.
     let fresh = signed_request("POST", uri, &key.plaintext, &key.signing_secret, &body);
     assert_eq!(send(&app, fresh).await.status, StatusCode::OK);
-    assert_eq!(execution_count(&db).await, 1, "only the fresh signature should have executed anything");
+    assert_eq!(
+        execution_count(&db).await,
+        1,
+        "only the fresh signature should have executed anything"
+    );
 }
 
 /// A key's own `canonical_template` override (as opposed to a hook's — see `tests/auth_mode_tests.rs`
@@ -888,7 +1137,14 @@ async fn a_keys_own_canonical_template_override_governs_every_route_it_signs() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let template = "{method}:{path}:{timestamp}:{body}";
-    let key = insert_key_with_template(&db, "templated-caller", "0.0.0.0/0", KeyScopes::plain(), template).await;
+    let key = insert_key_with_template(
+        &db,
+        "templated-caller",
+        "0.0.0.0/0",
+        KeyScopes::plain(),
+        template,
+    )
+    .await;
 
     let uri = "/api/hooks";
     let ts = now_timestamp();
@@ -915,7 +1171,10 @@ async fn a_keys_own_canonical_template_override_governs_every_route_it_signs() {
     // The service-wide default template, over the identical request: wrong material now that this
     // key has overridden it.
     let default_signed = signed_request_at("GET", uri, &key.plaintext, &key.signing_secret, "", ts);
-    assert_eq!(send(&app, default_signed).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, default_signed).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // An altered template string (a single character changed from what the key was configured
     // with) is, unsurprisingly, also wrong material — the signature was never computed against it.
@@ -936,14 +1195,20 @@ async fn a_keys_own_canonical_template_override_governs_every_route_it_signs() {
     )
     .body(axum::body::Body::empty())
     .expect("request builds");
-    assert_eq!(send(&app, altered_request).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, altered_request).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
 async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit() {
     let dir = ScriptDir::new();
     // Reports only lengths, so a multi-hundred-KB payload cannot blow the captured-output cap.
-    let script = dir.write_script("large.sh", "echo \"marker=${HOOK_PARAM_MARKER} blob_len=${#HOOK_PARAM_BLOB}\"");
+    let script = dir.write_script(
+        "large.sh",
+        "echo \"marker=${HOOK_PARAM_MARKER} blob_len=${#HOOK_PARAM_BLOB}\"",
+    );
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
@@ -960,14 +1225,27 @@ async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit
     // signature. That isolates "can we HMAC a large body" from argv/environment size limits.
     let padding = "x".repeat(512 * 1024);
     let large_body = json!({ "parameters": { "marker": "big" }, "padding": padding }).to_string();
-    assert!(large_body.len() > 512 * 1024, "the test payload should really be large");
+    assert!(
+        large_body.len() > 512 * 1024,
+        "the test payload should really be large"
+    );
 
     let response = send(
         &app,
-        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &large_body),
+        signed_request(
+            "POST",
+            uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &large_body,
+        ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "a ~512 KB signed body should verify and execute");
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "a ~512 KB signed body should verify and execute"
+    );
     assert_eq!(response.field("status"), &json!("SUCCESS"));
     assert!(response.string("stdout").contains("marker=big"));
 
@@ -975,7 +1253,7 @@ async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit
     // whole body is covered, not a prefix of it.
     let mut tampered = large_body.clone();
     let midpoint = tampered.len() / 2;
-    tampered.replace_range(midpoint..midpoint + 1, "y");
+    tampered.replace_range(midpoint..=midpoint, "y");
     let timestamp = now_timestamp();
     let stale_signature = sign_request(&sender.signing_secret, "POST", uri, timestamp, &large_body);
     let tampered_request = with_connect_info(
@@ -995,31 +1273,62 @@ async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit
         "a single altered byte in the middle of a large body must invalidate the signature"
     );
 
+    assert_signed_payload_limits(&db, &app, &sender, uri).await;
+}
+
+async fn assert_signed_payload_limits(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    sender: &SeededKey,
+    uri: &str,
+) {
     // Just under the buffer bound: still accepted. Sized from the constant rather than a literal,
     // so the converged 3 MiB figure cannot be changed in one place and silently missed here.
     let near_limit_padding = "z".repeat(simply_hook_executor::MAX_REQUEST_BODY_BYTES - 4096);
-    let near_limit_body = json!({ "parameters": { "marker": "near" }, "padding": near_limit_padding }).to_string();
+    let near_limit_body =
+        json!({ "parameters": { "marker": "near" }, "padding": near_limit_padding }).to_string();
     assert!(
         near_limit_body.len() < simply_hook_executor::MAX_REQUEST_BODY_BYTES,
         "must stay under the buffer limit"
     );
     let response = send(
-        &app,
-        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &near_limit_body),
+        app,
+        signed_request(
+            "POST",
+            uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &near_limit_body,
+        ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "a body just under the limit should be accepted");
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "a body just under the limit should be accepted"
+    );
 
     // Over the bound: refused before any hashing or execution, with an explanatory error rather
     // than a hang or an OOM.
     let oversized_padding = "w".repeat(2 * simply_hook_executor::MAX_REQUEST_BODY_BYTES);
-    let oversized_body = json!({ "parameters": { "marker": "over" }, "padding": oversized_padding }).to_string();
+    let oversized_body =
+        json!({ "parameters": { "marker": "over" }, "padding": oversized_padding }).to_string();
     let response = send(
-        &app,
-        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &oversized_body),
+        app,
+        signed_request(
+            "POST",
+            uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &oversized_body,
+        ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "an oversized body must be refused");
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "an oversized body must be refused"
+    );
     assert!(response.string("error").contains("too large"));
 
     // A genuinely large *parameter* also survives the round trip into the child's environment.
@@ -1029,19 +1338,27 @@ async fn large_payloads_are_signed_verified_and_executed_within_the_buffer_limit
     let blob = "b".repeat(64 * 1024);
     let blob_body = json!({ "parameters": { "marker": "blob", "blob": blob } }).to_string();
     let response = send(
-        &app,
-        signed_request("POST", uri, &sender.plaintext, &sender.signing_secret, &blob_body),
+        app,
+        signed_request(
+            "POST",
+            uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &blob_body,
+        ),
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
     assert!(
-        response.string("stdout").contains(&format!("blob_len={}", 64 * 1024)),
+        response
+            .string("stdout")
+            .contains(&format!("blob_len={}", 64 * 1024)),
         "the full parameter should reach the process environment intact: {}",
         response.string("stdout")
     );
 
     // Only the accepted requests produced history rows.
-    assert_eq!(execution_count(&db).await, 3);
+    assert_eq!(execution_count(db).await, 3);
 }
 
 #[tokio::test]
@@ -1051,15 +1368,22 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
 
     let db = setup_test_db().await;
     let cipher = Arc::new(
-        SecretCipher::from_hex_key("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
-            .expect("valid key"),
+        SecretCipher::from_hex_key(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .expect("valid key"),
     );
     let app = create_app(test_state_with_cipher(&db, cipher.clone()));
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
 
     let created = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "sealed", "bound_ips": "0.0.0.0/0" }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "sealed", "bound_ips": "0.0.0.0/0" })),
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK);
@@ -1077,8 +1401,14 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
         .expect("the key exists")
         .signing_secret
         .expect("a signing secret was stored");
-    assert!(!stored.contains(&signing_secret), "the raw secret must not be stored");
-    assert!(stored.starts_with("v1.xchacha20poly1305."), "it should be sealed: {stored}");
+    assert!(
+        !stored.contains(&signing_secret),
+        "the raw secret must not be stored"
+    );
+    assert!(
+        stored.starts_with("v1.xchacha20poly1305."),
+        "it should be sealed: {stored}"
+    );
     assert_eq!(cipher.open(&stored).expect("opens"), signing_secret);
 
     // And the sealed secret still verifies a real signature end to end.
@@ -1086,7 +1416,12 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     let script = dir.write_script("sealed.sh", "echo sealed-ok");
     let hook = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "sealed_hook", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "sealed_hook", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(hook.status, StatusCode::OK);
@@ -1104,7 +1439,13 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     let body = json!({}).to_string();
     let response = send(
         &app,
-        signed_request("POST", "/webhook/sealed_hook", &created_api_key, &signing_secret, &body),
+        signed_request(
+            "POST",
+            "/webhook/sealed_hook",
+            &created_api_key,
+            &signing_secret,
+            &body,
+        ),
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
@@ -1114,8 +1455,14 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
     let serialized = listed.json.to_string();
     assert!(serialized.contains(&key_id), "key_id should be listed");
-    assert!(!serialized.contains(&signing_secret), "the signing secret must never be listed");
-    assert!(!serialized.contains("signing_secret\":\""), "no raw secret field is exposed");
+    assert!(
+        !serialized.contains(&signing_secret),
+        "the signing secret must never be listed"
+    );
+    assert!(
+        !serialized.contains("signing_secret\":\""),
+        "no raw secret field is exposed"
+    );
 }
 
 #[tokio::test]
@@ -1151,24 +1498,7 @@ async fn hmac_signature_failures_are_rejected_without_executing_anything() {
         .expect("request builds")
     };
 
-    // Every one of these presents a *valid* API key — only the signature is wrong, so each must
-    // still be rejected at the authentication layer.
-    let rejected: Vec<(&str, String, String)> = vec![
-        ("tampered body", valid.clone(), json!({ "parameters": { "x": "1" } }).to_string()),
-        ("body with trailing whitespace", valid.clone(), format!("{body} ")),
-        ("signature from another valid key", sign_request(&other.signing_secret, "POST", &uri, timestamp, &body), body.clone()),
-        ("signature of a different payload", sign_request(&signer.signing_secret, "POST", &uri, timestamp, "{}"), body.clone()),
-        ("signature keyed on the bearer key instead of the signing secret", sign_request(&signer.plaintext, "POST", &uri, timestamp, &body), body.clone()),
-        ("signature computed for a different method", sign_request(&signer.signing_secret, "DELETE", &uri, timestamp, &body), body.clone()),
-        ("signature computed for a different path", sign_request(&signer.signing_secret, "POST", "/api/hooks/other/execute", timestamp, &body), body.clone()),
-        ("signature computed for a different timestamp", sign_request(&signer.signing_secret, "POST", &uri, timestamp - 60, &body), body.clone()),
-        ("missing sha256= prefix", valid.trim_start_matches("sha256=").to_owned(), body.clone()),
-        ("wrong algorithm prefix", format!("sha1={}", &valid[7..]), body.clone()),
-        ("non-hex digest", "sha256=zzzz".to_owned(), body.clone()),
-        ("empty digest", "sha256=".to_owned(), body.clone()),
-        ("truncated digest", format!("sha256={}", &valid[7..20]), body.clone()),
-    ];
-
+    let rejected = rejected_signatures(&signer, &other, &uri, &body, timestamp, &valid);
     for (label, signature, payload) in rejected {
         let response = send(&app, request(&signature, &payload)).await;
         assert_eq!(
@@ -1179,12 +1509,95 @@ async fn hmac_signature_failures_are_rejected_without_executing_anything() {
     }
 
     // Rejection happens before the engine is reached: nothing ran, nothing was recorded.
-    assert!(!std::path::Path::new(&side_effect).exists(), "a rejected request must not spawn the script");
+    assert!(
+        !std::path::Path::new(&side_effect).exists(),
+        "a rejected request must not spawn the script"
+    );
     assert_eq!(execution_count(&db).await, 0);
 
     // The control case still works, proving the hook itself was executable all along.
-    assert_eq!(send(&app, request(&valid, &body)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, request(&valid, &body)).await.status,
+        StatusCode::OK
+    );
     assert_eq!(execution_count(&db).await, 1);
+}
+
+fn rejected_signatures(
+    signer: &SeededKey,
+    other: &SeededKey,
+    uri: &str,
+    body: &str,
+    timestamp: i64,
+    valid: &str,
+) -> Vec<(&'static str, String, String)> {
+    // Every one of these presents a *valid* API key — only the signature is wrong, so each must
+    // still be rejected at the authentication layer.
+    vec![
+        (
+            "tampered body",
+            valid.to_owned(),
+            json!({ "parameters": { "x": "1" } }).to_string(),
+        ),
+        (
+            "body with trailing whitespace",
+            valid.to_owned(),
+            format!("{body} "),
+        ),
+        (
+            "signature from another valid key",
+            sign_request(&other.signing_secret, "POST", uri, timestamp, body),
+            body.to_owned(),
+        ),
+        (
+            "signature of a different payload",
+            sign_request(&signer.signing_secret, "POST", uri, timestamp, "{}"),
+            body.to_owned(),
+        ),
+        (
+            "signature keyed on the bearer key instead of the signing secret",
+            sign_request(&signer.plaintext, "POST", uri, timestamp, body),
+            body.to_owned(),
+        ),
+        (
+            "signature computed for a different method",
+            sign_request(&signer.signing_secret, "DELETE", uri, timestamp, body),
+            body.to_owned(),
+        ),
+        (
+            "signature computed for a different path",
+            sign_request(
+                &signer.signing_secret,
+                "POST",
+                "/api/hooks/other/execute",
+                timestamp,
+                body,
+            ),
+            body.to_owned(),
+        ),
+        (
+            "signature computed for a different timestamp",
+            sign_request(&signer.signing_secret, "POST", uri, timestamp - 60, body),
+            body.to_owned(),
+        ),
+        (
+            "missing sha256= prefix",
+            valid.trim_start_matches("sha256=").to_owned(),
+            body.to_owned(),
+        ),
+        (
+            "wrong algorithm prefix",
+            format!("sha1={}", &valid[7..]),
+            body.to_owned(),
+        ),
+        ("non-hex digest", "sha256=zzzz".to_owned(), body.to_owned()),
+        ("empty digest", "sha256=".to_owned(), body.to_owned()),
+        (
+            "truncated digest",
+            format!("sha256={}", &valid[7..20]),
+            body.to_owned(),
+        ),
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1203,8 +1616,13 @@ async fn hook_crud_lifecycle_and_creator_auto_provisioning() {
     // whose global half is `can_manage_keys`. Neither right implies the other, so a key that walks
     // the whole CRUD lifecycle holds both. `insert_key_full`, not `insert_key`: `can_manage_keys`
     // now requires every request to be signed — see `signed_send`.
-    let manager =
-        insert_key_full(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
+    let manager = insert_key_full(
+        &db,
+        "Hook Manager",
+        "0.0.0.0/0",
+        KeyScopes::parent_hook_manager(),
+    )
+    .await;
 
     let created = signed_send(
         &app,
@@ -1226,7 +1644,10 @@ async fn hook_crud_lifecycle_and_creator_auto_provisioning() {
     // AGENT.MD: creating a hook must auto-grant full execute/manage rights on it.
     assert_eq!(created.field("can_execute"), &json!(true));
     assert_eq!(created.field("can_manage"), &json!(true));
-    assert_eq!(created.field("parameters").as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        created.field("parameters").as_array().map(Vec::len),
+        Some(1)
+    );
 
     // Duplicate name -> 409, not a 500.
     let duplicate = signed_send(
@@ -1242,7 +1663,16 @@ async fn hook_crud_lifecycle_and_creator_auto_provisioning() {
 
     // Readable by UUID and by name.
     assert_eq!(
-        signed_send(&app, &mut clock, "GET", &format!("/api/hooks/{hook_id}"), &manager, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "GET",
+            &format!("/api/hooks/{hook_id}"),
+            &manager,
+            None
+        )
+        .await
+        .status,
         StatusCode::OK
     );
     let by_name = signed_send(&app, &mut clock, "GET", "/api/hooks/deploy", &manager, None).await;
@@ -1261,10 +1691,20 @@ async fn hook_crud_lifecycle_and_creator_auto_provisioning() {
     assert_eq!(updated.status, StatusCode::OK);
     assert_eq!(updated.field("default_timeout_seconds"), &json!(45));
 
-    let deleted = signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook_id}"), &manager, None).await;
+    let deleted = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("/api/hooks/{hook_id}"),
+        &manager,
+        None,
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     assert_eq!(
-        signed_send(&app, &mut clock, "GET", "/api/hooks/deploy", &manager, None).await.status,
+        signed_send(&app, &mut clock, "GET", "/api/hooks/deploy", &manager, None)
+            .await
+            .status,
         StatusCode::NOT_FOUND
     );
 }
@@ -1284,28 +1724,64 @@ async fn hook_name_is_validated_against_a_url_safe_charset() {
 
     // Letters, digits, '-', '_', '.', '~' — the exact set `percent_encode_path_segment` never
     // encodes — are all accepted, including at every position (leading/trailing/consecutive).
-    let valid_names = ["ban.ip", "my_hook-1", "Hook123", "a", "1", "..--__~~", "hook.name.v2"];
+    let valid_names = [
+        "ban.ip",
+        "my_hook-1",
+        "Hook123",
+        "a",
+        "1",
+        "..--__~~",
+        "hook.name.v2",
+    ];
     for name in valid_names {
         let created = send(
             &app,
-            json_request("POST", "/api/hooks", &master, Some(json!({ "name": name, "script_path": script }))),
+            json_request(
+                "POST",
+                "/api/hooks",
+                &master,
+                Some(json!({ "name": name, "script_path": script })),
+            ),
         )
         .await;
-        assert_eq!(created.status, StatusCode::OK, "{name:?} should be accepted: {}", created.raw);
+        assert_eq!(
+            created.status,
+            StatusCode::OK,
+            "{name:?} should be accepted: {}",
+            created.raw
+        );
         assert_eq!(created.field("name").as_str(), Some(name));
     }
 
     // A '/' splits the path outright; a space, a raw '%', and a literal percent-encoded sequence
     // all force a caller to get percent-encoding right just to reach an otherwise ordinary hook —
     // every one of these is refused with a 400, not silently accepted and later broken in the URL.
-    let invalid_names = ["ban/ip", "hook name", "hook%2Ftest", "hook?query", "hook#frag", "hook@host", "hook:8080"];
+    let invalid_names = [
+        "ban/ip",
+        "hook name",
+        "hook%2Ftest",
+        "hook?query",
+        "hook#frag",
+        "hook@host",
+        "hook:8080",
+    ];
     for name in invalid_names {
         let rejected = send(
             &app,
-            json_request("POST", "/api/hooks", &master, Some(json!({ "name": name, "script_path": script }))),
+            json_request(
+                "POST",
+                "/api/hooks",
+                &master,
+                Some(json!({ "name": name, "script_path": script })),
+            ),
         )
         .await;
-        assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "{name:?} should be refused: {}", rejected.raw);
+        assert_eq!(
+            rejected.status,
+            StatusCode::BAD_REQUEST,
+            "{name:?} should be refused: {}",
+            rejected.raw
+        );
     }
 
     // Empty (and whitespace-only, which trims to empty) names are refused the same way, distinctly
@@ -1313,32 +1789,70 @@ async fn hook_name_is_validated_against_a_url_safe_charset() {
     for name in ["", "   "] {
         let rejected = send(
             &app,
-            json_request("POST", "/api/hooks", &master, Some(json!({ "name": name, "script_path": script }))),
+            json_request(
+                "POST",
+                "/api/hooks",
+                &master,
+                Some(json!({ "name": name, "script_path": script })),
+            ),
         )
         .await;
-        assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "empty name {name:?} should be refused: {}", rejected.raw);
-        assert!(rejected.string("error").contains("required"), "{}", rejected.raw);
+        assert_eq!(
+            rejected.status,
+            StatusCode::BAD_REQUEST,
+            "empty name {name:?} should be refused: {}",
+            rejected.raw
+        );
+        assert!(
+            rejected.string("error").contains("required"),
+            "{}",
+            rejected.raw
+        );
     }
 
+    assert_hook_rename_validates_name(&app, &master, &script).await;
+}
+
+async fn assert_hook_rename_validates_name(app: &axum::Router, master: &str, script: &str) {
     // Renaming an existing hook to an invalid name is refused the same way, not only creation.
     let base = send(
-        &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "renameable", "script_path": script }))),
+        app,
+        json_request(
+            "POST",
+            "/api/hooks",
+            master,
+            Some(json!({ "name": "renameable", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(base.status, StatusCode::OK, "{}", base.raw);
     let hook_id = base.string("id");
 
     let bad_rename = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "name": "bad/name" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            master,
+            Some(json!({ "name": "bad/name" })),
+        ),
     )
     .await;
-    assert_eq!(bad_rename.status, StatusCode::BAD_REQUEST, "{}", bad_rename.raw);
+    assert_eq!(
+        bad_rename.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_rename.raw
+    );
 
     let good_rename = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "name": "renamed.ok" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            master,
+            Some(json!({ "name": "renamed.ok" })),
+        ),
     )
     .await;
     assert_eq!(good_rename.status, StatusCode::OK, "{}", good_rename.raw);
@@ -1358,7 +1872,12 @@ async fn hook_creation_and_management_respect_scopes() {
     // No can_manage_hooks scope -> cannot create.
     let denied = send(
         &app,
-        json_request("POST", "/api/hooks", &other, Some(json!({ "name": "nope", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &other,
+            Some(json!({ "name": "nope", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
@@ -1370,11 +1889,24 @@ async fn hook_creation_and_management_respect_scopes() {
 
     let update = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &other, Some(json!({ "name": "hijacked" }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &other,
+            Some(json!({ "name": "hijacked" })),
+        ),
     )
     .await;
     assert_eq!(update.status, StatusCode::FORBIDDEN);
-    assert_eq!(send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &other, None)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(
+            &app,
+            json_request("DELETE", &format!("/api/hooks/{hook_id}"), &other, None)
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
 }
 
 #[tokio::test]
@@ -1398,7 +1930,15 @@ async fn hooks_are_only_visible_to_keys_with_a_mapping() {
     assert_eq!(hidden.json.as_array().map(Vec::len), Some(0));
     // §4 oracle discipline: an unmapped caller gets exactly what a nonexistent hook id gives, so
     // the listing being empty and the direct fetch failing tell the same story.
-    assert_eq!(send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &unmapped, None)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(
+            &app,
+            json_request("GET", &format!("/api/hooks/{hook_id}"), &unmapped, None)
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
 
     let all = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
     assert_eq!(all.json.as_array().map(Vec::len), Some(1));
@@ -1411,7 +1951,8 @@ async fn executing_without_can_execute_is_forbidden() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (manage_only_id, manage_only) = insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::plain()).await;
+    let (manage_only_id, manage_only) =
+        insert_key(&db, "Manager", "0.0.0.0/0", KeyScopes::plain()).await;
     let (_, stranger) = insert_key(&db, "Stranger", "0.0.0.0/0", KeyScopes::plain()).await;
 
     let hook_id = insert_hook(&db, "guarded", &script, 30).await;
@@ -1421,8 +1962,18 @@ async fn executing_without_can_execute_is_forbidden() {
     // Two different refusals, and the difference is §4's whole point. The manage-only key *can*
     // see the hook — it holds a row — so it is merely short a verb: `403`. The stranger holds
     // nothing, so the hook is outside its visibility scope and must look nonexistent: `404`.
-    assert_eq!(send(&app, json_request("POST", &uri, &manage_only, None)).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(send(&app, json_request("POST", &uri, &stranger, None)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(&app, json_request("POST", &uri, &manage_only, None))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&app, json_request("POST", &uri, &stranger, None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1432,7 +1983,10 @@ async fn executing_without_can_execute_is_forbidden() {
 #[tokio::test]
 async fn successful_execution_captures_output_and_records_history() {
     let dir = ScriptDir::new();
-    let script = dir.write_script("hello.sh", "echo \"hello $HOOK_PARAM_TARGET\"\necho oops >&2");
+    let script = dir.write_script(
+        "hello.sh",
+        "echo \"hello $HOOK_PARAM_TARGET\"\necho oops >&2",
+    );
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
@@ -1467,7 +2021,12 @@ async fn successful_execution_captures_output_and_records_history() {
 
     let detail = send(
         &app,
-        json_request("GET", &format!("/api/executions/{}", response.string("id")), &key, None),
+        json_request(
+            "GET",
+            &format!("/api/executions/{}", response.string("id")),
+            &key,
+            None,
+        ),
     )
     .await;
     assert_eq!(detail.status, StatusCode::OK);
@@ -1486,7 +2045,11 @@ async fn non_zero_exit_is_recorded_as_failed() {
     grant(&db, key_id, hook_id, true, false).await;
 
     // A failing script is a completed request whose recorded outcome is FAILED — not an HTTP error.
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let response = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.field("status"), &json!("FAILED"));
     assert_eq!(response.field("exit_code"), &json!(3));
@@ -1496,7 +2059,10 @@ async fn non_zero_exit_is_recorded_as_failed() {
 #[tokio::test]
 async fn parameters_are_injected_as_env_vars_and_positional_arguments() {
     let dir = ScriptDir::new();
-    let script = dir.write_script("args.sh", "echo \"argv:$1|$2\"\necho \"env:$HOOK_PARAM_ALPHA|$HOOK_PARAM_BETA\"");
+    let script = dir.write_script(
+        "args.sh",
+        "echo \"argv:$1|$2\"\necho \"env:$HOOK_PARAM_ALPHA|$HOOK_PARAM_BETA\"",
+    );
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
@@ -1519,8 +2085,14 @@ async fn parameters_are_injected_as_env_vars_and_positional_arguments() {
 
     assert_eq!(response.status, StatusCode::OK);
     let stdout = response.string("stdout");
-    assert!(stdout.contains("argv:first|default-beta"), "positional args in declaration order: {stdout}");
-    assert!(stdout.contains("env:first|default-beta"), "HOOK_PARAM_* injection: {stdout}");
+    assert!(
+        stdout.contains("argv:first|default-beta"),
+        "positional args in declaration order: {stdout}"
+    );
+    assert!(
+        stdout.contains("env:first|default-beta"),
+        "HOOK_PARAM_* injection: {stdout}"
+    );
 }
 
 #[tokio::test]
@@ -1550,8 +2122,14 @@ async fn parameter_values_are_never_interpreted_by_a_shell() {
     .await;
 
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.string("stdout").trim(), format!("got:[{malicious}]"));
-    assert!(!std::path::Path::new("/tmp/pwned").exists(), "no shell interpretation occurred");
+    assert_eq!(
+        response.string("stdout").trim(),
+        format!("got:[{malicious}]")
+    );
+    assert!(
+        !std::path::Path::new("/tmp/pwned").exists(),
+        "no shell interpretation occurred"
+    );
 }
 
 #[tokio::test]
@@ -1578,10 +2156,19 @@ async fn child_environment_is_cleared_except_the_allowlist() {
     .await;
 
     let stdout = response.string("stdout");
-    assert!(stdout.contains("PATH="), "the allowlisted PATH is inherited: {stdout}");
-    assert!(stdout.contains("HOOK_PARAM_TARGET=isolated"), "parameters are injected: {stdout}");
+    assert!(
+        stdout.contains("PATH="),
+        "the allowlisted PATH is inherited: {stdout}"
+    );
+    assert!(
+        stdout.contains("HOOK_PARAM_TARGET=isolated"),
+        "parameters are injected: {stdout}"
+    );
     // cargo exports a pile of CARGO_* variables into this test process; none may reach the child.
-    assert!(!stdout.contains("CARGO"), "non-allowlisted host variables must not leak: {stdout}");
+    assert!(
+        !stdout.contains("CARGO"),
+        "non-allowlisted host variables must not leak: {stdout}"
+    );
 }
 
 #[tokio::test]
@@ -1601,7 +2188,11 @@ async fn timeout_kills_the_whole_process_group_and_records_timeout() {
     let hook_id = insert_hook(&db, "slow", &script, 1).await;
     grant(&db, key_id, hook_id, true, false).await;
 
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let response = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
 
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.field("status"), &json!("TIMEOUT"));
@@ -1623,7 +2214,13 @@ async fn exceeding_max_concurrent_jobs_returns_429() {
 
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let (key_id, key) = insert_key(&db, "Throttled", "0.0.0.0/0", KeyScopes::plain().with_jobs(1)).await;
+    let (key_id, key) = insert_key(
+        &db,
+        "Throttled",
+        "0.0.0.0/0",
+        KeyScopes::plain().with_jobs(1),
+    )
+    .await;
     let hook_id = insert_hook(&db, "busy", &script, 30).await;
     insert_parameter(&db, hook_id, "marker", Some(&marker), true).await;
     grant(&db, key_id, hook_id, true, false).await;
@@ -1669,7 +2266,13 @@ async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let budget = 2;
-    let (key_id, key) = insert_key(&db, "Peak", "0.0.0.0/0", KeyScopes::plain().with_jobs(budget)).await;
+    let (key_id, key) = insert_key(
+        &db,
+        "Peak",
+        "0.0.0.0/0",
+        KeyScopes::plain().with_jobs(budget),
+    )
+    .await;
     let hook_id = insert_hook(&db, "saturate", &script, 30).await;
     insert_parameter(&db, hook_id, "marker", None, true).await;
     grant(&db, key_id, hook_id, true, false).await;
@@ -1677,7 +2280,9 @@ async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
     let uri = format!("/api/hooks/{hook_id}/execute");
 
     // Fill every slot, each job announcing itself through its own marker file.
-    let markers: Vec<String> = (0..budget).map(|i| dir.path_for(&format!("slot-{i}"))).collect();
+    let markers: Vec<String> = (0..budget)
+        .map(|i| dir.path_for(&format!("slot-{i}")))
+        .collect();
     let occupying: Vec<_> = markers
         .iter()
         .map(|marker| {
@@ -1685,7 +2290,9 @@ async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
             let key = key.clone();
             let uri = uri.clone();
             let body = json!({ "parameters": { "marker": marker } });
-            tokio::spawn(async move { send(&app, json_request("POST", &uri, &key, Some(body))).await })
+            tokio::spawn(
+                async move { send(&app, json_request("POST", &uri, &key, Some(body))).await },
+            )
         })
         .collect();
 
@@ -1704,7 +2311,9 @@ async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
             let key = key.clone();
             let uri = uri.clone();
             let body = json!({ "parameters": { "marker": dir.path_for(&format!("burst-{i}")) } });
-            tokio::spawn(async move { send(&app, json_request("POST", &uri, &key, Some(body))).await })
+            tokio::spawn(
+                async move { send(&app, json_request("POST", &uri, &key, Some(body))).await },
+            )
         })
         .collect();
 
@@ -1743,7 +2352,10 @@ async fn peak_load_burst_is_rejected_immediately_rather_than_queued() {
         let response = task.await.expect("occupying request task completes");
         assert_eq!(response.status, StatusCode::OK);
     }
-    assert_eq!(execution_count(&db).await, u64::try_from(budget).expect("small budget"));
+    assert_eq!(
+        execution_count(&db).await,
+        u64::try_from(budget).expect("small budget")
+    );
 
     for i in 0..budget {
         let body = json!({ "parameters": { "marker": dir.path_for(&format!("after-{i}")) } });
@@ -1784,8 +2396,10 @@ async fn a_running_hook_does_not_hold_the_database_connection_hostage() {
         tokio::spawn(async move { send(&app, json_request("POST", &uri, &key, None)).await })
     };
 
-    let started =
-        wait_until(Duration::from_secs(10), async || std::path::Path::new(&marker).exists()).await;
+    let started = wait_until(Duration::from_secs(10), async || {
+        std::path::Path::new(&marker).exists()
+    })
+    .await;
     assert!(started, "the hook never started");
 
     // Issued *while the hook is still sleeping* — a request with nothing at all to do with the
@@ -1802,7 +2416,9 @@ async fn a_running_hook_does_not_hold_the_database_connection_hostage() {
          it was ever spawned"
     );
 
-    let finished = running.await.expect("the hook's own request task completes");
+    let finished = running
+        .await
+        .expect("the hook's own request task completes");
     assert_eq!(finished.status, StatusCode::OK, "{}", finished.raw);
     assert_eq!(finished.field("status"), &json!("SUCCESS"));
 }
@@ -1825,13 +2441,22 @@ async fn parameter_validation_rejects_missing_unknown_and_malformed_input() {
 
     let uri = format!("/api/hooks/{hook_id}/execute");
 
-    let missing = send(&app, json_request("POST", &uri, &key, Some(json!({ "parameters": {} })))).await;
+    let missing = send(
+        &app,
+        json_request("POST", &uri, &key, Some(json!({ "parameters": {} }))),
+    )
+    .await;
     assert_eq!(missing.status, StatusCode::BAD_REQUEST);
     assert!(missing.string("error").contains("required_one"));
 
     let unknown = send(
         &app,
-        json_request("POST", &uri, &key, Some(json!({ "parameters": { "required_one": "x", "surprise": "y" } }))),
+        json_request(
+            "POST",
+            &uri,
+            &key,
+            Some(json!({ "parameters": { "required_one": "x", "surprise": "y" } })),
+        ),
     )
     .await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
@@ -1881,10 +2506,19 @@ async fn non_scalar_parameter_values_are_rejected() {
     for (label, value) in non_scalars {
         let response = send(
             &app,
-            json_request("POST", &uri, &key, Some(json!({ "parameters": { "value": value } }))),
+            json_request(
+                "POST",
+                &uri,
+                &key,
+                Some(json!({ "parameters": { "value": value } })),
+            ),
         )
         .await;
-        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{label} must be rejected");
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{label} must be rejected"
+        );
         assert!(
             response.string("error").contains("value"),
             "{label}: the error should name the offending parameter, got {:?}",
@@ -1905,14 +2539,26 @@ async fn non_scalar_parameter_values_are_rejected() {
     for (value, expected) in scalars {
         let response = send(
             &app,
-            json_request("POST", &uri, &key, Some(json!({ "parameters": { "value": value } }))),
+            json_request(
+                "POST",
+                &uri,
+                &key,
+                Some(json!({ "parameters": { "value": value } })),
+            ),
         )
         .await;
-        assert_eq!(response.status, StatusCode::OK, "{value} should be accepted");
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{value} should be accepted"
+        );
         assert_eq!(response.field("parameters"), &json!({ "value": expected }));
     }
 
-    assert!(std::path::Path::new(&side_effect).exists(), "the accepted runs did execute");
+    assert!(
+        std::path::Path::new(&side_effect).exists(),
+        "the accepted runs did execute"
+    );
 }
 
 #[tokio::test]
@@ -1943,13 +2589,21 @@ async fn json_null_is_treated_as_an_omitted_parameter() {
     )
     .await;
     assert_eq!(with_null.status, StatusCode::OK);
-    assert_eq!(with_null.field("parameters"), &json!({ "defaulted": "fallback" }));
+    assert_eq!(
+        with_null.field("parameters"),
+        &json!({ "defaulted": "fallback" })
+    );
     assert_eq!(with_null.string("stdout").trim(), "[fallback][]");
 
     // An explicit empty string is distinguishable from `null`: it overrides the default.
     let with_empty = send(
         &app,
-        json_request("POST", &uri, &key, Some(json!({ "parameters": { "defaulted": "" } }))),
+        json_request(
+            "POST",
+            &uri,
+            &key,
+            Some(json!({ "parameters": { "defaulted": "" } })),
+        ),
     )
     .await;
     assert_eq!(with_empty.status, StatusCode::OK);
@@ -1989,35 +2643,101 @@ async fn positional_argument_order_is_deterministic_and_append_only() {
     // Declared in an order that does NOT match alphabetical or reverse-alphabetical sorting, so a
     // passing assertion can only mean declaration order is what's actually used.
     for (param, default) in [("zulu", "z"), ("alpha", "a"), ("mike", "m")] {
-        let created = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/parameters"), &key, Some(json!({ "param_key": param, "default_value": default }))).await;
+        let created = signed_send(
+            &app,
+            &mut clock,
+            "POST",
+            &format!("/api/hooks/{hook_id}/parameters"),
+            &key,
+            Some(json!({ "param_key": param, "default_value": default })),
+        )
+        .await;
         assert_eq!(created.status, StatusCode::OK);
     }
 
     let expected = json!(["z", "a", "m"]);
-    let preview = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/test"), &key, None).await;
-    assert_eq!(preview.json["command"]["args"], expected, "declaration order, not sorted order");
+    let preview = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook_id}/test"),
+        &key,
+        None,
+    )
+    .await;
+    assert_eq!(
+        preview.json["command"]["args"], expected,
+        "declaration order, not sorted order"
+    );
 
     // Repeated calls must produce the identical vector — an unstable ORDER BY would show up here
     // as an intermittent difference across runs.
     for attempt in 0..5 {
-        let run = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/execute"), &key, None).await;
+        let run = signed_send(
+            &app,
+            &mut clock,
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &key,
+            None,
+        )
+        .await;
         assert_eq!(run.status, StatusCode::OK);
-        assert_eq!(run.string("stdout").trim(), "z|a|m|", "attempt {attempt} differed");
+        assert_eq!(
+            run.string("stdout").trim(),
+            "z|a|m|",
+            "attempt {attempt} differed"
+        );
 
-        let preview = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/test"), &key, None).await;
-        assert_eq!(preview.json["command"]["args"], expected, "attempt {attempt} differed");
+        let preview = signed_send(
+            &app,
+            &mut clock,
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &key,
+            None,
+        )
+        .await;
+        assert_eq!(
+            preview.json["command"]["args"], expected,
+            "attempt {attempt} differed"
+        );
     }
 
     // A parameter declared later appends to the end rather than reshuffling existing positions,
     // so adding one cannot silently change what an existing caller's script receives as $1..$3.
-    let added = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/parameters"), &key, Some(json!({ "param_key": "bravo", "default_value": "b" }))).await;
+    let added = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook_id}/parameters"),
+        &key,
+        Some(json!({ "param_key": "bravo", "default_value": "b" })),
+    )
+    .await;
     assert_eq!(added.status, StatusCode::OK);
 
-    let run = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/execute"), &key, None).await;
+    let run = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook_id}/execute"),
+        &key,
+        None,
+    )
+    .await;
     assert_eq!(run.string("stdout").trim(), "z|a|m|b");
 
     // Supplied values land in the same positions as their defaults did.
-    let run = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/execute"), &key, Some(json!({ "parameters": { "mike": "M!", "zulu": "Z!" } }))).await;
+    let run = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook_id}/execute"),
+        &key,
+        Some(json!({ "parameters": { "mike": "M!", "zulu": "Z!" } })),
+    )
+    .await;
     assert_eq!(run.string("stdout").trim(), "Z!|a|M!|b");
 }
 
@@ -2037,10 +2757,14 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
 
     // Stop at the initial schema: this is what a database created by the previous release looks
     // like, i.e. `hooks` without a `run_as_user` column.
-    Migrator::up(&db, Some(1)).await.expect("the initial schema applies");
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("the initial schema applies");
 
     // Then apply the rest, exercising the ALTER TABLE upgrade path rather than a fresh CREATE.
-    Migrator::up(&db, None).await.expect("the run_as_user migration applies to an existing schema");
+    Migrator::up(&db, None)
+        .await
+        .expect("the run_as_user migration applies to an existing schema");
 
     // The new column is present, nullable, and defaults to NULL for pre-existing rows.
     let now = chrono::Utc::now().naive_utc();
@@ -2072,7 +2796,10 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
     .insert(&db)
     .await
     .expect("a hook is insertable after the upgrade");
-    assert_eq!(legacy.run_as_user, None, "an unelevated hook keeps running as the daemon user");
+    assert_eq!(
+        legacy.run_as_user, None,
+        "an unelevated hook keeps running as the daemon user"
+    );
     // The soft-delete migration backfills existing rows as live rather than leaving the column
     // nullable, so an upgrade cannot make a hook vanish from the default listing.
     assert!(!legacy.is_deleted, "an upgraded hook is live, not trashed");
@@ -2086,7 +2813,9 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
     assert_eq!(elevated.run_as_user.as_deref(), Some("root"));
 
     // Re-running the migrator is a no-op rather than an error, so a restart never fails.
-    Migrator::up(&db, None).await.expect("migrations are idempotent");
+    Migrator::up(&db, None)
+        .await
+        .expect("migrations are idempotent");
 }
 
 #[tokio::test]
@@ -2122,13 +2851,23 @@ async fn dry_run_previews_the_exact_sudo_command_for_a_privileged_hook() {
         json!(["-n", "-u", "root", "--", script, "203.0.113.7", "routine"])
     );
     // Parameters still reach the environment exactly as they do for an unprivileged hook.
-    assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_TARGET"], json!("203.0.113.7"));
-    assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_REASON"], json!("routine"));
+    assert_eq!(
+        preview.json["command"]["env"]["HOOK_PARAM_TARGET"],
+        json!("203.0.113.7")
+    );
+    assert_eq!(
+        preview.json["command"]["env"]["HOOK_PARAM_REASON"],
+        json!("routine")
+    );
 
     // The unprivileged form of the same hook has no sudo wrapper at all.
     let plain_id = insert_hook_as(&db, "unprivileged", &script, 30, None).await;
     grant(&db, key_id, plain_id, true, false).await;
-    let plain = send(&app, json_request("POST", &format!("/api/hooks/{plain_id}/test"), &key, None)).await;
+    let plain = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{plain_id}/test"), &key, None),
+    )
+    .await;
     assert_eq!(plain.json["command"]["program"], json!(script));
     assert_eq!(plain.json["command"]["args"], json!([]));
     assert_eq!(plain.json["command"]["run_as_user"], json!(null));
@@ -2158,16 +2897,32 @@ async fn run_as_user_survives_hook_crud_and_is_audited() {
     let hook_id = created.string("id");
 
     // It round-trips through the read paths.
-    let fetched = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    let fetched = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
     assert_eq!(fetched.field("run_as_user"), &json!("postgres"));
     let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
     assert_eq!(listed.json[0]["run_as_user"], json!("postgres"));
 
     // Creation is audited with the elevation, so "what runs as another account" is answerable
     // from the audit trail alone.
-    let audit = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_CREATE&limit=1", &master, None)).await;
+    let audit = send(
+        &app,
+        json_request(
+            "GET",
+            "/api/audit-logs?action=HOOK_CREATE&limit=1",
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert!(
-        audit.json[0]["details"].as_str().unwrap_or_default().contains("runs as 'postgres' via sudo"),
+        audit.json[0]["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runs as 'postgres' via sudo"),
         "audit details should record the elevation: {}",
         audit.json[0]["details"]
     );
@@ -2175,15 +2930,32 @@ async fn run_as_user_survives_hook_crud_and_is_audited() {
     // Changing the account is recorded too.
     let updated = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "run_as_user": "root" }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "run_as_user": "root" })),
+        ),
     )
     .await;
     assert_eq!(updated.status, StatusCode::OK);
     assert_eq!(updated.field("run_as_user"), &json!("root"));
 
-    let audit = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_UPDATE&limit=1", &master, None)).await;
+    let audit = send(
+        &app,
+        json_request(
+            "GET",
+            "/api/audit-logs?action=HOOK_UPDATE&limit=1",
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert!(
-        audit.json[0]["details"].as_str().unwrap_or_default().contains("runs as 'root' via sudo"),
+        audit.json[0]["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runs as 'root' via sudo"),
         "{}",
         audit.json[0]["details"]
     );
@@ -2191,7 +2963,12 @@ async fn run_as_user_survives_hook_crud_and_is_audited() {
     // An explicit empty string drops elevation; the field being absent would have left it alone.
     let cleared = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "run_as_user": "" }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "run_as_user": "" })),
+        ),
     )
     .await;
     assert_eq!(cleared.status, StatusCode::OK);
@@ -2199,7 +2976,12 @@ async fn run_as_user_survives_hook_crud_and_is_audited() {
 
     let untouched = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "description": "unrelated" }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "description": "unrelated" })),
+        ),
     )
     .await;
     assert_eq!(untouched.field("run_as_user"), &json!(null));
@@ -2214,19 +2996,36 @@ async fn only_master_keys_may_assign_run_as_user() {
     let app = create_app(test_state(&db));
     let mut clock = signing_clock();
     // A fully-scoped non-master: it may create *and* maintain hooks, it simply may not elevate them.
-    let manager =
-        insert_key_full(&db, "Hook Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
+    let manager = insert_key_full(
+        &db,
+        "Hook Manager",
+        "0.0.0.0/0",
+        KeyScopes::parent_hook_manager(),
+    )
+    .await;
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
 
     // Creating a *standard* hook is allowed and must keep working.
-    let ordinary = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": "ordinary", "script_path": script }))).await;
+    let ordinary = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/hooks",
+        &manager,
+        Some(json!({ "name": "ordinary", "script_path": script })),
+    )
+    .await;
     assert_eq!(ordinary.status, StatusCode::OK);
     assert_eq!(ordinary.field("run_as_user"), &json!(null));
 
     // Requesting elevation is not.
     for account in ["root", "postgres", "nobody"] {
         let denied = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": format!("escalate_{account}"), "script_path": script, "run_as_user": account }))).await;
-        assert_eq!(denied.status, StatusCode::FORBIDDEN, "run_as_user={account} must be refused");
+        assert_eq!(
+            denied.status,
+            StatusCode::FORBIDDEN,
+            "run_as_user={account} must be refused"
+        );
         assert_eq!(
             denied.string("error"),
             "Only master API keys can assign run_as_user privileges"
@@ -2235,7 +3034,15 @@ async fn only_master_keys_may_assign_run_as_user() {
 
     // The refusal is authorization, not validation: a syntactically invalid account from a
     // non-master must still be a 403, so probing the field cannot reveal what would be accepted.
-    let probe = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": "probe", "script_path": script, "run_as_user": "-i" }))).await;
+    let probe = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/hooks",
+        &manager,
+        Some(json!({ "name": "probe", "script_path": script, "run_as_user": "-i" })),
+    )
+    .await;
     assert_eq!(probe.status, StatusCode::FORBIDDEN);
 
     // The escalation check must fire *before* any other field is validated. Each of these payloads
@@ -2243,14 +3050,37 @@ async fn only_master_keys_may_assign_run_as_user() {
     // win, or an attacker could distinguish "my run_as_user was accepted" from "it was refused"
     // by observing which complaint came back.
     let masked = [
-        ("relative script_path", json!({ "name": "m1", "script_path": "relative.sh", "run_as_user": "root" })),
-        ("traversing script_path", json!({ "name": "m2", "script_path": "/opt/../etc/shadow", "run_as_user": "root" })),
-        ("invalid timeout", json!({ "name": "m3", "script_path": script, "default_timeout_seconds": 0, "run_as_user": "root" })),
-        ("empty name", json!({ "name": "   ", "script_path": script, "run_as_user": "root" })),
-        ("bad param_key", json!({ "name": "m4", "script_path": script, "run_as_user": "root", "parameters": [{ "param_key": "9bad" }] })),
+        (
+            "relative script_path",
+            json!({ "name": "m1", "script_path": "relative.sh", "run_as_user": "root" }),
+        ),
+        (
+            "traversing script_path",
+            json!({ "name": "m2", "script_path": "/opt/../etc/shadow", "run_as_user": "root" }),
+        ),
+        (
+            "invalid timeout",
+            json!({ "name": "m3", "script_path": script, "default_timeout_seconds": 0, "run_as_user": "root" }),
+        ),
+        (
+            "empty name",
+            json!({ "name": "   ", "script_path": script, "run_as_user": "root" }),
+        ),
+        (
+            "bad param_key",
+            json!({ "name": "m4", "script_path": script, "run_as_user": "root", "parameters": [{ "param_key": "9bad" }] }),
+        ),
     ];
     for (label, payload) in masked {
-        let response = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(payload)).await;
+        let response = signed_send(
+            &app,
+            &mut clock,
+            "POST",
+            "/api/hooks",
+            &manager,
+            Some(payload),
+        )
+        .await;
         assert_eq!(
             response.status,
             StatusCode::FORBIDDEN,
@@ -2263,8 +3093,30 @@ async fn only_master_keys_may_assign_run_as_user() {
         );
     }
 
+    assert_elevation_updates_are_master_only(
+        &app, &mut clock, &manager, &master, &script, &ordinary,
+    )
+    .await;
+}
+
+async fn assert_elevation_updates_are_master_only(
+    app: &axum::Router,
+    clock: &mut i64,
+    manager: &SeededKey,
+    master: &str,
+    script: &str,
+    ordinary: &TestResponse,
+) {
     // The same ordering holds on update.
-    let masked_update = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{}", ordinary.string("id")), &manager, Some(json!({ "script_path": "relative.sh", "run_as_user": "root" }))).await;
+    let masked_update = signed_send(
+        app,
+        clock,
+        "PUT",
+        &format!("/api/hooks/{}", ordinary.string("id")),
+        manager,
+        Some(json!({ "script_path": "relative.sh", "run_as_user": "root" })),
+    )
+    .await;
     assert_eq!(masked_update.status, StatusCode::FORBIDDEN);
     assert_eq!(
         masked_update.string("error"),
@@ -2276,14 +3128,26 @@ async fn only_master_keys_may_assign_run_as_user() {
     // two literal quote characters `""`, which `validate_hook_name` now (correctly) refuses, and
     // nothing about this test is actually exercising hook *names*.
     for (i, null_ish) in [json!(null), json!("")].into_iter().enumerate() {
-        let allowed = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": format!("plain_{i}"), "script_path": script, "run_as_user": null_ish }))).await;
-        assert_eq!(allowed.status, StatusCode::OK, "an unelevated hook must still be creatable");
+        let allowed = signed_send(app, clock, "POST", "/api/hooks", manager, Some(json!({ "name": format!("plain_{i}"), "script_path": script, "run_as_user": null_ish }))).await;
+        assert_eq!(
+            allowed.status,
+            StatusCode::OK,
+            "an unelevated hook must still be creatable"
+        );
         assert_eq!(allowed.field("run_as_user"), &json!(null));
     }
 
     // The guard covers updates too — including on a hook the non-master owns outright.
     let owned_id = ordinary.string("id");
-    let escalate = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "root" }))).await;
+    let escalate = signed_send(
+        app,
+        clock,
+        "PUT",
+        &format!("/api/hooks/{owned_id}"),
+        manager,
+        Some(json!({ "run_as_user": "root" })),
+    )
+    .await;
     assert_eq!(escalate.status, StatusCode::FORBIDDEN);
     assert_eq!(
         escalate.string("error"),
@@ -2291,24 +3155,55 @@ async fn only_master_keys_may_assign_run_as_user() {
     );
 
     // ...and via PATCH, which is routed to the same handler.
-    let patched = signed_send(&app, &mut clock, "PATCH", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "root" }))).await;
+    let patched = signed_send(
+        app,
+        clock,
+        "PATCH",
+        &format!("/api/hooks/{owned_id}"),
+        manager,
+        Some(json!({ "run_as_user": "root" })),
+    )
+    .await;
     assert_eq!(patched.status, StatusCode::FORBIDDEN);
 
     // A master can do what the manager could not.
     let elevated = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{owned_id}"), &master, Some(json!({ "run_as_user": "root" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{owned_id}"),
+            master,
+            Some(json!({ "run_as_user": "root" })),
+        ),
     )
     .await;
     assert_eq!(elevated.status, StatusCode::OK);
     assert_eq!(elevated.field("run_as_user"), &json!("root"));
 
+    assert_privileged_hook_edit_requires_master(app, clock, manager, master, &owned_id).await;
+}
+
+async fn assert_privileged_hook_edit_requires_master(
+    app: &axum::Router,
+    clock: &mut i64,
+    manager: &SeededKey,
+    master: &str,
+    owned_id: &str,
+) {
     // Once the hook is elevated, the non-master creator loses the ability to edit it *at all* —
     // even fields that look harmless, and even though it created the hook and holds full rights on
     // it. This assertion is the inverse of what it was before finding #4: the old expectation was
     // that omitting `run_as_user` left an edit permissible, which is exactly what let a
     // `can_manage` holder repoint a root hook's `script_path` while the elevation survived.
-    let unrelated = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "description": "edited" }))).await;
+    let unrelated = signed_send(
+        app,
+        clock,
+        "PUT",
+        &format!("/api/hooks/{owned_id}"),
+        manager,
+        Some(json!({ "description": "edited" })),
+    )
+    .await;
     assert_eq!(
         unrelated.status,
         StatusCode::FORBIDDEN,
@@ -2317,20 +3212,49 @@ async fn only_master_keys_may_assign_run_as_user() {
 
     // Nor can it drop the elevation. Permitting that would only add a step to the same attack:
     // clear `run_as_user`, then repoint the script freely.
-    let cleared = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "run_as_user": "" }))).await;
-    assert_eq!(cleared.status, StatusCode::FORBIDDEN, "clearing elevation is master-only too");
+    let cleared = signed_send(
+        app,
+        clock,
+        "PUT",
+        &format!("/api/hooks/{owned_id}"),
+        manager,
+        Some(json!({ "run_as_user": "" })),
+    )
+    .await;
+    assert_eq!(
+        cleared.status,
+        StatusCode::FORBIDDEN,
+        "clearing elevation is master-only too"
+    );
 
     // A master clears it, and the hook becomes an ordinary one the manager can edit again.
     let by_master = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{owned_id}"), &master, Some(json!({ "run_as_user": "" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{owned_id}"),
+            master,
+            Some(json!({ "run_as_user": "" })),
+        ),
     )
     .await;
     assert_eq!(by_master.status, StatusCode::OK);
     assert_eq!(by_master.field("run_as_user"), &json!(null));
 
-    let now_editable = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{owned_id}"), &manager, Some(json!({ "description": "edited" }))).await;
-    assert_eq!(now_editable.status, StatusCode::OK, "an unelevated hook is manageable again");
+    let now_editable = signed_send(
+        app,
+        clock,
+        "PUT",
+        &format!("/api/hooks/{owned_id}"),
+        manager,
+        Some(json!({ "description": "edited" })),
+    )
+    .await;
+    assert_eq!(
+        now_editable.status,
+        StatusCode::OK,
+        "an unelevated hook is manageable again"
+    );
 }
 
 #[tokio::test]
@@ -2341,7 +3265,8 @@ async fn granular_hook_permissions_separate_execute_from_manage() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let mut clock = signing_clock();
-    let (executor_id, executor) = insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
+    let (executor_id, executor) =
+        insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
     // A Parent, not a plain Daughter: R2 makes management a conjunction, so the manage row granted
     // below is only half of what editing this hook takes. The other half is this flag.
     let manager = insert_key_full(&db, "Manager", "0.0.0.0/0", KeyScopes::parent()).await;
@@ -2358,79 +3283,228 @@ async fn granular_hook_permissions_separate_execute_from_manage() {
     let test_uri = format!("/api/hooks/{hook_id}/test");
     let hook_uri = format!("/api/hooks/{hook_id}");
 
+    assert_execute_only_hook_access(&app, &executor, &hook_uri, &execute_uri, &test_uri).await;
+
+    assert_manage_only_hook_access(
+        &app,
+        &mut clock,
+        &manager,
+        &stranger,
+        &hook_uri,
+        &execute_uri,
+        &test_uri,
+    )
+    .await;
+}
+
+async fn assert_execute_only_hook_access(
+    app: &axum::Router,
+    executor: &str,
+    hook_uri: &str,
+    execute_uri: &str,
+    test_uri: &str,
+) {
     // can_execute: may run and dry-run...
-    assert_eq!(send(&app, json_request("POST", &execute_uri, &executor, None)).await.status, StatusCode::OK);
-    assert_eq!(send(&app, json_request("POST", &test_uri, &executor, None)).await.status, StatusCode::OK);
-    // ...may read the definition, its parameters, and its history...
-    assert_eq!(send(&app, json_request("GET", &hook_uri, &executor, None)).await.status, StatusCode::OK);
     assert_eq!(
-        send(&app, json_request("GET", &format!("{hook_uri}/parameters"), &executor, None)).await.status,
+        send(app, json_request("POST", execute_uri, executor, None))
+            .await
+            .status,
         StatusCode::OK
     );
-    let history = send(&app, json_request("GET", "/api/executions", &executor, None)).await;
+    assert_eq!(
+        send(app, json_request("POST", test_uri, executor, None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // ...may read the definition, its parameters, and its history...
+    assert_eq!(
+        send(app, json_request("GET", hook_uri, executor, None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            app,
+            json_request("GET", &format!("{hook_uri}/parameters"), executor, None)
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let history = send(app, json_request("GET", "/api/executions", executor, None)).await;
     assert_eq!(history.status, StatusCode::OK);
     assert_eq!(history.json.as_array().map(Vec::len), Some(1));
     // ...but may not modify or delete it.
     assert_eq!(
-        send(&app, json_request("PUT", &hook_uri, &executor, Some(json!({ "name": "hijacked" })))).await.status,
+        send(
+            app,
+            json_request(
+                "PUT",
+                hook_uri,
+                executor,
+                Some(json!({ "name": "hijacked" }))
+            )
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        send(&app, json_request("PATCH", &hook_uri, &executor, Some(json!({ "name": "hijacked" })))).await.status,
+        send(
+            app,
+            json_request(
+                "PATCH",
+                hook_uri,
+                executor,
+                Some(json!({ "name": "hijacked" }))
+            )
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN
     );
-    assert_eq!(send(&app, json_request("DELETE", &hook_uri, &executor, None)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(
-        send(&app, json_request("POST", &format!("{hook_uri}/parameters"), &executor, Some(json!({ "param_key": "x" })))).await.status,
+        send(app, json_request("DELETE", hook_uri, executor, None))
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
+    assert_eq!(
+        send(
+            app,
+            json_request(
+                "POST",
+                &format!("{hook_uri}/parameters"),
+                executor,
+                Some(json!({ "param_key": "x" }))
+            )
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+}
 
+async fn assert_manage_only_hook_access(
+    app: &axum::Router,
+    clock: &mut i64,
+    manager: &SeededKey,
+    stranger: &str,
+    hook_uri: &str,
+    execute_uri: &str,
+    test_uri: &str,
+) {
     // can_manage: may edit and read...
     assert_eq!(
-        signed_send(&app, &mut clock, "PUT", &hook_uri, &manager, Some(json!({ "description": "managed" }))).await.status,
+        signed_send(
+            app,
+            clock,
+            "PUT",
+            hook_uri,
+            manager,
+            Some(json!({ "description": "managed" }))
+        )
+        .await
+        .status,
         StatusCode::OK
     );
-    assert_eq!(signed_send(&app, &mut clock, "GET", &hook_uri, &manager, None).await.status, StatusCode::OK);
     assert_eq!(
-        signed_send(&app, &mut clock, "POST", &format!("{hook_uri}/parameters"), &manager, Some(json!({ "param_key": "added", "default_value": "v" }))).await.status,
+        signed_send(app, clock, "GET", hook_uri, manager, None)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        signed_send(
+            app,
+            clock,
+            "POST",
+            &format!("{hook_uri}/parameters"),
+            manager,
+            Some(json!({ "param_key": "added", "default_value": "v" }))
+        )
+        .await
+        .status,
         StatusCode::OK
     );
     // ...but manage alone does NOT confer the right to run it, in either mode.
     assert_eq!(
-        signed_send(&app, &mut clock, "POST", &execute_uri, &manager, None).await.status,
+        signed_send(app, clock, "POST", execute_uri, manager, None)
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        signed_send(&app, &mut clock, "POST", &test_uri, &manager, None).await.status,
+        signed_send(app, clock, "POST", test_uri, manager, None)
+            .await
+            .status,
         StatusCode::FORBIDDEN,
         "a dry run reveals the resolved command line, so it requires execute rights"
     );
 
+    assert_unmapped_hook_access(
+        app,
+        clock,
+        manager,
+        stranger,
+        hook_uri,
+        execute_uri,
+        test_uri,
+    )
+    .await;
+}
+
+async fn assert_unmapped_hook_access(
+    app: &axum::Router,
+    clock: &mut i64,
+    manager: &SeededKey,
+    stranger: &str,
+    hook_uri: &str,
+    execute_uri: &str,
+    test_uri: &str,
+) {
     // A key with no mapping at all sees and does nothing.
     for (method, uri) in [
-        ("GET", hook_uri.as_str()),
-        ("POST", execute_uri.as_str()),
-        ("POST", test_uri.as_str()),
-        ("PUT", hook_uri.as_str()),
-        ("DELETE", hook_uri.as_str()),
+        ("GET", hook_uri),
+        ("POST", execute_uri),
+        ("POST", test_uri),
+        ("PUT", hook_uri),
+        ("DELETE", hook_uri),
     ] {
-        let body = if method == "PUT" { Some(json!({ "description": "x" })) } else { None };
+        let body = if method == "PUT" {
+            Some(json!({ "description": "x" }))
+        } else {
+            None
+        };
         // `404` throughout: the stranger holds no row, so §4 requires every one of these to be
         // indistinguishable from a hook id that was never issued.
         assert_eq!(
-            send(&app, json_request(method, uri, &stranger, body)).await.status,
+            send(app, json_request(method, uri, stranger, body))
+                .await
+                .status,
             StatusCode::NOT_FOUND,
             "{method} {uri} must be denied without a mapping"
         );
     }
     assert_eq!(
-        send(&app, json_request("GET", "/api/executions", &stranger, None)).await.json.as_array().map(Vec::len),
+        send(app, json_request("GET", "/api/executions", stranger, None))
+            .await
+            .json
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "history is scoped to hooks the key can see"
     );
 
     // Deletion is the manager's, and it is the last word.
-    assert_eq!(signed_send(&app, &mut clock, "DELETE", &hook_uri, &manager, None).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        signed_send(app, clock, "DELETE", hook_uri, manager, None)
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
 }
 
 #[tokio::test]
@@ -2444,8 +3518,19 @@ async fn run_as_user_rejects_option_injection_and_malformed_accounts() {
 
     // Each of these would be an argument to sudo's `-u`; a leading dash is the injection case.
     let hostile = [
-        "-i", "--login", "-u", "-s", "root user", "root;id", "root&&id", "root|id",
-        "1root", "root/../etc", "üser", "root\nother", &"a".repeat(64),
+        "-i",
+        "--login",
+        "-u",
+        "-s",
+        "root user",
+        "root;id",
+        "root&&id",
+        "root|id",
+        "1root",
+        "root/../etc",
+        "üser",
+        "root\nother",
+        &"a".repeat(64),
     ];
 
     for candidate in hostile {
@@ -2478,7 +3563,12 @@ async fn run_as_user_rejects_option_injection_and_malformed_accounts() {
     // The same validation guards the update path.
     let created = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "ok", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "ok", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK);
@@ -2486,74 +3576,61 @@ async fn run_as_user_rejects_option_injection_and_malformed_accounts() {
 
     let rejected = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "run_as_user": "-i" }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "run_as_user": "-i" })),
+        ),
     )
     .await;
     assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
 
-    let still_unprivileged = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    let still_unprivileged = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
     assert_eq!(still_unprivileged.field("run_as_user"), &json!(null));
 }
 
-/// # Why this is `#[ignore]`d rather than skipped
-///
-/// It used to run by default and `return` early when `/usr/bin/sudo` was absent — which reports
-/// **PASS** while asserting nothing. That is the same failure class as a green audit over a stale
-/// tree: a signal that says "covered" over work that never happened, and it is worst on the machine
-/// that lacks the dependency, which is exactly where someone would want to know.
-///
-/// The convention is adapted from `example/simply_ip_sync/tests/live_feed_ingestion_tests.rs`, whose
-/// header states the rule directly: an `#[ignore]`d test "panics (failing the test) rather than
-/// skipping — a `#[ignore]`d test that silently passes when the [dependency] is unreachable would
-/// stop meaning anything the first time someone actually needed it to fail."
-///
-/// So the precondition below is an **assertion**, not a guard. The default `cargo test` run no
-/// longer claims this coverage; `cargo test -- --ignored` runs it and fails loudly on a host without
-/// sudo, which is the honest answer to "is this covered here?".
 #[tokio::test]
-#[ignore = "requires /usr/bin/sudo on the host; run with `cargo test -- --ignored`"]
-async fn a_privileged_hook_actually_executes_through_sudo() {
-    let dir = ScriptDir::new();
-    let script = dir.write_script("via_sudo.sh", "echo ran");
+async fn a_privileged_hook_builds_and_delivers_the_sudo_argument_vector() {
+    use simply_hook_executor::{
+        entities::{execution::ExecutionStatus, hook},
+        executor::{ResolvedParameters, build_command_plan, run_process},
+    };
 
+    let scripts = ScriptDir::new();
+    let script = scripts.write_script("via sudo.sh", "exit 0");
     let db = setup_test_db().await;
-    let app = create_app(test_state(&db));
-    let (key_id, key) = insert_key(&db, "Runner", "0.0.0.0/0", KeyScopes::plain()).await;
-    // Elevating to this test's *own* user keeps the sudoers requirement as small as possible,
-    // but the suite still must not depend on any sudo configuration to pass.
-    let whoami = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
-    let hook_id = insert_hook_as(&db, "via_sudo", &script, 30, Some(&whoami)).await;
-    grant(&db, key_id, hook_id, true, false).await;
+    let hook_id = insert_hook_as(&db, "via_sudo", &script, 30, Some("test-account")).await;
+    let hook = hook::Entity::find_by_id(hook_id)
+        .one(&db)
+        .await
+        .expect("query hook")
+        .expect("stored hook");
+    let value = "two words";
+    let resolved = ResolvedParameters {
+        values: vec![("value".to_owned(), value.to_owned())],
+        ..Default::default()
+    };
+    let mut plan = build_command_plan(&hook, &resolved, &test_config()).expect("sudo plan");
+    let expected = ["-n", "-u", "test-account", "--", script.as_str(), value];
+    assert_eq!(plan.program, "/usr/bin/sudo");
+    assert_eq!(plan.run_as_user.as_deref(), Some("test-account"));
+    assert_eq!(plan.args, expected);
 
-    assert!(
-        std::path::Path::new("/usr/bin/sudo").exists(),
-        "/usr/bin/sudo is not installed, so this test cannot observe what it exists to observe. \
-         Asserted rather than skipped: a silent `return` here would report PASS while proving \
-         nothing about the sudo boundary"
+    // Substitute only the executable and observe the exact arguments the real runner passes.
+    plan.program = scripts.write_script(
+        "sudo-probe.sh",
+        "printf '%s\\n' \"$@\"; printf '%s' 'probe refused' >&2; exit 23",
     );
-
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
-    assert_eq!(response.status, StatusCode::OK, "the request itself must complete");
-
-    // Whether sudo *permits* the elevation depends entirely on this machine's sudoers, which a
-    // test must not assume. Both outcomes are asserted precisely:
-    //   - permitted  -> the script ran and its stdout is captured;
-    //   - refused    -> sudo exits non-zero without a password prompt (because of `-n`), which is
-    //                   recorded as a normal FAILED execution rather than hanging or crashing.
-    let status = response.string("status");
-    if status == "SUCCESS" {
-        assert_eq!(response.string("stdout").trim(), "ran");
-    } else {
-        assert_eq!(status, "FAILED");
-        let stderr = response.string("stderr");
-        assert!(
-            stderr.contains("sudo") || stderr.contains("password") || stderr.contains("not allowed"),
-            "a sudo refusal should be captured in stderr, got: {stderr:?}"
-        );
-    }
-
-    // Either way the attempt is recorded, with the hook's elevation intact.
-    assert_eq!(execution_count(&db).await, 1);
+    let outcome = run_process(&plan, Duration::from_secs(10), 4096).await;
+    assert_eq!(outcome.stdout.lines().collect::<Vec<_>>(), expected);
+    assert_eq!(outcome.stderr, "probe refused");
+    assert_eq!(outcome.status, ExecutionStatus::Failed);
+    assert_eq!(outcome.exit_code, Some(23));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2572,31 +3649,58 @@ async fn non_executable_script_is_refused_with_an_actionable_diagnostic() {
     let hook_id = insert_hook(&db, "no_exec_bit", &script, 30).await;
     grant(&db, key_id, hook_id, true, true).await;
 
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let response = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
 
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let error = response.string("error");
-    assert!(error.starts_with("[ERROR] Cannot execute '"), "unexpected shape: {error}");
-    assert!(error.contains(&script), "the diagnostic must name the offending path: {error}");
+    assert!(
+        error.starts_with("[ERROR] Cannot execute '"),
+        "unexpected shape: {error}"
+    );
+    assert!(
+        error.contains(&script),
+        "the diagnostic must name the offending path: {error}"
+    );
     assert!(error.contains("no execute bit set"), "{error}");
     // The exact mode is reported, so an operator can tell 0600 from 0644 without another round-trip.
-    assert!(error.contains("0600"), "the diagnostic must report the actual mode: {error}");
-    assert!(error.contains("chmod +x"), "the diagnostic must state the remedy: {error}");
+    assert!(
+        error.contains("0600"),
+        "the diagnostic must report the actual mode: {error}"
+    );
+    assert!(
+        error.contains("chmod +x"),
+        "the diagnostic must state the remedy: {error}"
+    );
     // ...and who to grant it to.
-    assert!(error.contains("uid="), "the diagnostic must identify the running user: {error}");
+    assert!(
+        error.contains("uid="),
+        "the diagnostic must identify the running user: {error}"
+    );
 
     // Nothing ran, so nothing is recorded: a refused hook must not pollute execution history.
     assert_eq!(execution_count(&db).await, 0);
 
     // The dry run reports the identical diagnostic as data rather than as an error.
-    let preview = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/test"), &key, None)).await;
+    let preview = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/test"), &key, None),
+    )
+    .await;
     assert_eq!(preview.status, StatusCode::OK);
     assert_eq!(preview.field("would_execute"), &json!(false));
     assert_eq!(preview.string("blocking_reason"), error);
 
     // Granting the bit makes it run, proving the refusal was about permissions and nothing else.
     std::fs::set_permissions(&script, permissions(0o755)).expect("permissions are settable");
-    let now_ok = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let now_ok = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
     assert_eq!(now_ok.status, StatusCode::OK);
     assert_eq!(now_ok.field("status"), &json!("SUCCESS"));
 }
@@ -2612,13 +3716,26 @@ async fn missing_script_is_refused_with_an_enoent_diagnostic() {
     let hook_id = insert_hook(&db, "never_deployed", &missing, 30).await;
     grant(&db, key_id, hook_id, true, false).await;
 
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let response = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
 
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let error = response.string("error");
-    assert!(error.starts_with("[ERROR] Cannot execute '"), "unexpected shape: {error}");
-    assert!(error.contains("No such file or directory (ENOENT)"), "{error}");
-    assert!(error.contains("Deploy the script"), "the diagnostic must state the remedy: {error}");
+    assert!(
+        error.starts_with("[ERROR] Cannot execute '"),
+        "unexpected shape: {error}"
+    );
+    assert!(
+        error.contains("No such file or directory (ENOENT)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Deploy the script"),
+        "the diagnostic must state the remedy: {error}"
+    );
     // ENOENT must not be reported as a permission problem — the two send an operator to very
     // different places.
     assert!(!error.contains("EACCES"), "{error}");
@@ -2636,9 +3753,17 @@ async fn a_directory_as_script_path_is_refused() {
     let hook_id = insert_hook(&db, "dir_hook", &subdir, 30).await;
     grant(&db, key_id, hook_id, true, false).await;
 
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let response = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert!(response.string("error").contains("not a regular file"), "{}", response.string("error"));
+    assert!(
+        response.string("error").contains("not a regular file"),
+        "{}",
+        response.string("error")
+    );
     assert_eq!(execution_count(&db).await, 0);
 }
 
@@ -2665,14 +3790,21 @@ async fn unsearchable_parent_directory_is_diagnosed_as_eacces() {
     let hook_id = insert_hook(&db, "locked_dir", &script, 30).await;
     grant(&db, key_id, hook_id, true, false).await;
 
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None)).await;
+    let response = send(
+        &app,
+        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &key, None),
+    )
+    .await;
 
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let error = response.string("error");
     assert!(error.contains("Permission denied (EACCES)"), "{error}");
     // The diagnostic must pinpoint the directory at fault, not just the script: an EACCES on a
     // file almost always means a parent lacks the search bit.
-    assert!(error.contains(&locked), "the diagnostic must name the blocking directory: {error}");
+    assert!(
+        error.contains(&locked),
+        "the diagnostic must name the blocking directory: {error}"
+    );
     assert!(error.contains("uid="), "{error}");
     assert_eq!(execution_count(&db).await, 0);
 
@@ -2691,8 +3823,13 @@ async fn path_traversal_payloads_are_blocked_at_definition_time() {
     // Both rights: the traversal payloads are asserted at creation *and* on update below, and each
     // path sits behind a different gate. A key short of either would produce a 403 that masks the
     // 400 this test is actually about.
-    let manager =
-        insert_key_full(&db, "Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
+    let manager = insert_key_full(
+        &db,
+        "Manager",
+        "0.0.0.0/0",
+        KeyScopes::parent_hook_manager(),
+    )
+    .await;
 
     let payloads = [
         "/scripts/../../etc/shadow",
@@ -2705,7 +3842,15 @@ async fn path_traversal_payloads_are_blocked_at_definition_time() {
     ];
 
     for payload in payloads {
-        let response = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": "evil", "script_path": payload }))).await;
+        let response = signed_send(
+            &app,
+            &mut clock,
+            "POST",
+            "/api/hooks",
+            &manager,
+            Some(json!({ "name": "evil", "script_path": payload })),
+        )
+        .await;
         assert_eq!(
             response.status,
             StatusCode::BAD_REQUEST,
@@ -2723,12 +3868,28 @@ async fn path_traversal_payloads_are_blocked_at_definition_time() {
     assert_eq!(hooks.json.as_array().map(Vec::len), Some(0));
 
     // The same validation runs on update, so an existing hook cannot be re-pointed at /etc/shadow.
-    let created = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": "legit", "script_path": legit }))).await;
+    let created = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/hooks",
+        &manager,
+        Some(json!({ "name": "legit", "script_path": legit })),
+    )
+    .await;
     assert_eq!(created.status, StatusCode::OK);
     let hook_id = created.string("id");
 
     for payload in payloads {
-        let response = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook_id}"), &manager, Some(json!({ "script_path": payload }))).await;
+        let response = signed_send(
+            &app,
+            &mut clock,
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &manager,
+            Some(json!({ "script_path": payload })),
+        )
+        .await;
         assert_eq!(
             response.status,
             StatusCode::BAD_REQUEST,
@@ -2737,7 +3898,15 @@ async fn path_traversal_payloads_are_blocked_at_definition_time() {
     }
 
     // The hook still points where it did before every rejected update.
-    let unchanged = signed_send(&app, &mut clock, "GET", &format!("/api/hooks/{hook_id}"), &manager, None).await;
+    let unchanged = signed_send(
+        &app,
+        &mut clock,
+        "GET",
+        &format!("/api/hooks/{hook_id}"),
+        &manager,
+        None,
+    )
+    .await;
     assert_eq!(unchanged.string("script_path"), legit);
 }
 
@@ -2752,28 +3921,68 @@ async fn script_paths_are_confined_to_allowed_roots() {
     let app = create_app(test_state_with_roots(&db, vec![allowed.root()]));
     let mut clock = signing_clock();
     // Both rights: containment is asserted at creation and on re-pointing an existing hook.
-    let manager =
-        insert_key_full(&db, "Manager", "0.0.0.0/0", KeyScopes::parent_hook_manager()).await;
+    let manager = insert_key_full(
+        &db,
+        "Manager",
+        "0.0.0.0/0",
+        KeyScopes::parent_hook_manager(),
+    )
+    .await;
 
-    let ok = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": "inside", "script_path": inside }))).await;
+    let ok = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/hooks",
+        &manager,
+        Some(json!({ "name": "inside", "script_path": inside })),
+    )
+    .await;
     assert_eq!(ok.status, StatusCode::OK);
     let inside_id = ok.string("id");
     assert_eq!(
-        signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{inside_id}/execute"), &manager, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "POST",
+            &format!("/api/hooks/{inside_id}/execute"),
+            &manager,
+            None
+        )
+        .await
+        .status,
         StatusCode::OK
     );
 
     // A perfectly valid absolute path that simply is not inside a vetted root.
-    let rejected = signed_send(&app, &mut clock, "POST", "/api/hooks", &manager, Some(json!({ "name": "outside", "script_path": outside }))).await;
+    let rejected = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/hooks",
+        &manager,
+        Some(json!({ "name": "outside", "script_path": outside })),
+    )
+    .await;
     assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
     assert!(
-        rejected.string("error").contains("outside the allowed script roots"),
+        rejected
+            .string("error")
+            .contains("outside the allowed script roots"),
         "{}",
         rejected.string("error")
     );
 
     // Neither can an existing, contained hook be re-pointed outside.
-    let escaped = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{inside_id}"), &manager, Some(json!({ "script_path": outside }))).await;
+    let escaped = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{inside_id}"),
+        &manager,
+        Some(json!({ "script_path": outside })),
+    )
+    .await;
     assert_eq!(escaped.status, StatusCode::BAD_REQUEST);
 }
 
@@ -2793,18 +4002,42 @@ async fn a_symlink_escaping_the_allowed_roots_is_blocked_at_execution() {
 
     let created = send(
         &app,
-        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "symlinked", "script_path": link }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &manager,
+            Some(json!({ "name": "symlinked", "script_path": link })),
+        ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::OK, "the link's literal path is inside the root");
+    assert_eq!(
+        created.status,
+        StatusCode::OK,
+        "the link's literal path is inside the root"
+    );
     let hook_id = created.string("id");
 
     // Execution canonicalizes first, so the escape is caught before anything is spawned.
-    let response = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &manager, None)).await;
+    let response = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &manager,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let error = response.string("error");
-    assert!(error.contains("outside the allowed script roots"), "{error}");
-    assert!(error.contains("it resolves to"), "the diagnostic must reveal the real target: {error}");
+    assert!(
+        error.contains("outside the allowed script roots"),
+        "{error}"
+    );
+    assert!(
+        error.contains("it resolves to"),
+        "the diagnostic must reveal the real target: {error}"
+    );
     assert_eq!(execution_count(&db).await, 0);
 
     // A symlink that stays inside the root is fine — containment, not a blanket symlink ban.
@@ -2812,12 +4045,26 @@ async fn a_symlink_escaping_the_allowed_roots_is_blocked_at_execution() {
     let good_link = allowed.symlink_to("good_link.sh", &contained_target);
     let good = send(
         &app,
-        json_request("POST", "/api/hooks", &manager, Some(json!({ "name": "good_link", "script_path": good_link }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &manager,
+            Some(json!({ "name": "good_link", "script_path": good_link })),
+        ),
     )
     .await;
     assert_eq!(good.status, StatusCode::OK);
     let good_id = good.string("id");
-    let ran = send(&app, json_request("POST", &format!("/api/hooks/{good_id}/execute"), &manager, None)).await;
+    let ran = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{good_id}/execute"),
+            &manager,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(ran.status, StatusCode::OK);
     assert_eq!(ran.string("stdout").trim(), "contained");
 }
@@ -2833,7 +4080,12 @@ async fn hook_and_key_field_validation_is_enforced() {
 
     let bad_timeout = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "t", "script_path": script, "default_timeout_seconds": 0 }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "t", "script_path": script, "default_timeout_seconds": 0 })),
+        ),
     )
     .await;
     assert_eq!(bad_timeout.status, StatusCode::BAD_REQUEST);
@@ -2852,14 +4104,24 @@ async fn hook_and_key_field_validation_is_enforced() {
 
     let bad_cidr = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "k", "bound_ips": "999.999.999.999/99" }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "k", "bound_ips": "999.999.999.999/99" })),
+        ),
     )
     .await;
     assert_eq!(bad_cidr.status, StatusCode::BAD_REQUEST);
 
     let bad_jobs = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "k", "bound_ips": "0.0.0.0/0", "max_concurrent_jobs": 0 }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "k", "bound_ips": "0.0.0.0/0", "max_concurrent_jobs": 0 })),
+        ),
     )
     .await;
     assert_eq!(bad_jobs.status, StatusCode::BAD_REQUEST);
@@ -2897,19 +4159,39 @@ async fn dry_run_previews_the_command_without_executing() {
     assert_eq!(preview.status, StatusCode::OK);
     assert_eq!(preview.field("would_execute"), &json!(true));
     assert_eq!(preview.field("timeout_seconds"), &json!(42));
-    assert_eq!(preview.field("resolved_parameters"), &json!({ "alpha": "supplied", "beta": "fallback" }));
+    assert_eq!(
+        preview.field("resolved_parameters"),
+        &json!({ "alpha": "supplied", "beta": "fallback" })
+    );
     assert_eq!(preview.json["command"]["program"], json!(script));
-    assert_eq!(preview.json["command"]["args"], json!(["supplied", "fallback"]));
-    assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_ALPHA"], json!("supplied"));
-    assert_eq!(preview.json["command"]["env"]["HOOK_PARAM_BETA"], json!("fallback"));
+    assert_eq!(
+        preview.json["command"]["args"],
+        json!(["supplied", "fallback"])
+    );
+    assert_eq!(
+        preview.json["command"]["env"]["HOOK_PARAM_ALPHA"],
+        json!("supplied")
+    );
+    assert_eq!(
+        preview.json["command"]["env"]["HOOK_PARAM_BETA"],
+        json!("fallback")
+    );
 
-    assert!(!std::path::Path::new(&side_effect).exists(), "a dry run must not spawn the script");
+    assert!(
+        !std::path::Path::new(&side_effect).exists(),
+        "a dry run must not spawn the script"
+    );
     assert_eq!(execution_count(&db).await, 0);
 
     // Missing requirements are reported as data, not as a 400.
     let blocked = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/test"), &key, Some(json!({ "parameters": {} }))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &key,
+            Some(json!({ "parameters": {} })),
+        ),
     )
     .await;
     assert_eq!(blocked.status, StatusCode::OK);
@@ -2936,7 +4218,12 @@ async fn webhook_alias_executes_by_name_with_a_flat_payload() {
     // A third-party sender posts its own flat document to a fixed URL keyed by hook name.
     let response = send(
         &app,
-        json_request("POST", "/webhook/nftables_ban", &key, Some(json!({ "target_address": "203.0.113.7" }))),
+        json_request(
+            "POST",
+            "/webhook/nftables_ban",
+            &key,
+            Some(json!({ "target_address": "203.0.113.7" })),
+        ),
     )
     .await;
 
@@ -2961,8 +4248,26 @@ async fn execution_history_is_scoped_and_filterable() {
     grant(&db, alpha_id, alpha_hook, true, false).await;
     grant(&db, beta_id, beta_hook, true, false).await;
 
-    send(&app, json_request("POST", &format!("/api/hooks/{alpha_hook}/execute"), &alpha, None)).await;
-    send(&app, json_request("POST", &format!("/api/hooks/{beta_hook}/execute"), &beta, None)).await;
+    send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{alpha_hook}/execute"),
+            &alpha,
+            None,
+        ),
+    )
+    .await;
+    send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{beta_hook}/execute"),
+            &beta,
+            None,
+        ),
+    )
+    .await;
 
     // Each tenant sees only their own hook's history.
     let alpha_view = send(&app, json_request("GET", "/api/executions", &alpha, None)).await;
@@ -2974,26 +4279,50 @@ async fn execution_history_is_scoped_and_filterable() {
     let all = send(&app, json_request("GET", "/api/executions", &master, None)).await;
     assert_eq!(all.json.as_array().map(Vec::len), Some(2));
 
-    let failed = send(&app, json_request("GET", "/api/executions?status=FAILED", &master, None)).await;
+    let failed = send(
+        &app,
+        json_request("GET", "/api/executions?status=FAILED", &master, None),
+    )
+    .await;
     let rows = failed.json.as_array().cloned().unwrap_or_default();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["hook_name"], json!("beta_hook"));
 
-    let by_hook = send(&app, json_request("GET", "/api/executions?hook=alpha_hook", &master, None)).await;
+    let by_hook = send(
+        &app,
+        json_request("GET", "/api/executions?hook=alpha_hook", &master, None),
+    )
+    .await;
     assert_eq!(by_hook.json.as_array().map(Vec::len), Some(1));
 
-    let bad_filter = send(&app, json_request("GET", "/api/executions?status=NOPE", &master, None)).await;
+    let bad_filter = send(
+        &app,
+        json_request("GET", "/api/executions?status=NOPE", &master, None),
+    )
+    .await;
     assert_eq!(bad_filter.status, StatusCode::BAD_REQUEST);
 
     // Reading another tenant's execution by id is refused, not merely filtered out — and refused
     // as `404`, so the id cannot be used to confirm that a run happened at all (§4).
-    let beta_exec_id = send(&app, json_request("GET", "/api/executions?hook=beta_hook", &master, None))
-        .await
-        .json[0]["id"]
+    let beta_exec_id = send(
+        &app,
+        json_request("GET", "/api/executions?hook=beta_hook", &master, None),
+    )
+    .await
+    .json[0]["id"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    let cross_tenant = send(&app, json_request("GET", &format!("/api/executions/{beta_exec_id}"), &alpha, None)).await;
+    let cross_tenant = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions/{beta_exec_id}"),
+            &alpha,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(cross_tenant.status, StatusCode::NOT_FOUND);
 }
 
@@ -3008,11 +4337,24 @@ async fn execution_listing_exposes_pagination_headers_in_both_query_styles() {
     let hook_id = insert_hook(&db, "paged_hook", &script, 30).await;
 
     for _ in 0..5 {
-        send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None)).await;
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook_id}/execute"),
+                &master,
+                None,
+            ),
+        )
+        .await;
     }
 
     // page/per_page style: page 1 of 2, per_page 3 -> 3 rows, 2 total pages.
-    let paged = send(&app, json_request("GET", "/api/executions?page=1&per_page=3", &master, None)).await;
+    let paged = send(
+        &app,
+        json_request("GET", "/api/executions?page=1&per_page=3", &master, None),
+    )
+    .await;
     assert_eq!(paged.status, StatusCode::OK);
     assert_eq!(paged.json.as_array().map(Vec::len), Some(3));
     assert_eq!(paged.header("x-total-count"), "5");
@@ -3020,12 +4362,24 @@ async fn execution_listing_exposes_pagination_headers_in_both_query_styles() {
     assert_eq!(paged.header("x-per-page"), "3");
     assert_eq!(paged.header("x-total-pages"), "2");
 
-    let second_page = send(&app, json_request("GET", "/api/executions?page=2&per_page=3", &master, None)).await;
-    assert_eq!(second_page.json.as_array().map(Vec::len), Some(2), "5 rows, 3 on page 1, 2 remain on page 2");
+    let second_page = send(
+        &app,
+        json_request("GET", "/api/executions?page=2&per_page=3", &master, None),
+    )
+    .await;
+    assert_eq!(
+        second_page.json.as_array().map(Vec::len),
+        Some(2),
+        "5 rows, 3 on page 1, 2 remain on page 2"
+    );
     assert_eq!(second_page.header("x-page"), "2");
 
     // legacy limit/offset style still reports the same total metadata.
-    let legacy = send(&app, json_request("GET", "/api/executions?limit=3&offset=3", &master, None)).await;
+    let legacy = send(
+        &app,
+        json_request("GET", "/api/executions?limit=3&offset=3", &master, None),
+    )
+    .await;
     assert_eq!(legacy.json.as_array().map(Vec::len), Some(2));
     assert_eq!(legacy.header("x-total-count"), "5");
     assert_eq!(legacy.header("x-per-page"), "3");
@@ -3046,10 +4400,28 @@ async fn deep_and_overflowing_pagination_requests_return_a_clean_empty_page() {
     let app = create_app(test_state(&db));
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
     let hook_id = insert_hook(&db, "deep_page_hook", &script, 30).await;
-    send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None)).await;
+    send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            None,
+        ),
+    )
+    .await;
 
     // An ordinary out-of-range page: past the one real row, well within any sane integer range.
-    let far = send(&app, json_request("GET", "/api/executions?page=1000&per_page=10", &master, None)).await;
+    let far = send(
+        &app,
+        json_request(
+            "GET",
+            "/api/executions?page=1000&per_page=10",
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(far.status, StatusCode::OK, "{}", far.raw);
     assert_eq!(far.json.as_array().map(Vec::len), Some(0));
     assert_eq!(far.header("x-total-count"), "1");
@@ -3058,17 +4430,34 @@ async fn deep_and_overflowing_pagination_requests_return_a_clean_empty_page() {
     // this is the exact shape that panics `(page - 1) * per_page` without the saturating fix.
     let overflow = send(
         &app,
-        json_request("GET", &format!("/api/executions?page={}&per_page=4", u64::MAX / 2), &master, None),
+        json_request(
+            "GET",
+            &format!("/api/executions?page={}&per_page=4", u64::MAX / 2),
+            &master,
+            None,
+        ),
     )
     .await;
     assert_eq!(overflow.status, StatusCode::OK, "{}", overflow.raw);
     assert_eq!(overflow.json.as_array().map(Vec::len), Some(0));
 
     // The legacy limit/offset spelling, pushed to its own overflow-prone extreme.
-    let legacy_overflow =
-        send(&app, json_request("GET", &format!("/api/executions?limit=1&offset={}", u64::MAX), &master, None))
-            .await;
-    assert_eq!(legacy_overflow.status, StatusCode::OK, "{}", legacy_overflow.raw);
+    let legacy_overflow = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions?limit=1&offset={}", u64::MAX),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        legacy_overflow.status,
+        StatusCode::OK,
+        "{}",
+        legacy_overflow.raw
+    );
     assert_eq!(legacy_overflow.json.as_array().map(Vec::len), Some(0));
 }
 
@@ -3083,41 +4472,76 @@ async fn retention_purges_only_expired_executions() {
     insert_execution_aged(&db, hook_id, 45).await;
     let recent = insert_execution_aged(&db, hook_id, 1).await;
 
-    let purged = purge_expired_executions(&db, 30).await.expect("purge succeeds");
+    let purged = purge_expired_executions(&db, 30)
+        .await
+        .expect("purge succeeds");
     assert_eq!(purged, 2);
     assert_eq!(execution_count(&db).await, 1);
     // The survivor is specifically the one inside the window, not merely "one row".
     assert!(
-        Execution::find_by_id(recent).one(&db).await.expect("query succeeds").is_some(),
+        Execution::find_by_id(recent)
+            .one(&db)
+            .await
+            .expect("query succeeds")
+            .is_some(),
         "the row inside the retention window must survive"
     );
 
     // A retention window of 0 means "keep forever" and must delete nothing.
-    let noop = purge_expired_executions(&db, 0).await.expect("purge succeeds");
+    let noop = purge_expired_executions(&db, 0)
+        .await
+        .expect("purge succeeds");
     assert_eq!(noop, 0);
     assert_eq!(execution_count(&db).await, 1);
 
     // The same sweep is available on demand, master-only.
     let (_, scoped) = insert_key(&db, "Scoped", "0.0.0.0/0", KeyScopes::plain()).await;
     assert_eq!(
-        send(&app, json_request("DELETE", "/api/executions?older_than_days=1", &scoped, None)).await.status,
+        send(
+            &app,
+            json_request("DELETE", "/api/executions?older_than_days=1", &scoped, None)
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN
     );
 
     insert_execution_aged(&db, hook_id, 90).await;
-    let response = send(&app, json_request("DELETE", "/api/executions?older_than_days=30", &master, None)).await;
+    let response = send(
+        &app,
+        json_request(
+            "DELETE",
+            "/api/executions?older_than_days=30",
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.field("purged"), &json!(1));
 
     // `older_than_days=0` on the endpoint carries the same "keep forever" meaning as the config
     // flag, rather than the "delete everything" a caller might assume.
     insert_execution_aged(&db, hook_id, 365).await;
-    let zero = send(&app, json_request("DELETE", "/api/executions?older_than_days=0", &master, None)).await;
+    let zero = send(
+        &app,
+        json_request("DELETE", "/api/executions?older_than_days=0", &master, None),
+    )
+    .await;
     assert_eq!(zero.status, StatusCode::OK);
     assert_eq!(zero.field("purged"), &json!(0));
     assert_eq!(execution_count(&db).await, 2);
 
-    let negative = send(&app, json_request("DELETE", "/api/executions?older_than_days=-5", &master, None)).await;
+    let negative = send(
+        &app,
+        json_request(
+            "DELETE",
+            "/api/executions?older_than_days=-5",
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(negative.status, StatusCode::BAD_REQUEST);
 }
 
@@ -3143,23 +4567,36 @@ async fn retention_worker_purges_on_its_own_schedule_and_shuts_down_cleanly() {
     );
     let (shutdown_tx, worker) = spawn_retention_worker(&state);
 
-    let purged = wait_until(Duration::from_secs(10), async || execution_count(&db).await == 1).await;
+    let purged = wait_until(Duration::from_secs(10), async || {
+        execution_count(&db).await == 1
+    })
+    .await;
     assert!(purged, "the worker did not purge expired executions");
     assert!(
-        Execution::find_by_id(survivor).one(&db).await.expect("query succeeds").is_some(),
+        Execution::find_by_id(survivor)
+            .one(&db)
+            .await
+            .expect("query succeeds")
+            .is_some(),
         "the worker purged a record inside the retention window"
     );
 
     // Rows that age past the window while the worker runs are picked up by a later sweep.
     insert_execution_aged(&db, hook_id, 30).await;
-    let purged_again = wait_until(Duration::from_secs(10), async || execution_count(&db).await == 1).await;
+    let purged_again = wait_until(Duration::from_secs(10), async || {
+        execution_count(&db).await == 1
+    })
+    .await;
     assert!(purged_again, "a later sweep did not run");
 
     // Dropping the sender is the shutdown signal; the worker must then finish promptly rather
     // than being left to be aborted at process exit.
     drop(shutdown_tx);
     let stopped = tokio::time::timeout(Duration::from_secs(5), worker).await;
-    assert!(stopped.is_ok(), "the worker did not shut down when its channel closed");
+    assert!(
+        stopped.is_ok(),
+        "the worker did not shut down when its channel closed"
+    );
 }
 
 #[tokio::test]
@@ -3216,7 +4653,12 @@ async fn key_lifecycle_rotation_and_permission_assignment() {
 
     let created = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "worker", "bound_ips": "0.0.0.0/0", "max_concurrent_jobs": 3 }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "worker", "bound_ips": "0.0.0.0/0", "max_concurrent_jobs": 3 })),
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK);
@@ -3226,7 +4668,12 @@ async fn key_lifecycle_rotation_and_permission_assignment() {
     // No grant yet: the hook is outside the worker's visibility scope entirely, so §4 requires the
     // answer a nonexistent hook id gives.
     let uri = format!("/api/hooks/{hook_id}/execute");
-    assert_eq!(send(&app, json_request("POST", &uri, &worker_key, None)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(&app, json_request("POST", &uri, &worker_key, None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 
     // Grant by hook name.
     let granted = send(
@@ -3240,39 +4687,94 @@ async fn key_lifecycle_rotation_and_permission_assignment() {
     )
     .await;
     assert_eq!(granted.status, StatusCode::OK);
-    assert_eq!(send(&app, json_request("POST", &uri, &worker_key, None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, json_request("POST", &uri, &worker_key, None))
+            .await
+            .status,
+        StatusCode::OK
+    );
 
     // The grant is reported back on /auth/me and in the admin listing.
     let me = send(&app, json_request("GET", "/api/auth/me", &worker_key, None)).await;
     assert_eq!(me.field("max_concurrent_jobs"), &json!(3));
     assert_eq!(me.json["hook_permissions"][0]["hook_name"], json!("shared"));
 
+    assert_key_rotation_and_revocation(&app, &master, &worker_id, &worker_key, &uri).await;
+}
+
+async fn assert_key_rotation_and_revocation(
+    app: &axum::Router,
+    master: &str,
+    worker_id: &str,
+    worker_key: &str,
+    uri: &str,
+) {
     // Rotation invalidates the old secret immediately.
-    let rotated = send(&app, json_request("POST", &format!("/api/keys/{worker_id}/rotate"), &master, None)).await;
+    let rotated = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{worker_id}/rotate"),
+            master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(rotated.status, StatusCode::OK);
     let new_key = rotated.string("plaintext_key");
-    assert_eq!(send(&app, json_request("GET", "/api/auth/me", &worker_key, None)).await.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(send(&app, json_request("GET", "/api/auth/me", &new_key, None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(app, json_request("GET", "/api/auth/me", worker_key, None))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(app, json_request("GET", "/api/auth/me", &new_key, None))
+            .await
+            .status,
+        StatusCode::OK
+    );
 
     // Revocation by hook name removes the grant.
     let revoked = send(
-        &app,
-        json_request("DELETE", &format!("/api/keys/{worker_id}/permissions/shared"), &master, None),
+        app,
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{worker_id}/permissions/shared"),
+            master,
+            None,
+        ),
     )
     .await;
     assert_eq!(revoked.status, StatusCode::NO_CONTENT);
     // The row is gone, so the hook is invisible againrather than merely unusable (§4).
-    assert_eq!(send(&app, json_request("POST", &uri, &new_key, None)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(app, json_request("POST", uri, &new_key, None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 
     // A scoped key cannot manage keys at all.
     assert_eq!(
-        send(&app, json_request("GET", "/api/keys", &new_key, None)).await.status,
+        send(app, json_request("GET", "/api/keys", &new_key, None))
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
 
-    let deleted = send(&app, json_request("DELETE", &format!("/api/keys/{worker_id}"), &master, None)).await;
+    let deleted = send(
+        app,
+        json_request("DELETE", &format!("/api/keys/{worker_id}"), master, None),
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
-    assert_eq!(send(&app, json_request("GET", "/api/auth/me", &new_key, None)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(app, json_request("GET", "/api/auth/me", &new_key, None))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -3287,19 +4789,49 @@ async fn audit_trail_records_mutations_and_is_master_only() {
 
     let created = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "audited", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "audited", "script_path": script })),
+        ),
     )
     .await;
     let hook_id = created.string("id");
-    grant(&db, scoped_id, Uuid::parse_str(&hook_id).expect("valid uuid"), true, false).await;
-    let executed = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &scoped, None)).await;
+    grant(
+        &db,
+        scoped_id,
+        Uuid::parse_str(&hook_id).expect("valid uuid"),
+        true,
+        false,
+    )
+    .await;
+    let executed = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &scoped,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(executed.status, StatusCode::OK, "{}", executed.raw);
 
     // Scoped keys cannot read the trail at all.
-    assert_eq!(send(&app, json_request("GET", "/api/audit-logs", &scoped, None)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(&app, json_request("GET", "/api/audit-logs", &scoped, None))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
 
-    let creates = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_CREATE", &master, None)).await;
-    let rows = creates.json.as_array().cloned().unwrap_or_default();
+    let creation_logs = send(
+        &app,
+        json_request("GET", "/api/audit-logs?action=HOOK_CREATE", &master, None),
+    )
+    .await;
+    let rows = creation_logs.json.as_array().cloned().unwrap_or_default();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["api_key_name"], json!("Master"));
     assert_eq!(rows[0]["client_ip"], json!("127.0.0.1"));
@@ -3309,13 +4841,29 @@ async fn audit_trail_records_mutations_and_is_master_only() {
     // its own purpose-built, RBAC-scoped record in `executions`. Asserted two ways: no `HOOK_EXECUTE`
     // action was ever written, and the trail's total row count is exactly the one mutation above —
     // the execution did not sneak in under some other action name either.
-    let executes = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_EXECUTE", &master, None)).await;
-    let rows = executes.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 0, "hook execution must never write an audit_logs entry");
+    let invocation_logs = send(
+        &app,
+        json_request("GET", "/api/audit-logs?action=HOOK_EXECUTE", &master, None),
+    )
+    .await;
+    let rows = invocation_logs.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        rows.len(),
+        0,
+        "hook execution must never write an audit_logs entry"
+    );
 
-    let all = send(&app, json_request("GET", "/api/audit-logs?limit=50", &master, None)).await;
+    let all = send(
+        &app,
+        json_request("GET", "/api/audit-logs?limit=50", &master, None),
+    )
+    .await;
     let rows = all.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 1, "the only audit entry in this test is the HOOK_CREATE above: {:?}", rows);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the only audit entry in this test is the HOOK_CREATE above: {rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -3325,13 +4873,19 @@ async fn settings_expose_runtime_configuration_to_master_keys_only() {
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
     let (_, scoped) = insert_key(&db, "Scoped", "0.0.0.0/0", KeyScopes::plain()).await;
 
-    assert_eq!(send(&app, json_request("GET", "/api/settings", &scoped, None)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(&app, json_request("GET", "/api/settings", &scoped, None))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
 
     let settings = send(&app, json_request("GET", "/api/settings", &master, None)).await;
     assert_eq!(settings.status, StatusCode::OK);
     assert_eq!(settings.field("allowed_env_vars"), &json!(["PATH"]));
     assert_eq!(settings.field("log_retention_days"), &json!(30));
     assert_eq!(settings.field("api_key_count"), &json!(2));
+    assert!(settings.field("audit_log_count").as_u64().is_some());
 }
 
 #[tokio::test]
@@ -3346,7 +4900,8 @@ async fn hook_parameter_crud_is_guarded_by_manage_rights() {
     // A parameter is argv for whatever `script_path` names, which is why it sits behind the same
     // gate as the definition rather than behind the operational verb.
     let manager = insert_key_full(&db, "Manager", "0.0.0.0/0", KeyScopes::parent()).await;
-    let (executor_id, executor) = insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
+    let (executor_id, executor) =
+        insert_key(&db, "Executor", "0.0.0.0/0", KeyScopes::plain()).await;
 
     let hook_id = insert_hook(&db, "paramful", &script, 30).await;
     grant(&db, manager.id, hook_id, true, true).await;
@@ -3355,33 +4910,92 @@ async fn hook_parameter_crud_is_guarded_by_manage_rights() {
     let uri = format!("/api/hooks/{hook_id}/parameters");
 
     // Execute-only keys may read the contract but not change it.
-    assert_eq!(send(&app, json_request("GET", &uri, &executor, None)).await.status, StatusCode::OK);
     assert_eq!(
-        send(&app, json_request("POST", &uri, &executor, Some(json!({ "param_key": "sneaky" })))).await.status,
+        send(&app, json_request("GET", &uri, &executor, None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            json_request(
+                "POST",
+                &uri,
+                &executor,
+                Some(json!({ "param_key": "sneaky" }))
+            )
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN
     );
 
-    let created = signed_send(&app, &mut clock, "POST", &uri, &manager, Some(json!({ "param_key": "target", "default_value": "1.2.3.4", "is_required": true }))).await;
+    let created = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &uri,
+        &manager,
+        Some(json!({ "param_key": "target", "default_value": "1.2.3.4", "is_required": true })),
+    )
+    .await;
     assert_eq!(created.status, StatusCode::OK);
     let param_id = created.string("id");
 
     // Duplicate declaration -> 409.
-    let duplicate = signed_send(&app, &mut clock, "POST", &uri, &manager, Some(json!({ "param_key": "target" }))).await;
+    let duplicate = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &uri,
+        &manager,
+        Some(json!({ "param_key": "target" })),
+    )
+    .await;
     assert_eq!(duplicate.status, StatusCode::CONFLICT);
 
     // Invalid key shape -> 400.
-    let invalid = signed_send(&app, &mut clock, "POST", &uri, &manager, Some(json!({ "param_key": "9bad key" }))).await;
+    let invalid = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &uri,
+        &manager,
+        Some(json!({ "param_key": "9bad key" })),
+    )
+    .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
 
-    let updated = signed_send(&app, &mut clock, "PUT", &format!("{uri}/{param_id}"), &manager, Some(json!({ "default_value": "9.9.9.9", "is_required": false }))).await;
+    let updated = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("{uri}/{param_id}"),
+        &manager,
+        Some(json!({ "default_value": "9.9.9.9", "is_required": false })),
+    )
+    .await;
     assert_eq!(updated.status, StatusCode::OK);
     assert_eq!(updated.field("default_value"), &json!("9.9.9.9"));
     assert_eq!(updated.field("is_required"), &json!(false));
 
-    let deleted = signed_send(&app, &mut clock, "DELETE", &format!("{uri}/{param_id}"), &manager, None).await;
+    let deleted = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("{uri}/{param_id}"),
+        &manager,
+        None,
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     assert_eq!(
-        signed_send(&app, &mut clock, "GET", &uri, &manager, None).await.json.as_array().map(Vec::len),
+        signed_send(&app, &mut clock, "GET", &uri, &manager, None)
+            .await
+            .json
+            .as_array()
+            .map(Vec::len),
         Some(0)
     );
 }
@@ -3421,7 +5035,12 @@ async fn hook_output_containing_live_markup_round_trips_verbatim_as_json() {
 
     let res = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({})),
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
@@ -3448,7 +5067,16 @@ async fn hook_output_containing_live_markup_round_trips_verbatim_as_json() {
 
     // And it must still be retrievable, unchanged, from the persisted history.
     let execution_id = res.string("id");
-    let stored = send(&app, json_request("GET", &format!("/api/executions/{execution_id}"), &master, None)).await;
+    let stored = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions/{execution_id}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(stored.status, StatusCode::OK);
     assert_eq!(stored.field("stdout"), &json!(XSS_PAYLOAD));
     assert_eq!(stored.field("stderr"), &json!(XSS_BREAKOUT_PAYLOAD));
@@ -3502,7 +5130,11 @@ async fn hook_metadata_containing_markup_round_trips_verbatim() {
 
     // The audit trail embeds `script_path` in a human-readable `details` string; it must be stored
     // as written rather than interpreted.
-    let logs = send(&app, json_request("GET", "/api/audit-logs?action=HOOK_CREATE", &master, None)).await;
+    let logs = send(
+        &app,
+        json_request("GET", "/api/audit-logs?action=HOOK_CREATE", &master, None),
+    )
+    .await;
     assert_eq!(logs.status, StatusCode::OK);
     assert!(
         logs.raw.contains("onerror=alert(1)"),
@@ -3523,6 +5155,15 @@ async fn hook_metadata_containing_markup_round_trips_verbatim() {
 /// above pin the other half: the bytes reaching the renderer really are attacker-controlled.
 #[test]
 fn spa_renders_captured_output_through_text_nodes_only() {
+    const TAINTED_FIELDS: [&str; 6] = [
+        "stdout",
+        "stderr",
+        "blocking_reason",
+        "res.command.program",
+        "argList",
+        "envRows",
+    ];
+
     let source = std::fs::read_to_string("static/app.js").expect("the SPA source is readable");
 
     // The single sink every captured stream flows through must assign, not parse.
@@ -3549,14 +5190,6 @@ fn spa_renders_captured_output_through_text_nodes_only() {
     // No line that assigns innerHTML may mention a field carrying attacker-controlled content.
     // Deliberately field names, not free text: `renderResultView` legitimately assigns trusted
     // header markup, and this check must not forbid that.
-    const TAINTED_FIELDS: [&str; 6] = [
-        "stdout",
-        "stderr",
-        "blocking_reason",
-        "res.command.program",
-        "argList",
-        "envRows",
-    ];
     for (number, line) in source.lines().enumerate() {
         if !line.contains("innerHTML") {
             continue;
@@ -3636,20 +5269,45 @@ async fn cli_flag_shaped_parameters_stay_literal_in_argv_and_environment() {
         )
         .await;
 
-        assert_eq!(res.status, StatusCode::OK, "hostile payload {flag:?} should execute inertly");
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "hostile payload {flag:?} should execute inertly"
+        );
         assert_eq!(res.field("status"), &json!("SUCCESS"), "for {flag:?}");
 
         let stdout = res.string("stdout");
         // Positional: exactly the bytes supplied, in declaration order, one argv slot each.
-        assert!(stdout.contains(&format!("argv[1]=<{flag}>")), "argv[1] for {flag:?} in:\n{stdout}");
-        assert!(stdout.contains(&format!("argv[2]=<{target}>")), "argv[2] for {target:?} in:\n{stdout}");
-        assert!(stdout.contains(&format!("argv[3]=<{extra}>")), "argv[3] for {extra:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("argv[1]=<{flag}>")),
+            "argv[1] for {flag:?} in:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("argv[2]=<{target}>")),
+            "argv[2] for {target:?} in:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("argv[3]=<{extra}>")),
+            "argv[3] for {extra:?} in:\n{stdout}"
+        );
         // Environment: same bytes again, prefixed and uppercased.
-        assert!(stdout.contains(&format!("env_flag=<{flag}>")), "env for {flag:?} in:\n{stdout}");
-        assert!(stdout.contains(&format!("env_target=<{target}>")), "env for {target:?} in:\n{stdout}");
-        assert!(stdout.contains(&format!("env_extra=<{extra}>")), "env for {extra:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("env_flag=<{flag}>")),
+            "env for {flag:?} in:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("env_target=<{target}>")),
+            "env for {target:?} in:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("env_extra=<{extra}>")),
+            "env for {extra:?} in:\n{stdout}"
+        );
         // No argument absorbed another: three declared parameters, three argv slots.
-        assert!(!stdout.contains("argv[4]="), "no extra argv entry appeared for {flag:?}:\n{stdout}");
+        assert!(
+            !stdout.contains("argv[4]="),
+            "no extra argv entry appeared for {flag:?}:\n{stdout}"
+        );
     }
 
     assert!(
@@ -3677,7 +5335,17 @@ async fn hostile_parameters_cannot_escape_the_sudo_argument_boundary() {
 
     // Each of these would change *who* the command runs as, or what sudo does, if it were parsed
     // as an option rather than as an argument to the script.
-    let escapes = ["-u", "-u root", "--user=root", "-i", "--login", "-E", "--preserve-env", "--", "-s"];
+    let escapes = [
+        "-u",
+        "-u root",
+        "--user=root",
+        "-i",
+        "--login",
+        "-E",
+        "--preserve-env",
+        "--",
+        "-s",
+    ];
 
     for payload in escapes {
         let res = send(
@@ -3699,22 +5367,53 @@ async fn hostile_parameters_cannot_escape_the_sudo_argument_boundary() {
             .map(|v| v.as_str().unwrap_or_default().to_owned())
             .collect();
 
-        assert_eq!(res.json["command"]["program"], json!("/usr/bin/sudo"), "for {payload:?}");
-        assert_eq!(res.json["command"]["run_as_user"], json!("root"), "for {payload:?}");
+        assert_eq!(
+            res.json["command"]["program"],
+            json!("/usr/bin/sudo"),
+            "for {payload:?}"
+        );
+        assert_eq!(
+            res.json["command"]["run_as_user"],
+            json!("root"),
+            "for {payload:?}"
+        );
 
         // The prefix is fixed and complete: nothing attacker-supplied can appear before `--`.
-        assert_eq!(&args[..4], &["-n", "-u", "root", "--"], "sudo prefix intact for {payload:?}");
-        assert_eq!(args[4], script, "the script path follows the separator for {payload:?}");
+        assert_eq!(
+            &args[..4],
+            &["-n", "-u", "root", "--"],
+            "sudo prefix intact for {payload:?}"
+        );
+        assert_eq!(
+            args[4], script,
+            "the script path follows the separator for {payload:?}"
+        );
 
         // Both hostile values land strictly after the separator, where sudo treats them as
         // arguments to the script.
-        let separator = args.iter().position(|a| a == "--").expect("separator present");
+        let separator = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("separator present");
         for (index, value) in args.iter().enumerate().skip(5) {
-            assert!(index > separator, "{value:?} must sit after the separator for {payload:?}");
+            assert!(
+                index > separator,
+                "{value:?} must sit after the separator for {payload:?}"
+            );
         }
-        assert_eq!(args[5], payload, "the payload is passed through verbatim for {payload:?}");
-        assert_eq!(args[6], "-i", "the second payload is passed through verbatim for {payload:?}");
-        assert_eq!(args.len(), 7, "no extra arguments were synthesized for {payload:?}");
+        assert_eq!(
+            args[5], payload,
+            "the payload is passed through verbatim for {payload:?}"
+        );
+        assert_eq!(
+            args[6], "-i",
+            "the second payload is passed through verbatim for {payload:?}"
+        );
+        assert_eq!(
+            args.len(),
+            7,
+            "no extra arguments were synthesized for {payload:?}"
+        );
     }
 }
 
@@ -3729,7 +5428,15 @@ async fn option_shaped_run_as_user_is_refused_at_definition_time() {
     let script = scripts.write_script("elevated.sh", "echo ok");
     let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
-    for hostile in ["-i", "--login", "-u", "root -i", "root;id", "--user=root", "-E"] {
+    for hostile in [
+        "-i",
+        "--login",
+        "-u",
+        "root -i",
+        "root;id",
+        "--user=root",
+        "-E",
+    ] {
         let res = send(
             &app,
             json_request(
@@ -3744,7 +5451,11 @@ async fn option_shaped_run_as_user_is_refused_at_definition_time() {
             ),
         )
         .await;
-        assert_eq!(res.status, StatusCode::BAD_REQUEST, "run_as_user {hostile:?} must be refused");
+        assert_eq!(
+            res.status,
+            StatusCode::BAD_REQUEST,
+            "run_as_user {hostile:?} must be refused"
+        );
     }
 }
 
@@ -3771,12 +5482,21 @@ async fn timeout_kills_backgrounded_grandchildren_in_the_same_process_group() {
 
     let res = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({})),
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.field("status"), &json!("TIMEOUT"));
-    assert_eq!(res.field("exit_code"), &json!(137), "SIGKILL is recorded as 128+9");
+    assert_eq!(
+        res.field("exit_code"),
+        &json!(137),
+        "SIGKILL is recorded as 128+9"
+    );
 
     // Outlive the grandchild's own sleep: if it were still alive it would create the marker.
     tokio::time::sleep(Duration::from_millis(4500)).await;
@@ -3786,78 +5506,138 @@ async fn timeout_kills_backgrounded_grandchildren_in_the_same_process_group() {
     );
 }
 
-/// Documents the exact boundary of `libc::killpg`: a child that calls `setsid` becomes the leader
-/// of a *new* process group and is therefore out of reach.
-///
-/// This test asserts the escape happens. That is deliberate, and it is not an endorsement — it is
-/// the honest shape of the guarantee. `killpg(pgid, SIGKILL)` signals one process group; a process
-/// that has left that group is, by POSIX definition, no longer a member. Containing it would
-/// require a kernel-level accounting boundary the daemon does not create (a cgroup, a PID
-/// namespace, or a session-wide sweep), and pretending otherwise in a test would leave an operator
-/// believing in an isolation property that does not exist. If a future change adds cgroup
-/// confinement, this test failing is precisely the signal that the boundary moved.
-/// `#[ignore]`d for the same reason as [`a_privileged_hook_actually_executes_through_sudo`]: it
-/// depends on a host tool that is not POSIX, and a silent early `return` reported PASS on hosts
-/// lacking it. The precondition is asserted, not guarded — see that test for the convention and
-/// where it comes from.
+#[cfg(unix)]
+const SESSION_PROBE_READY: &str = "session ready";
+
+#[cfg(unix)]
+fn run_session_probe(group: &std::ffi::OsStr) {
+    use rustix::process::{getpgid, getpid, getsid, setsid};
+    use std::io::{self, Write};
+
+    let group: i32 = group
+        .to_str()
+        .expect("UTF-8 group")
+        .parse()
+        .expect("group ID");
+    assert_eq!(getpgid(None).expect("original group").as_raw_pid(), group);
+    assert_eq!(setsid().expect("create session"), getpid());
+    assert_eq!(getsid(None).expect("new session"), getpid());
+    assert_eq!(getpgid(None).expect("new group"), getpid());
+    writeln!(io::stdout(), "{SESSION_PROBE_READY}").expect("announce readiness");
+    io::copy(&mut io::stdin(), &mut io::sink()).expect("wait for release");
+}
+
+/// A timeout kills members of the hook's process group. A process in a new session survives.
+#[cfg(unix)]
 #[tokio::test]
-#[ignore = "requires setsid(1) from util-linux; run with `cargo test -- --ignored`"]
 async fn a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill() {
-    // `setsid(1)` is util-linux, not POSIX; without it there is nothing to measure.
-    let has_setsid = std::process::Command::new("sh")
-        .args(["-c", "command -v setsid >/dev/null 2>&1"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(
-        has_setsid,
-        "setsid(1) is not available, so the process-escape boundary cannot be measured here. \
-         Asserted rather than skipped, so this reports absence instead of success"
-    );
+    use rustix::process::{Pid, getpgid};
+    use simply_hook_executor::{
+        entities::execution::ExecutionStatus,
+        executor::{CommandPlan, run_process},
+    };
+    use std::{collections::BTreeMap, os::unix::process::ExitStatusExt, process::Stdio};
+    use tokio::{
+        io::{AsyncBufReadExt, BufReader},
+        process::Command,
+        time::{advance, pause, resume, sleep, timeout},
+    };
 
-    let db = setup_test_db().await;
-    let app = create_app(test_state(&db));
+    const PROBE: &str = "SIMPLY_HOOK_EXECUTOR_SESSION_PROBE";
+    const TEST: &str = "a_setsid_child_leaves_the_process_group_and_survives_the_timeout_kill";
+    const WATCHDOG: Duration = Duration::from_secs(15);
+    const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+    if let Some(group) = std::env::var_os(PROBE) {
+        run_session_probe(&group);
+        return;
+    }
+
     let scripts = ScriptDir::new();
+    let ready = scripts.path_for("hook-pid");
+    let plan = CommandPlan {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 120".to_owned(),
+            "hook".to_owned(),
+            ready.clone(),
+        ],
+        env: BTreeMap::new(),
+        run_as_user: None,
+    };
 
-    let escaped = scripts.path_for("setsid_child_survived");
-    let contained = scripts.path_for("plain_child_survived");
-    // Two grandchildren, identical but for the process group they end up in. Running both in one
-    // execution is what makes the comparison airtight: same kill, same timing, same machine.
-    // Both sleep well past the 1s timeout so neither can win a race against the kill and produce a
-    // misleading result; output is redirected so neither holds the captured pipe open either.
-    let script = scripts.write_script(
-        "setsid_escape.sh",
-        &format!(
-            "( sleep 3; touch {contained} ) >/dev/null 2>&1 &\n\
-             setsid sh -c 'sleep 3; touch {escaped}' >/dev/null 2>&1 &\n\
-             sleep 30"
-        ),
-    );
+    let exercise_timeout = async {
+        let pid = timeout(WATCHDOG, async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&ready)
+                    && let Some(line) = contents.strip_suffix('\n')
+                    && let Ok(raw_pid) = line.parse()
+                    && let Some(pid) = Pid::from_raw(raw_pid)
+                {
+                    break pid;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("hook reports its PID");
+        assert_eq!(getpgid(Some(pid)).expect("hook group"), pid);
 
-    let hook_id = insert_hook(&db, "setsid_escape", &script, 1).await;
-    let (_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
+        // Join both children to the hook group while retaining direct handles to reap them.
+        let mut in_group = Command::new("/bin/cat")
+            .process_group(pid.as_raw_pid())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start in-group child");
+        // Child::wait closes its stdin, so retain the pipe separately until the signal arrives.
+        let _group_input = in_group.stdin.take().expect("in-group input");
+        let mut detached = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(PROBE, pid.as_raw_pid().to_string())
+            .process_group(pid.as_raw_pid())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start session child");
+        let mut lines = BufReader::new(detached.stdout.take().expect("session output")).lines();
+        timeout(WATCHDOG, async {
+            while let Some(line) = lines.next_line().await.expect("read session output") {
+                if line == SESSION_PROBE_READY {
+                    return;
+                }
+            }
+            panic!("session child exited before reporting readiness");
+        })
+        .await
+        .expect("session child reports readiness");
 
-    let res = send(
-        &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.field("status"), &json!("TIMEOUT"));
-    assert_eq!(res.field("exit_code"), &json!(137));
+        // Advance the executor's deadline only after both children are in position.
+        pause();
+        advance(HOOK_TIMEOUT).await;
+        resume();
 
-    // Both grandchildren sleep 3s; the hook is killed at 1s. Wait well past their wake-up.
-    tokio::time::sleep(Duration::from_millis(4500)).await;
+        let status = timeout(WATCHDOG, in_group.wait())
+            .await
+            .expect("in-group child is killed on timeout")
+            .expect("reap in-group child");
+        assert_eq!(status.signal(), Some(9));
 
-    assert!(
-        !std::path::Path::new(&contained).exists(),
-        "the same-group grandchild must be killed — if this fails, killpg itself regressed"
-    );
-    assert!(
-        std::path::Path::new(&escaped).exists(),
-        "a setsid child is expected to escape killpg; if it no longer does, the daemon gained a \
-         stronger containment boundary and AGENT_NOTES.MD must be updated to match"
-    );
+        // Closing stdin lets the session child finish and prove it survived the signal.
+        drop(detached.stdin.take().expect("session input"));
+        let status = timeout(WATCHDOG, detached.wait())
+            .await
+            .expect("session child exits when released")
+            .expect("reap session child");
+        assert!(status.success(), "session child should survive: {status}");
+    };
+
+    let (outcome, ()) = tokio::join!(run_process(&plan, HOOK_TIMEOUT, 4096), exercise_timeout);
+    assert_eq!(outcome.status, ExecutionStatus::Timeout);
+    assert_eq!(outcome.exit_code, Some(137));
 }
 
 /// Nothing a hook leaves behind may become a zombie held open by the daemon.
@@ -3878,7 +5658,12 @@ async fn timed_out_executions_do_not_leave_zombie_children() {
     for _ in 0..3 {
         let res = send(
             &app,
-            json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook_id}/execute"),
+                &master,
+                Some(json!({})),
+            ),
         )
         .await;
         assert_eq!(res.field("status"), &json!("TIMEOUT"));
@@ -3888,12 +5673,18 @@ async fn timed_out_executions_do_not_leave_zombie_children() {
     // well have unrelated zombies, and blaming them on this daemon would make the test flaky.
     let pid = std::process::id();
     let zombies = std::process::Command::new("sh")
-        .args(["-c", &format!("ps -o stat=,ppid= -A 2>/dev/null | awk '$1 ~ /^Z/ && $2 == {pid}'")])
+        .args([
+            "-c",
+            &format!("ps -o stat=,ppid= -A 2>/dev/null | awk '$1 ~ /^Z/ && $2 == {pid}'"),
+        ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
 
-    assert!(zombies.is_empty(), "timed-out hooks left zombie children behind:\n{zombies}");
+    assert!(
+        zombies.is_empty(),
+        "timed-out hooks left zombie children behind:\n{zombies}"
+    );
 }
 
 /// A body past [`simply_hook_executor::MAX_REQUEST_BODY_BYTES`] is refused before a handler runs.
@@ -3932,7 +5723,12 @@ async fn oversized_request_bodies_are_rejected_before_a_handler_runs() {
     // The refusal is the *limit*, not the content: the same route accepts a well-formed body.
     let accepted = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({})),
+        ),
     )
     .await;
     assert_eq!(accepted.status, StatusCode::OK);
@@ -3960,7 +5756,11 @@ async fn an_unauthenticated_oversized_body_is_refused_without_being_buffered() {
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
 
     // An unknown key is the same story: still 401, still no buffering.
-    let unknown = send(&app, raw_request("POST", "/api/hooks", "not-a-real-key", oversized)).await;
+    let unknown = send(
+        &app,
+        raw_request("POST", "/api/hooks", "not-a-real-key", oversized),
+    )
+    .await;
     assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
 }
 
@@ -3991,7 +5791,12 @@ async fn a_body_just_under_the_ceiling_is_accepted() {
 
     let res = send(
         &app,
-        raw_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, encoded),
+        raw_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            encoded,
+        ),
     )
     .await;
     // A top-level `parameters` object wins, so the ~1 MiB of sibling padding is read and parsed but
@@ -4015,7 +5820,11 @@ async fn a_body_just_under_the_ceiling_is_accepted() {
 /// Seeds a non-master key holding the `can_manage_keys` scope — the credential every finding in
 /// this group started from.
 async fn seed_key_manager(db: &sea_orm::DatabaseConnection) -> SeededKey {
-    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let scopes = KeyScopes {
+        can_manage_keys: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    };
     // `insert_key_full`, not `insert_key`: every caller holds `can_manage_keys` and must now sign
     // every request — see `signed_send`.
     insert_key_full(db, "key-manager", "", scopes).await
@@ -4055,7 +5864,11 @@ async fn seed_parent_manager(
     hook_id: Uuid,
     can_execute: bool,
 ) -> SeededKey {
-    let scopes = KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() };
+    let scopes = KeyScopes {
+        can_manage_keys: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    };
     // `insert_key_full`, not `insert_key`: every caller holds `can_manage_keys` and must now sign
     // every request — see `signed_send`.
     let seeded = insert_key_full(db, name, "", scopes).await;
@@ -4085,8 +5898,14 @@ async fn regression_non_master_cannot_mint_a_master_key() {
         Some(json!({ "name": "escalated", "is_master": true })),
     )
     .await;
-    assert!(res.status.is_client_error(), "minting a master key must be refused");
-    assert!(res.string("error").contains("is_master"), "the refusal names the offending scope");
+    assert!(
+        res.status.is_client_error(),
+        "minting a master key must be refused"
+    );
+    assert!(
+        res.string("error").contains("is_master"),
+        "the refusal names the offending scope"
+    );
     assert!(
         res.json.get("plaintext_key").is_none(),
         "a refused creation must not have minted a credential"
@@ -4103,21 +5922,41 @@ async fn regression_non_master_cannot_mint_a_master_key() {
             Some(json!({ "name": "escalated", scope: true })),
         )
         .await;
-        assert_eq!(res.status, StatusCode::FORBIDDEN, "granting {scope} must be refused");
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "granting {scope} must be refused"
+        );
     }
 
     // Nothing was created by any of the refused attempts.
     let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
     let keys = send(&app, json_request("GET", "/api/keys", &master, None)).await;
-    let names: Vec<&str> = keys.json.as_array().map(|rows| {
-        rows.iter().filter_map(|k| k.get("name").and_then(|n| n.as_str())).collect()
-    }).unwrap_or_default();
-    assert!(!names.contains(&"escalated"), "a refused creation must not persist a row: {names:?}");
+    let names: Vec<&str> = keys
+        .json
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|k| k.get("name").and_then(|n| n.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !names.contains(&"escalated"),
+        "a refused creation must not persist a row: {names:?}"
+    );
 
     // An ordinary, scope-free key is still creatable — the gate is about escalation, not about
     // disabling the scope the caller legitimately holds.
-    let ok = signed_send(&app, &mut clock, "POST", "/api/keys", &manager, Some(json!({ "name": "ordinary" })))
-        .await;
+    let ok = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/keys",
+        &manager,
+        Some(json!({ "name": "ordinary" })),
+    )
+    .await;
     assert_eq!(ok.status, StatusCode::OK);
     assert_eq!(ok.field("name"), &json!("ordinary"));
 }
@@ -4144,7 +5983,11 @@ async fn regression_non_master_cannot_grant_global_scopes_by_update() {
             Some(json!({ scope: true })),
         )
         .await;
-        assert_eq!(res.status, StatusCode::FORBIDDEN, "granting {scope} by update must be refused");
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "granting {scope} by update must be refused"
+        );
     }
 
     // Revoking a scope is not an escalation and stays available to a key manager.
@@ -4157,7 +6000,11 @@ async fn regression_non_master_cannot_grant_global_scopes_by_update() {
         Some(json!({ "can_manage_hooks": false })),
     )
     .await;
-    assert_eq!(revoke.status, StatusCode::OK, "removing authority is not an escalation");
+    assert_eq!(
+        revoke.status,
+        StatusCode::OK,
+        "removing authority is not an escalation"
+    );
 }
 
 /// Finding #2 — `can_manage_keys` could rotate a master key and read its new plaintext secret.
@@ -4172,9 +6019,24 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
     // `404` rather than `403` since §4 landed: the master is not in this manager's subtree and does
     // not share a hook with it, so it is outside every visibility scope and must look like an id
     // that was never issued. The refusal is no weaker — it is strictly less informative.
-    let rotate = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{master_id}/rotate"), &manager, None).await;
-    assert_eq!(rotate.status, StatusCode::NOT_FOUND, "rotating a master key must be refused");
-    assert!(rotate.json.get("plaintext_key").is_none(), "no secret may leak in the refusal body");
+    let rotate = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{master_id}/rotate"),
+        &manager,
+        None,
+    )
+    .await;
+    assert_eq!(
+        rotate.status,
+        StatusCode::NOT_FOUND,
+        "rotating a master key must be refused"
+    );
+    assert!(
+        rotate.json.get("plaintext_key").is_none(),
+        "no secret may leak in the refusal body"
+    );
 
     let update = signed_send(
         &app,
@@ -4185,16 +6047,42 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
         Some(json!({ "bound_ips": "0.0.0.0/0" })),
     )
     .await;
-    assert_eq!(update.status, StatusCode::NOT_FOUND, "editing a master key must be refused");
+    assert_eq!(
+        update.status,
+        StatusCode::NOT_FOUND,
+        "editing a master key must be refused"
+    );
 
-    let delete = signed_send(&app, &mut clock, "DELETE", &format!("/api/keys/{master_id}"), &manager, None).await;
-    assert_eq!(delete.status, StatusCode::NOT_FOUND, "deleting a master key must be refused");
+    let delete = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("/api/keys/{master_id}"),
+        &manager,
+        None,
+    )
+    .await;
+    assert_eq!(
+        delete.status,
+        StatusCode::NOT_FOUND,
+        "deleting a master key must be refused"
+    );
 
     // The `404`s above are §4 talking, not §5. To prove the master-specific guard still stands on
     // its own, ask again as a caller the master *is* visible to — the master itself, whose refusals
     // are `403` and name the reason.
     assert_eq!(
-        send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &master, None)).await.status,
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/keys/{master_id}/rotate"),
+                &master,
+                None
+            )
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN,
         "§5 still refuses rotation for a caller that can see the master"
     );
@@ -4209,13 +6097,36 @@ async fn regression_non_master_cannot_rotate_update_or_delete_a_master_key() {
     // exactly one master row can exist — meant "the master may rotate itself", and rotation hands
     // back the new plaintext secret in its response. A stolen master credential could therefore
     // mint itself a fresh one and lock the operator out with a single request.
-    let by_master = send(&app, json_request("POST", &format!("/api/keys/{master_id}/rotate"), &master, None)).await;
-    assert_eq!(by_master.status, StatusCode::FORBIDDEN, "even the master may not rotate itself");
-    assert!(by_master.json.get("plaintext_key").is_none(), "no secret may leak in the refusal body");
+    let by_master = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{master_id}/rotate"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        by_master.status,
+        StatusCode::FORBIDDEN,
+        "even the master may not rotate itself"
+    );
+    assert!(
+        by_master.json.get("plaintext_key").is_none(),
+        "no secret may leak in the refusal body"
+    );
 
-    let self_delete =
-        send(&app, json_request("DELETE", &format!("/api/keys/{master_id}"), &master, None)).await;
-    assert_eq!(self_delete.status, StatusCode::FORBIDDEN, "even the master may not delete itself");
+    let self_delete = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{master_id}"), &master, None),
+    )
+    .await;
+    assert_eq!(
+        self_delete.status,
+        StatusCode::FORBIDDEN,
+        "even the master may not delete itself"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -4237,11 +6148,22 @@ async fn even_a_master_cannot_mint_a_second_master() {
 
     let res = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "peer", "is_master": true }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "peer", "is_master": true })),
+        ),
     )
     .await;
-    assert!(res.status.is_client_error(), "a master minting a second master must be refused");
-    assert!(res.string("error").contains("is_master"), "the refusal names the offending field");
+    assert!(
+        res.status.is_client_error(),
+        "a master minting a second master must be refused"
+    );
+    assert!(
+        res.string("error").contains("is_master"),
+        "the refusal names the offending field"
+    );
 
     // Exactly one master row survives, and it is the original.
     let masters = ApiKey::find()
@@ -4274,8 +6196,14 @@ async fn an_update_payload_carrying_is_master_is_refused_rather_than_ignored() {
         ),
     )
     .await;
-    assert!(res.status.is_client_error(), "promotion through update must be refused");
-    assert!(res.string("error").contains("is_master"), "the refusal names the offending field");
+    assert!(
+        res.status.is_client_error(),
+        "promotion through update must be refused"
+    );
+    assert!(
+        res.string("error").contains("is_master"),
+        "the refusal names the offending field"
+    );
 
     let victim = ApiKey::find_by_id(victim_id)
         .one(&db)
@@ -4289,7 +6217,7 @@ async fn an_update_payload_carrying_is_master_is_refused_rather_than_ignored() {
 ///
 /// This is the control that has to hold when application logic is wrong, bypassed, or not involved
 /// at all — a migration, a restored backup, an operator at a SQL prompt. It writes the row
-/// directly through SeaORM, taking the same path `tests/common` uses to seed fixtures, so nothing
+/// directly through `SeaORM`, taking the same path `tests/common` uses to seed fixtures, so nothing
 /// in `src/api.rs` participates in the refusal.
 #[tokio::test]
 async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
@@ -4320,7 +6248,10 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
     .insert(&db)
     .await;
 
-    assert!(second.is_err(), "the unique index must refuse a second master row");
+    assert!(
+        second.is_err(),
+        "the unique index must refuse a second master row"
+    );
 
     // ...while ordinary keys are entirely unaffected: the constraint is on the *marker*, which is
     // NULL for every non-master, and NULLs do not collide. A constraint that also capped the
@@ -4328,7 +6259,11 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
     for name in ["ordinary-a", "ordinary-b", "ordinary-c"] {
         insert_key(&db, name, "", KeyScopes::plain()).await;
     }
-    let total = ApiKey::find().all(&db).await.expect("querying keys succeeds").len();
+    let total = ApiKey::find()
+        .all(&db)
+        .await
+        .expect("querying keys succeeds")
+        .len();
     assert_eq!(total, 4, "one master plus three ordinary keys coexist");
 }
 
@@ -4351,7 +6286,11 @@ async fn the_master_may_edit_only_its_own_bound_ips() {
         ),
     )
     .await;
-    assert_eq!(allowed.status, StatusCode::OK, "the master may narrow its own bound_ips");
+    assert_eq!(
+        allowed.status,
+        StatusCode::OK,
+        "the master may narrow its own bound_ips"
+    );
     assert_eq!(allowed.string("bound_ips"), "127.0.0.0/8,::1/128");
 
     // Everything else on the same payload shape is refused, one field at a time so a passing
@@ -4379,8 +6318,15 @@ async fn the_master_may_edit_only_its_own_bound_ips() {
             ),
         )
         .await;
-        assert_eq!(res.status, StatusCode::FORBIDDEN, "the master's '{field}' must be immutable");
-        assert!(res.string("error").contains(field), "the refusal names '{field}'");
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "the master's '{field}' must be immutable"
+        );
+        assert!(
+            res.string("error").contains(field),
+            "the refusal names '{field}'"
+        );
     }
 
     // None of the refusals partially applied.
@@ -4408,11 +6354,16 @@ async fn seed_three_level_subtree(
     db: &sea_orm::DatabaseConnection,
     script: &str,
 ) -> (Uuid, String, Uuid, Uuid, Uuid) {
-    let (parent_id, parent) = insert_key(db, "parent", "", KeyScopes {
-        can_manage_keys: true,
-        max_concurrent_jobs: 10,
-        ..Default::default()
-    })
+    let (parent_id, parent) = insert_key(
+        db,
+        "parent",
+        "",
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Default::default()
+        },
+    )
     .await;
     let (daughter_id, _daughter) = insert_key(db, "daughter", "", KeyScopes::plain()).await;
     let (grand_id, _grand) = insert_key(db, "granddaughter", "", KeyScopes::plain()).await;
@@ -4439,12 +6390,28 @@ async fn s6_the_inventory_reaches_resources_owned_two_levels_down() {
         seed_three_level_subtree(&db, &script).await;
     let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
-    let refused = send(&app, json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None)).await;
-    assert_eq!(refused.status, StatusCode::CONFLICT, "deletion is refused, not performed");
+    let refused = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "deletion is refused, not performed"
+    );
 
     // The inventory names the deep hook, with everything §6 requires.
-    let inventory = refused.json["inventory"].as_array().cloned().unwrap_or_default();
-    assert_eq!(inventory.len(), 1, "exactly the one owned hook: {}", refused.raw);
+    let inventory = refused.json["inventory"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        inventory.len(),
+        1,
+        "exactly the one owned hook: {}",
+        refused.raw
+    );
     assert_eq!(inventory[0]["type"], json!("hook"));
     assert_eq!(inventory[0]["id"], json!(deep_hook.to_string()));
     assert_eq!(inventory[0]["name"], json!("granddaughters_hook"));
@@ -4464,12 +6431,27 @@ async fn s6_the_inventory_reaches_resources_owned_two_levels_down() {
         .collect();
     assert_eq!(subtree.len(), 3, "parent, daughter, granddaughter");
     for id in [parent_id, daughter_id, grand_id] {
-        assert!(subtree.contains(&id.to_string()), "{id} missing from the reported subtree");
+        assert!(
+            subtree.contains(&id.to_string()),
+            "{id} missing from the reported subtree"
+        );
     }
 
     // Nothing happened: the refusal is a question, not a partial execution.
-    assert!(ApiKey::find_by_id(parent_id).one(&db).await.expect("query").is_some());
-    assert!(ApiKey::find_by_id(grand_id).one(&db).await.expect("query").is_some());
+    assert!(
+        ApiKey::find_by_id(parent_id)
+            .one(&db)
+            .await
+            .expect("query")
+            .is_some()
+    );
+    assert!(
+        ApiKey::find_by_id(grand_id)
+            .one(&db)
+            .await
+            .expect("query")
+            .is_some()
+    );
 }
 
 /// **§6** — "Deletion executes only when every entity in the inventory carries an explicit
@@ -4500,13 +6482,32 @@ async fn s6_a_partial_resolution_map_is_refused() {
         ),
     )
     .await;
-    assert_eq!(partial.status, StatusCode::CONFLICT, "a partial map is refused: {}", partial.raw);
-    assert!(ApiKey::find_by_id(parent_id).one(&db).await.expect("query").is_some(), "nothing deleted");
+    assert_eq!(
+        partial.status,
+        StatusCode::CONFLICT,
+        "a partial map is refused: {}",
+        partial.raw
+    );
+    assert!(
+        ApiKey::find_by_id(parent_id)
+            .one(&db)
+            .await
+            .expect("query")
+            .is_some(),
+        "nothing deleted"
+    );
 
     // The still-unresolved entity is the one reported back, so the caller can complete the map
     // rather than re-derive it.
-    let inventory = partial.json["inventory"].as_array().cloned().unwrap_or_default();
-    assert_eq!(inventory.len(), 2, "the full inventory comes back, not just the gap");
+    let inventory = partial.json["inventory"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        inventory.len(),
+        2,
+        "the full inventory comes back, not just the gap"
+    );
 
     // A resolution naming something the subtree does not own is a mistake, not a no-op: it usually
     // means the map was built against a different subtree.
@@ -4525,8 +6526,16 @@ async fn s6_a_partial_resolution_map_is_refused() {
         ),
     )
     .await;
-    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "a stray resolution is refused: {}", bad.raw);
-    assert!(bad.raw.contains(&stray.to_string()), "and names the offending id");
+    assert_eq!(
+        bad.status,
+        StatusCode::BAD_REQUEST,
+        "a stray resolution is refused: {}",
+        bad.raw
+    );
+    assert!(
+        bad.raw.contains(&stray.to_string()),
+        "and names the offending id"
+    );
 
     // The complete map succeeds.
     let complete = send(
@@ -4542,7 +6551,12 @@ async fn s6_a_partial_resolution_map_is_refused() {
         ),
     )
     .await;
-    assert_eq!(complete.status, StatusCode::NO_CONTENT, "a total map executes: {}", complete.raw);
+    assert_eq!(
+        complete.status,
+        StatusCode::NO_CONTENT,
+        "a total map executes: {}",
+        complete.raw
+    );
 }
 
 /// **§6** — the cascade removes the whole subtree, and reassignment moves ownership rather than
@@ -4572,8 +6586,17 @@ async fn s6_reassignment_moves_ownership_and_the_cascade_removes_the_subtree() {
         ),
     )
     .await;
-    assert_eq!(into_subtree.status, StatusCode::BAD_REQUEST, "{}", into_subtree.raw);
-    assert!(into_subtree.raw.contains("inside the subtree"), "{}", into_subtree.raw);
+    assert_eq!(
+        into_subtree.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        into_subtree.raw
+    );
+    assert!(
+        into_subtree.raw.contains("inside the subtree"),
+        "{}",
+        into_subtree.raw
+    );
 
     // A nonexistent successor is refused too — it would leave the hook owned by nothing.
     let nowhere = send(
@@ -4608,17 +6631,33 @@ async fn s6_reassignment_moves_ownership_and_the_cascade_removes_the_subtree() {
     // The entire subtree is gone — recursively, not just the key that was named.
     for id in [parent_id, daughter_id, grand_id] {
         assert!(
-            ApiKey::find_by_id(id).one(&db).await.expect("query").is_none(),
+            ApiKey::find_by_id(id)
+                .one(&db)
+                .await
+                .expect("query")
+                .is_none(),
             "{id} should have been cascaded away"
         );
     }
-    assert!(ApiKey::find_by_id(successor_id).one(&db).await.expect("query").is_some());
+    assert!(
+        ApiKey::find_by_id(successor_id)
+            .one(&db)
+            .await
+            .expect("query")
+            .is_some()
+    );
 
     // The hook survives, owned by the successor. §6: "Hooks must never disappear as a side effect
     // of removing a key."
-    let survivor = fetch_hook_row(&db, deep_hook).await.expect("the hook must survive");
+    let survivor = fetch_hook_row(&db, deep_hook)
+        .await
+        .expect("the hook must survive");
     assert!(!survivor.is_deleted, "reassignment is not deletion");
-    assert_eq!(survivor.owner_key_id, Some(successor_id), "ownership moved to the successor");
+    assert_eq!(
+        survivor.owner_key_id,
+        Some(successor_id),
+        "ownership moved to the successor"
+    );
 }
 
 /// **§6** — "Data is never destroyed implicitly."
@@ -4634,11 +6673,16 @@ async fn s6_resolving_by_delete_trashes_the_hook_without_destroying_its_history(
     let script = scripts.write_script("history.sh", "#!/bin/sh\necho ran\n");
 
     let (owner_id, owner) = insert_key(&db, "owner", "", KeyScopes::plain()).await;
-    let (parent_id, _parent) = insert_key(&db, "parent", "", KeyScopes {
-        can_manage_keys: true,
-        max_concurrent_jobs: 10,
-        ..Default::default()
-    })
+    let (parent_id, _parent) = insert_key(
+        &db,
+        "parent",
+        "",
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Default::default()
+        },
+    )
     .await;
     set_parent(&db, owner_id, parent_id).await;
     let hook = insert_hook_owned_by(&db, "historic_hook", &script, owner_id).await;
@@ -4649,7 +6693,12 @@ async fn s6_resolving_by_delete_trashes_the_hook_without_destroying_its_history(
     // Give it a run worth preserving.
     let run = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &owner, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook}/execute"),
+            &owner,
+            Some(json!({})),
+        ),
     )
     .await;
     assert_eq!(run.status, StatusCode::OK);
@@ -4667,17 +6716,39 @@ async fn s6_resolving_by_delete_trashes_the_hook_without_destroying_its_history(
     assert_eq!(done.status, StatusCode::NO_CONTENT, "{}", done.raw);
 
     // The hook row survives, flagged.
-    let row = fetch_hook_row(&db, hook).await.expect("the row must survive a resolved delete");
+    let row = fetch_hook_row(&db, hook)
+        .await
+        .expect("the row must survive a resolved delete");
     assert!(row.is_deleted, "it went to the trash");
 
     // ...and so did the history, even though the key that made it is gone.
-    let history = Execution::find().all(&db).await.expect("querying executions succeeds");
+    let history = Execution::find()
+        .all(&db)
+        .await
+        .expect("querying executions succeeds");
     assert_eq!(history.len(), 1, "the run survives its author");
-    assert_eq!(history[0].api_key_id, None, "attribution is nulled, not cascaded away");
+    assert_eq!(
+        history[0].api_key_id, None,
+        "attribution is nulled, not cascaded away"
+    );
 
     // Master can still see and restore it — nothing was silently destroyed.
-    let trashed = send(&app, json_request("GET", &format!("/api/hooks/{hook}?include_deleted=true"), &master, None)).await;
-    assert_eq!(trashed.status, StatusCode::OK, "master can still reach it: {}", trashed.raw);
+    let trashed = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/hooks/{hook}?include_deleted=true"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        trashed.status,
+        StatusCode::OK,
+        "master can still reach it: {}",
+        trashed.raw
+    );
 }
 
 /// **§6** — a subtree owning nothing still deletes in one request.
@@ -4689,21 +6760,45 @@ async fn s6_a_subtree_owning_nothing_deletes_in_a_single_request() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
 
-    let (parent_id, _parent) = insert_key(&db, "parent", "", KeyScopes {
-        can_manage_keys: true,
-        max_concurrent_jobs: 10,
-        ..Default::default()
-    })
+    let (parent_id, _parent) = insert_key(
+        &db,
+        "parent",
+        "",
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Default::default()
+        },
+    )
     .await;
     let (daughter_id, _daughter) = insert_key(&db, "daughter", "", KeyScopes::plain()).await;
     set_parent(&db, daughter_id, parent_id).await;
     let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
-    let done = send(&app, json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None)).await;
-    assert_eq!(done.status, StatusCode::NO_CONTENT, "no body required: {}", done.raw);
-    assert!(ApiKey::find_by_id(parent_id).one(&db).await.expect("query").is_none());
+    let done = send(
+        &app,
+        json_request("DELETE", &format!("/api/keys/{parent_id}"), &master, None),
+    )
+    .await;
+    assert_eq!(
+        done.status,
+        StatusCode::NO_CONTENT,
+        "no body required: {}",
+        done.raw
+    );
     assert!(
-        ApiKey::find_by_id(daughter_id).one(&db).await.expect("query").is_none(),
+        ApiKey::find_by_id(parent_id)
+            .one(&db)
+            .await
+            .expect("query")
+            .is_none()
+    );
+    assert!(
+        ApiKey::find_by_id(daughter_id)
+            .one(&db)
+            .await
+            .expect("query")
+            .is_none(),
         "the cascade still ran"
     );
 }
@@ -4732,18 +6827,24 @@ async fn s4_a_shared_resource_discloses_only_id_name_and_rights_on_that_resource
 
     // Two unrelated parents, meeting only through `shared`.
     let ours = seed_parent_manager(&db, "our-parent", shared, true).await;
-    let (theirs_id, _theirs) = insert_key(&db, "their-parent", "10.9.8.0/24", KeyScopes {
-        can_manage_keys: true,
-        can_manage_hooks: true,
-        max_concurrent_jobs: 7,
-        ..Default::default()
-    })
+    let (theirs_id, _theirs) = insert_key(
+        &db,
+        "their-parent",
+        "10.9.8.0/24",
+        KeyScopes {
+            can_manage_keys: true,
+            can_manage_hooks: true,
+            max_concurrent_jobs: 7,
+            ..Default::default()
+        },
+    )
     .await;
     grant(&db, theirs_id, shared, true, false).await;
     grant(&db, theirs_id, private, true, true).await;
 
     // ...and our own daughter, which we are entitled to see in full.
-    let (daughter_id, _daughter) = insert_key(&db, "our-daughter", "127.0.0.1/32", KeyScopes::plain()).await;
+    let (daughter_id, _daughter) =
+        insert_key(&db, "our-daughter", "127.0.0.1/32", KeyScopes::plain()).await;
     set_parent(&db, daughter_id, ours.id).await;
     grant(&db, daughter_id, shared, true, false).await;
 
@@ -4760,19 +6861,51 @@ async fn s4_a_shared_resource_discloses_only_id_name_and_rights_on_that_resource
 
     // Ourselves and our daughter: full detail.
     let self_view = find(ours.id).expect("the caller sees itself");
-    assert_eq!(self_view["bound_ips"], json!(""), "own entry is the full summary");
+    assert_eq!(
+        self_view["bound_ips"],
+        json!(""),
+        "own entry is the full summary"
+    );
     let daughter_view = find(daughter_id).expect("the caller sees its own daughter");
-    assert_eq!(daughter_view["bound_ips"], json!("127.0.0.1/32"), "own subtree is full detail");
-    assert_eq!(daughter_view["can_manage_keys"], json!(false), "including global flags");
+    assert_eq!(
+        daughter_view["bound_ips"],
+        json!("127.0.0.1/32"),
+        "own subtree is full detail"
+    );
+    assert_eq!(
+        daughter_view["can_manage_keys"],
+        json!(false),
+        "including global flags"
+    );
 
     // The other parent: minimal, and *only* because of the shared hook.
-    let their_view = find(theirs_id).expect("a key sharing a managed hook is visible in minimal form");
-    assert_eq!(their_view["partial"], json!(true), "the entry announces that it is abridged");
-    assert!(their_view.get("bound_ips").is_none(), "bound IPs stay hidden: {their_view}");
-    assert!(their_view.get("can_manage_keys").is_none(), "global flags stay hidden: {their_view}");
-    assert!(their_view.get("can_manage_hooks").is_none(), "...all of them: {their_view}");
-    assert!(their_view.get("prefix").is_none(), "and so does the key prefix: {their_view}");
-    assert!(their_view.get("max_concurrent_jobs").is_none(), "and the budget: {their_view}");
+    let their_view =
+        find(theirs_id).expect("a key sharing a managed hook is visible in minimal form");
+    assert_eq!(
+        their_view["partial"],
+        json!(true),
+        "the entry announces that it is abridged"
+    );
+    assert!(
+        their_view.get("bound_ips").is_none(),
+        "bound IPs stay hidden: {their_view}"
+    );
+    assert!(
+        their_view.get("can_manage_keys").is_none(),
+        "global flags stay hidden: {their_view}"
+    );
+    assert!(
+        their_view.get("can_manage_hooks").is_none(),
+        "...all of them: {their_view}"
+    );
+    assert!(
+        their_view.get("prefix").is_none(),
+        "and so does the key prefix: {their_view}"
+    );
+    assert!(
+        their_view.get("max_concurrent_jobs").is_none(),
+        "and the budget: {their_view}"
+    );
 
     // The rights shown are on the shared hook alone — never the unrelated one.
     let names: Vec<String> = their_view["hook_permissions"]
@@ -4782,7 +6915,11 @@ async fn s4_a_shared_resource_discloses_only_id_name_and_rights_on_that_resource
         .iter()
         .filter_map(|p| p["hook_name"].as_str().map(str::to_owned))
         .collect();
-    assert_eq!(names, vec!["shared_hook".to_owned()], "unrelated memberships stay hidden");
+    assert_eq!(
+        names,
+        vec!["shared_hook".to_owned()],
+        "unrelated memberships stay hidden"
+    );
 }
 
 /// **§4** — a key outside every scope is not listed at all. Omission is the listing form of oracle
@@ -4810,18 +6947,48 @@ async fn s4_keys_outside_every_scope_are_omitted_from_the_listing() {
         .filter_map(|e| e["id"].as_str().map(str::to_owned))
         .collect();
     assert!(ids.contains(&ours.id.to_string()), "the caller sees itself");
-    assert!(!ids.contains(&stranger_id.to_string()), "an unrelated key is not listed at all");
+    assert!(
+        !ids.contains(&stranger_id.to_string()),
+        "an unrelated key is not listed at all"
+    );
 
     // ...and is unreachable by id, with the answer a nonexistent id gives.
-    let by_id = signed_send(&app, &mut clock, "PUT", &format!("/api/keys/{stranger_id}"), &ours, Some(json!({ "name": "x" }))).await;
-    let invented = signed_send(&app, &mut clock, "PUT", &format!("/api/keys/{}", Uuid::new_v4()), &ours, Some(json!({ "name": "x" }))).await;
-    assert_eq!(by_id.status, StatusCode::NOT_FOUND, "an invisible key reads as nonexistent");
-    assert_eq!(by_id.status, invented.status, "identical status to an id that was never issued");
+    let by_id = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/keys/{stranger_id}"),
+        &ours,
+        Some(json!({ "name": "x" })),
+    )
+    .await;
+    let invented = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/keys/{}", Uuid::new_v4()),
+        &ours,
+        Some(json!({ "name": "x" })),
+    )
+    .await;
+    assert_eq!(
+        by_id.status,
+        StatusCode::NOT_FOUND,
+        "an invisible key reads as nonexistent"
+    );
+    assert_eq!(
+        by_id.status, invented.status,
+        "identical status to an id that was never issued"
+    );
     assert_eq!(by_id.raw, invented.raw, "and an identical body");
 
     // Master sees everything, which is what makes the omission a scope rather than a bug.
     let all = send(&app, json_request("GET", "/api/keys", &master, None)).await;
-    assert_eq!(all.json.as_array().map(Vec::len), Some(3), "our parent, the stranger, and master");
+    assert_eq!(
+        all.json.as_array().map(Vec::len),
+        Some(3),
+        "our parent, the stranger, and master"
+    );
 }
 
 /// **§4 oracle discipline** — an out-of-scope hook is byte-identical to a nonexistent one.
@@ -4851,12 +7018,22 @@ async fn s4_an_invisible_hook_is_indistinguishable_from_a_nonexistent_one() {
     ] {
         let on_real = send(
             &app,
-            json_request(method, &format!("/api/hooks/{real}{suffix}"), &outsider, body.clone()),
+            json_request(
+                method,
+                &format!("/api/hooks/{real}{suffix}"),
+                &outsider,
+                body.clone(),
+            ),
         )
         .await;
         let on_invented = send(
             &app,
-            json_request(method, &format!("/api/hooks/{invented}{suffix}"), &outsider, body),
+            json_request(
+                method,
+                &format!("/api/hooks/{invented}{suffix}"),
+                &outsider,
+                body,
+            ),
         )
         .await;
 
@@ -4876,10 +7053,24 @@ async fn s4_an_invisible_hook_is_indistinguishable_from_a_nonexistent_one() {
     }
 
     // Resolution by *name* must not leak either — names are guessable in a way UUIDs are not.
-    let by_name = send(&app, json_request("GET", "/api/hooks/a_real_hook", &outsider, None)).await;
-    let by_absent_name = send(&app, json_request("GET", "/api/hooks/no_such_hook", &outsider, None)).await;
-    assert_eq!(by_name.status, by_absent_name.status, "name lookup leaks existence by status");
-    assert_eq!(by_name.raw, by_absent_name.raw, "name lookup leaks existence by body");
+    let by_name = send(
+        &app,
+        json_request("GET", "/api/hooks/a_real_hook", &outsider, None),
+    )
+    .await;
+    let by_absent_name = send(
+        &app,
+        json_request("GET", "/api/hooks/no_such_hook", &outsider, None),
+    )
+    .await;
+    assert_eq!(
+        by_name.status, by_absent_name.status,
+        "name lookup leaks existence by status"
+    );
+    assert_eq!(
+        by_name.raw, by_absent_name.raw,
+        "name lookup leaks existence by body"
+    );
 }
 
 /// **§4, third scope** — an execution record is creator-private, with three named exceptions.
@@ -4929,7 +7120,12 @@ async fn s4_execution_records_are_creator_private_with_three_named_exceptions() 
 
     let run = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &runner, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook}/execute"),
+            &runner,
+            Some(json!({})),
+        ),
     )
     .await;
     assert_eq!(run.status, StatusCode::OK);
@@ -4938,19 +7134,36 @@ async fn s4_execution_records_are_creator_private_with_three_named_exceptions() 
 
     for (who, label) in [
         (&runner, "the acting key sees its own run"),
-        (&owner, "the hook's owner sees runs of the hook it is answerable for"),
-        (&auditor, "a can_view_execution holder sees the history it was granted"),
+        (
+            &owner,
+            "the hook's owner sees runs of the hook it is answerable for",
+        ),
+        (
+            &auditor,
+            "a can_view_execution holder sees the history it was granted",
+        ),
         (&master, "master sees everything"),
     ] {
         let listed = send(&app, json_request("GET", "/api/executions", who, None)).await;
-        assert_eq!(listed.json.as_array().map(Vec::len), Some(1), "{label}: {}", listed.raw);
+        assert_eq!(
+            listed.json.as_array().map(Vec::len),
+            Some(1),
+            "{label}: {}",
+            listed.raw
+        );
         let single = send(&app, json_request("GET", &uri, who, None)).await;
-        assert_eq!(single.status, StatusCode::OK, "{label} (by id): {}", single.raw);
+        assert_eq!(
+            single.status,
+            StatusCode::OK,
+            "{label} (by id): {}",
+            single.raw
+        );
     }
 
     // The manager is a Parent (`can_manage_keys`), so it must sign — pulled out of the loop above
     // since every other caller there is unsigned.
-    let manager_listed = signed_send(&app, &mut clock, "GET", "/api/executions", &manager, None).await;
+    let manager_listed =
+        signed_send(&app, &mut clock, "GET", "/api/executions", &manager, None).await;
     assert_eq!(
         manager_listed.json.as_array().map(Vec::len),
         Some(1),
@@ -4965,30 +7178,60 @@ async fn s4_execution_records_are_creator_private_with_three_named_exceptions() 
         manager_single.raw
     );
 
+    assert_execution_access_refusals(&app, &peer, &auditor, &uri).await;
+}
+
+async fn assert_execution_access_refusals(
+    app: &axum::Router,
+    peer: &str,
+    auditor: &str,
+    uri: &str,
+) {
     // `can_execute` alone reads nothing, and the refusal is `404` — indistinguishable from an
     // execution id that was never issued, per oracle discipline.
-    let listed = send(&app, json_request("GET", "/api/executions", &peer, None)).await;
+    let listed = send(app, json_request("GET", "/api/executions", peer, None)).await;
     assert_eq!(
         listed.json.as_array().map(Vec::len),
         Some(0),
         "running a hook is not licence to read another key's runs: {}",
         listed.raw
     );
-    let by_id = send(&app, json_request("GET", &uri, &peer, None)).await;
-    assert_eq!(by_id.status, StatusCode::NOT_FOUND, "refused as nonexistent, not as forbidden");
-    assert!(!by_id.raw.contains("secret-output"), "no output leaks in the refusal: {}", by_id.raw);
+    let by_id = send(app, json_request("GET", uri, peer, None)).await;
+    assert_eq!(
+        by_id.status,
+        StatusCode::NOT_FOUND,
+        "refused as nonexistent, not as forbidden"
+    );
+    assert!(
+        !by_id.raw.contains("secret-output"),
+        "no output leaks in the refusal: {}",
+        by_id.raw
+    );
     let invented = send(
-        &app,
-        json_request("GET", &format!("/api/executions/{}", Uuid::new_v4()), &peer, None),
+        app,
+        json_request(
+            "GET",
+            &format!("/api/executions/{}", Uuid::new_v4()),
+            peer,
+            None,
+        ),
     )
     .await;
-    assert_eq!(by_id.status, invented.status, "an unreadable record leaks existence by status");
-    assert_eq!(by_id.raw, invented.raw, "an unreadable record leaks existence by body");
+    assert_eq!(
+        by_id.status, invented.status,
+        "an unreadable record leaks existence by status"
+    );
+    assert_eq!(
+        by_id.raw, invented.raw,
+        "an unreadable record leaks existence by body"
+    );
 
     // Reading is not deleting. The auditor may see the record and may not destroy it — history
     // access is deliberately weaker than `can_manage`, or an auditor would be a redactor.
     assert_eq!(
-        send(&app, json_request("DELETE", &uri, &auditor, None)).await.status,
+        send(app, json_request("DELETE", uri, auditor, None))
+            .await
+            .status,
         StatusCode::FORBIDDEN,
         "can_view_execution must not confer deletion"
     );
@@ -5008,13 +7251,26 @@ async fn s4_unauthenticated_callers_cannot_probe_bound_ips_via_401_vs_403() {
     let app = create_app(test_state(&db));
 
     // A real key, bound to a range the test client is not in.
-    let (_id, bound) = insert_key(&db, "bound-elsewhere", "10.10.10.0/24", KeyScopes::plain()).await;
+    let (_id, bound) =
+        insert_key(&db, "bound-elsewhere", "10.10.10.0/24", KeyScopes::plain()).await;
 
     // No credential at all, and a credential that was never issued: both `401`, and identical.
     let absent = send(&app, json_request("GET", "/api/hooks", "", None)).await;
-    let invented = send(&app, json_request("GET", "/api/hooks", "not-a-real-key", None)).await;
-    assert_eq!(absent.status, StatusCode::UNAUTHORIZED, "no credential is 401");
-    assert_eq!(invented.status, StatusCode::UNAUTHORIZED, "an unknown credential is 401");
+    let invented = send(
+        &app,
+        json_request("GET", "/api/hooks", "not-a-real-key", None),
+    )
+    .await;
+    assert_eq!(
+        absent.status,
+        StatusCode::UNAUTHORIZED,
+        "no credential is 401"
+    );
+    assert_eq!(
+        invented.status,
+        StatusCode::UNAUTHORIZED,
+        "an unknown credential is 401"
+    );
 
     // A *real* credential from the wrong network is `403`, not `401`. That difference is only
     // reachable by someone already holding the secret, which is the point: the caller learns
@@ -5063,27 +7319,86 @@ async fn s3_managing_a_hook_does_not_confer_authority_to_delete_it() {
     grant(&db, manager_id, hook, true, true).await;
 
     // The manager holds *both* verbs — this is not a case of insufficient operational rights.
-    let edit = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook}"), &manager, Some(json!({ "description": "edited" }))).await;
-    assert_eq!(edit.status, StatusCode::OK, "manage still means manage: content edits work");
+    let edit = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{hook}"),
+        &manager,
+        Some(json!({ "description": "edited" })),
+    )
+    .await;
+    assert_eq!(
+        edit.status,
+        StatusCode::OK,
+        "manage still means manage: content edits work"
+    );
 
-    let delete = signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook}"), &manager, None).await;
-    assert_eq!(delete.status, StatusCode::FORBIDDEN, "but deletion is the owner's: {}", delete.raw);
-    assert!(delete.raw.contains("owner"), "the refusal explains why: {}", delete.raw);
+    let delete = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("/api/hooks/{hook}"),
+        &manager,
+        None,
+    )
+    .await;
+    assert_eq!(
+        delete.status,
+        StatusCode::FORBIDDEN,
+        "but deletion is the owner's: {}",
+        delete.raw
+    );
+    assert!(
+        delete.raw.contains("owner"),
+        "the refusal explains why: {}",
+        delete.raw
+    );
 
     // Renaming is grouped with deletion, not with the edits above: this service resolves hooks by
     // name on `/webhook/{identifier}`, so a rename silently breaks every caller pointed at the old
     // one. It is a lifecycle act wearing an edit's clothes.
-    let rename = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook}"), &manager, Some(json!({ "name": "renamed" }))).await;
-    assert_eq!(rename.status, StatusCode::FORBIDDEN, "renaming is a lifecycle action");
+    let rename = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{hook}"),
+        &manager,
+        Some(json!({ "name": "renamed" })),
+    )
+    .await;
+    assert_eq!(
+        rename.status,
+        StatusCode::FORBIDDEN,
+        "renaming is a lifecycle action"
+    );
 
     // The owner may do both.
     assert_eq!(
-        signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook}"), &owner, Some(json!({ "name": "renamed" }))).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "PUT",
+            &format!("/api/hooks/{hook}"),
+            &owner,
+            Some(json!({ "name": "renamed" }))
+        )
+        .await
+        .status,
         StatusCode::OK,
         "the owner may rename"
     );
     assert_eq!(
-        signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook}"), &owner, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "DELETE",
+            &format!("/api/hooks/{hook}"),
+            &owner,
+            None
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT,
         "and delete"
     );
@@ -5108,12 +7423,22 @@ async fn s3_a_hook_with_no_owner_is_lifecycle_master_only() {
     let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
     assert_eq!(
-        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &manager, None)).await.status,
+        send(
+            &app,
+            json_request("DELETE", &format!("/api/hooks/{hook}"), &manager, None)
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN,
         "no owner means no non-master lifecycle authority"
     );
     assert_eq!(
-        send(&app, json_request("DELETE", &format!("/api/hooks/{hook}"), &master, None)).await.status,
+        send(
+            &app,
+            json_request("DELETE", &format!("/api/hooks/{hook}"), &master, None)
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT,
         "master is unaffected by ownership"
     );
@@ -5141,8 +7466,20 @@ async fn s3_only_master_reassigns_ownership() {
 
     // The current owner cannot hand ownership on. Letting it would let an owner walk away from a
     // resource rather than resolve it — the step §6's inventory exists to make impossible.
-    let by_owner = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook}"), &owner, Some(json!({ "owner_key_id": successor_id }))).await;
-    assert_eq!(by_owner.status, StatusCode::FORBIDDEN, "ownership is not delegable by its holder");
+    let by_owner = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{hook}"),
+        &owner,
+        Some(json!({ "owner_key_id": successor_id })),
+    )
+    .await;
+    assert_eq!(
+        by_owner.status,
+        StatusCode::FORBIDDEN,
+        "ownership is not delegable by its holder"
+    );
 
     // A dangling owner is refused: it would put the hook permanently beyond §3's non-master path
     // and make §6's inventory report an id resolving to nothing.
@@ -5156,23 +7493,55 @@ async fn s3_only_master_reassigns_ownership() {
         ),
     )
     .await;
-    assert_eq!(dangling.status, StatusCode::BAD_REQUEST, "the new owner must exist");
+    assert_eq!(
+        dangling.status,
+        StatusCode::BAD_REQUEST,
+        "the new owner must exist"
+    );
 
     let by_master = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook}"), &master, Some(json!({ "owner_key_id": successor_id }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook}"),
+            &master,
+            Some(json!({ "owner_key_id": successor_id })),
+        ),
     )
     .await;
-    assert_eq!(by_master.status, StatusCode::OK, "master reassigns: {}", by_master.raw);
+    assert_eq!(
+        by_master.status,
+        StatusCode::OK,
+        "master reassigns: {}",
+        by_master.raw
+    );
 
     // Authority moved with the column, in both directions.
     assert_eq!(
-        signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook}"), &owner, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "DELETE",
+            &format!("/api/hooks/{hook}"),
+            &owner,
+            None
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN,
         "the former owner lost lifecycle authority"
     );
     assert_eq!(
-        signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook}"), &successor, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "DELETE",
+            &format!("/api/hooks/{hook}"),
+            &successor,
+            None
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT,
         "and the new owner gained it"
     );
@@ -5195,50 +7564,119 @@ async fn r3_a_daughter_of_the_master_holds_no_authority_another_daughter_lacks()
 
     let hook = insert_hook(&db, "lineage_hook", &script, 30).await;
     let (master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
-    let parent = insert_key_full(&db, "ordinary-parent", "", KeyScopes {
-        can_manage_keys: true,
-        max_concurrent_jobs: 10,
-        ..Default::default()
-    })
+    let parent = insert_key_full(
+        &db,
+        "ordinary-parent",
+        "",
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Default::default()
+        },
+    )
     .await;
     let parent_id = parent.id;
 
     // Two daughters, differing only in who created them.
     let of_master = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "daughter-of-master" }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "daughter-of-master" })),
+        ),
     )
     .await;
     assert_eq!(of_master.status, StatusCode::OK);
-    let of_parent =
-        signed_send(&app, &mut clock, "POST", "/api/keys", &parent, Some(json!({ "name": "daughter-of-parent" })))
-            .await;
+    let of_parent = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        "/api/keys",
+        &parent,
+        Some(json!({ "name": "daughter-of-parent" })),
+    )
+    .await;
     assert_eq!(of_parent.status, StatusCode::OK);
 
     // Lineage was recorded, and recorded differently — otherwise the comparison below is vacuous.
     let id_of = |res: &TestResponse| -> Uuid {
-        res.json["id"].as_str().expect("id present").parse().expect("id parses")
+        res.json["id"]
+            .as_str()
+            .expect("id present")
+            .parse()
+            .expect("id parses")
     };
-    let daughter_of_master =
-        ApiKey::find_by_id(id_of(&of_master)).one(&db).await.expect("query").expect("row");
-    let daughter_of_parent =
-        ApiKey::find_by_id(id_of(&of_parent)).one(&db).await.expect("query").expect("row");
-    assert_eq!(daughter_of_master.parent_key_id, Some(master_id), "lineage records the master");
-    assert_eq!(daughter_of_parent.parent_key_id, Some(parent_id), "and the ordinary parent");
+    let daughter_of_master = ApiKey::find_by_id(id_of(&of_master))
+        .one(&db)
+        .await
+        .expect("query")
+        .expect("row");
+    let daughter_of_parent = ApiKey::find_by_id(id_of(&of_parent))
+        .one(&db)
+        .await
+        .expect("query")
+        .expect("row");
+    assert_eq!(
+        daughter_of_master.parent_key_id,
+        Some(master_id),
+        "lineage records the master"
+    );
+    assert_eq!(
+        daughter_of_parent.parent_key_id,
+        Some(parent_id),
+        "and the ordinary parent"
+    );
 
+    assert_lineage_confers_no_authority(&app, hook, &of_master, &of_parent).await;
+}
+
+async fn assert_lineage_confers_no_authority(
+    app: &axum::Router,
+    hook: Uuid,
+    of_master: &TestResponse,
+    of_parent: &TestResponse,
+) {
     // Every authority-bearing route answers identically for both.
-    let a = of_master.json["plaintext_key"].as_str().expect("key").to_owned();
-    let b = of_parent.json["plaintext_key"].as_str().expect("key").to_owned();
+    let a = of_master.json["plaintext_key"]
+        .as_str()
+        .expect("key")
+        .to_owned();
+    let b = of_parent.json["plaintext_key"]
+        .as_str()
+        .expect("key")
+        .to_owned();
     for (label, path, method, body) in [
-        ("execute the hook", format!("/api/hooks/{hook}/execute"), "POST", Some(json!({}))),
+        (
+            "execute the hook",
+            format!("/api/hooks/{hook}/execute"),
+            "POST",
+            Some(json!({})),
+        ),
         ("read the hook", format!("/api/hooks/{hook}"), "GET", None),
-        ("delete the hook", format!("/api/hooks/{hook}"), "DELETE", None),
-        ("create a key", "/api/keys".to_owned(), "POST", Some(json!({ "name": "x" }))),
-        ("read the audit log", "/api/audit-logs".to_owned(), "GET", None),
+        (
+            "delete the hook",
+            format!("/api/hooks/{hook}"),
+            "DELETE",
+            None,
+        ),
+        (
+            "create a key",
+            "/api/keys".to_owned(),
+            "POST",
+            Some(json!({ "name": "x" })),
+        ),
+        (
+            "read the audit log",
+            "/api/audit-logs".to_owned(),
+            "GET",
+            None,
+        ),
         ("read settings", "/api/settings".to_owned(), "GET", None),
     ] {
-        let from_master_line = send(&app, json_request(method, &path, &a, body.clone())).await;
-        let from_parent_line = send(&app, json_request(method, &path, &b, body)).await;
+        let from_master_line = send(app, json_request(method, &path, &a, body.clone())).await;
+        let from_parent_line = send(app, json_request(method, &path, &b, body)).await;
         assert_eq!(
             from_master_line.status, from_parent_line.status,
             "R3: being the master's daughter changed the answer for '{label}'              ({} vs {})",
@@ -5266,12 +7704,32 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
     set_parent(&db, victim_id, manager.id).await;
 
     // Self-grant on the privileged hook: the original exploit.
-    let self_grant = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{}/permissions", manager.id), &manager, Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": true }))).await;
-    assert_eq!(self_grant.status, StatusCode::FORBIDDEN, "self-granting must be refused");
+    let self_grant = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{}/permissions", manager.id),
+        &manager,
+        Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": true })),
+    )
+    .await;
+    assert_eq!(
+        self_grant.status,
+        StatusCode::FORBIDDEN,
+        "self-granting must be refused"
+    );
 
     // Still refused for an unprivileged hook: the rule is about granting to yourself, not about
     // which hook you picked.
-    let self_grant_plain = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{}/permissions", manager.id), &manager, Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false }))).await;
+    let self_grant_plain = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{}/permissions", manager.id),
+        &manager,
+        Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false })),
+    )
+    .await;
     assert_eq!(self_grant_plain.status, StatusCode::FORBIDDEN);
 
     // Granting to somebody else on an *ordinary* hook the caller does not manage is refused too.
@@ -5279,7 +7737,15 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
     // and so is not bounded by any one hook; R2 rejects that reasoning outright, because the scope
     // can also mint the key it grants to. The self-grant block below never contained the exploit on
     // its own — it only made it cost one extra credential.
-    let third_party = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false }))).await;
+    let third_party = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false })),
+    )
+    .await;
     assert_eq!(
         third_party.status,
         StatusCode::FORBIDDEN,
@@ -5288,7 +7754,17 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
 
     // The same request against the *privileged* hook is still refused, which is the boundary that
     // actually contains the override.
-    let third_party_privileged = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false }))).await;
+    let third_party_privileged = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        &manager,
+        Some(
+            json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false }),
+        ),
+    )
+    .await;
     assert_eq!(
         third_party_privileged.status,
         StatusCode::FORBIDDEN,
@@ -5296,17 +7772,62 @@ async fn regression_non_master_cannot_self_grant_hook_permissions() {
     );
 
     // The grant never landed: the manager still cannot reach the privileged hook.
-    let probe = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{privileged}/test"), &manager, None).await;
+    let probe = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{privileged}/test"),
+        &manager,
+        None,
+    )
+    .await;
     assert_eq!(probe.status, StatusCode::NOT_FOUND);
 
+    assert_delegation_depends_on_hook_authority(
+        &db, &app, &mut clock, &manager, victim_id, ordinary, privileged,
+    )
+    .await;
+}
+
+async fn assert_delegation_depends_on_hook_authority(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    clock: &mut i64,
+    manager: &SeededKey,
+    victim_id: Uuid,
+    ordinary: Uuid,
+    privileged: Uuid,
+) {
     // A caller who *does* manage the hook may still delegate it — the scope keeps working.
-    grant(&db, manager.id, ordinary, true, true).await;
-    let delegated = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false }))).await;
-    assert_eq!(delegated.status, StatusCode::OK, "delegating a hook you manage is still allowed");
+    grant(db, manager.id, ordinary, true, true).await;
+    let delegated = signed_send(
+        app,
+        clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        manager,
+        Some(json!({ "hook_id": ordinary.to_string(), "can_execute": true, "can_manage": false })),
+    )
+    .await;
+    assert_eq!(
+        delegated.status,
+        StatusCode::OK,
+        "delegating a hook you manage is still allowed"
+    );
 
     // ...but never on a privileged one, even with a legitimate manage grant.
-    grant(&db, manager.id, privileged, true, true).await;
-    let delegated_privileged = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false }))).await;
+    grant(db, manager.id, privileged, true, true).await;
+    let delegated_privileged = signed_send(
+        app,
+        clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        manager,
+        Some(
+            json!({ "hook_id": privileged.to_string(), "can_execute": true, "can_manage": false }),
+        ),
+    )
+    .await;
     assert_eq!(delegated_privileged.status, StatusCode::FORBIDDEN);
 }
 
@@ -5328,9 +7849,25 @@ async fn regression_non_master_cannot_repoint_a_privileged_hook() {
     grant(&db, editor.id, hook_id, true, true).await;
 
     // The original exploit: swap the binary, leave `run_as_user` untouched.
-    let repoint = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook_id}"), &editor, Some(json!({ "script_path": attacker }))).await;
-    assert_eq!(repoint.status, StatusCode::FORBIDDEN, "repointing a privileged hook must be refused");
-    assert!(repoint.string("error").contains("root"), "the refusal names the account: {}", repoint.string("error"));
+    let repoint = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{hook_id}"),
+        &editor,
+        Some(json!({ "script_path": attacker })),
+    )
+    .await;
+    assert_eq!(
+        repoint.status,
+        StatusCode::FORBIDDEN,
+        "repointing a privileged hook must be refused"
+    );
+    assert!(
+        repoint.string("error").contains("root"),
+        "the refusal names the account: {}",
+        repoint.string("error")
+    );
 
     // Every other field is gated too — the guard is on the hook's privileged status, not on which
     // field the payload happened to mention.
@@ -5341,20 +7878,48 @@ async fn regression_non_master_cannot_repoint_a_privileged_hook() {
         // Including clearing the elevation, which would otherwise just add a step to the attack.
         json!({ "run_as_user": "" }),
     ] {
-        let res = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{hook_id}"), &editor, Some(payload.clone())).await;
-        assert_eq!(res.status, StatusCode::FORBIDDEN, "modifying {payload} must be refused");
+        let res = signed_send(
+            &app,
+            &mut clock,
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &editor,
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "modifying {payload} must be refused"
+        );
     }
 
     // Parameters are argv for the elevated command, so the parameter routes are gated as well —
     // a defaulted parameter is how you feed `-c <command>` to a root hook without touching
     // script_path at all.
     let param_uri = format!("/api/hooks/{hook_id}/parameters");
-    let declare = signed_send(&app, &mut clock, "POST", &param_uri, &editor, Some(json!({ "param_key": "injected", "default_value": "-c" }))).await;
-    assert_eq!(declare.status, StatusCode::FORBIDDEN, "declaring a parameter on a root hook must be refused");
+    let declare = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &param_uri,
+        &editor,
+        Some(json!({ "param_key": "injected", "default_value": "-c" })),
+    )
+    .await;
+    assert_eq!(
+        declare.status,
+        StatusCode::FORBIDDEN,
+        "declaring a parameter on a root hook must be refused"
+    );
 
     // The hook is untouched: still the safe script, still elevated.
     let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
-    let after = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    let after = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
     assert_eq!(after.field("script_path"), &json!(safe));
     assert_eq!(after.field("run_as_user"), &json!("root"));
 
@@ -5362,14 +7927,27 @@ async fn regression_non_master_cannot_repoint_a_privileged_hook() {
     // elevation, and did not just turn `can_manage` into a decoration.
     let plain_id = insert_hook(&db, "plain_hook", &safe, 30).await;
     grant(&db, editor.id, plain_id, true, true).await;
-    let plain_edit = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{plain_id}"), &editor, Some(json!({ "script_path": attacker }))).await;
+    let plain_edit = signed_send(
+        &app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{plain_id}"),
+        &editor,
+        Some(json!({ "script_path": attacker })),
+    )
+    .await;
     assert_eq!(plain_edit.status, StatusCode::OK);
     assert_eq!(plain_edit.field("script_path"), &json!(attacker));
 
     // And a master may still administer the privileged hook.
     let by_master = send(
         &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "script_path": attacker }))),
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            &master,
+            Some(json!({ "script_path": attacker })),
+        ),
     )
     .await;
     assert_eq!(by_master.status, StatusCode::OK);
@@ -5397,7 +7975,11 @@ async fn regression_forged_forwarding_headers_cannot_defeat_bound_ips() {
         ("X-Real-IP", "10.1.2.3"),
         ("X-Forwarded-For", "::ffff:10.1.2.3"),
     ] {
-        let res = send(&app, forwarded_request("/api/auth/me", &scoped, header, value)).await;
+        let res = send(
+            &app,
+            forwarded_request("/api/auth/me", &scoped, header, value),
+        )
+        .await;
         assert_eq!(
             res.status,
             StatusCode::FORBIDDEN,
@@ -5412,14 +7994,24 @@ async fn regression_forged_forwarding_headers_cannot_defeat_bound_ips() {
     let script = scripts.write_script("noop.sh", "echo ok");
     let created = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "audited", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "audited", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK);
 
     let spoofed_audit = send(
         &app,
-        forwarded_request("/api/audit-logs", &master, "X-Forwarded-For", "203.0.113.77"),
+        forwarded_request(
+            "/api/audit-logs",
+            &master,
+            "X-Forwarded-For",
+            "203.0.113.77",
+        ),
     )
     .await;
     assert_eq!(spoofed_audit.status, StatusCode::OK);
@@ -5428,32 +8020,57 @@ async fn regression_forged_forwarding_headers_cannot_defeat_bound_ips() {
         "a forged address must never be recorded as client_ip: {}",
         spoofed_audit.raw
     );
-    assert!(spoofed_audit.raw.contains("127.0.0.1"), "the real TCP peer is what gets recorded");
+    assert!(
+        spoofed_audit.raw.contains("127.0.0.1"),
+        "the real TCP peer is what gets recorded"
+    );
 }
 
 /// A trusted proxy's headers are believed — the fix must not break real reverse-proxy deployments.
 #[tokio::test]
 async fn a_trusted_proxy_can_still_present_the_real_client_address() {
     let db = setup_test_db().await;
-    let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1/32", "10.0.0.0/8"]));
+    let app = create_app(test_state_with_trusted_proxies(
+        &db,
+        &["127.0.0.1/32", "10.0.0.0/8"],
+    ));
     let (_id, scoped) = insert_key(&db, "lan-only", "192.168.0.0/16", KeyScopes::plain()).await;
 
     // Without a header the peer itself is used, and 127.0.0.1 is outside the key's range.
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &scoped, None)).await.status,
+        send(&app, json_request("GET", "/api/auth/me", &scoped, None))
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
 
     // With one, the rightmost hop is taken as the client.
-    let res = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "203.0.113.1, 192.168.4.4")).await;
+    let res = send(
+        &app,
+        forwarded_request(
+            "/api/auth/me",
+            &scoped,
+            "X-Forwarded-For",
+            "203.0.113.1, 192.168.4.4",
+        ),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK);
 
     // An IPv4-mapped IPv6 hop still matches an IPv4 CIDR.
-    let mapped = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Real-IP", "::ffff:192.168.4.4")).await;
+    let mapped = send(
+        &app,
+        forwarded_request("/api/auth/me", &scoped, "X-Real-IP", "::ffff:192.168.4.4"),
+    )
+    .await;
     assert_eq!(mapped.status, StatusCode::OK);
 
     // A garbage header falls back to the peer rather than failing open.
-    let garbage = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "not-an-ip")).await;
+    let garbage = send(
+        &app,
+        forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "not-an-ip"),
+    )
+    .await;
     assert_eq!(garbage.status, StatusCode::FORBIDDEN);
 }
 
@@ -5469,7 +8086,9 @@ async fn bound_ips_restricts_master_keys_as_well() {
         let db = setup_test_db().await;
         let app = create_app(test_state(&db));
         let (_id, master) = insert_key(&db, "the-master", allowlist, KeyScopes::master()).await;
-        send(&app, json_request("GET", "/api/auth/me", &master, None)).await.status
+        send(&app, json_request("GET", "/api/auth/me", &master, None))
+            .await
+            .status
     }
 
     assert_eq!(
@@ -5512,14 +8131,32 @@ async fn a_non_master_delete_is_soft_and_leaves_the_row_intact() {
     grant(&db, editor.id, hook_id, true, true).await;
 
     // Run it once so there is history worth preserving.
-    let run = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/execute"), &editor, Some(json!({}))).await;
+    let run = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook_id}/execute"),
+        &editor,
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(run.status, StatusCode::OK);
 
-    let deleted = signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook_id}"), &editor, None).await;
+    let deleted = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("/api/hooks/{hook_id}"),
+        &editor,
+        None,
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
 
     // The row is still there, flagged and attributed.
-    let row = fetch_hook_row(&db, hook_id).await.expect("the row must survive a soft delete");
+    let row = fetch_hook_row(&db, hook_id)
+        .await
+        .expect("the row must survive a soft delete");
     assert!(row.is_deleted, "the hook is flagged as deleted");
     assert!(row.deleted_at.is_some(), "the deletion is timestamped");
     assert_eq!(
@@ -5528,15 +8165,32 @@ async fn a_non_master_delete_is_soft_and_leaves_the_row_intact() {
         "the acting key is recorded"
     );
     // Nothing cascaded: the parameter contract and the execution history are untouched.
-    assert_eq!(execution_count(&db).await, 1, "history survives a soft delete");
+    assert_eq!(
+        execution_count(&db).await,
+        1,
+        "history survives a soft delete"
+    );
 
     // ...but the API behaves as though it is gone, for every route.
     assert_eq!(
-        signed_send(&app, &mut clock, "GET", &format!("/api/hooks/{hook_id}"), &editor, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "GET",
+            &format!("/api/hooks/{hook_id}"),
+            &editor,
+            None
+        )
+        .await
+        .status,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        signed_send(&app, &mut clock, "GET", "/api/hooks", &editor, None).await.json.as_array().map(Vec::len),
+        signed_send(&app, &mut clock, "GET", "/api/hooks", &editor, None)
+            .await
+            .json
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "a trashed hook is absent from the listing"
     );
@@ -5547,13 +8201,29 @@ async fn a_non_master_delete_is_soft_and_leaves_the_row_intact() {
         ("GET", format!("/api/hooks/{hook_id}/parameters")),
     ] {
         let res = signed_send(&app, &mut clock, method, &uri, &editor, Some(json!({}))).await;
-        assert_eq!(res.status, StatusCode::NOT_FOUND, "{method} {uri} must treat a trashed hook as gone");
+        assert_eq!(
+            res.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must treat a trashed hook as gone"
+        );
     }
     // Above all: it cannot run.
-    assert_eq!(execution_count(&db).await, 1, "no execution was recorded for a trashed hook");
+    assert_eq!(
+        execution_count(&db).await,
+        1,
+        "no execution was recorded for a trashed hook"
+    );
 
     // A non-master cannot see the trash, by name or by flag.
-    let peeking = signed_send(&app, &mut clock, "GET", "/api/hooks?include_deleted=true", &editor, None).await;
+    let peeking = signed_send(
+        &app,
+        &mut clock,
+        "GET",
+        "/api/hooks?include_deleted=true",
+        &editor,
+        None,
+    )
+    .await;
     assert_eq!(peeking.status, StatusCode::FORBIDDEN);
 }
 
@@ -5569,26 +8239,47 @@ async fn a_master_can_view_restore_and_hard_delete_a_trashed_hook() {
     let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
     assert_eq!(
-        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &master, None)).await.status,
+        send(
+            &app,
+            json_request("DELETE", &format!("/api/hooks/{hook_id}"), &master, None)
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT
     );
 
     // Default listing hides it; the trash view shows it, flagged.
     assert_eq!(
-        send(&app, json_request("GET", "/api/hooks", &master, None)).await.json.as_array().map(Vec::len),
+        send(&app, json_request("GET", "/api/hooks", &master, None))
+            .await
+            .json
+            .as_array()
+            .map(Vec::len),
         Some(0)
     );
-    let trash = send(&app, json_request("GET", "/api/hooks?include_deleted=true", &master, None)).await;
+    let trash = send(
+        &app,
+        json_request("GET", "/api/hooks?include_deleted=true", &master, None),
+    )
+    .await;
     assert_eq!(trash.status, StatusCode::OK);
     let rows = trash.json.as_array().cloned().unwrap_or_default();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["is_deleted"], json!(true));
-    assert!(rows[0]["deleted_at"].is_string(), "the trash view reports when it was deleted");
+    assert!(
+        rows[0]["deleted_at"].is_string(),
+        "the trash view reports when it was deleted"
+    );
 
     // Restore brings it back into service.
     let restored = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/restore"), &master, None),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/restore"),
+            &master,
+            None,
+        ),
     )
     .await;
     assert_eq!(restored.status, StatusCode::OK);
@@ -5598,19 +8289,46 @@ async fn a_master_can_view_restore_and_hard_delete_a_trashed_hook() {
 
     // It is fully live again.
     assert_eq!(
-        send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await.status,
+        send(
+            &app,
+            json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)
+        )
+        .await
+        .status,
         StatusCode::OK
     );
     // Restoring something that is not deleted is a 400, not a silent no-op.
-    let again = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/restore"), &master, None)).await;
+    let again = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/restore"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(again.status, StatusCode::BAD_REQUEST);
 
     // Hard delete drops the row for good.
     assert_eq!(
-        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}?hard=true"), &master, None)).await.status,
+        send(
+            &app,
+            json_request(
+                "DELETE",
+                &format!("/api/hooks/{hook_id}?hard=true"),
+                &master,
+                None
+            )
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT
     );
-    assert!(fetch_hook_row(&db, hook_id).await.is_none(), "a hard delete removes the row");
+    assert!(
+        fetch_hook_row(&db, hook_id).await.is_none(),
+        "a hard delete removes the row"
+    );
 }
 
 /// Restore and hard delete are master-only; a `can_manage` grant is not enough.
@@ -5632,19 +8350,49 @@ async fn trash_management_is_master_only() {
 
     // A non-master cannot destroy the row even on a hook it fully manages: hard delete discards an
     // audit trail, which no scoped grant should be able to do.
-    let hard = signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook_id}?hard=true"), &editor, None).await;
+    let hard = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("/api/hooks/{hook_id}?hard=true"),
+        &editor,
+        None,
+    )
+    .await;
     assert_eq!(hard.status, StatusCode::FORBIDDEN);
-    assert!(fetch_hook_row(&db, hook_id).await.is_some(), "the row survives the refused hard delete");
+    assert!(
+        fetch_hook_row(&db, hook_id).await.is_some(),
+        "the row survives the refused hard delete"
+    );
 
     // Soft delete, then confirm restore is refused too.
     assert_eq!(
-        signed_send(&app, &mut clock, "DELETE", &format!("/api/hooks/{hook_id}"), &editor, None).await.status,
+        signed_send(
+            &app,
+            &mut clock,
+            "DELETE",
+            &format!("/api/hooks/{hook_id}"),
+            &editor,
+            None
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT
     );
-    let restore = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook_id}/restore"), &editor, None).await;
+    let restore = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook_id}/restore"),
+        &editor,
+        None,
+    )
+    .await;
     assert_eq!(restore.status, StatusCode::FORBIDDEN);
     assert!(
-        fetch_hook_row(&db, hook_id).await.is_some_and(|h| h.is_deleted),
+        fetch_hook_row(&db, hook_id)
+            .await
+            .is_some_and(|h| h.is_deleted),
         "the hook stays in the trash"
     );
 }
@@ -5661,9 +8409,21 @@ async fn deleting_a_privileged_hook_stays_master_only() {
     let (key_id, editor) = insert_key(&db, "editor", "", KeyScopes::plain()).await;
     grant(&db, key_id, hook_id, true, true).await;
 
-    let soft = send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &editor, None)).await;
-    assert_eq!(soft.status, StatusCode::FORBIDDEN, "even trashing an elevated hook is master-only");
-    assert!(fetch_hook_row(&db, hook_id).await.is_some_and(|h| !h.is_deleted));
+    let soft = send(
+        &app,
+        json_request("DELETE", &format!("/api/hooks/{hook_id}"), &editor, None),
+    )
+    .await;
+    assert_eq!(
+        soft.status,
+        StatusCode::FORBIDDEN,
+        "even trashing an elevated hook is master-only"
+    );
+    assert!(
+        fetch_hook_row(&db, hook_id)
+            .await
+            .is_some_and(|h| !h.is_deleted)
+    );
 }
 
 /// A trashed hook still holds its unique name, and the conflict says so.
@@ -5682,13 +8442,23 @@ async fn a_trashed_hook_still_holds_its_name_and_says_so() {
     let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
 
     assert_eq!(
-        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}"), &master, None)).await.status,
+        send(
+            &app,
+            json_request("DELETE", &format!("/api/hooks/{hook_id}"), &master, None)
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT
     );
 
     let conflict = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "taken_name", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "taken_name", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(conflict.status, StatusCode::CONFLICT);
@@ -5700,12 +8470,27 @@ async fn a_trashed_hook_still_holds_its_name_and_says_so() {
 
     // Freeing the name makes the create succeed.
     assert_eq!(
-        send(&app, json_request("DELETE", &format!("/api/hooks/{hook_id}?hard=true"), &master, None)).await.status,
+        send(
+            &app,
+            json_request(
+                "DELETE",
+                &format!("/api/hooks/{hook_id}?hard=true"),
+                &master,
+                None
+            )
+        )
+        .await
+        .status,
         StatusCode::NO_CONTENT
     );
     let created = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "taken_name", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "taken_name", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK);
@@ -5724,31 +8509,68 @@ async fn the_purge_removes_only_trash_past_the_retention_window() {
     let inside = insert_hook_deleted_days_ago(&db, "inside", "/bin/true", 91, owner_id).await;
     let outside = insert_hook_deleted_days_ago(&db, "outside", "/bin/true", 93, owner_id).await;
 
-    let purged = send(&app, json_request("POST", "/api/system/purge-hooks", &master, None)).await;
+    let purged = send(
+        &app,
+        json_request("POST", "/api/system/purge-hooks", &master, None),
+    )
+    .await;
     assert_eq!(purged.status, StatusCode::OK);
-    assert_eq!(purged.field("purged"), &json!(1), "only the row past 92 days is dropped");
+    assert_eq!(
+        purged.field("purged"),
+        &json!(1),
+        "only the row past 92 days is dropped"
+    );
     assert_eq!(purged.field("older_than_days"), &json!(92));
 
-    assert!(fetch_hook_row(&db, outside).await.is_none(), "expired trash is gone");
-    assert!(fetch_hook_row(&db, inside).await.is_some(), "trash inside the window survives");
-    assert!(fetch_hook_row(&db, fresh).await.is_some(), "recent trash survives");
-    assert!(fetch_hook_row(&db, live).await.is_some(), "a live hook is never touched");
+    assert!(
+        fetch_hook_row(&db, outside).await.is_none(),
+        "expired trash is gone"
+    );
+    assert!(
+        fetch_hook_row(&db, inside).await.is_some(),
+        "trash inside the window survives"
+    );
+    assert!(
+        fetch_hook_row(&db, fresh).await.is_some(),
+        "recent trash survives"
+    );
+    assert!(
+        fetch_hook_row(&db, live).await.is_some(),
+        "a live hook is never touched"
+    );
 
     // The threshold is overridable for an operator reclaiming space sooner.
     let aggressive = send(
         &app,
-        json_request("POST", "/api/system/purge-hooks?older_than_days=30", &master, None),
+        json_request(
+            "POST",
+            "/api/system/purge-hooks?older_than_days=30",
+            &master,
+            None,
+        ),
     )
     .await;
     assert_eq!(aggressive.status, StatusCode::OK);
-    assert_eq!(aggressive.field("purged"), &json!(1), "the 91-day row is now in scope");
+    assert_eq!(
+        aggressive.field("purged"),
+        &json!(1),
+        "the 91-day row is now in scope"
+    );
     assert!(fetch_hook_row(&db, inside).await.is_none());
-    assert!(fetch_hook_row(&db, live).await.is_some(), "a live hook is still never touched");
+    assert!(
+        fetch_hook_row(&db, live).await.is_some(),
+        "a live hook is still never touched"
+    );
 
     // A zero threshold is a no-op rather than "delete everything", matching LOG_RETENTION_DAYS=0.
     let zero = send(
         &app,
-        json_request("POST", "/api/system/purge-hooks?older_than_days=0", &master, None),
+        json_request(
+            "POST",
+            "/api/system/purge-hooks?older_than_days=0",
+            &master,
+            None,
+        ),
     )
     .await;
     assert_eq!(zero.field("purged"), &json!(0));
@@ -5761,18 +8583,34 @@ async fn the_purge_endpoint_is_master_only_and_validated() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let (owner_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
-    let scopes = KeyScopes { can_manage_hooks: true, max_concurrent_jobs: 10, ..Default::default() };
+    let scopes = KeyScopes {
+        can_manage_hooks: true,
+        max_concurrent_jobs: 10,
+        ..Default::default()
+    };
     let (_id, manager) = insert_key(&db, "manager", "", scopes).await;
 
     let expired = insert_hook_deleted_days_ago(&db, "expired", "/bin/true", 200, owner_id).await;
 
-    let refused = send(&app, json_request("POST", "/api/system/purge-hooks", &manager, None)).await;
+    let refused = send(
+        &app,
+        json_request("POST", "/api/system/purge-hooks", &manager, None),
+    )
+    .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
-    assert!(fetch_hook_row(&db, expired).await.is_some(), "the refused purge changed nothing");
+    assert!(
+        fetch_hook_row(&db, expired).await.is_some(),
+        "the refused purge changed nothing"
+    );
 
     let negative = send(
         &app,
-        json_request("POST", "/api/system/purge-hooks?older_than_days=-1", &master, None),
+        json_request(
+            "POST",
+            "/api/system/purge-hooks?older_than_days=-1",
+            &master,
+            None,
+        ),
     )
     .await;
     assert_eq!(negative.status, StatusCode::BAD_REQUEST);
@@ -5789,7 +8627,10 @@ async fn the_retention_worker_purges_expired_trash_on_its_own() {
 
     let state = AppState::new(
         db.clone(),
-        Arc::new(RuntimeConfig { retention_sweep_seconds: 1, ..(*test_config()).clone() }),
+        Arc::new(RuntimeConfig {
+            retention_sweep_seconds: 1,
+            ..(*test_config()).clone()
+        }),
         test_cipher(),
     );
     let (shutdown_tx, worker) = spawn_retention_worker(&state);
@@ -5801,7 +8642,10 @@ async fn the_retention_worker_purges_expired_trash_on_its_own() {
         .await,
         "the worker should purge trash past the 92-day window"
     );
-    assert!(fetch_hook_row(&db, recent).await.is_some(), "recent trash is left alone");
+    assert!(
+        fetch_hook_row(&db, recent).await.is_some(),
+        "recent trash is left alone"
+    );
 
     drop(shutdown_tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
@@ -5825,7 +8669,9 @@ async fn a_hostname_trusted_proxy_is_resolved_and_honoured() {
 
     // Without a header the peer itself is used, and loopback is outside the key's range.
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &scoped, None)).await.status,
+        send(&app, json_request("GET", "/api/auth/me", &scoped, None))
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
 
@@ -5834,7 +8680,11 @@ async fn a_hostname_trusted_proxy_is_resolved_and_honoured() {
         forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "192.168.4.4"),
     )
     .await;
-    assert_eq!(forwarded.status, StatusCode::OK, "a name-resolved proxy's header is believed");
+    assert_eq!(
+        forwarded.status,
+        StatusCode::OK,
+        "a name-resolved proxy's header is believed"
+    );
 }
 
 /// A Docker bridge CIDR works alongside a hostname, and neither widens the other.
@@ -5842,13 +8692,20 @@ async fn a_hostname_trusted_proxy_is_resolved_and_honoured() {
 async fn docker_cidrs_and_hostnames_coexist_without_widening_trust() {
     let db = setup_test_db().await;
     // The classic Docker/Traefik shape: the bridge network plus the proxy's service name.
-    let app = create_app(test_state_with_trusted_proxies(&db, &["172.16.0.0/12", "traefik"]));
+    let app = create_app(test_state_with_trusted_proxies(
+        &db,
+        &["172.16.0.0/12", "traefik"],
+    ));
     let (_id, scoped) = insert_key(&db, "lan-only", "10.0.0.0/8", KeyScopes::plain()).await;
 
     // The test peer is 127.0.0.1: not in the bridge range, and `traefik` does not resolve here.
     // Its forged header must therefore be ignored outright.
     for value in ["10.1.2.3", "10.1.2.3, 10.4.5.6"] {
-        let res = send(&app, forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", value)).await;
+        let res = send(
+            &app,
+            forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", value),
+        )
+        .await;
         assert_eq!(
             res.status,
             StatusCode::FORBIDDEN,
@@ -5865,16 +8722,28 @@ async fn docker_cidrs_and_hostnames_coexist_without_widening_trust() {
 #[tokio::test]
 async fn a_proxy_chain_resolves_to_the_real_client() {
     let db = setup_test_db().await;
-    let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1", "172.16.0.0/12"]));
+    let app = create_app(test_state_with_trusted_proxies(
+        &db,
+        &["127.0.0.1", "172.16.0.0/12"],
+    ));
     let (_id, scoped) = insert_key(&db, "corp", "203.0.113.0/24", KeyScopes::plain()).await;
 
     // client(203.0.113.50) → P1(172.16.0.9) → us(127.0.0.1). The header's last entry is P1.
     let res = send(
         &app,
-        forwarded_request("/api/auth/me", &scoped, "X-Forwarded-For", "203.0.113.50, 172.16.0.9"),
+        forwarded_request(
+            "/api/auth/me",
+            &scoped,
+            "X-Forwarded-For",
+            "203.0.113.50, 172.16.0.9",
+        ),
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "the trusted hop is peeled to reach the real client");
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "the trusted hop is peeled to reach the real client"
+    );
 
     // A client prepending a lie cannot displace the suffix the proxies appended.
     let spoofed = send(
@@ -5917,8 +8786,14 @@ async fn an_unauthenticated_caller_cannot_distinguish_a_bad_key_from_a_bad_sourc
 
     // No signature at all, with signing mandatory.
     let unsigned = |key: &str| json_request("GET", "/api/auth/me", key, None);
-    assert_eq!(send(&app, unsigned(&elsewhere.plaintext)).await.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(send(&app, unsigned(&local.plaintext)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, unsigned(&elsewhere.plaintext)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&app, unsigned(&local.plaintext)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // A *wrong* signature — the stolen-key case. The out-of-network key must not answer 403 while
     // the in-network one answers 401; that difference is the oracle.
@@ -5944,12 +8819,21 @@ async fn an_unauthenticated_caller_cannot_distinguish_a_bad_key_from_a_bad_sourc
     );
 
     // And an unknown key is indistinguishable from both.
-    assert_eq!(send(&app, wrong_signature("no-such-key")).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, wrong_signature("no-such-key")).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // Authorization still happens — it just happens *after* authentication succeeds.
     let authenticated_but_out_of_network = send(
         &app,
-        signed_bearer_request("GET", "/api/auth/me", &elsewhere.plaintext, &elsewhere.signing_secret, ""),
+        signed_bearer_request(
+            "GET",
+            "/api/auth/me",
+            &elsewhere.plaintext,
+            &elsewhere.signing_secret,
+            "",
+        ),
     )
     .await;
     assert_eq!(
@@ -5992,7 +8876,11 @@ async fn an_intercepted_signed_request_cannot_be_replayed_inside_the_window() {
     };
 
     let first = send(&app, intercepted()).await;
-    assert_eq!(first.status, StatusCode::OK, "the legitimate request goes through");
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "the legitimate request goes through"
+    );
     assert_eq!(first.field("status"), &json!("SUCCESS"));
 
     // Byte-for-byte the same request: same key, same timestamp, same signature, same body. The
@@ -6009,7 +8897,10 @@ async fn an_intercepted_signed_request_cannot_be_replayed_inside_the_window() {
 
     // Replaying it repeatedly stays refused rather than sliding through on a later attempt.
     for _ in 0..3 {
-        assert_eq!(send(&app, intercepted()).await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            send(&app, intercepted()).await.status,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     // A freshly signed request from the same key still works — the guard rejects reuse, not the key.
@@ -6025,7 +8916,11 @@ async fn an_intercepted_signed_request_cannot_be_replayed_inside_the_window() {
         ),
     )
     .await;
-    assert_eq!(fresh.status, StatusCode::OK, "a distinct signature is not a replay");
+    assert_eq!(
+        fresh.status,
+        StatusCode::OK,
+        "a distinct signature is not a replay"
+    );
 }
 
 /// `HMAC_ONLY` (`hooks.auth_mode`) is deliberately exempt from single-use enforcement: it carries
@@ -6074,7 +8969,11 @@ async fn hmac_only_hooks_are_not_subject_to_single_use_enforcement() {
         .body(axum::body::Body::from(body))
         .expect("request builds");
         let response = send(&app, request).await;
-        assert_eq!(response.status, StatusCode::OK, "redelivery {attempt} must be accepted");
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "redelivery {attempt} must be accepted"
+        );
     }
 }
 
@@ -6103,7 +9002,13 @@ async fn tampering_with_the_query_string_invalidates_the_signature() {
             .header("X-Timestamp", timestamp.to_string())
             .header(
                 "X-Signature-256",
-                sign_request(&master.signing_secret, "DELETE", &signed_path, timestamp, ""),
+                sign_request(
+                    &master.signing_secret,
+                    "DELETE",
+                    &signed_path,
+                    timestamp,
+                    "",
+                ),
             ),
     )
     .body(axum::body::Body::empty())
@@ -6165,9 +9070,17 @@ async fn the_body_limit_is_three_mib_and_shared_by_the_router_and_the_signature_
     let body = json!({ "parameters": {}, "padding": padding }).to_string();
     assert!(body.len() > 1024 * 1024 && body.len() < simply_hook_executor::MAX_REQUEST_BODY_BYTES);
 
-    let response =
-        send(&app, signed_request("POST", &uri, &sender.plaintext, &sender.signing_secret, &body))
-            .await;
+    let response = send(
+        &app,
+        signed_request(
+            "POST",
+            &uri,
+            &sender.plaintext,
+            &sender.signing_secret,
+            &body,
+        ),
+    )
+    .await;
     assert_eq!(
         response.status,
         StatusCode::OK,
@@ -6209,26 +9122,47 @@ async fn the_purge_spares_live_and_restored_hooks_whatever_their_deleted_at_says
     // A restored hook: `is_deleted` cleared, but `deleted_at` deliberately left behind, which is
     // exactly the row the `is_deleted = true` guard exists to protect.
     let restored = insert_hook_deleted_days_ago(&db, "brought_back", &script, 300, owner.id).await;
-    let model = fetch_hook_row(&db, restored).await.expect("the restored hook exists");
+    let model = fetch_hook_row(&db, restored)
+        .await
+        .expect("the restored hook exists");
     let mut active: simply_hook_executor::entities::hook::ActiveModel = model.into();
     active.is_deleted = Set(false);
     active.update(&db).await.expect("restore succeeds");
 
-    let removed = purge_expired_deleted_hooks(&db, 92).await.expect("the sweep runs");
-    assert_eq!(removed, 1, "only the genuinely expired trashed hook is destroyed");
+    let removed = purge_expired_deleted_hooks(&db, 92)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(
+        removed, 1,
+        "only the genuinely expired trashed hook is destroyed"
+    );
 
-    assert!(fetch_hook_row(&db, live).await.is_some(), "a live hook is untouched");
-    assert!(fetch_hook_row(&db, recent).await.is_some(), "trash inside the window is kept");
+    assert!(
+        fetch_hook_row(&db, live).await.is_some(),
+        "a live hook is untouched"
+    );
+    assert!(
+        fetch_hook_row(&db, recent).await.is_some(),
+        "trash inside the window is kept"
+    );
     assert!(
         fetch_hook_row(&db, restored).await.is_some(),
         "a restored hook must survive its own stale deleted_at"
     );
-    assert!(fetch_hook_row(&db, trashed).await.is_none(), "expired trash is gone");
+    assert!(
+        fetch_hook_row(&db, trashed).await.is_none(),
+        "expired trash is gone"
+    );
 
     // A disabled window keeps everything, so an operator can opt out without stopping the worker.
     let still_there =
         insert_hook_deleted_days_ago(&db, "kept_forever", &script, 999, owner.id).await;
-    assert_eq!(purge_expired_deleted_hooks(&db, 0).await.expect("no-op sweep"), 0);
+    assert_eq!(
+        purge_expired_deleted_hooks(&db, 0)
+            .await
+            .expect("no-op sweep"),
+        0
+    );
     assert!(fetch_hook_row(&db, still_there).await.is_some());
 }
 
@@ -6237,10 +9171,13 @@ async fn the_purge_spares_live_and_restored_hooks_whatever_their_deleted_at_says
 #[tokio::test]
 async fn the_hook_retention_window_is_configurable_and_independent_of_log_retention() {
     use simply_hook_executor::retention::{
-        purge_expired_deleted_hooks, DEFAULT_DELETED_HOOK_RETENTION_DAYS,
+        DEFAULT_DELETED_HOOK_RETENTION_DAYS, purge_expired_deleted_hooks,
     };
 
-    assert_eq!(DEFAULT_DELETED_HOOK_RETENTION_DAYS, 92, "the converged default");
+    assert_eq!(
+        DEFAULT_DELETED_HOOK_RETENTION_DAYS, 92,
+        "the converged default"
+    );
 
     let db = setup_test_db().await;
     let owner = insert_key_full(&db, "owner", "", KeyScopes::hook_manager()).await;
@@ -6251,7 +9188,9 @@ async fn the_hook_retention_window_is_configurable_and_independent_of_log_retent
 
     // Survives the default window...
     assert_eq!(
-        purge_expired_deleted_hooks(&db, DEFAULT_DELETED_HOOK_RETENTION_DAYS).await.expect("sweep"),
+        purge_expired_deleted_hooks(&db, DEFAULT_DELETED_HOOK_RETENTION_DAYS)
+            .await
+            .expect("sweep"),
         0
     );
     assert!(fetch_hook_row(&db, hook).await.is_some());
@@ -6307,7 +9246,15 @@ async fn a_parents_delegated_grant_cannot_exceed_the_verbs_it_holds() {
     // below would be a `404` about visibility rather than the `403` about R1 under test.
     set_parent(&db, accomplice_id, manager.id).await;
 
-    let over_grant = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{accomplice_id}/permissions"), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false }))).await;
+    let over_grant = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{accomplice_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+    )
+    .await;
     assert_eq!(
         over_grant.status,
         StatusCode::FORBIDDEN,
@@ -6322,36 +9269,89 @@ async fn a_parents_delegated_grant_cannot_exceed_the_verbs_it_holds() {
     // The refusal was real: no row was written, so the accomplice still cannot run the hook.
     let attempt = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &accomplice, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook}/execute"),
+            &accomplice,
+            Some(json!({})),
+        ),
     )
     .await;
     // `404`, not `403`: with no row the accomplice cannot see the hook at all (§4).
-    assert_eq!(attempt.status, StatusCode::NOT_FOUND, "the blocked grant never landed");
+    assert_eq!(
+        attempt.status,
+        StatusCode::NOT_FOUND,
+        "the blocked grant never landed"
+    );
 
     // Handing out a verb the caller *does* hold still works — this is proportionality, not a ban
     // on delegation.
-    let within_bounds = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{accomplice_id}/permissions"), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": true }))).await;
-    assert_eq!(within_bounds.status, StatusCode::OK, "delegating a verb you hold is allowed");
+    let within_bounds = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{accomplice_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": true })),
+    )
+    .await;
+    assert_eq!(
+        within_bounds.status,
+        StatusCode::OK,
+        "delegating a verb you hold is allowed"
+    );
 
     // Revoking is never an escalation, so turning a flag off is allowed even for the verb the
     // caller lacks: `false` cannot exceed anything.
-    let revoke = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{accomplice_id}/permissions"), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false }))).await;
-    assert_eq!(revoke.status, StatusCode::OK, "revocation must not require holding the verb");
+    let revoke = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{accomplice_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+    )
+    .await;
+    assert_eq!(
+        revoke.status,
+        StatusCode::OK,
+        "revocation must not require holding the verb"
+    );
 
     // On a hook where the caller genuinely holds execution, the identical request succeeds —
     // proving the block was about the caller's own grant and nothing else about the payload.
     let held_fully = insert_hook(&db, "fully_held_hook", &script, 30).await;
     grant(&db, manager.id, held_fully, true, true).await;
-    let now_permitted = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{accomplice_id}/permissions"), &manager, Some(
-                json!({ "hook_id": held_fully.to_string(), "can_execute": true, "can_manage": false }),
-            )).await;
-    assert_eq!(now_permitted.status, StatusCode::OK, "holding the verb makes the grant legitimate");
-
-    // A master key is exempt, as everywhere else in the RBAC model.
-    let (_, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
-    let (bystander_id, _) = insert_key(&db, "bystander", "", KeyScopes::plain()).await;
-    let by_master = send(
+    let now_permitted = signed_send(
         &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{accomplice_id}/permissions"),
+        &manager,
+        Some(
+            json!({ "hook_id": held_fully.to_string(), "can_execute": true, "can_manage": false }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        now_permitted.status,
+        StatusCode::OK,
+        "holding the verb makes the grant legitimate"
+    );
+
+    assert_master_can_delegate_unconditionally(&db, &app, hook).await;
+}
+
+async fn assert_master_can_delegate_unconditionally(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    hook: Uuid,
+) {
+    // A master key is exempt, as everywhere else in the RBAC model.
+    let (_, master) = insert_key(db, "master", "", KeyScopes::master()).await;
+    let (bystander_id, _) = insert_key(db, "bystander", "", KeyScopes::plain()).await;
+    let by_master = send(
+        app,
         json_request(
             "POST",
             &format!("/api/keys/{bystander_id}/permissions"),
@@ -6360,7 +9360,11 @@ async fn a_parents_delegated_grant_cannot_exceed_the_verbs_it_holds() {
         ),
     )
     .await;
-    assert_eq!(by_master.status, StatusCode::OK, "master keys bypass proportionality");
+    assert_eq!(
+        by_master.status,
+        StatusCode::OK,
+        "master keys bypass proportionality"
+    );
 }
 
 /// A **local manager** holding no grant on the target hook is still refused.
@@ -6387,7 +9391,15 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
     set_parent(&db, victim_id, manager.id).await;
 
     // No row on the target hook at all.
-    let no_grant = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false }))).await;
+    let no_grant = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+    )
+    .await;
     // §4: no row on the target hook means the hook is invisible to this caller, so the refusal is
     // the one a nonexistent hook produces. The `403` "manage access" wording is reserved for a
     // caller that *does* hold a row and is short the global half of R2.
@@ -6400,7 +9412,15 @@ async fn granting_on_a_hook_the_caller_does_not_manage_is_still_refused() {
 
     // A row that grants execution but not management is not authority to administer grants either.
     grant(&db, manager.id, hook, true, false).await;
-    let execute_only = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false }))).await;
+    let execute_only = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+    )
+    .await;
     // The caller now holds `can_execute` but not `can_manage` on this hook. It can *see* the hook,
     // so §4 is satisfied and the refusal is R2's — the manage row is what is missing.
     assert_eq!(
@@ -6431,14 +9451,19 @@ async fn a_caller_managing_nothing_is_refused_before_the_target_key_is_looked_up
     // An execute-only row is not management, so this caller manages nothing.
     grant(&db, nobody_id, hook, true, false).await;
 
-    for (label, target) in [("a real key", victim_id), ("a key that does not exist", Uuid::new_v4())] {
+    for (label, target) in [
+        ("a real key", victim_id),
+        ("a key that does not exist", Uuid::new_v4()),
+    ] {
         let refused = send(
             &app,
             json_request(
                 "POST",
                 &format!("/api/keys/{target}/permissions"),
                 &nobody,
-                Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+                Some(
+                    json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true }),
+                ),
             ),
         )
         .await;
@@ -6452,10 +9477,19 @@ async fn a_caller_managing_nothing_is_refused_before_the_target_key_is_looked_up
     // Same on the revoke path, which shares the standing check.
     let revoke = send(
         &app,
-        json_request("DELETE", &format!("/api/keys/{victim_id}/permissions/{hook}"), &nobody, None),
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{victim_id}/permissions/{hook}"),
+            &nobody,
+            None,
+        ),
     )
     .await;
-    assert_eq!(revoke.status, StatusCode::FORBIDDEN, "revoke shares the standing check");
+    assert_eq!(
+        revoke.status,
+        StatusCode::FORBIDDEN,
+        "revoke shares the standing check"
+    );
 }
 
 /// **R2** — `can_manage_keys` is necessary but never sufficient. It is not a global bypass.
@@ -6482,7 +9516,15 @@ async fn r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused() {
     // below would be about visibility rather than about R2.
     set_parent(&db, worker_id, admin.id).await;
 
-    let granted = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{worker_id}/permissions"), &admin, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true }))).await;
+    let granted = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{worker_id}/permissions"),
+        &admin,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+    )
+    .await;
     assert_eq!(
         granted.status,
         StatusCode::FORBIDDEN,
@@ -6493,10 +9535,19 @@ async fn r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused() {
     // The refusal is real, not merely a status: nothing was written, so the worker cannot run it.
     let ran = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &worker, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook}/execute"),
+            &worker,
+            Some(json!({})),
+        ),
     )
     .await;
-    assert_eq!(ran.status, StatusCode::NOT_FOUND, "the blocked grant never landed");
+    assert_eq!(
+        ran.status,
+        StatusCode::NOT_FOUND,
+        "the blocked grant never landed"
+    );
 
     // Revocation takes the same route and is refused identically — the two directions agree about
     // who may act, or the stricter one is simply routed around.
@@ -6509,13 +9560,30 @@ async fn r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused() {
         None,
     )
     .await;
-    assert_eq!(revoked.status, StatusCode::FORBIDDEN, "revoke enforces the same conjunction");
+    assert_eq!(
+        revoked.status,
+        StatusCode::FORBIDDEN,
+        "revoke enforces the same conjunction"
+    );
 
     // Supplying the missing half makes both succeed, which is what proves the refusals above were
     // about the conjunction rather than about something incidental to this fixture.
     grant(&db, admin.id, hook, true, true).await;
-    let now_granted = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{worker_id}/permissions"), &admin, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true }))).await;
-    assert_eq!(now_granted.status, StatusCode::OK, "both halves of R2 present: {}", now_granted.raw);
+    let now_granted = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{worker_id}/permissions"),
+        &admin,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+    )
+    .await;
+    assert_eq!(
+        now_granted.status,
+        StatusCode::OK,
+        "both halves of R2 present: {}",
+        now_granted.raw
+    );
 
     let now_revoked = signed_send(
         &app,
@@ -6526,7 +9594,11 @@ async fn r2_a_can_manage_keys_holder_without_a_row_on_the_hook_is_refused() {
         None,
     )
     .await;
-    assert_eq!(now_revoked.status, StatusCode::NO_CONTENT, "and revoke likewise");
+    assert_eq!(
+        now_revoked.status,
+        StatusCode::NO_CONTENT,
+        "and revoke likewise"
+    );
 }
 
 /// **R2** — the other half, from the other side: a manage row without `can_manage_keys`.
@@ -6544,8 +9616,7 @@ async fn r2_a_daughter_holding_only_a_manage_row_may_not_administer_grants() {
 
     let hook = insert_hook(&db, "daughter_governed_hook", &script, 30).await;
     // Full rights on the hook — both verbs — and still not a manager of its grants.
-    let (_daughter_id, daughter) =
-        seed_daughter_with_manage_row(&db, "daughter", hook, true).await;
+    let (_daughter_id, daughter) = seed_daughter_with_manage_row(&db, "daughter", hook, true).await;
     let (worker_id, worker) = insert_key(&db, "worker", "", KeyScopes::plain()).await;
 
     let granted = send(
@@ -6569,17 +9640,35 @@ async fn r2_a_daughter_holding_only_a_manage_row_may_not_administer_grants() {
     // administers grants, not who may use the hook.
     let ran = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &daughter, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook}/execute"),
+            &daughter,
+            Some(json!({})),
+        ),
     )
     .await;
-    assert_eq!(ran.status, StatusCode::OK, "the daughter may still run the hook it manages");
+    assert_eq!(
+        ran.status,
+        StatusCode::OK,
+        "the daughter may still run the hook it manages"
+    );
 
     let revoked = send(
         &app,
-        json_request("DELETE", &format!("/api/keys/{worker_id}/permissions/{hook}"), &daughter, None),
+        json_request(
+            "DELETE",
+            &format!("/api/keys/{worker_id}/permissions/{hook}"),
+            &daughter,
+            None,
+        ),
     )
     .await;
-    assert_eq!(revoked.status, StatusCode::FORBIDDEN, "revoke enforces the same conjunction");
+    assert_eq!(
+        revoked.status,
+        StatusCode::FORBIDDEN,
+        "revoke enforces the same conjunction"
+    );
 
     let _ = worker;
 }
@@ -6628,12 +9717,21 @@ async fn a_can_manage_holder_may_revoke_a_verb_it_does_not_itself_hold() {
     // It really landed: the victim can no longer run the hook.
     let now_denied = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook}/execute"), &victim, Some(json!({}))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook}/execute"),
+            &victim,
+            Some(json!({})),
+        ),
     )
     .await;
     // `404` rather than `403`: with its row gone the victim is outside the hook's visibility scope,
     // and §4 requires that to be indistinguishable from a hook that never existed.
-    assert_eq!(now_denied.status, StatusCode::NOT_FOUND, "the revocation took effect");
+    assert_eq!(
+        now_denied.status,
+        StatusCode::NOT_FOUND,
+        "the revocation took effect"
+    );
 
     // And the caller gained nothing by it — de-escalating someone else does not escalate you.
     let attempt = signed_send(
@@ -6675,7 +9773,15 @@ async fn delete_and_post_revocation_paths_agree_on_who_may_revoke() {
 
     // Route A: zero the grant through the grant endpoint.
     grant(&db, victim_id, hook, true, true).await;
-    let via_post = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{victim_id}/permissions"), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false }))).await;
+    let via_post = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{victim_id}/permissions"),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+    )
+    .await;
 
     // Route B: delete the row outright, from the identical starting state.
     let db2 = setup_test_db().await;
@@ -6683,14 +9789,14 @@ async fn delete_and_post_revocation_paths_agree_on_who_may_revoke() {
     let mut clock2 = signing_clock();
     let hook2 = insert_hook(&db2, "parity_hook", &script, 30).await;
     let manager2 = seed_key_manager(&db2).await;
-    let (victim2_id, _) = insert_key(&db2, "victim", "", KeyScopes::plain()).await;
+    let (deleted_key_id, _) = insert_key(&db2, "victim", "", KeyScopes::plain()).await;
     grant(&db2, manager2.id, hook2, false, true).await;
-    grant(&db2, victim2_id, hook2, true, true).await;
+    grant(&db2, deleted_key_id, hook2, true, true).await;
     let via_delete = signed_send(
         &app2,
         &mut clock2,
         "DELETE",
-        &format!("/api/keys/{victim2_id}/permissions/{hook2}"),
+        &format!("/api/keys/{deleted_key_id}/permissions/{hook2}"),
         &manager2,
         None,
     )
@@ -6699,7 +9805,11 @@ async fn delete_and_post_revocation_paths_agree_on_who_may_revoke() {
     // Different status codes (200 vs 204) because they are different verbs; what must match is
     // whether the caller was *allowed*.
     assert!(via_post.status.is_success(), "POST route: {}", via_post.raw);
-    assert!(via_delete.status.is_success(), "DELETE route: {}", via_delete.raw);
+    assert!(
+        via_delete.status.is_success(),
+        "DELETE route: {}",
+        via_delete.raw
+    );
     assert_eq!(
         via_post.status.is_client_error(),
         via_delete.status.is_client_error(),
@@ -6733,11 +9843,29 @@ async fn r6_a_post_that_only_reduces_is_judged_as_a_revocation() {
 
     // Sanity: the verb the parent does not hold is really in place on the target.
     assert_eq!(
-        send(&app, json_request("POST", &format!("/api/hooks/{hook}/execute"), &worker, Some(json!({})))).await.status,
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook}/execute"),
+                &worker,
+                Some(json!({}))
+            )
+        )
+        .await
+        .status,
         StatusCode::OK
     );
 
-    let reduce = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{worker_id}/permissions"), &parent, Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false }))).await;
+    let reduce = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{worker_id}/permissions"),
+        &parent,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": false })),
+    )
+    .await;
     assert_eq!(
         reduce.status,
         StatusCode::OK,
@@ -6745,20 +9873,42 @@ async fn r6_a_post_that_only_reduces_is_judged_as_a_revocation() {
         reduce.raw
     );
     assert_eq!(
-        send(&app, json_request("POST", &format!("/api/hooks/{hook}/execute"), &worker, Some(json!({})))).await.status,
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook}/execute"),
+                &worker,
+                Some(json!({}))
+            )
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN,
         "the reduction actually landed"
     );
 
     // The complement, on the same route with the same caller: putting the verb *back* is a grant,
     // and R1 refuses it. One route, two classifications, decided purely by effect.
-    let restore = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{worker_id}/permissions"), &parent, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false }))).await;
+    let restore = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{worker_id}/permissions"),
+        &parent,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": false })),
+    )
+    .await;
     assert_eq!(
         restore.status,
         StatusCode::FORBIDDEN,
         "the same route refuses the same verb in the granting direction"
     );
-    assert!(restore.raw.contains("can_execute"), "and names it: {}", restore.raw);
+    assert!(
+        restore.raw.contains("can_execute"),
+        "and names it: {}",
+        restore.raw
+    );
 }
 
 /// **R6** — self-reduction through the general update endpoint, the case endpoint parity creates.
@@ -6781,14 +9931,47 @@ async fn r6_a_key_may_reduce_its_own_row_through_the_update_endpoint() {
     // Drop `can_execute` from its own row while keeping `can_manage` — a partial self-reduction,
     // which `DELETE` cannot express at all. Ordered last among this key's authority checks, since
     // it reduces the very rights the earlier assertions depend on.
-    let reduce = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{}/permissions", parent.id), &parent, Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": true }))).await;
-    assert_eq!(reduce.status, StatusCode::OK, "self-reduction is a de-escalation: {}", reduce.raw);
+    let reduce = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{}/permissions", parent.id),
+        &parent,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": false, "can_manage": true })),
+    )
+    .await;
+    assert_eq!(
+        reduce.status,
+        StatusCode::OK,
+        "self-reduction is a de-escalation: {}",
+        reduce.raw
+    );
 
-    let execute = signed_send(&app, &mut clock, "POST", &format!("/api/hooks/{hook}/execute"), &parent, Some(json!({}))).await;
-    assert_eq!(execute.status, StatusCode::FORBIDDEN, "it gave up the verb for real");
+    let execute = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/hooks/{hook}/execute"),
+        &parent,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        execute.status,
+        StatusCode::FORBIDDEN,
+        "it gave up the verb for real"
+    );
 
     // Taking it back is a grant, and self-granting stays refused — the asymmetry R6 preserves.
-    let regrant = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{}/permissions", parent.id), &parent, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true }))).await;
+    let regrant = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{}/permissions", parent.id),
+        &parent,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+    )
+    .await;
     assert_eq!(
         regrant.status,
         StatusCode::FORBIDDEN,
@@ -6831,7 +10014,11 @@ async fn a_key_may_revoke_its_own_hook_permissions() {
 
     // The key really did give up its access, in both directions.
     let me = signed_send(&app, &mut clock, "GET", "/api/auth/me", &manager, None).await;
-    assert_eq!(me.json["hook_permissions"], json!([]), "the grant is gone from the profile");
+    assert_eq!(
+        me.json["hook_permissions"],
+        json!([]),
+        "the grant is gone from the profile"
+    );
     let execute = signed_send(
         &app,
         &mut clock,
@@ -6842,10 +10029,22 @@ async fn a_key_may_revoke_its_own_hook_permissions() {
     )
     .await;
     // §4: having no row at all means the hook is invisible, not merely unusable.
-    assert_eq!(execute.status, StatusCode::NOT_FOUND, "and the capability with it");
+    assert_eq!(
+        execute.status,
+        StatusCode::NOT_FOUND,
+        "and the capability with it"
+    );
 
     // Having given it up, it cannot hand it back to itself — self-*granting* is still escalation.
-    let regrant = signed_send(&app, &mut clock, "POST", &format!("/api/keys/{}/permissions", manager.id), &manager, Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true }))).await;
+    let regrant = signed_send(
+        &app,
+        &mut clock,
+        "POST",
+        &format!("/api/keys/{}/permissions", manager.id),
+        &manager,
+        Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
+    )
+    .await;
     assert_eq!(
         regrant.status,
         StatusCode::FORBIDDEN,
@@ -6877,7 +10076,15 @@ async fn revoking_on_a_hook_the_caller_does_not_manage_is_refused() {
     set_parent(&db, victim_id, manager.id).await;
     grant(&db, victim_id, hook, true, true).await;
 
-    let no_grant = signed_send(&app, &mut clock, "DELETE", &format!("/api/keys/{victim_id}/permissions/{hook}"), &manager, None).await;
+    let no_grant = signed_send(
+        &app,
+        &mut clock,
+        "DELETE",
+        &format!("/api/keys/{victim_id}/permissions/{hook}"),
+        &manager,
+        None,
+    )
+    .await;
     // §4: no row on the target hook makes it invisible, so the refusal is the one a nonexistent
     // hook produces rather than a `403` confirming it is real.
     assert_eq!(no_grant.status, StatusCode::NOT_FOUND);
@@ -6922,21 +10129,43 @@ async fn an_ungoverned_hook_stays_visible_and_manageable_by_a_master() {
         None,
     )
     .await;
-    assert_eq!(self_revoke.status, StatusCode::NO_CONTENT, "the last manager revoked itself");
+    assert_eq!(
+        self_revoke.status,
+        StatusCode::NO_CONTENT,
+        "the last manager revoked itself"
+    );
 
     // Nobody can see it through a grant any more — including the key that used to manage it.
     let orphaned = signed_send(&app, &mut clock, "GET", "/api/hooks", &manager, None).await;
-    assert_eq!(orphaned.json.as_array().map(Vec::len), Some(0), "the ex-manager sees nothing");
     assert_eq!(
-        signed_send(&app, &mut clock, "GET", &format!("/api/hooks/{hook}"), &manager, None).await.status,
+        orphaned.json.as_array().map(Vec::len),
+        Some(0),
+        "the ex-manager sees nothing"
+    );
+    assert_eq!(
+        signed_send(
+            &app,
+            &mut clock,
+            "GET",
+            &format!("/api/hooks/{hook}"),
+            &manager,
+            None
+        )
+        .await
+        .status,
         StatusCode::NOT_FOUND,
         "and cannot reach it directly either"
     );
 
     // The master still lists it...
     let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
-    let names: Vec<&str> =
-        listed.json.as_array().expect("a list").iter().filter_map(|h| h["name"].as_str()).collect();
+    let names: Vec<&str> = listed
+        .json
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|h| h["name"].as_str())
+        .collect();
     assert!(
         names.contains(&"ungoverned_hook"),
         "an ungoverned hook must not disappear from the master's listing: {names:?}"
@@ -6944,35 +10173,64 @@ async fn an_ungoverned_hook_stays_visible_and_manageable_by_a_master() {
 
     // ...can read it by id and by name...
     for reference in [hook.to_string(), "ungoverned_hook".to_owned()] {
-        let detail =
-            send(&app, json_request("GET", &format!("/api/hooks/{reference}"), &master, None)).await;
-        assert_eq!(detail.status, StatusCode::OK, "master reads {reference} on an ungoverned hook");
+        let detail = send(
+            &app,
+            json_request("GET", &format!("/api/hooks/{reference}"), &master, None),
+        )
+        .await;
+        assert_eq!(
+            detail.status,
+            StatusCode::OK,
+            "master reads {reference} on an ungoverned hook"
+        );
         assert_eq!(detail.json["name"], json!("ungoverned_hook"));
     }
 
     // ...can still execute and manage it, so it is not merely readable...
     assert_eq!(
-        send(&app, json_request("POST", &format!("/api/hooks/{hook}/execute"), &master, Some(json!({}))))
-            .await
-            .status,
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/hooks/{hook}/execute"),
+                &master,
+                Some(json!({}))
+            )
+        )
+        .await
+        .status,
         StatusCode::OK,
         "an ungoverned hook is still executable by a master"
     );
 
+    assert_master_can_restore_governance(&app, &mut clock, &master, &manager, hook).await;
+}
+
+async fn assert_master_can_restore_governance(
+    app: &axum::Router,
+    clock: &mut i64,
+    master: &str,
+    manager: &SeededKey,
+    hook: Uuid,
+) {
     // ...and, decisively, can put it back under governance.
     let regrant = send(
-        &app,
+        app,
         json_request(
             "POST",
             &format!("/api/keys/{}/permissions", manager.id),
-            &master,
+            master,
             Some(json!({ "hook_id": hook.to_string(), "can_execute": true, "can_manage": true })),
         ),
     )
     .await;
-    assert_eq!(regrant.status, StatusCode::OK, "a master can re-grant on an ungoverned hook");
+    assert_eq!(
+        regrant.status,
+        StatusCode::OK,
+        "a master can re-grant on an ungoverned hook"
+    );
 
-    let restored = signed_send(&app, &mut clock, "GET", "/api/hooks", &manager, None).await;
+    let restored = signed_send(app, clock, "GET", "/api/hooks", manager, None).await;
     assert_eq!(
         restored.json.as_array().map(Vec::len),
         Some(1),
@@ -7089,7 +10347,10 @@ async fn hoisting_the_window_check_does_not_reach_unsigned_traffic() {
     )
     .body(axum::body::Body::empty())
     .expect("request builds");
-    assert_eq!(send(&app, signed_shape).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, signed_shape).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -7111,15 +10372,25 @@ async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
     let state = test_state(&db);
     let app = create_app(state.clone());
 
-    let (real_master_id, real_master) = insert_key(&db, "the-master", "", KeyScopes::master()).await;
+    let (real_master_id, real_master) =
+        insert_key(&db, "the-master", "", KeyScopes::master()).await;
     let (impostor_id, impostor) = insert_key(&db, "impostor", "", KeyScopes::plain()).await;
 
     // One authenticated request establishes the pin from a database holding exactly one master.
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &real_master, None)).await.status,
+        send(
+            &app,
+            json_request("GET", "/api/auth/me", &real_master, None)
+        )
+        .await
+        .status,
         StatusCode::OK
     );
-    assert_eq!(state.master_pin.get(), Some(real_master_id), "the real master was pinned");
+    assert_eq!(
+        state.master_pin.get(),
+        Some(real_master_id),
+        "the real master was pinned"
+    );
 
     // The tamper. No endpoint can do this — `is_master` is not a field on any payload — so it goes
     // in behind the application's back. Written through the entity layer rather than as a SQL
@@ -7128,7 +10399,10 @@ async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
     // What matters here is bypassing the *application*, which this does completely.
     let promote = |db: sea_orm::DatabaseConnection| async move {
         ApiKey::update_many()
-            .col_expr(api_key::Column::IsMaster, sea_orm::sea_query::Expr::value(true))
+            .col_expr(
+                api_key::Column::IsMaster,
+                sea_orm::sea_query::Expr::value(true),
+            )
             .filter(api_key::Column::Id.eq(impostor_id))
             .exec(&db)
             .await
@@ -7146,7 +10420,9 @@ async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
     db.execute_unprepared("DROP INDEX idx_api_keys_master_marker")
         .await
         .expect("dropping the index models an attacker who reached the schema");
-    promote(db.clone()).await.expect("with the constraint gone, the row flips");
+    promote(db.clone())
+        .await
+        .expect("with the constraint gone, the row flips");
 
     // The database now says two keys are master.
     assert_eq!(
@@ -7162,7 +10438,11 @@ async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
 
     // And it buys nothing. The impostor is refused everywhere master authority is required.
     let me = send(&app, json_request("GET", "/api/auth/me", &impostor, None)).await;
-    assert_eq!(me.status, StatusCode::OK, "the impostor is still a valid key");
+    assert_eq!(
+        me.status,
+        StatusCode::OK,
+        "the impostor is still a valid key"
+    );
     assert_eq!(
         me.field("is_master"),
         &json!(false),
@@ -7173,7 +10453,11 @@ async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
     for (method, uri, body) in [
         ("GET", "/api/settings", None),
         ("GET", "/api/audit-logs", None),
-        ("POST", "/api/keys", Some(json!({ "name": "minted-by-impostor" }))),
+        (
+            "POST",
+            "/api/keys",
+            Some(json!({ "name": "minted-by-impostor" })),
+        ),
         ("GET", "/api/hooks?include_deleted=true", None),
     ] {
         let response = send(&app, json_request(method, uri, &impostor, body)).await;
@@ -7187,7 +10471,12 @@ async fn a_hot_flipped_is_master_row_confers_nothing_on_the_running_process() {
 
     // The genuine master is unaffected — pinning must not break the key it pinned.
     assert_eq!(
-        send(&app, json_request("GET", "/api/settings", &real_master, None)).await.status,
+        send(
+            &app,
+            json_request("GET", "/api/settings", &real_master, None)
+        )
+        .await
+        .status,
         StatusCode::OK,
         "the pinned master still works"
     );
@@ -7203,7 +10492,9 @@ async fn the_master_pin_is_resolved_once_and_never_moves() {
 
     let (first_id, first) = insert_key(&db, "first-master", "", KeyScopes::master()).await;
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &first, None)).await.status,
+        send(&app, json_request("GET", "/api/auth/me", &first, None))
+            .await
+            .status,
         StatusCode::OK
     );
     assert_eq!(state.master_pin.get(), Some(first_id));
@@ -7221,7 +10512,11 @@ async fn the_master_pin_is_resolved_once_and_never_moves() {
     let second_key = insert_key_full(&db, "second-master", "", KeyScopes::master()).await;
     let second_id = second_key.id;
 
-    assert_eq!(state.master_pin.get(), Some(first_id), "the pin did not move");
+    assert_eq!(
+        state.master_pin.get(),
+        Some(first_id),
+        "the pin did not move"
+    );
     assert_ne!(second_id, first_id);
 
     let me = signed_send(&app, &mut clock, "GET", "/api/auth/me", &second_key, None).await;
@@ -7273,7 +10568,11 @@ async fn a_parent_key_can_only_mint_daughter_keys() {
             "R4: a Parent minted a key holding '{scope}': {}",
             refused.raw
         );
-        assert!(refused.raw.contains(scope), "the refusal names the scope: {}", refused.raw);
+        assert!(
+            refused.raw.contains(scope),
+            "the refusal names the scope: {}",
+            refused.raw
+        );
 
         // And nothing was created — a refusal that still writes the row is not a refusal.
         let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
@@ -7294,7 +10593,12 @@ async fn a_parent_key_can_only_mint_daughter_keys() {
         Some(json!({ "name": "ordinary-daughter" })),
     )
     .await;
-    assert_eq!(daughter.status, StatusCode::OK, "a Parent may mint a Daughter: {}", daughter.raw);
+    assert_eq!(
+        daughter.status,
+        StatusCode::OK,
+        "a Parent may mint a Daughter: {}",
+        daughter.raw
+    );
 
     // Escalating an existing key is the same rule on the update route.
     let target_id = daughter.string("id");
@@ -7319,10 +10623,20 @@ async fn a_parent_key_can_only_mint_daughter_keys() {
     // Master may do both, or the refusals above could be explained by the route being broken.
     let promoted = send(
         &app,
-        json_request("POST", "/api/keys", &master, Some(json!({ "name": "real-parent", "can_manage_keys": true }))),
+        json_request(
+            "POST",
+            "/api/keys",
+            &master,
+            Some(json!({ "name": "real-parent", "can_manage_keys": true })),
+        ),
     )
     .await;
-    assert_eq!(promoted.status, StatusCode::OK, "master may mint a Parent: {}", promoted.raw);
+    assert_eq!(
+        promoted.status,
+        StatusCode::OK,
+        "master may mint a Parent: {}",
+        promoted.raw
+    );
 }
 
 /// **§3 + R2** — owning a hook is authority over the hook and its *general content*, not over its
@@ -7338,7 +10652,6 @@ async fn a_parent_key_can_only_mint_daughter_keys() {
 async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delegate() {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
-    let mut clock = signing_clock();
     let scripts = ScriptDir::new();
     let original = scripts.write_script("owned.sh", "#!/bin/sh\necho original\n");
     let replacement = scripts.write_script("replacement.sh", "#!/bin/sh\necho replaced\n");
@@ -7346,8 +10659,7 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
     let (_master_id, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
     // A Daughter with the creation right and nothing else: no `can_manage_keys`, so R2's conjunction
     // is out of reach for it entirely.
-    let (owner_id, owner) =
-        insert_key(&db, "creator", "", KeyScopes::hook_manager()).await;
+    let (owner_id, owner) = insert_key(&db, "creator", "", KeyScopes::hook_manager()).await;
 
     let created = send(
         &app,
@@ -7359,13 +10671,25 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::OK, "the daughter may create a hook: {}", created.raw);
+    assert_eq!(
+        created.status,
+        StatusCode::OK,
+        "the daughter may create a hook: {}",
+        created.raw
+    );
     let hook_id = created.string("id");
-    assert_eq!(created.field("is_owner"), &json!(true), "the creator is the owner");
+    assert_eq!(
+        created.field("is_owner"),
+        &json!(true),
+        "the creator is the owner"
+    );
 
     // ── It may maintain what it owns — general content, on ownership alone ───
     for (label, body) in [
-        ("its description", json!({ "description": "maintained by its owner" })),
+        (
+            "its description",
+            json!({ "description": "maintained by its owner" }),
+        ),
         ("its timeout", json!({ "default_timeout_seconds": 45 })),
         ("its name", json!({ "name": "renamed_by_owner" })),
     ] {
@@ -7407,27 +10731,7 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
         denied.raw
     );
 
-    // ── With R2's global half also held, the same edit succeeds ─────────────
-    //
-    // A *different* key, deliberately: promoting `owner` itself would satisfy R2 on this hook from
-    // here on and quietly invalidate the "may not delegate" assertions further down, which depend on
-    // `owner` specifically lacking `can_manage_keys`. `parent_hook_manager` holds both
-    // `can_manage_hooks` (to create) and `can_manage_keys` (R2's global half) from the start, and
-    // creation auto-provisions the `can_manage` row that completes R2 on the hook it makes — proving
-    // the guard enforces "R2 in full", not "master only", without touching `owner`'s state at all.
-    let full_r2_owner =
-        insert_key_full(&db, "full-r2", "", KeyScopes::parent_hook_manager()).await;
-    let its_own_hook = signed_send(&app, &mut clock, "POST", "/api/hooks", &full_r2_owner, Some(json!({ "name": "full_r2_hook", "script_path": original }))).await;
-    assert_eq!(its_own_hook.status, StatusCode::OK, "R2-in-full key may create: {}", its_own_hook.raw);
-    let full_r2_hook_id = its_own_hook.string("id");
-
-    let now_allowed = signed_send(&app, &mut clock, "PUT", &format!("/api/hooks/{full_r2_hook_id}"), &full_r2_owner, Some(json!({ "script_path": replacement }))).await;
-    assert_eq!(
-        now_allowed.status,
-        StatusCode::OK,
-        "R2 in full (can_manage_keys + its own can_manage row) authorises the dispatch-config edit: {}",
-        now_allowed.raw
-    );
+    assert_r2_owner_can_change_dispatch(&db, &app, &original, &replacement).await;
 
     let param = send(
         &app,
@@ -7439,23 +10743,43 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
         ),
     )
     .await;
-    assert_eq!(param.status, StatusCode::OK, "the owner declares parameters: {}", param.raw);
+    assert_eq!(
+        param.status,
+        StatusCode::OK,
+        "the owner declares parameters: {}",
+        param.raw
+    );
 
     // It can see it, which `visible_hook_ids` has to agree with or the hook would be
     // editable-but-unlistable.
     let listed = send(&app, json_request("GET", "/api/hooks", &owner, None)).await;
-    assert!(listed.raw.contains("renamed_by_owner"), "the owner sees its own hook: {}", listed.raw);
+    assert!(
+        listed.raw.contains("renamed_by_owner"),
+        "the owner sees its own hook: {}",
+        listed.raw
+    );
 
+    assert_owner_cannot_delegate(&db, &app, owner_id, &owner, &master, &hook_id).await;
+}
+
+async fn assert_owner_cannot_delegate(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    owner_id: Uuid,
+    owner: &str,
+    master: &str,
+    hook_id: &str,
+) {
     // ── It may not delegate ─────────────────────────────────────────────────
-    let (target_id, _target) = insert_key(&db, "someone-else", "", KeyScopes::plain()).await;
-    set_parent(&db, target_id, owner_id).await;
+    let (target_id, _target) = insert_key(db, "someone-else", "", KeyScopes::plain()).await;
+    set_parent(db, target_id, owner_id).await;
 
     let delegation = send(
-        &app,
+        app,
         json_request(
             "POST",
             &format!("/api/keys/{target_id}/permissions"),
-            &owner,
+            owner,
             Some(json!({ "hook_id": hook_id, "can_execute": true, "can_manage": false })),
         ),
     )
@@ -7469,13 +10793,20 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
 
     // Revocation is the same rule from the other direction — R6 lowers the bar to "manage rights on
     // the resource", and the owner does not have those in R2's sense.
-    grant(&db, target_id, Uuid::parse_str(&hook_id).expect("hook id is a uuid"), true, false).await;
+    grant(
+        db,
+        target_id,
+        Uuid::parse_str(hook_id).expect("hook id is a uuid"),
+        true,
+        false,
+    )
+    .await;
     let revocation = send(
-        &app,
+        app,
         json_request(
             "DELETE",
             &format!("/api/keys/{target_id}/permissions/{hook_id}"),
-            &owner,
+            owner,
             None,
         ),
     )
@@ -7490,11 +10821,11 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
     // Master can do what the owner could not, so the refusals are about the caller and not the route.
     assert_eq!(
         send(
-            &app,
+            app,
             json_request(
                 "POST",
                 &format!("/api/keys/{target_id}/permissions"),
-                &master,
+                master,
                 Some(json!({ "hook_id": hook_id, "can_execute": true, "can_manage": false })),
             ),
         )
@@ -7502,6 +10833,56 @@ async fn a_hook_owner_may_edit_general_content_but_not_dispatch_config_or_delega
         .status,
         StatusCode::OK,
         "master may delegate on the same hook"
+    );
+}
+
+async fn assert_r2_owner_can_change_dispatch(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    original: &str,
+    replacement: &str,
+) {
+    let mut clock = signing_clock();
+    // ── With R2's global half also held, the same edit succeeds ─────────────
+    //
+    // A *different* key, deliberately: promoting `owner` itself would satisfy R2 on this hook from
+    // here on and quietly invalidate the "may not delegate" assertions further down, which depend on
+    // `owner` specifically lacking `can_manage_keys`. `parent_hook_manager` holds both
+    // `can_manage_hooks` (to create) and `can_manage_keys` (R2's global half) from the start, and
+    // creation auto-provisions the `can_manage` row that completes R2 on the hook it makes — proving
+    // the guard enforces "R2 in full", not "master only", without touching `owner`'s state at all.
+    let full_r2_owner = insert_key_full(db, "full-r2", "", KeyScopes::parent_hook_manager()).await;
+    let its_own_hook = signed_send(
+        app,
+        &mut clock,
+        "POST",
+        "/api/hooks",
+        &full_r2_owner,
+        Some(json!({ "name": "full_r2_hook", "script_path": original })),
+    )
+    .await;
+    assert_eq!(
+        its_own_hook.status,
+        StatusCode::OK,
+        "R2-in-full key may create: {}",
+        its_own_hook.raw
+    );
+    let full_r2_hook_id = its_own_hook.string("id");
+
+    let now_allowed = signed_send(
+        app,
+        &mut clock,
+        "PUT",
+        &format!("/api/hooks/{full_r2_hook_id}"),
+        &full_r2_owner,
+        Some(json!({ "script_path": replacement })),
+    )
+    .await;
+    assert_eq!(
+        now_allowed.status,
+        StatusCode::OK,
+        "R2 in full (can_manage_keys + its own can_manage row) authorises the dispatch-config edit: {}",
+        now_allowed.raw
     );
 }
 
@@ -7516,28 +10897,54 @@ async fn regenerate_key_replaces_only_the_bearer_credential() {
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
     let target = insert_key_full(&db, "Target", "0.0.0.0/0", KeyScopes::plain()).await;
 
-    let res = send(&app, json_request("POST", &format!("/api/keys/{}/regenerate-key", target.id), &master, None)).await;
+    let res = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{}/regenerate-key", target.id),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
     let new_key = res.string("plaintext_key");
-    assert!(res.json.get("key_id").is_none(), "regenerate-key does not echo the (unchanged) key_id");
-    assert!(res.json.get("signing_secret").is_none(), "nor the (unchanged) signing secret");
+    assert!(
+        res.json.get("key_id").is_none(),
+        "regenerate-key does not echo the (unchanged) key_id"
+    );
+    assert!(
+        res.json.get("signing_secret").is_none(),
+        "nor the (unchanged) signing secret"
+    );
 
     // The old bearer key is dead.
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &target.plaintext, None)).await.status,
+        send(
+            &app,
+            json_request("GET", "/api/auth/me", &target.plaintext, None)
+        )
+        .await
+        .status,
         StatusCode::UNAUTHORIZED,
         "the old X-API-Key must stop working immediately"
     );
     // The new one works.
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &new_key, None)).await.status,
+        send(&app, json_request("GET", "/api/auth/me", &new_key, None))
+            .await
+            .status,
         StatusCode::OK,
         "the new X-API-Key must work immediately"
     );
     // The signing secret is untouched: a request signed with the *original* secret, presented with
     // the *new* bearer key, still verifies.
     let signed = signed_request("GET", "/api/auth/me", &new_key, &target.signing_secret, "");
-    assert_eq!(send(&app, signed).await.status, StatusCode::OK, "the original signing secret still verifies");
+    assert_eq!(
+        send(&app, signed).await.status,
+        StatusCode::OK,
+        "the original signing secret still verifies"
+    );
 }
 
 #[tokio::test]
@@ -7547,23 +10954,57 @@ async fn regenerate_secret_replaces_only_the_signing_pair() {
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
     let target = insert_key_full(&db, "Target", "0.0.0.0/0", KeyScopes::plain()).await;
 
-    let res = send(&app, json_request("POST", &format!("/api/keys/{}/regenerate-secret", target.id), &master, None)).await;
+    let res = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/keys/{}/regenerate-secret", target.id),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
     let new_secret = res.string("signing_secret");
-    assert_ne!(new_secret, target.signing_secret, "a genuinely new secret is minted");
-    assert!(res.json.get("plaintext_key").is_none(), "regenerate-secret does not echo the (unchanged) bearer key");
+    assert_ne!(
+        new_secret, target.signing_secret,
+        "a genuinely new secret is minted"
+    );
+    assert!(
+        res.json.get("plaintext_key").is_none(),
+        "regenerate-secret does not echo the (unchanged) bearer key"
+    );
 
     // The bearer key is untouched: it still authenticates unsigned.
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &target.plaintext, None)).await.status,
+        send(
+            &app,
+            json_request("GET", "/api/auth/me", &target.plaintext, None)
+        )
+        .await
+        .status,
         StatusCode::OK,
         "the unchanged bearer key still works"
     );
     // The old secret no longer verifies; the new one does.
-    let old_sig = signed_request("GET", "/api/auth/me", &target.plaintext, &target.signing_secret, "");
-    assert_eq!(send(&app, old_sig).await.status, StatusCode::UNAUTHORIZED, "the old signing secret is dead");
+    let old_sig = signed_request(
+        "GET",
+        "/api/auth/me",
+        &target.plaintext,
+        &target.signing_secret,
+        "",
+    );
+    assert_eq!(
+        send(&app, old_sig).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the old signing secret is dead"
+    );
     let new_sig = signed_request("GET", "/api/auth/me", &target.plaintext, &new_secret, "");
-    assert_eq!(send(&app, new_sig).await.status, StatusCode::OK, "the new signing secret verifies");
+    assert_eq!(
+        send(&app, new_sig).await.status,
+        StatusCode::OK,
+        "the new signing secret verifies"
+    );
 }
 
 #[tokio::test]
@@ -7577,13 +11018,37 @@ async fn regenerate_endpoints_require_key_management_and_refuse_the_master() {
     for path_suffix in ["regenerate-key", "regenerate-secret"] {
         let denied = send(
             &app,
-            json_request("POST", &format!("/api/keys/{}/{path_suffix}", target.id), &plain.plaintext, None),
+            json_request(
+                "POST",
+                &format!("/api/keys/{}/{path_suffix}", target.id),
+                &plain.plaintext,
+                None,
+            ),
         )
         .await;
-        assert_eq!(denied.status, StatusCode::FORBIDDEN, "a plain key cannot {path_suffix}: {}", denied.raw);
+        assert_eq!(
+            denied.status,
+            StatusCode::FORBIDDEN,
+            "a plain key cannot {path_suffix}: {}",
+            denied.raw
+        );
 
-        let on_master = send(&app, json_request("POST", &format!("/api/keys/{master_id}/{path_suffix}"), &master, None)).await;
-        assert_eq!(on_master.status, StatusCode::FORBIDDEN, "{path_suffix} refuses the master key itself: {}", on_master.raw);
+        let on_master = send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/keys/{master_id}/{path_suffix}"),
+                &master,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            on_master.status,
+            StatusCode::FORBIDDEN,
+            "{path_suffix} refuses the master key itself: {}",
+            on_master.raw
+        );
     }
 }
 
@@ -7604,17 +11069,30 @@ async fn a_key_can_be_created_with_no_signing_secret_and_can_manage_keys_forbids
     )
     .await;
     assert_eq!(bearer_only.status, StatusCode::OK, "{}", bearer_only.raw);
-    assert_eq!(bearer_only.json.get("key_id"), Some(&json!(null)), "no key_id is minted");
-    assert_eq!(bearer_only.json.get("signing_secret"), Some(&json!(null)), "no signing secret is minted");
+    assert_eq!(
+        bearer_only.json.get("key_id"),
+        Some(&json!(null)),
+        "no key_id is minted"
+    );
+    assert_eq!(
+        bearer_only.json.get("signing_secret"),
+        Some(&json!(null)),
+        "no signing secret is minted"
+    );
     let plaintext = bearer_only.string("plaintext_key");
     assert_eq!(
-        send(&app, json_request("GET", "/api/auth/me", &plaintext, None)).await.status,
+        send(&app, json_request("GET", "/api/auth/me", &plaintext, None))
+            .await
+            .status,
         StatusCode::OK,
         "the bearer-only key still authenticates unsigned"
     );
     let listed = send(&app, json_request("GET", "/api/keys", &master, None)).await;
     let rows = listed.json.as_array().cloned().unwrap_or_default();
-    let row = rows.iter().find(|k| k["name"] == json!("bearer_only")).expect("listed");
+    let row = rows
+        .iter()
+        .find(|k| k["name"] == json!("bearer_only"))
+        .expect("listed");
     assert_eq!(row["key_id"], json!(null));
     assert_eq!(row["has_signing_secret"], json!(false));
 
@@ -7633,7 +11111,12 @@ async fn a_key_can_be_created_with_no_signing_secret_and_can_manage_keys_forbids
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "can_manage_keys requires a signing secret: {}", refused.raw);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "can_manage_keys requires a signing secret: {}",
+        refused.raw
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -7672,7 +11155,12 @@ async fn sample_payload_json_is_validated_against_declared_parameters() {
         ),
     )
     .await;
-    assert_eq!(not_object.status, StatusCode::BAD_REQUEST, "{}", not_object.raw);
+    assert_eq!(
+        not_object.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        not_object.raw
+    );
 
     // A declared parameter absent from the sample is refused, naming the missing key.
     let missing_key = send(
@@ -7690,8 +11178,17 @@ async fn sample_payload_json_is_validated_against_declared_parameters() {
         ),
     )
     .await;
-    assert_eq!(missing_key.status, StatusCode::BAD_REQUEST, "{}", missing_key.raw);
-    assert!(missing_key.raw.contains("target_ip"), "the error names the missing key: {}", missing_key.raw);
+    assert_eq!(
+        missing_key.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        missing_key.raw
+    );
+    assert!(
+        missing_key.raw.contains("target_ip"),
+        "the error names the missing key: {}",
+        missing_key.raw
+    );
 
     // A sample that names every declared parameter is accepted.
     let ok = send(
@@ -7710,7 +11207,10 @@ async fn sample_payload_json_is_validated_against_declared_parameters() {
     )
     .await;
     assert_eq!(ok.status, StatusCode::OK, "{}", ok.raw);
-    assert_eq!(ok.field("sample_payload_json").as_str(), Some("{\"target_ip\": \"203.0.113.5\"}"));
+    assert_eq!(
+        ok.field("sample_payload_json").as_str(),
+        Some("{\"target_ip\": \"203.0.113.5\"}")
+    );
     let hook_id = ok.string("id");
 
     // A hook with no parameters at all needs no cross-check, only well-formed JSON.
@@ -7726,23 +11226,41 @@ async fn sample_payload_json_is_validated_against_declared_parameters() {
     .await;
     assert_eq!(no_params.status, StatusCode::OK, "{}", no_params.raw);
 
+    assert_sample_updates_match_the_parameter_contract(&app, &master, &hook_id).await;
+}
+
+async fn assert_sample_updates_match_the_parameter_contract(
+    app: &axum::Router,
+    master: &str,
+    hook_id: &str,
+) {
     // Updating the sample re-validates against the hook's *current* declared parameters.
     let update_refused = send(
-        &app,
+        app,
         json_request(
             "PUT",
             &format!("/api/hooks/{hook_id}"),
-            &master,
+            master,
             Some(json!({ "sample_payload_json": "{\"wrong_field\": \"x\"}" })),
         ),
     )
     .await;
-    assert_eq!(update_refused.status, StatusCode::BAD_REQUEST, "{}", update_refused.raw);
+    assert_eq!(
+        update_refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        update_refused.raw
+    );
 
     // Clearing it with "" is always permitted, regardless of the parameter contract.
     let cleared = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "sample_payload_json": "" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            master,
+            Some(json!({ "sample_payload_json": "" })),
+        ),
     )
     .await;
     assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
@@ -7761,13 +11279,28 @@ async fn settings_expose_whether_keyless_hooks_are_globally_allowed() {
     let master = insert_key_full(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
 
     let permissive = create_app(test_state(&db));
-    let res = send(&permissive, json_request("GET", "/api/settings", &master.plaintext, None)).await;
+    let res = send(
+        &permissive,
+        json_request("GET", "/api/settings", &master.plaintext, None),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
     assert_eq!(res.field("require_signed_requests"), &json!(false));
-    assert_eq!(res.field("keyless_hooks_allowed"), &json!(true), "the negation of require_signed_requests: {}", res.raw);
+    assert_eq!(
+        res.field("keyless_hooks_allowed"),
+        &json!(true),
+        "the negation of require_signed_requests: {}",
+        res.raw
+    );
 
     let strict = create_app(test_state_requiring_signatures(&db));
-    let signed = signed_request("GET", "/api/settings", &master.plaintext, &master.signing_secret, "");
+    let signed = signed_request(
+        "GET",
+        "/api/settings",
+        &master.plaintext,
+        &master.signing_secret,
+        "",
+    );
     let res = send(&strict, signed).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.raw);
     assert_eq!(res.field("require_signed_requests"), &json!(true));
@@ -7792,23 +11325,58 @@ async fn execution_history_reports_and_filters_by_acting_key() {
     grant(&db, alice.id, hook_id, true, false).await;
     grant(&db, bob.id, hook_id, true, false).await;
 
-    let ran_alice = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &alice.plaintext, None)).await;
+    let ran_alice = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &alice.plaintext,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(ran_alice.status, StatusCode::OK, "{}", ran_alice.raw);
-    assert_eq!(ran_alice.field("api_key_name").as_str(), Some("Alice"), "the acting key's name is reported");
+    assert_eq!(
+        ran_alice.field("api_key_name").as_str(),
+        Some("Alice"),
+        "the acting key's name is reported"
+    );
 
-    let ran_bob = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &bob.plaintext, None)).await;
+    let ran_bob = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &bob.plaintext,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(ran_bob.status, StatusCode::OK, "{}", ran_bob.raw);
 
     // By name.
-    let by_name = send(&app, json_request("GET", "/api/executions?api_key=Alice", &master, None)).await;
+    let by_name = send(
+        &app,
+        json_request("GET", "/api/executions?api_key=Alice", &master, None),
+    )
+    .await;
     let rows = by_name.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["api_key_name"], json!("Alice"));
 
     // By UUID.
-    let by_id = send(&app, json_request("GET", &format!("/api/executions?api_key={}", bob.id), &master, None)).await;
+    let by_id = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions?api_key={}", bob.id),
+            &master,
+            None,
+        ),
+    )
+    .await;
     let rows = by_id.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["api_key_name"], json!("Bob"));
 }
 
@@ -7824,7 +11392,12 @@ async fn execution_and_audit_history_filter_by_time_range() {
     // audit-log half of this test needs a real HOOK_CREATE entry to filter against.
     let created = send(
         &app,
-        json_request("POST", "/api/hooks", &master, Some(json!({ "name": "time_hook", "script_path": script }))),
+        json_request(
+            "POST",
+            "/api/hooks",
+            &master,
+            Some(json!({ "name": "time_hook", "script_path": script })),
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
@@ -7837,25 +11410,126 @@ async fn execution_and_audit_history_filter_by_time_range() {
     // string reinterprets.
     let boundary_str = boundary.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
-    let ran = send(&app, json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None)).await;
+    let ran = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(ran.status, StatusCode::OK, "{}", ran.raw);
 
     // Executions: the run happened after the captured boundary.
-    let since = send(&app, json_request("GET", &format!("/api/executions?since={boundary_str}"), &master, None)).await;
-    assert_eq!(since.json.as_array().map(Vec::len).unwrap_or(0), 1, "{}", since.raw);
-    let until = send(&app, json_request("GET", &format!("/api/executions?until={boundary_str}"), &master, None)).await;
-    assert_eq!(until.json.as_array().map(Vec::len).unwrap_or(0), 0, "{}", until.raw);
+    let since = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions?since={boundary_str}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        since.json.as_array().map_or(0, Vec::len),
+        1,
+        "{}",
+        since.raw
+    );
+    let until = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions?until={boundary_str}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        until.json.as_array().map_or(0, Vec::len),
+        0,
+        "{}",
+        until.raw
+    );
 
+    assert_audit_time_filters(&app, &master, &boundary_str).await;
+
+    // Exact execution timestamp must be included by `until` (inclusive <= semantics).
+    let exec_ts = ran.string("timestamp");
+    let exec_ts_z = if exec_ts.ends_with('Z') {
+        exec_ts
+    } else {
+        format!("{exec_ts}Z")
+    };
+    let inclusive_until = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/executions?until={exec_ts_z}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        inclusive_until.json.as_array().map_or(0, Vec::len),
+        1,
+        "until must be inclusive of exact execution timestamp: {}",
+        inclusive_until.raw
+    );
+}
+
+async fn assert_audit_time_filters(app: &axum::Router, master: &str, boundary_str: &str) {
     // Audit logs: the hook's own HOOK_CREATE entry happened before the boundary.
-    let audit_since = send(&app, json_request("GET", &format!("/api/audit-logs?action=HOOK_CREATE&since={boundary_str}"), &master, None)).await;
-    assert_eq!(audit_since.json.as_array().map(Vec::len).unwrap_or(0), 0, "{}", audit_since.raw);
-    let audit_until = send(&app, json_request("GET", &format!("/api/audit-logs?action=HOOK_CREATE&until={boundary_str}"), &master, None)).await;
-    assert_eq!(audit_until.json.as_array().map(Vec::len).unwrap_or(0), 1, "{}", audit_until.raw);
+    let audit_since = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/api/audit-logs?action=HOOK_CREATE&since={boundary_str}"),
+            master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        audit_since.json.as_array().map_or(0, Vec::len),
+        0,
+        "{}",
+        audit_since.raw
+    );
+    let audit_until = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/api/audit-logs?action=HOOK_CREATE&until={boundary_str}"),
+            master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        audit_until.json.as_array().map_or(0, Vec::len),
+        1,
+        "{}",
+        audit_until.raw
+    );
 
     // A malformed timestamp is refused, not silently ignored.
-    let malformed = send(&app, json_request("GET", "/api/executions?since=not-a-timestamp", &master, None)).await;
+    let malformed = send(
+        app,
+        json_request("GET", "/api/executions?since=not-a-timestamp", master, None),
+    )
+    .await;
     assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
-    let malformed_audit = send(&app, json_request("GET", "/api/audit-logs?until=not-a-timestamp", &master, None)).await;
+    let malformed_audit = send(
+        app,
+        json_request("GET", "/api/audit-logs?until=not-a-timestamp", master, None),
+    )
+    .await;
     assert_eq!(malformed_audit.status, StatusCode::BAD_REQUEST);
 }
 
@@ -7868,7 +11542,11 @@ async fn audit_logs_filter_by_acting_key() {
         &db,
         "Parent",
         "0.0.0.0/0",
-        KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() },
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Default::default()
+        },
     )
     .await;
 
@@ -7876,18 +11554,37 @@ async fn audit_logs_filter_by_acting_key() {
     let body = json!({ "name": "child", "bound_ips": "0.0.0.0/0" }).to_string();
     let created = send(
         &app,
-        signed_request("POST", "/api/keys", &parent.plaintext, &parent.signing_secret, &body),
+        signed_request(
+            "POST",
+            "/api/keys",
+            &parent.plaintext,
+            &parent.signing_secret,
+            &body,
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
 
-    let by_name = send(&app, json_request("GET", "/api/audit-logs?api_key=Parent", &master, None)).await;
+    let by_name = send(
+        &app,
+        json_request("GET", "/api/audit-logs?api_key=Parent", &master, None),
+    )
+    .await;
     let rows = by_name.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["action"], json!("KEY_CREATE"));
 
-    let none_match = send(&app, json_request("GET", "/api/audit-logs?api_key=NoSuchKeyNameAtAll", &master, None)).await;
-    assert_eq!(none_match.json.as_array().map(Vec::len).unwrap_or(0), 0);
+    let none_match = send(
+        &app,
+        json_request(
+            "GET",
+            "/api/audit-logs?api_key=NoSuchKeyNameAtAll",
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(none_match.json.as_array().map_or(0, Vec::len), 0);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -7939,9 +11636,18 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
     )
     .await;
     assert_eq!(blocked.status, StatusCode::OK, "{}", blocked.raw);
-    assert_eq!(blocked.field("would_execute"), &json!(false), "{}", blocked.raw);
+    assert_eq!(
+        blocked.field("would_execute"),
+        &json!(false),
+        "{}",
+        blocked.raw
+    );
     assert!(blocked.field("command").is_null(), "{}", blocked.raw);
-    assert!(blocked.string("blocking_reason").contains("target_port"), "{}", blocked.raw);
+    assert!(
+        blocked.string("blocking_reason").contains("target_port"),
+        "{}",
+        blocked.raw
+    );
 
     // Declaring the missing parameter afterward — the deferred flow this relaxation exists for —
     // is itself re-validated by `create_hook_parameter`'s sibling endpoints, and once declared, the
@@ -7952,7 +11658,9 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
             "POST",
             &format!("/api/hooks/{deferred_id}/parameters"),
             &master,
-            Some(json!({ "param_key": "target_port", "default_value": "443", "is_required": true })),
+            Some(
+                json!({ "param_key": "target_port", "default_value": "443", "is_required": true }),
+            ),
         ),
     )
     .await;
@@ -7968,7 +11676,12 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
         ),
     )
     .await;
-    assert_eq!(resolved.field("would_execute"), &json!(true), "{}", resolved.raw);
+    assert_eq!(
+        resolved.field("would_execute"),
+        &json!(true),
+        "{}",
+        resolved.raw
+    );
     assert_eq!(
         resolved.json["command"]["args"],
         json!(["add", "bad_ip", "203.0.113.5", "port", "443"]),
@@ -7976,13 +11689,21 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
         resolved.raw
     );
 
+    assert_declared_args_template_create_and_update(&app, &master, &script).await;
+}
+
+async fn assert_declared_args_template_create_and_update(
+    app: &axum::Router,
+    master: &str,
+    script: &str,
+) {
     // A template naming only declared parameters is accepted and stored verbatim.
     let ok = send(
-        &app,
+        app,
         json_request(
             "POST",
             "/api/hooks",
-            &master,
+            master,
             Some(json!({
                 "name": "templated_hook",
                 "script_path": script,
@@ -7993,33 +11714,46 @@ async fn args_template_is_validated_against_declared_parameters_at_create_and_up
     )
     .await;
     assert_eq!(ok.status, StatusCode::OK, "{}", ok.raw);
-    assert_eq!(ok.field("args_template").as_str(), Some("add bad_ip ${target_ip}"));
+    assert_eq!(
+        ok.field("args_template").as_str(),
+        Some("add bad_ip ${target_ip}")
+    );
     let hook_id = ok.string("id");
 
     // Updating to reference a variable the hook does not (yet) declare is refused the same way.
     let bad_update = send(
-        &app,
+        app,
         json_request(
             "PUT",
             &format!("/api/hooks/{hook_id}"),
-            &master,
+            master,
             Some(json!({ "args_template": "add bad_ip ${nonexistent}" })),
         ),
     )
     .await;
-    assert_eq!(bad_update.status, StatusCode::BAD_REQUEST, "{}", bad_update.raw);
+    assert_eq!(
+        bad_update.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_update.raw
+    );
 
     // Clearing it with an empty string reverts to plain positional arguments.
     let cleared = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "args_template": "" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            master,
+            Some(json!({ "args_template": "" })),
+        ),
     )
     .await;
     assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
     assert_eq!(cleared.field("args_template"), &json!(null));
 }
 
-/// Covers the WebUI's `deriveInitialParameters` (`static/app.js`): rather than saving a fresh hook
+/// Covers the `WebUI`'s `deriveInitialParameters` (`static/app.js`): rather than saving a fresh hook
 /// with an empty parameter list, the create form derives `parameters` client-side from the Sample
 /// JSON Payload's own flat top-level keys and sends them inline in the same `POST /api/hooks`
 /// request — this is the shape that flow actually produces on the wire.
@@ -8052,7 +11786,11 @@ async fn creating_a_hook_with_parameters_derived_from_its_own_sample_payload_suc
     )
     .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
-    let declared = created.field("parameters").as_array().cloned().unwrap_or_default();
+    let declared = created
+        .field("parameters")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(declared.len(), 2, "{}", created.raw);
 
     // The unsafe shape this test guards against: a declared key absent from the sample. This is
@@ -8078,8 +11816,17 @@ async fn creating_a_hook_with_parameters_derived_from_its_own_sample_payload_suc
         ),
     )
     .await;
-    assert_eq!(unsafe_shape.status, StatusCode::BAD_REQUEST, "{}", unsafe_shape.raw);
-    assert!(unsafe_shape.string("error").contains("port"), "{}", unsafe_shape.raw);
+    assert_eq!(
+        unsafe_shape.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        unsafe_shape.raw
+    );
+    assert!(
+        unsafe_shape.string("error").contains("port"),
+        "{}",
+        unsafe_shape.raw
+    );
 }
 
 #[tokio::test]
@@ -8111,10 +11858,17 @@ async fn deleting_a_parameter_still_referenced_by_args_template_is_refused() {
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
     let hook_id = created.string("id");
     let params: Vec<serde_json::Value> = created.json["parameters"].as_array().cloned().unwrap();
-    let target_ip_param_id =
-        params.iter().find(|p| p["param_key"] == "target_ip").unwrap()["id"].as_str().unwrap().to_owned();
-    let port_param_id =
-        params.iter().find(|p| p["param_key"] == "port").unwrap()["id"].as_str().unwrap().to_owned();
+    let target_ip_param_id = params
+        .iter()
+        .find(|p| p["param_key"] == "target_ip")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let port_param_id = params.iter().find(|p| p["param_key"] == "port").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     // `target_ip` is referenced by `args_template` — deleting it would leave the hook silently
     // broken, so the deletion itself is refused rather than the breakage surfacing only at the
@@ -8130,10 +11884,23 @@ async fn deleting_a_parameter_still_referenced_by_args_template_is_refused() {
     )
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.raw);
-    assert!(refused.raw.contains("target_ip"), "the error names the still-referenced parameter: {}", refused.raw);
+    assert!(
+        refused.raw.contains("target_ip"),
+        "the error names the still-referenced parameter: {}",
+        refused.raw
+    );
 
     // The parameter survives the refused deletion.
-    let still_there = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}/parameters"), &master, None)).await;
+    let still_there = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/hooks/{hook_id}/parameters"),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(
         still_there.json.as_array().map(Vec::len),
         Some(2),
@@ -8141,21 +11908,43 @@ async fn deleting_a_parameter_still_referenced_by_args_template_is_refused() {
         still_there.raw
     );
 
+    assert_parameter_delete_after_clearing_args_template(
+        &app,
+        &master,
+        &hook_id,
+        &target_ip_param_id,
+        &port_param_id,
+    )
+    .await;
+}
+
+async fn assert_parameter_delete_after_clearing_args_template(
+    app: &axum::Router,
+    master: &str,
+    hook_id: &str,
+    target_ip_param_id: &str,
+    port_param_id: &str,
+) {
     // Clearing the template first, then the same deletion succeeds — nothing references the
     // parameter any more.
     let cleared = send(
-        &app,
-        json_request("PUT", &format!("/api/hooks/{hook_id}"), &master, Some(json!({ "args_template": "" }))),
+        app,
+        json_request(
+            "PUT",
+            &format!("/api/hooks/{hook_id}"),
+            master,
+            Some(json!({ "args_template": "" })),
+        ),
     )
     .await;
     assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.raw);
 
     let allowed = send(
-        &app,
+        app,
         json_request(
             "DELETE",
             &format!("/api/hooks/{hook_id}/parameters/{target_ip_param_id}"),
-            &master,
+            master,
             None,
         ),
     )
@@ -8165,11 +11954,21 @@ async fn deleting_a_parameter_still_referenced_by_args_template_is_refused() {
     // Deleting a parameter the (now-cleared) template never referenced in the first place was
     // never blocked at all — `port` could have been removed just as freely before the clear above.
     let unreferenced = send(
-        &app,
-        json_request("DELETE", &format!("/api/hooks/{hook_id}/parameters/{port_param_id}"), &master, None),
+        app,
+        json_request(
+            "DELETE",
+            &format!("/api/hooks/{hook_id}/parameters/{port_param_id}"),
+            master,
+            None,
+        ),
     )
     .await;
-    assert_eq!(unreferenced.status, StatusCode::NO_CONTENT, "{}", unreferenced.raw);
+    assert_eq!(
+        unreferenced.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        unreferenced.raw
+    );
 }
 
 #[tokio::test]
@@ -8203,8 +12002,10 @@ async fn updating_a_parameter_is_unaffected_by_args_template_revalidation() {
     .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
     let hook_id = created.string("id");
-    let param_id =
-        created.json["parameters"][0]["id"].as_str().expect("the declared parameter has an id").to_owned();
+    let param_id = created.json["parameters"][0]["id"]
+        .as_str()
+        .expect("the declared parameter has an id")
+        .to_owned();
 
     let updated = send(
         &app,
@@ -8330,11 +12131,17 @@ async fn dry_run_and_execute_substitute_args_template_from_the_real_payload() {
     )
     .await;
     assert_eq!(ran.status, StatusCode::OK, "{}", ran.raw);
-    assert_eq!(ran.field("stdout").as_str(), Some("argv:add|bad_ip\n"), "{}", ran.raw);
+    assert_eq!(
+        ran.field("stdout").as_str(),
+        Some("argv:add|bad_ip\n"),
+        "{}",
+        ran.raw
+    );
 }
 
 #[tokio::test]
-async fn args_template_referencing_an_unresolved_variable_blocks_the_dry_run_and_the_real_execution() {
+async fn args_template_referencing_an_unresolved_variable_blocks_the_dry_run_and_the_real_execution()
+ {
     let db = setup_test_db().await;
     let app = create_app(test_state(&db));
     let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
@@ -8363,21 +12170,39 @@ async fn args_template_referencing_an_unresolved_variable_blocks_the_dry_run_and
     // template cannot be built at all.
     let dry = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/test"), &master, Some(json!({ "parameters": {} }))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/test"),
+            &master,
+            Some(json!({ "parameters": {} })),
+        ),
     )
     .await;
     assert_eq!(dry.status, StatusCode::OK, "{}", dry.raw);
     assert_eq!(dry.field("would_execute"), &json!(false), "{}", dry.raw);
-    assert_eq!(dry.field("command"), &json!(null), "no command can be shown when the template fails: {}", dry.raw);
+    assert_eq!(
+        dry.field("command"),
+        &json!(null),
+        "no command can be shown when the template fails: {}",
+        dry.raw
+    );
     assert!(
-        dry.field("blocking_reason").as_str().unwrap_or_default().contains("opt"),
+        dry.field("blocking_reason")
+            .as_str()
+            .unwrap_or_default()
+            .contains("opt"),
         "{}",
         dry.raw
     );
 
     let ran = send(
         &app,
-        json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, Some(json!({ "parameters": {} }))),
+        json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            Some(json!({ "parameters": {} })),
+        ),
     )
     .await;
     assert_eq!(
@@ -8543,10 +12368,19 @@ async fn hook_responses_expose_an_invocable_webhook_path() {
     // one is a row that predates that validation — seeded directly into the database, bypassing the
     // API, rather than through `POST /api/hooks`. `percent_encode_path_segment` still has to handle
     // that legacy row correctly: this is exactly the defense-in-depth case it exists for.
-    let hook_id = insert_hook(&db, "url hook #2", &script, 30).await.to_string();
-    let created = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    let hook_id = insert_hook(&db, "url hook #2", &script, 30)
+        .await
+        .to_string();
+    let created = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
-    assert_eq!(created.field("webhook_path").as_str(), Some("/webhook/url%20hook%20%232"));
+    assert_eq!(
+        created.field("webhook_path").as_str(),
+        Some("/webhook/url%20hook%20%232")
+    );
 
     // `GET /api/hooks` and `GET /api/hooks/{id}` expose the same field, not only the fetch above.
     let listed = send(&app, json_request("GET", "/api/hooks", &master, None)).await;
@@ -8557,16 +12391,37 @@ async fn hook_responses_expose_an_invocable_webhook_path() {
         .iter()
         .find(|h| h["id"].as_str() == Some(hook_id.as_str()))
         .expect("the hook is listed");
-    assert_eq!(listed_hook["webhook_path"], created.field("webhook_path").clone());
+    assert_eq!(
+        listed_hook["webhook_path"],
+        created.field("webhook_path").clone()
+    );
 
-    let fetched = send(&app, json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None)).await;
+    let fetched = send(
+        &app,
+        json_request("GET", &format!("/api/hooks/{hook_id}"), &master, None),
+    )
+    .await;
     assert_eq!(fetched.field("webhook_path"), created.field("webhook_path"));
 
     // And the path is genuinely invocable, not merely well-formed — a keyed POST against exactly
     // the exposed path runs the hook, the same as `/api/hooks/{id}/execute` would.
-    let invoked = send(&app, json_request("POST", fetched.string("webhook_path").as_str(), &master, None)).await;
+    let invoked = send(
+        &app,
+        json_request(
+            "POST",
+            fetched.string("webhook_path").as_str(),
+            &master,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(invoked.status, StatusCode::OK, "{}", invoked.raw);
-    assert_eq!(invoked.field("status"), &json!("SUCCESS"), "{}", invoked.raw);
+    assert_eq!(
+        invoked.field("status"),
+        &json!("SUCCESS"),
+        "{}",
+        invoked.raw
+    );
 }
 
 #[tokio::test]
@@ -8583,15 +12438,24 @@ async fn execution_records_capture_the_resolved_caller_ip() {
         let app = create_app(test_state(&db));
         let hook_id = insert_hook(&db, "ip_hook_untrusted", &script, 30).await;
 
-        let mut req = json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None);
-        req.headers_mut().insert("X-Forwarded-For", "203.0.113.99".parse().unwrap());
+        let mut req = json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            None,
+        );
+        req.headers_mut()
+            .insert("X-Forwarded-For", "203.0.113.99".parse().unwrap());
         let executed = send(&app, req).await;
         assert_eq!(executed.status, StatusCode::OK, "{}", executed.raw);
         assert_eq!(executed.field("caller_ip"), &json!("127.0.0.1"));
 
         let history = send(&app, json_request("GET", "/api/executions", &master, None)).await;
         let rows = history.json.as_array().cloned().unwrap_or_default();
-        let row = rows.iter().find(|r| r["hook_name"] == "ip_hook_untrusted").expect("row is present");
+        let row = rows
+            .iter()
+            .find(|r| r["hook_name"] == "ip_hook_untrusted")
+            .expect("row is present");
         assert_eq!(row["caller_ip"], json!("127.0.0.1"));
     }
 
@@ -8601,10 +12465,166 @@ async fn execution_records_capture_the_resolved_caller_ip() {
         let app = create_app(test_state_with_trusted_proxies(&db, &["127.0.0.1"]));
         let hook_id = insert_hook(&db, "ip_hook_trusted", &script, 30).await;
 
-        let mut req = json_request("POST", &format!("/api/hooks/{hook_id}/execute"), &master, None);
-        req.headers_mut().insert("X-Forwarded-For", "203.0.113.99".parse().unwrap());
+        let mut req = json_request(
+            "POST",
+            &format!("/api/hooks/{hook_id}/execute"),
+            &master,
+            None,
+        );
+        req.headers_mut()
+            .insert("X-Forwarded-For", "203.0.113.99".parse().unwrap());
         let executed = send(&app, req).await;
         assert_eq!(executed.status, StatusCode::OK, "{}", executed.raw);
         assert_eq!(executed.field("caller_ip"), &json!("203.0.113.99"));
     }
+}
+
+#[tokio::test]
+async fn audit_logs_find_deleted_key_snapshots_and_treat_until_inclusively() {
+    let db = setup_test_db().await;
+    let app = create_app(test_state(&db));
+    let (_, master) = insert_key(&db, "Master", "0.0.0.0/0", KeyScopes::master()).await;
+
+    let deleted_actor = insert_key_full(
+        &db,
+        "EphemeralAuditActor",
+        "0.0.0.0/0",
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 5,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let child_body = json!({ "name": "temp-child", "bound_ips": "0.0.0.0/0" }).to_string();
+    let child_resp = send(
+        &app,
+        signed_request(
+            "POST",
+            "/api/keys",
+            &deleted_actor.plaintext,
+            &deleted_actor.signing_secret,
+            &child_body,
+        ),
+    )
+    .await;
+    assert_eq!(child_resp.status, StatusCode::OK, "{}", child_resp.raw);
+    let child_id = child_resp.field("id").as_str().expect("id").to_owned();
+
+    // Delete both child and the acting parent key so `audit_logs.api_key_id` becomes NULL.
+    assert_eq!(
+        send(
+            &app,
+            json_request("DELETE", &format!("/api/keys/{child_id}"), &master, None)
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            &app,
+            json_request(
+                "DELETE",
+                &format!("/api/keys/{}", deleted_actor.id),
+                &master,
+                None
+            )
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+
+    let by_deleted_name = send(
+        &app,
+        json_request(
+            "GET",
+            "/api/audit-logs?api_key=EphemeralAudit",
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(by_deleted_name.status, StatusCode::OK);
+    let name_rows = by_deleted_name.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        name_rows.len(),
+        1,
+        "deleted acting key must remain searchable via api_key_name snapshot"
+    );
+
+    let deleted_prefix: String = deleted_actor.plaintext.chars().take(8).collect();
+    let by_deleted_prefix = send(
+        &app,
+        json_request(
+            "GET",
+            &format!("/api/audit-logs?api_key={deleted_prefix}"),
+            &master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(by_deleted_prefix.status, StatusCode::OK);
+    let prefix_rows = by_deleted_prefix
+        .json
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        prefix_rows.len(),
+        1,
+        "deleted acting key must remain searchable via api_key_prefix snapshot"
+    );
+
+    assert_inclusive_audit_boundary(&db, &app, &master).await;
+}
+
+async fn assert_inclusive_audit_boundary(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    master: &str,
+) {
+    use sea_orm::{ActiveModelTrait, Set};
+
+    // Exact boundary check for `until` (`<=`).
+    let boundary_ts = chrono::DateTime::from_timestamp(
+        (chrono::Utc::now() - chrono::Duration::seconds(60)).timestamp(),
+        0,
+    )
+    .expect("timestamp");
+    simply_hook_executor::entities::audit_log::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(None),
+        api_key_name: Set("SnapshotBot".to_owned()),
+        api_key_prefix: Set("snap1234".to_owned()),
+        client_ip: Set("127.0.0.1".to_owned()),
+        action: Set("INCLUSIVE_BOUNDARY_PROBE".to_owned()),
+        target_resource: Set(None),
+        details: Set(None),
+        timestamp: Set(boundary_ts.naive_utc()),
+    }
+    .insert(db)
+    .await
+    .expect("insert audit probe");
+
+    let until_str = boundary_ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let until_res = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/api/audit-logs?action=INCLUSIVE_BOUNDARY_PROBE&until={until_str}"),
+            master,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(until_res.status, StatusCode::OK);
+    let until_rows = until_res.json.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        until_rows.len(),
+        1,
+        "audit `until` filter must be inclusive (<=)"
+    );
 }

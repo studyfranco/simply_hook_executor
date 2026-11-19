@@ -69,7 +69,6 @@
             </div>
             <div class="header-actions">
                 <span id="current-key-tier" class="badge badge-tier"></span>
-                <span id="identity-badge" class="identity-pill hidden"></span>
                 <button id="refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
                 <button id="logout-btn" class="btn btn-logout btn-sm">Logout</button>
             </div>
@@ -182,7 +181,7 @@
                                 <option value="TIMEOUT">Timeout</option>
                             </select>
                             <input type="datetime-local" id="exec-since-filter" class="input-field" title="Since (inclusive)">
-                            <input type="datetime-local" id="exec-until-filter" class="input-field" title="Until (exclusive)">
+                            <input type="datetime-local" id="exec-until-filter" class="input-field" title="Until (inclusive)">
                             <button type="button" id="exec-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
                             <button type="button" id="exec-clear-filters-btn" class="btn btn-secondary btn-sm">Clear</button>
                         </div>
@@ -245,10 +244,13 @@
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-keys" class="tab-panel">
             <div class="admin-grid">
-                <section class="card admin-section">
+                <section class="card admin-section list-section">
                     <div class="list-header">
                         <h2>API Keys</h2>
-                        <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+                        <div class="header-actions">
+                            <button type="button" id="btn-open-manage-rights" class="btn btn-secondary">+ Assign Hook Rights</button>
+                            <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+                        </div>
                     </div>
                     <p class="subtitle">Create and manage API keys, their global scopes, and their execution budgets.</p>
 
@@ -277,47 +279,6 @@
                             </tbody>
                         </table>
                     </div>
-
-                    <!-- Grant hook rights to an existing key -->
-                    <div class="mt-4 pt-4" style="border-top: 1px solid var(--border);">
-                        <h4>Manage Hook Rights</h4>
-                        <p class="subtitle text-sm">Grant a specific key execute/manage rights on a specific hook.</p>
-                        <form id="form-manage-rights" class="admin-form">
-                            <div class="form-grid">
-                                <div class="form-group">
-                                    <label for="manage-rights-key">Target Key <span>*</span></label>
-                                    <select id="manage-rights-key" class="input-field select-field" required>
-                                        <option value="">-- Select API Key --</option>
-                                    </select>
-                                </div>
-                                <div class="form-group">
-                                    <label for="manage-rights-hook-search">Hook <span>*</span></label>
-                                    <div class="combobox" id="manage-rights-hook-combobox">
-                                        <input type="text" id="manage-rights-hook-search" class="input-field combobox-input" placeholder="-- Select Hook --" autocomplete="off" required>
-                                        <input type="hidden" id="manage-rights-hook">
-                                        <div class="combobox-menu hidden"></div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="permissions-grid mt-2 mb-4">
-                                <label class="checkbox-container" title="Run the hook">
-                                    <input type="checkbox" id="manage-rights-execute" checked>
-                                    <span class="checkmark"></span> Execute
-                                </label>
-                                <label class="checkbox-container" title="Edit the hook's definition and parameters. Takes effect only for keys that also hold Manage Keys (RBAC_MODEL.md R2).">
-                                    <input type="checkbox" id="manage-rights-manage">
-                                    <span class="checkmark"></span> Manage
-                                </label>
-                                <label class="checkbox-container" title="Read this hook's execution history, including runs made by other keys. Read-only: it never permits deleting a record.">
-                                    <input type="checkbox" id="manage-rights-view-execution">
-                                    <span class="checkmark"></span> View History
-                                </label>
-                            </div>
-                            <div class="form-actions">
-                                <button type="submit" class="btn btn-secondary">Assign Hook Rights</button>
-                            </div>
-                        </form>
-                    </div>
                 </section>
             </div>
         </main>
@@ -327,44 +288,16 @@
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-ssh" class="tab-panel">
             <div class="admin-grid">
-                <section class="card admin-section">
-                    <h2>SSH Credentials</h2>
+                <section class="card admin-section list-section">
+                    <div class="list-header">
+                        <h2>SSH Credentials</h2>
+                        <button type="button" id="btn-open-create-ssh-credential" class="btn btn-primary">+ Add SSH Credential</button>
+                    </div>
                     <p class="subtitle">
                         Reusable SSH authentication material for remote execution targets. Master keys only — an SSH
                         credential can authenticate against infrastructure outside this service entirely, so it is not
                         delegable via Create Hooks the way ordinary hook management is.
                     </p>
-
-                    <form id="form-create-ssh-credential" class="admin-form">
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="ssh-credential-name">Name <span>*</span></label>
-                                <input type="text" id="ssh-credential-name" placeholder="e.g. deploy-key-prod" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="ssh-credential-auth-type">Auth Type <span>*</span></label>
-                                <select id="ssh-credential-auth-type" class="input-field select-field">
-                                    <option value="KEY">Private Key</option>
-                                    <option value="PASSWORD">Password</option>
-                                </select>
-                            </div>
-                            <div class="form-group col-span-2" id="ssh-credential-key-group">
-                                <label for="ssh-credential-private-key">Private Key <span>*</span></label>
-                                <textarea id="ssh-credential-private-key" class="input-field font-mono" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false"></textarea>
-                            </div>
-                            <div class="form-group col-span-2" id="ssh-credential-passphrase-group">
-                                <label for="ssh-credential-passphrase">Passphrase</label>
-                                <input type="password" id="ssh-credential-passphrase" class="input-field" placeholder="(none)" autocomplete="off">
-                            </div>
-                            <div class="form-group col-span-2 hidden" id="ssh-credential-password-group">
-                                <label for="ssh-credential-password">Password <span>*</span></label>
-                                <input type="password" id="ssh-credential-password" class="input-field" autocomplete="off">
-                            </div>
-                        </div>
-                        <div class="form-actions mt-4">
-                            <button type="submit" class="btn btn-primary">Create Credential</button>
-                        </div>
-                    </form>
 
                     <div class="table-container mt-4">
                         <table class="data-table">
@@ -386,55 +319,15 @@
                     </div>
                 </section>
 
-                <section class="card admin-section">
-                    <h2>SSH Targets</h2>
+                <section class="card admin-section list-section">
+                    <div class="list-header">
+                        <h2>SSH Targets</h2>
+                        <button type="button" id="btn-open-create-ssh-target" class="btn btn-primary">+ Add SSH Target</button>
+                    </div>
                     <p class="subtitle">
                         Remote hosts a hook may dispatch execution to. A target's host key must be fetched and pinned
                         before it can be tested or used — there is no trust-on-first-use fallback at execution time.
                     </p>
-
-                    <form id="form-create-ssh-target" class="admin-form">
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="ssh-target-name">Name <span>*</span></label>
-                                <input type="text" id="ssh-target-name" placeholder="e.g. prod-web-01" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="ssh-target-credential-id">Credential <span>*</span></label>
-                                <select id="ssh-target-credential-id" class="input-field select-field" required>
-                                    <option value="">-- Select Credential --</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label for="ssh-target-host">Host <span>*</span></label>
-                                <input type="text" id="ssh-target-host" placeholder="e.g. 10.0.0.5" required class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="ssh-target-port">Port</label>
-                                <input type="number" id="ssh-target-port" min="1" max="65535" value="22" class="input-field">
-                            </div>
-                            <div class="form-group">
-                                <label for="ssh-target-username">Username <span>*</span></label>
-                                <input type="text" id="ssh-target-username" required class="input-field">
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="ssh-target-fingerprint">Host Key Fingerprint</label>
-                                <div class="flex gap-2">
-                                    <input type="text" id="ssh-target-fingerprint" class="input-field font-mono" placeholder="SHA256:... (unpinned)" autocomplete="off" spellcheck="false">
-                                    <button type="button" id="ssh-target-fetch-fingerprint-btn" class="btn btn-secondary">Fetch Fingerprint</button>
-                                </div>
-                                <span class="text-muted text-sm">
-                                    Fetches the host key currently offered by the Host/Port above — connects, records the key,
-                                    and disconnects without authenticating. Verify the returned fingerprint out of band
-                                    (documentation, a provisioning system, a phone call) before trusting it; this is
-                                    trust-on-first-use, not verification.
-                                </span>
-                            </div>
-                        </div>
-                        <div class="form-actions mt-4">
-                            <button type="submit" class="btn btn-primary">Create Target</button>
-                        </div>
-                    </form>
 
                     <div class="table-container mt-4">
                         <table class="data-table">
@@ -509,9 +402,9 @@
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-audit" class="tab-panel">
             <div class="admin-grid">
-                <section class="card admin-section">
+                <section class="card admin-section audit-section">
                     <h2>Audit Logs</h2>
-                    <p class="subtitle">Every mutating configuration change — key and hook CRUD, permission grants. Hook execution has its own history on the Executions tab, not here. Master keys only.</p>
+                    <p class="subtitle">Every mutating configuration change — key, hook, SSH, and permission updates. Hook execution has its own history on the Executions tab, not here. Master keys only.</p>
 
                     <div class="filters mb-4">
                         <!-- Exact match server-side (audit_log::Column::Action.eq), so a free-text
@@ -535,18 +428,26 @@
                             <option value="KEY_ROTATE"></option>
                             <option value="KEY_PERM_UPDATE"></option>
                             <option value="KEY_PERM_REVOKE"></option>
+                            <option value="SSH_CREDENTIAL_CREATE"></option>
+                            <option value="SSH_CREDENTIAL_UPDATE"></option>
+                            <option value="SSH_CREDENTIAL_DELETE"></option>
+                            <option value="SSH_TARGET_CREATE"></option>
+                            <option value="SSH_TARGET_UPDATE"></option>
+                            <option value="SSH_TARGET_DELETE"></option>
+                            <option value="SSH_TARGET_PERM_UPDATE"></option>
+                            <option value="SSH_TARGET_PERM_REVOKE"></option>
                             <option value="EXECUTION_DELETE"></option>
                             <option value="EXECUTION_PURGE"></option>
                         </datalist>
                         <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
                         <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name or id)...">
                         <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
-                        <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+                        <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (inclusive)">
                         <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
                         <button type="button" id="audit-clear-filters-btn" class="btn btn-secondary btn-sm">Clear</button>
                     </div>
 
-                    <div class="table-container">
+                    <div class="table-container table-scroll">
                         <table class="data-table">
                             <thead>
                                 <tr>
@@ -820,7 +721,7 @@
         <div class="modal-card modal-card-form card">
             <div class="modal-header">
                 <h3>Edit API Key</h3>
-                <button type="button" class="btn-modal-close" aria-label="Close" onclick="document.getElementById('edit-key-modal').classList.add('hidden')">&times;</button>
+                <button type="button" id="edit-key-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
             </div>
             <form id="form-edit-key" class="admin-form">
                 <input type="hidden" id="edit-key-id">
@@ -848,24 +749,119 @@
                     <input type="text" id="edit-key-canonical-template" class="input-field font-mono" placeholder="{method}\n{path}\n{timestamp}\n{body} (default)" autocomplete="off" spellcheck="false">
                     <span class="text-muted text-sm">Send blank to reset to the service-wide default. Refused if <strong>Manage Keys</strong> is also set.</span>
                 </div>
-                <div class="permissions-grid mt-2 mb-4" id="edit-key-master-only-scopes">
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="edit-key-can-manage-keys">
-                        <span class="checkmark"></span> can_manage_keys
-                    </label>
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="edit-key-can-manage-hooks">
-                        <span class="checkmark"></span> can_manage_hooks
-                    </label>
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="edit-key-can-manage-ssh">
-                        <span class="checkmark"></span> can_manage_ssh
-                    </label>
+                <div class="form-group mt-3">
+                    <label>Global Rights</label>
+                    <div class="permissions-grid" id="edit-key-master-only-scopes">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="edit-key-can-manage-keys">
+                            <span class="checkmark"></span> can_manage_keys
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="edit-key-can-manage-hooks">
+                            <span class="checkmark"></span> can_manage_hooks
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="edit-key-can-manage-ssh">
+                            <span class="checkmark"></span> can_manage_ssh
+                        </label>
+                    </div>
                 </div>
                 <p class="text-muted text-sm mt-2 mb-4 hidden" id="edit-key-scopes-locked-note"></p>
                 <div class="form-actions mt-4">
-                    <button type="submit" class="btn btn-primary">Save Changes</button>
                     <button type="button" id="edit-key-cancel" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Manage Hook Rights Modal -->
+    <div id="manage-rights-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="manage-rights-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="manage-rights-modal-title">Assign Hook Rights</h3>
+                <button type="button" id="manage-rights-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle">Grant a specific key execute, manage, or history-viewing rights on a specific hook.</p>
+            <form id="form-manage-rights" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="manage-rights-key">Target Key <span>*</span></label>
+                        <select id="manage-rights-key" class="input-field select-field" required>
+                            <option value="">-- Select API Key --</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="manage-rights-hook-search">Hook <span>*</span></label>
+                        <div class="combobox" id="manage-rights-hook-combobox">
+                            <input type="text" id="manage-rights-hook-search" class="input-field combobox-input" placeholder="-- Select Hook --" autocomplete="off" required>
+                            <input type="hidden" id="manage-rights-hook">
+                            <div class="combobox-menu hidden"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group mt-3">
+                    <label>Hook Permissions</label>
+                    <div class="permissions-grid">
+                        <label class="checkbox-container" title="Run the hook">
+                            <input type="checkbox" id="manage-rights-execute" checked>
+                            <span class="checkmark"></span> Execute
+                        </label>
+                        <label class="checkbox-container" title="Edit the hook's definition and parameters. Takes effect only for keys that also hold Manage Keys (RBAC_MODEL.md R2).">
+                            <input type="checkbox" id="manage-rights-manage">
+                            <span class="checkmark"></span> Manage
+                        </label>
+                        <label class="checkbox-container" title="Read this hook's execution history, including runs made by other keys. Read-only: it never permits deleting a record.">
+                            <input type="checkbox" id="manage-rights-view-execution">
+                            <span class="checkmark"></span> View History
+                        </label>
+                    </div>
+                </div>
+                <div class="form-actions mt-4">
+                    <button type="button" id="btn-cancel-manage-rights" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Assign Hook Rights</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Create SSH Credential Modal -->
+    <div id="create-ssh-credential-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-ssh-credential-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="create-ssh-credential-modal-title">Add SSH Credential</h3>
+                <button type="button" id="create-ssh-credential-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle">Store reusable SSH private-key or password authentication material sealed at rest.</p>
+            <form id="form-create-ssh-credential" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="ssh-credential-name">Name <span>*</span></label>
+                        <input type="text" id="ssh-credential-name" placeholder="e.g. deploy-key-prod" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="ssh-credential-auth-type">Auth Type <span>*</span></label>
+                        <select id="ssh-credential-auth-type" class="input-field select-field">
+                            <option value="KEY">Private Key</option>
+                            <option value="PASSWORD">Password</option>
+                        </select>
+                    </div>
+                    <div class="form-group col-span-2" id="ssh-credential-key-group">
+                        <label for="ssh-credential-private-key">Private Key <span>*</span></label>
+                        <textarea id="ssh-credential-private-key" class="input-field font-mono" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false"></textarea>
+                    </div>
+                    <div class="form-group col-span-2" id="ssh-credential-passphrase-group">
+                        <label for="ssh-credential-passphrase">Passphrase</label>
+                        <input type="password" id="ssh-credential-passphrase" class="input-field" placeholder="(none)" autocomplete="off">
+                    </div>
+                    <div class="form-group col-span-2 hidden" id="ssh-credential-password-group">
+                        <label for="ssh-credential-password">Password <span>*</span></label>
+                        <input type="password" id="ssh-credential-password" class="input-field" autocomplete="off">
+                    </div>
+                </div>
+                <div class="form-actions mt-4">
+                    <button type="button" id="btn-cancel-create-ssh-credential" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Credential</button>
                 </div>
             </form>
         </div>
@@ -874,7 +870,10 @@
     <!-- Edit SSH Credential Modal -->
     <div id="edit-ssh-credential-modal" class="modal-overlay hidden">
         <div class="modal-card modal-card-form card">
-            <h3>Edit SSH Credential</h3>
+            <div class="modal-header">
+                <h3>Edit SSH Credential</h3>
+                <button type="button" id="edit-ssh-credential-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
             <form id="form-edit-ssh-credential">
                 <input type="hidden" id="edit-ssh-credential-id">
                 <div class="form-group">
@@ -910,10 +909,67 @@
         </div>
     </div>
 
+    <!-- Create SSH Target Modal -->
+    <div id="create-ssh-target-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-ssh-target-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="create-ssh-target-modal-title">Add SSH Target</h3>
+                <button type="button" id="create-ssh-target-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle">Define a remote host and pin its host key fingerprint before dispatching hooks to it.</p>
+            <form id="form-create-ssh-target" class="admin-form">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="ssh-target-name">Name <span>*</span></label>
+                        <input type="text" id="ssh-target-name" placeholder="e.g. prod-web-01" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="ssh-target-credential-id">Credential <span>*</span></label>
+                        <select id="ssh-target-credential-id" class="input-field select-field" required>
+                            <option value="">-- Select Credential --</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="ssh-target-host">Host <span>*</span></label>
+                        <input type="text" id="ssh-target-host" placeholder="e.g. 10.0.0.5" required class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="ssh-target-port">Port</label>
+                        <input type="number" id="ssh-target-port" min="1" max="65535" value="22" class="input-field">
+                    </div>
+                    <div class="form-group">
+                        <label for="ssh-target-username">Username <span>*</span></label>
+                        <input type="text" id="ssh-target-username" required class="input-field">
+                    </div>
+                    <div class="form-group col-span-2">
+                        <label for="ssh-target-fingerprint">Host Key Fingerprint</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="ssh-target-fingerprint" class="input-field font-mono" placeholder="SHA256:... (unpinned)" autocomplete="off" spellcheck="false">
+                            <button type="button" id="ssh-target-fetch-fingerprint-btn" class="btn btn-secondary">Fetch Fingerprint</button>
+                        </div>
+                        <span class="text-muted text-sm">
+                            Fetches the host key currently offered by the Host/Port above — connects, records the key,
+                            and disconnects without authenticating. Verify the returned fingerprint out of band
+                            (documentation, a provisioning system, a phone call) before trusting it; this is
+                            trust-on-first-use, not verification.
+                        </span>
+                    </div>
+                </div>
+                <div class="form-actions mt-4">
+                    <button type="button" id="btn-cancel-create-ssh-target" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Target</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Edit SSH Target Modal -->
     <div id="edit-ssh-target-modal" class="modal-overlay hidden">
         <div class="modal-card modal-card-form card">
-            <h3>Edit SSH Target</h3>
+            <div class="modal-header">
+                <h3>Edit SSH Target</h3>
+                <button type="button" id="edit-ssh-target-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
             <form id="form-edit-ssh-target">
                 <input type="hidden" id="edit-ssh-target-id">
                 <div class="form-group">
@@ -1002,7 +1058,7 @@
         <div class="modal-card modal-card-form card">
             <div class="modal-header">
                 <h3 id="create-key-modal-title">Create API Key</h3>
-                <button type="button" class="btn-modal-close" aria-label="Close" onclick="document.getElementById('create-key-modal').classList.add('hidden')">&times;</button>
+                <button type="button" id="create-key-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
             </div>
             <p class="subtitle">Issue a new API key with specific network bindings, global scopes, and execution limits.</p>
 
@@ -1040,32 +1096,35 @@
                     </div>
                 </div>
 
-                <div class="permissions-grid mt-2 mb-4" id="apikey-master-only-scopes">
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="apikey-can-manage-keys">
-                        <span class="checkmark"></span>
-                        can_manage_keys
-                    </label>
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="apikey-can-manage-hooks">
-                        <span class="checkmark"></span>
-                        can_manage_hooks
-                    </label>
-                    <label class="checkbox-container">
-                        <input type="checkbox" id="apikey-can-manage-ssh">
-                        <span class="checkmark"></span>
-                        can_manage_ssh
-                    </label>
+                <div class="form-group mt-3" id="apikey-scopes-container">
+                    <label>Global Rights</label>
+                    <div class="permissions-grid" id="apikey-master-only-scopes">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-can-manage-keys">
+                            <span class="checkmark"></span>
+                            can_manage_keys
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-can-manage-hooks">
+                            <span class="checkmark"></span>
+                            can_manage_hooks
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="apikey-can-manage-ssh">
+                            <span class="checkmark"></span>
+                            can_manage_ssh
+                        </label>
+                    </div>
+                    <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scopes-locked-note">
+                        Only the Master key may grant <strong>can_manage_keys</strong>,
+                        <strong>can_manage_hooks</strong>, or <strong>can_manage_ssh</strong> (RBAC_MODEL.md R4). Keys you create are
+                        Daughter keys: they hold neither scope.
+                    </p>
                 </div>
-                <p class="text-muted text-sm mt-2 mb-4 hidden" id="apikey-scopes-locked-note">
-                    Only the Master key may grant <strong>can_manage_keys</strong>,
-                    <strong>can_manage_hooks</strong>, or <strong>can_manage_ssh</strong> (RBAC_MODEL.md R4). Keys you create are
-                    Daughter keys: they hold neither scope.
-                </p>
 
                 <div class="form-actions mt-4">
-                    <button type="submit" class="btn btn-primary">Create Key</button>
                     <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Key</button>
                 </div>
             </form>
         </div>

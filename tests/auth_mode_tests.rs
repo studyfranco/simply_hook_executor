@@ -8,8 +8,7 @@
 //! requiring a key exactly as before this feature existed; that is covered by the existing suites,
 //! not repeated here.
 
-#[allow(dead_code)]
-mod common;
+pub mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,8 +21,12 @@ use simply_hook_executor::create_app;
 /// Builds a request with **no** `X-API-Key` header at all — the shape every keyless scenario here
 /// exercises.
 fn keyless_request(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body> {
-    let builder =
-        with_connect_info(Request::builder().method(method).uri(uri).header("Content-Type", "application/json"));
+    let builder = with_connect_info(
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Content-Type", "application/json"),
+    );
     let body = match body {
         Some(value) => Body::from(value.to_string()),
         None => Body::empty(),
@@ -41,7 +44,8 @@ fn hmac_only_request(
     prefix: &str,
     secret: &str,
 ) -> Request<Body> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(body.as_bytes());
     let signature = format!("{prefix}{}", hex::encode(mac.finalize().into_bytes()));
     with_connect_info(
@@ -72,7 +76,8 @@ fn sign_with_template(
         .replace("{path}", path)
         .replace("{timestamp}", timestamp)
         .replace("{body}", body);
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(base.as_bytes());
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
@@ -136,21 +141,47 @@ async fn canonical_v1_custom_template_is_verified_against_and_the_default_is_ref
     assert_eq!(create.field("canonical_template").as_str(), Some(template));
 
     let caller = insert_key_full(&db, "template-caller", "0.0.0.0/0", KeyScopes::plain()).await;
-    grant(&db, caller.id, uuid::Uuid::parse_str(&hook_id).unwrap(), true, false).await;
+    grant(
+        &db,
+        caller.id,
+        uuid::Uuid::parse_str(&hook_id).unwrap(),
+        true,
+        false,
+    )
+    .await;
 
     let uri = format!("/api/hooks/{hook_id}/execute");
     let body = "{}";
     let ts = now_timestamp();
 
-    let custom_sig = sign_with_template(&caller.signing_secret, template, "POST", &uri, &ts.to_string(), body);
-    let ok = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &custom_sig)).await;
-    assert_eq!(ok.status, StatusCode::OK, "custom-template signature must verify: {}", ok.raw);
+    let custom_sig = sign_with_template(
+        &caller.signing_secret,
+        template,
+        "POST",
+        &uri,
+        &ts.to_string(),
+        body,
+    );
+    let ok = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &custom_sig),
+    )
+    .await;
+    assert_eq!(
+        ok.status,
+        StatusCode::OK,
+        "custom-template signature must verify: {}",
+        ok.raw
+    );
 
     // The default (newline-joined) template, over the identical request, must NOT verify — proving
     // the hook's override actually replaced it rather than being consulted only cosmetically.
     let default_sig = sign_request(&caller.signing_secret, "POST", &uri, ts, body);
-    let refused =
-        send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &default_sig)).await;
+    let refused = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &default_sig),
+    )
+    .await;
     assert_eq!(
         refused.status,
         StatusCode::UNAUTHORIZED,
@@ -173,7 +204,17 @@ async fn a_hook_with_no_template_override_still_signs_the_service_wide_default()
     grant(&db, caller.id, hook_id, true, false).await;
 
     let uri = format!("/api/hooks/{hook_id}/execute");
-    let response = send(&app, signed_request("POST", &uri, &caller.plaintext, &caller.signing_secret, "{}")).await;
+    let response = send(
+        &app,
+        signed_request(
+            "POST",
+            &uri,
+            &caller.plaintext,
+            &caller.signing_secret,
+            "{}",
+        ),
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK, "{}", response.raw);
 }
 
@@ -211,23 +252,63 @@ async fn a_hooks_canonical_template_takes_precedence_over_the_keys_own_template(
     let hook_id = create.string("id");
 
     let key_template = "{method}|{path}|{timestamp}|{body}";
-    let caller =
-        insert_key_with_template(&db, "precedence-caller", "0.0.0.0/0", KeyScopes::plain(), key_template).await;
-    grant(&db, caller.id, uuid::Uuid::parse_str(&hook_id).unwrap(), true, false).await;
+    let caller = insert_key_with_template(
+        &db,
+        "precedence-caller",
+        "0.0.0.0/0",
+        KeyScopes::plain(),
+        key_template,
+    )
+    .await;
+    grant(
+        &db,
+        caller.id,
+        uuid::Uuid::parse_str(&hook_id).unwrap(),
+        true,
+        false,
+    )
+    .await;
 
     let uri = format!("/api/hooks/{hook_id}/execute");
     let body = "{}";
     let ts = now_timestamp();
 
     // Signed against the hook's own template: verifies — it wins over the key's own override.
-    let hook_sig = sign_with_template(&caller.signing_secret, hook_template, "POST", &uri, &ts.to_string(), body);
-    let ok = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &hook_sig)).await;
-    assert_eq!(ok.status, StatusCode::OK, "the hook's own template must govern: {}", ok.raw);
+    let hook_sig = sign_with_template(
+        &caller.signing_secret,
+        hook_template,
+        "POST",
+        &uri,
+        &ts.to_string(),
+        body,
+    );
+    let ok = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &hook_sig),
+    )
+    .await;
+    assert_eq!(
+        ok.status,
+        StatusCode::OK,
+        "the hook's own template must govern: {}",
+        ok.raw
+    );
 
     // Signed against the key's own template instead: refused — proving the hook's override actually
     // took precedence rather than either template being accepted.
-    let key_sig = sign_with_template(&caller.signing_secret, key_template, "POST", &uri, &ts.to_string(), body);
-    let refused = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &key_sig)).await;
+    let key_sig = sign_with_template(
+        &caller.signing_secret,
+        key_template,
+        "POST",
+        &uri,
+        &ts.to_string(),
+        body,
+    );
+    let refused = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &key_sig),
+    )
+    .await;
     assert_eq!(
         refused.status,
         StatusCode::UNAUTHORIZED,
@@ -237,9 +318,17 @@ async fn a_hooks_canonical_template_takes_precedence_over_the_keys_own_template(
 
     // Signed against the service-wide default: refused too.
     let default_sig = sign_request(&caller.signing_secret, "POST", &uri, ts, body);
-    let refused_default =
-        send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &default_sig)).await;
-    assert_eq!(refused_default.status, StatusCode::UNAUTHORIZED, "{}", refused_default.raw);
+    let refused_default = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, body, &default_sig),
+    )
+    .await;
+    assert_eq!(
+        refused_default.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        refused_default.raw
+    );
 }
 
 /// A canonical template that reduces to nothing but `{body}` — the exact shape `BODY_ONLY` used to
@@ -273,16 +362,40 @@ async fn a_body_only_shaped_template_verifies_a_genuinely_empty_body() {
     assert_eq!(create.status, StatusCode::OK, "{}", create.raw);
     let hook_id = create.string("id");
 
-    let caller = insert_key_full(&db, "body-only-shaped-caller", "0.0.0.0/0", KeyScopes::plain()).await;
-    grant(&db, caller.id, uuid::Uuid::parse_str(&hook_id).unwrap(), true, false).await;
+    let caller = insert_key_full(
+        &db,
+        "body-only-shaped-caller",
+        "0.0.0.0/0",
+        KeyScopes::plain(),
+    )
+    .await;
+    grant(
+        &db,
+        caller.id,
+        uuid::Uuid::parse_str(&hook_id).unwrap(),
+        true,
+        false,
+    )
+    .await;
 
     let uri = format!("/api/hooks/{hook_id}/execute");
     let ts = now_timestamp();
 
     // A genuinely empty body — not "{}" — since the hook takes no parameters and the execute
     // endpoint reads its body as raw bytes (an empty body is a valid "no parameters" request).
-    let sig = sign_with_template(&caller.signing_secret, template, "POST", &uri, &ts.to_string(), "");
-    let response = send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, "", &sig)).await;
+    let sig = sign_with_template(
+        &caller.signing_secret,
+        template,
+        "POST",
+        &uri,
+        &ts.to_string(),
+        "",
+    );
+    let response = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, "", &sig),
+    )
+    .await;
     assert_eq!(
         response.status,
         StatusCode::OK,
@@ -292,9 +405,17 @@ async fn a_body_only_shaped_template_verifies_a_genuinely_empty_body() {
 
     // The identical signature, but a body with one trailing space: the material it was computed
     // over no longer matches, so this must be refused, not silently trimmed into matching.
-    let with_space =
-        send(&app, signed_request_with_signature("POST", &uri, &caller.plaintext, ts, " ", &sig)).await;
-    assert_eq!(with_space.status, StatusCode::UNAUTHORIZED, "{}", with_space.raw);
+    let with_space = send(
+        &app,
+        signed_request_with_signature("POST", &uri, &caller.plaintext, ts, " ", &sig),
+    )
+    .await;
+    assert_eq!(
+        with_space.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        with_space.raw
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -338,7 +459,9 @@ async fn auth_mode_is_not_recognized_on_api_key_payloads_but_canonical_template_
             "POST",
             "/api/keys",
             &master,
-            Some(json!({ "name": "y", "canonical_template": "{method}|{path}|{timestamp}|{body}" })),
+            Some(
+                json!({ "name": "y", "canonical_template": "{method}|{path}|{timestamp}|{body}" }),
+            ),
         ),
     )
     .await;
@@ -371,13 +494,21 @@ async fn a_can_manage_keys_holder_must_sign_even_on_an_invocation_route() {
         &db,
         "key-admin",
         "0.0.0.0/0",
-        KeyScopes { can_manage_keys: true, max_concurrent_jobs: 10, ..Default::default() },
+        KeyScopes {
+            can_manage_keys: true,
+            max_concurrent_jobs: 10,
+            ..Default::default()
+        },
     )
     .await;
     grant(&db, admin.id, hook_id, true, false).await;
 
     let uri = format!("/api/hooks/{hook_id}/execute");
-    let unsigned = send(&app, json_request("POST", &uri, &admin.plaintext, Some(json!({})))).await;
+    let unsigned = send(
+        &app,
+        json_request("POST", &uri, &admin.plaintext, Some(json!({}))),
+    )
+    .await;
     assert_eq!(
         unsigned.status,
         StatusCode::UNAUTHORIZED,
@@ -385,7 +516,11 @@ async fn a_can_manage_keys_holder_must_sign_even_on_an_invocation_route() {
         unsigned.raw
     );
 
-    let signed = send(&app, signed_request("POST", &uri, &admin.plaintext, &admin.signing_secret, "{}")).await;
+    let signed = send(
+        &app,
+        signed_request("POST", &uri, &admin.plaintext, &admin.signing_secret, "{}"),
+    )
+    .await;
     assert_eq!(signed.status, StatusCode::OK, "{}", signed.raw);
 }
 
@@ -426,8 +561,11 @@ async fn none_mode_is_keyless_reachable_only_when_signing_is_not_globally_mandat
     // Same hook, same database — but a *second* app instance built with signing mandatory
     // globally. NONE must not carve out an exception to that posture.
     let strict_app = create_app(test_state_requiring_signatures(&db));
-    let refused = send(&strict_app, keyless_request("POST", "/api/hooks/public_hook/execute", Some(json!({}))))
-        .await;
+    let refused = send(
+        &strict_app,
+        keyless_request("POST", "/api/hooks/public_hook/execute", Some(json!({}))),
+    )
+    .await;
     assert_eq!(
         refused.status,
         StatusCode::UNAUTHORIZED,
@@ -437,8 +575,11 @@ async fn none_mode_is_keyless_reachable_only_when_signing_is_not_globally_mandat
 
     // The refusal is indistinguishable from a keyless request naming a hook that requires a key —
     // no oracle for "this hook exists and is configured NONE, but currently blocked".
-    let unrelated_key_required =
-        send(&strict_app, keyless_request("POST", "/api/hooks/does_not_exist/execute", Some(json!({})))).await;
+    let unrelated_key_required = send(
+        &strict_app,
+        keyless_request("POST", "/api/hooks/does_not_exist/execute", Some(json!({}))),
+    )
+    .await;
     assert_eq!(refused.status, unrelated_key_required.status);
     assert_eq!(refused.raw, unrelated_key_required.raw);
 }
@@ -475,7 +616,10 @@ async fn hmac_only_verifies_against_the_hooks_own_secret_header_and_prefix() {
     assert_eq!(create.status, StatusCode::OK, "{}", create.raw);
     assert_eq!(create.field("auth_mode").as_str(), Some("HMAC_ONLY"));
     assert_eq!(create.field("hmac_secret_configured"), &json!(true));
-    assert_eq!(create.field("signature_header").as_str(), Some("X-Custom-Signature"));
+    assert_eq!(
+        create.field("signature_header").as_str(),
+        Some("X-Custom-Signature")
+    );
     assert_eq!(create.field("signature_prefix").as_str(), Some("hmac="));
     // The secret itself is never echoed back, in any field.
     assert!(!create.raw.contains("correct-horse-battery-staple"));
@@ -492,10 +636,22 @@ async fn hmac_only_verifies_against_the_hooks_own_secret_header_and_prefix() {
         "correct-horse-battery-staple",
     );
     let ok = send(&app, valid).await;
-    assert_eq!(ok.status, StatusCode::OK, "a correctly signed HMAC_ONLY request must succeed: {}", ok.raw);
+    assert_eq!(
+        ok.status,
+        StatusCode::OK,
+        "a correctly signed HMAC_ONLY request must succeed: {}",
+        ok.raw
+    );
 
     // Wrong secret.
-    let bad_secret = hmac_only_request("POST", uri, &body, "X-Custom-Signature", "hmac=", "wrong-secret");
+    let bad_secret = hmac_only_request(
+        "POST",
+        uri,
+        &body,
+        "X-Custom-Signature",
+        "hmac=",
+        "wrong-secret",
+    );
     let refused = send(&app, bad_secret).await;
     assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.raw);
 
@@ -588,7 +744,12 @@ async fn hmac_only_requires_a_secret_at_creation_and_on_update() {
         ),
     )
     .await;
-    assert_eq!(switch_refused.status, StatusCode::BAD_REQUEST, "{}", switch_refused.raw);
+    assert_eq!(
+        switch_refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        switch_refused.raw
+    );
 
     let switch_with_secret = send(
         &app,
@@ -600,7 +761,12 @@ async fn hmac_only_requires_a_secret_at_creation_and_on_update() {
         ),
     )
     .await;
-    assert_eq!(switch_with_secret.status, StatusCode::OK, "{}", switch_with_secret.raw);
+    assert_eq!(
+        switch_with_secret.status,
+        StatusCode::OK,
+        "{}",
+        switch_with_secret.raw
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -640,15 +806,33 @@ async fn api_key_only_refuses_keyless_and_accepts_any_permitted_key_exactly_like
 
     let canonical_hook_id = insert_hook(&db, "canonical_default_hook", &script, 30).await;
     let canonical_uri = format!("/api/hooks/{canonical_hook_id}/execute");
-    let keyless_canonical = send(&app, keyless_request("POST", &canonical_uri, Some(json!({})))).await;
+    let keyless_canonical = send(
+        &app,
+        keyless_request("POST", &canonical_uri, Some(json!({}))),
+    )
+    .await;
     assert_eq!(keyless.status, keyless_canonical.status);
-    assert_eq!(keyless.raw, keyless_canonical.raw, "API_KEY_ONLY and CANONICAL_V1 must refuse a keyless caller identically — neither is a keyless mode");
+    assert_eq!(
+        keyless.raw, keyless_canonical.raw,
+        "API_KEY_ONLY and CANONICAL_V1 must refuse a keyless caller identically — neither is a keyless mode"
+    );
 
     // Keyed, unsigned bearer-only request: succeeds — that is the whole point of API_KEY_ONLY, and
     // it is no different from what CANONICAL_V1 already permits when REQUIRE_SIGNED_REQUESTS=false.
     let caller = insert_key_full(&db, "api-key-only-caller", "0.0.0.0/0", KeyScopes::plain()).await;
-    grant(&db, caller.id, uuid::Uuid::parse_str(&hook_id).unwrap(), true, false).await;
-    let keyed = send(&app, json_request("POST", &uri, &caller.plaintext, Some(json!({})))).await;
+    grant(
+        &db,
+        caller.id,
+        uuid::Uuid::parse_str(&hook_id).unwrap(),
+        true,
+        false,
+    )
+    .await;
+    let keyed = send(
+        &app,
+        json_request("POST", &uri, &caller.plaintext, Some(json!({}))),
+    )
+    .await;
     assert_eq!(keyed.status, StatusCode::OK, "{}", keyed.raw);
 }
 
@@ -675,7 +859,11 @@ async fn unknown_key_and_bad_signature_produce_the_identical_401_on_invocation_r
     let uri = format!("/api/hooks/{hook_id}/execute");
 
     // Case 1: a key that does not exist at all.
-    let unknown_key = send(&app, json_request("POST", &uri, "never-issued-key-0123456789", Some(json!({})))).await;
+    let unknown_key = send(
+        &app,
+        json_request("POST", &uri, "never-issued-key-0123456789", Some(json!({}))),
+    )
+    .await;
     assert_eq!(unknown_key.status, StatusCode::UNAUTHORIZED);
 
     // Case 2: a real key, wrong secret (bad signature).
@@ -704,8 +892,14 @@ async fn unknown_key_and_bad_signature_produce_the_identical_401_on_invocation_r
     assert_eq!(stale.status, StatusCode::UNAUTHORIZED);
 
     // All three must be byte-identical — status and body alike.
-    assert_eq!(unknown_key.raw, bad_signature.raw, "unknown key vs bad signature must be indistinguishable");
-    assert_eq!(unknown_key.raw, stale.raw, "unknown key vs stale timestamp must be indistinguishable");
+    assert_eq!(
+        unknown_key.raw, bad_signature.raw,
+        "unknown key vs bad signature must be indistinguishable"
+    );
+    assert_eq!(
+        unknown_key.raw, stale.raw,
+        "unknown key vs stale timestamp must be indistinguishable"
+    );
     assert_eq!(unknown_key.field("error"), &json!("Unauthorized"));
 
     // Contrast: a genuinely *valid* key lacking `can_execute` gets a different, specific `403` —
@@ -713,11 +907,19 @@ async fn unknown_key_and_bad_signature_produce_the_identical_401_on_invocation_r
     // Holds a row on the hook (so it is *visible*, not merely absent) with `can_execute: false` —
     // §4 oracle discipline means a key with no row at all gets `404`, not `403`; the `403` case
     // needs a real, visible permission row that simply lacks the verb.
-    let unpermitted = insert_key_full(&db, "no-execute-rights", "0.0.0.0/0", KeyScopes::plain()).await;
+    let unpermitted =
+        insert_key_full(&db, "no-execute-rights", "0.0.0.0/0", KeyScopes::plain()).await;
     grant(&db, unpermitted.id, hook_id, false, true).await;
-    let forbidden = send(&app, json_request("POST", &uri, &unpermitted.plaintext, Some(json!({})))).await;
+    let forbidden = send(
+        &app,
+        json_request("POST", &uri, &unpermitted.plaintext, Some(json!({}))),
+    )
+    .await;
     assert_eq!(forbidden.status, StatusCode::FORBIDDEN, "{}", forbidden.raw);
-    assert_ne!(forbidden.raw, unknown_key.raw, "a real, unpermitted key must not look like a bad credential");
+    assert_ne!(
+        forbidden.raw, unknown_key.raw,
+        "a real, unpermitted key must not look like a bad credential"
+    );
 }
 
 /// The same uniformity holds on `POST /api/hooks/{id}/test` and `POST /webhook/{identifier}`, not
@@ -731,12 +933,20 @@ async fn the_uniform_401_covers_test_and_webhook_routes_too() {
     let hook_id = insert_hook(&db, "uniform_hook_two", &script, 30).await;
 
     let test_uri = format!("/api/hooks/{hook_id}/test");
-    let unknown_on_test = send(&app, json_request("POST", &test_uri, "not-a-real-key", Some(json!({})))).await;
+    let unknown_on_test = send(
+        &app,
+        json_request("POST", &test_uri, "not-a-real-key", Some(json!({}))),
+    )
+    .await;
     assert_eq!(unknown_on_test.status, StatusCode::UNAUTHORIZED);
     assert_eq!(unknown_on_test.field("error"), &json!("Unauthorized"));
 
     let webhook_uri = "/webhook/uniform_hook_two";
-    let unknown_on_webhook = send(&app, json_request("POST", webhook_uri, "also-not-real", Some(json!({})))).await;
+    let unknown_on_webhook = send(
+        &app,
+        json_request("POST", webhook_uri, "also-not-real", Some(json!({}))),
+    )
+    .await;
     assert_eq!(unknown_on_webhook.status, StatusCode::UNAUTHORIZED);
     assert_eq!(unknown_on_webhook.raw, unknown_on_test.raw);
 }
@@ -829,7 +1039,10 @@ async fn a_none_hook_without_a_stray_signature_still_succeeds() {
     )
     .body(Body::from("{}"))
     .expect("request builds");
-    assert_eq!(send(&app, with_signature).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, with_signature).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // Without one: succeeds, proving the refusal above was really about the stray header.
     let clean = keyless_request("POST", uri, Some(json!({})));

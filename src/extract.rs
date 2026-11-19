@@ -113,7 +113,7 @@ where
 ///
 /// `GET /api/executions/not-a-uuid` is the case this exists for. Axum rejects it before any handler
 /// runs, so **no handler test covers it** — there is no handler involved — and its refusal used to
-/// arrive as `text/plain` reading `Invalid URL: Cannot parse \`id\` with value \`not-a-uuid\`…`. A
+/// arrive as `text/plain` reading `Invalid URL: Cannot parse id with value not-a-uuid…`. A
 /// client that parses `{"error": …}` got a body with no `error` field, on a request it had every
 /// reason to expect a machine-readable refusal for: a malformed identifier is the single most likely
 /// thing a caller gets wrong.
@@ -209,7 +209,9 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = axum::body::Bytes::from_request(req, state).await.map_err(|rejection| envelope!(rejection))?;
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|rejection| envelope!(rejection))?;
 
         if bytes.is_empty() {
             return Ok(Self(T::default()));

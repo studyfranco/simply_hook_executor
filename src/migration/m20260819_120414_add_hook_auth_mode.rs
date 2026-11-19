@@ -113,7 +113,12 @@ impl MigrationTrait for Migration {
             Hooks::AuthMode,
         ] {
             manager
-                .alter_table(Table::alter().table(Hooks::Table).drop_column(column).to_owned())
+                .alter_table(
+                    Table::alter()
+                        .table(Hooks::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
                 .await?;
         }
         Ok(())
