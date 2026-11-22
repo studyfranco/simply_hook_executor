@@ -1,6 +1,6 @@
 # simply_hook_executor
 
-See [GOALS.md](GOALS.md) for the mission, execution boundary, and network placement.
+See [GOALS.md](GOALS.md) for the mission, execution boundary, and network placement, and [.agents/skills/use-hook-executor/SKILL.md](.agents/skills/use-hook-executor/SKILL.md) for the agent skill.
 
 Simply efficient. A secure hook execution daemon.
 

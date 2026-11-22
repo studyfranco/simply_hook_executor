@@ -511,7 +511,7 @@ pub async fn signed_send(
     body: Option<serde_json::Value>,
 ) -> TestResponse {
     *clock -= 1;
-    let body_str = body.map(|v| v.to_string()).unwrap_or_default();
+    let body_str = body.map_or_default(|v| v.to_string());
     let req = signed_request_at(
         method,
         uri,

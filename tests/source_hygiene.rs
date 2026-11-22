@@ -273,7 +273,7 @@ fn manifest_policy(source: &str) -> Vec<String> {
 #[test]
 fn cargo_manifest_enforces_ecosystem_policy() {
     let violations = manifest_policy(&read("Cargo.toml"));
-    assert!(violations.is_empty(), "{}", violations.join("\n"));
+    assert_eq!(violations, [] as [String; 0], "{}", violations.join("\n"));
 }
 
 #[test]
@@ -293,7 +293,7 @@ fn manifest_policy_rejects_drift() {
         [dependencies]
         sea-schema = { default-features = false, features = ['sqlx-postgres', 'sqlx-sqlite', 'sqlx-mysql', 'discovery', 'probe', 'runtime-tokio-rustls'] }
     "#;
-    assert!(manifest_policy(manifest).is_empty());
+    assert_eq!(manifest_policy(manifest), [] as [String; 0]);
     for (before, after, diagnostic) in [
         ("priority = -2", "priority = -1", "clippy.all"),
         ("'2024'", "'2021'", "package.edition"),
@@ -644,8 +644,9 @@ fn rust_sources_do_not_ignore_tests() {
             .find_iter(&rust.code)
             .map(|m| m.start())
             .collect();
-        assert!(
-            violations.is_empty(),
+        assert_eq!(
+            violations,
+            [] as [usize; 0],
             "{}: ignored test attributes at byte offsets {violations:?}",
             path.display()
         );
@@ -660,8 +661,9 @@ fn rust_sources_do_not_suppress_clippy_lints() {
             path.parent() == Some(Path::new("src/entities")),
             &rust_source(&source),
         );
-        assert!(
-            violations.is_empty(),
+        assert_eq!(
+            violations,
+            [] as [usize; 0],
             "{}: forbidden Clippy attributes at byte offsets {violations:?}",
             path.display()
         );
@@ -677,8 +679,14 @@ fn clippy_policy_rejects_suppressions_outside_the_entity_exception() {
         "struct_excessive_bools, reason = \"SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns\")]\n",
         "pub struct Model { a: bool, b: bool, c: bool, d: bool }",
     );
-    assert!(lint_attribute_violations(true, &rust_source(permitted)).is_empty());
-    assert!(!lint_attribute_violations(false, &rust_source(permitted)).is_empty());
+    assert_eq!(
+        lint_attribute_violations(true, &rust_source(permitted)),
+        [] as [usize; 0]
+    );
+    assert_ne!(
+        lint_attribute_violations(false, &rust_source(permitted)),
+        [] as [usize; 0]
+    );
     for source in [
         "#[allow(dead_code)] fn f() {}".to_owned(),
         concat!("#[", "allow(clippy::", "all)] fn f() {}").to_owned(),
@@ -693,8 +701,9 @@ fn clippy_policy_rejects_suppressions_outside_the_entity_exception() {
         permitted.replace("d: bool", "d: u8"),
         permitted.replace(", reason = \"SeaORM DeriveEntityModel requires flat 1:1 fields for SQL BOOLEAN columns\"", ""),
     ] {
-        assert!(
-            !lint_attribute_violations(true, &rust_source(&source)).is_empty(),
+        assert_ne!(
+            lint_attribute_violations(true, &rust_source(&source)),
+            [] as [usize; 0],
             "{source}"
         );
     }
@@ -721,8 +730,9 @@ fn rust_production_code_is_panic_free_and_safe() {
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
             .unwrap_or(rust.code.len());
         let violations = production_code_violations(&rust.code[..end]);
-        assert!(
-            violations.is_empty(),
+        assert_eq!(
+            violations,
+            [] as [&str; 0],
             "{}: forbidden Rust constructs {violations:?}",
             path.display()
         );
@@ -760,7 +770,10 @@ fn production_check_rejects_panics_and_unsafe_code() {
         " { } \"#\"##;\n",
         "let character = '\"'; let label = 'x';",
     );
-    assert!(production_code_violations(&rust_source(ignored).code).is_empty());
+    assert_eq!(
+        production_code_violations(&rust_source(ignored).code),
+        [] as [&str; 0]
+    );
 }
 
 const RAW_SQL_MARKERS: &str = concat!(
@@ -838,8 +851,9 @@ fn production_uses_typed_queries_outside_raw_sql_exceptions() {
 
 #[test]
 fn no_raw_sql_handler_is_ever_exempted() {
-    assert!(
-        RAW_SQL_ALLOWED.is_empty(),
+    assert_eq!(
+        RAW_SQL_ALLOWED,
+        [] as [&str; 0],
         "RAW_SQL_ALLOWED must remain empty — zero raw SQL allowed anywhere under src/"
     );
     for path in rust_files("src/api").chain(rust_files("src/migration")) {
@@ -902,9 +916,18 @@ fn raw_sql_check_rejects_raw_apis_and_dml_literals() {
     );
     let advisory = r#""Demote the extra keys with `UPDATE api_keys SET is_master = false`.""#;
     let select_one = r#""SELECT 1""#;
-    assert!(raw_sql_violations(&rust_source(advisory), advisory.len()).is_empty());
-    assert!(raw_sql_violations(&rust_source(select_one), select_one.len()).is_empty());
-    assert!(raw_sql_violations(&rust_source(source), source.len()).is_empty());
+    assert_eq!(
+        raw_sql_violations(&rust_source(advisory), advisory.len()),
+        [] as [&str; 0]
+    );
+    assert_eq!(
+        raw_sql_violations(&rust_source(select_one), select_one.len()),
+        [] as [&str; 0]
+    );
+    assert_eq!(
+        raw_sql_violations(&rust_source(source), source.len()),
+        [] as [&str; 0]
+    );
 }
 
 fn syntax_errors(relative: &str, source: &str) -> Vec<String> {
@@ -940,7 +963,7 @@ fn dashboard_assets_exist() {
 #[test]
 fn app_js_parses_without_syntax_errors() {
     let errors = syntax_errors("static/app.js", &read("static/app.js"));
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    assert_eq!(errors, [] as [String; 0], "{}", errors.join("\n"));
 }
 
 #[test]
@@ -1122,7 +1145,7 @@ fn subpath_violations(js: &str) -> Vec<&'static str> {
 #[test]
 fn dashboard_routes_requests_and_signs_with_independent_bases() {
     let violations = subpath_violations(&read("static/app.js"));
-    assert!(violations.is_empty(), "{violations:?}");
+    assert_eq!(violations, [] as [&str; 0], "{violations:?}");
 }
 
 #[test]
@@ -1318,8 +1341,9 @@ fn key_payload_violations(js: &str) -> Vec<&str> {
 fn the_dashboard_never_sends_is_master_in_a_key_payload() {
     let js = read("static/app.js");
     let violations = key_payload_violations(&js);
-    assert!(
-        violations.is_empty(),
+    assert_eq!(
+        violations,
+        [] as [String; 0],
         "is_master sent in key payloads: {violations:?}"
     );
 }
@@ -1429,8 +1453,9 @@ fn frontend_has_no_external_assets_or_svg_data_uris() {
         {
             let source = read(path.to_str().expect("UTF-8 path"));
             let violations = external_asset_violations(&source, extension);
-            assert!(
-                violations.is_empty(),
+            assert_eq!(
+                violations,
+                [] as [&str; 0],
                 "{}: forbidden frontend assets {violations:?}",
                 path.display()
             );
@@ -1479,8 +1504,9 @@ fn offline_asset_check_rejects_external_resources_and_svg_data() {
             "node.innerHTML = `<img src='http://example.test/image'>`;",
         ),
     ] {
-        assert!(
-            !external_asset_violations(source, extension).is_empty(),
+        assert_ne!(
+            external_asset_violations(source, extension),
+            [] as [&str; 0],
             "{source}"
         );
     }
@@ -1489,7 +1515,7 @@ fn offline_asset_check_rejects_external_resources_and_svg_data() {
         const svg = `<svg xmlns="http://www.w3.org/2000/svg"></svg>`;
         const local = `<img src="./local.png" alt="try https://example.test">`;
         fetch(this.requestBase + path);"#;
-    assert!(external_asset_violations(benign, "js").is_empty());
+    assert_eq!(external_asset_violations(benign, "js"), [] as [&str; 0]);
 }
 
 #[test]
@@ -1551,6 +1577,12 @@ fn non_documentation_addresses(source: &str) -> Vec<&str> {
                         );
                     }
                     let host = candidate.to_ascii_lowercase();
+                    if Path::new(&host)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
+                        return false;
+                    }
                     !["example", "example.com", "example.net", "example.org"]
                         .iter()
                         .any(|domain| {
@@ -1577,20 +1609,21 @@ fn onboarding_links_goals_and_uses_documentation_addresses() {
     }
     let goals = read("GOALS.md");
     let addresses = non_documentation_addresses(&goals);
-    assert!(
-        addresses.is_empty(),
+    assert_eq!(
+        addresses,
+        [] as [&str; 0],
         "Unexpected addresses in GOALS.md: {addresses:?}"
     );
 }
 
 #[test]
 fn onboarding_address_check_rejects_network_address_drift() {
-    assert!(
+    assert_eq!(
         non_documentation_addresses(
             "http://hooks.example.com:3560 hooks.example test.example.net example.org \
              192.0.2.10 198.51.100.15/24 203.0.113.42 127.0.0.1 [::1] 0.0.0.0"
-        )
-        .is_empty()
+        ),
+        [] as [&str; 0]
     );
     assert_eq!(
         non_documentation_addresses(
@@ -1607,4 +1640,92 @@ fn onboarding_address_check_rejects_network_address_drift() {
             "10.0.0.4",
         ]
     );
+}
+
+#[test]
+fn agent_skill_exists_has_frontmatter_is_linked_and_uses_documentation_addresses() {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let skill_rel = ".agents/skills/use-hook-executor/SKILL.md";
+    assert!(repo_path(skill_rel).is_file(), "{skill_rel} must exist");
+    let skill = read(skill_rel);
+
+    let after_start = skill
+        .strip_prefix("---\n")
+        .expect("SKILL.md must start with YAML frontmatter");
+    let (frontmatter, _body) = after_start
+        .split_once("\n---\n")
+        .expect("SKILL.md must close YAML frontmatter");
+    assert!(
+        frontmatter
+            .lines()
+            .any(|line| line.trim() == "name: use-hook-executor"),
+        "SKILL.md frontmatter must declare `name: use-hook-executor`"
+    );
+    assert!(
+        frontmatter
+            .lines()
+            .any(|line| line.trim_start().starts_with("description:")
+                && line.trim_start()["description:".len()..].trim() != ""),
+        "SKILL.md frontmatter must declare a non-empty `description:`"
+    );
+
+    for document in ["AGENT.MD", "README.md", "GOALS.md"] {
+        assert!(
+            read(document).contains(skill_rel),
+            "{document} must link {skill_rel}"
+        );
+    }
+
+    assert!(
+        !skill.contains("127.0.0.1") && !skill.contains("169.254."),
+        "SKILL.md must use RFC 5737 / RFC 3849 / RFC 2606 documentation addresses, not loopback/link-local"
+    );
+
+    let ipv4_re = regex(r"\b(?:\d{1,3}\.){3}\d{1,3}\b");
+    for m in ipv4_re.find_iter(&skill) {
+        let ip: Ipv4Addr = m.as_str().parse().expect("valid IPv4 in SKILL.md");
+        assert!(
+            matches!(
+                ip.octets(),
+                [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+            ),
+            "SKILL.md contains non-RFC-5737 IPv4 address: {ip}"
+        );
+    }
+
+    let ipv6_re = regex(r"(?i)\b(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*\b");
+    for m in ipv6_re.find_iter(&skill) {
+        let candidate = m.as_str().trim_end_matches('.');
+        if let Ok(ip) = candidate.parse::<Ipv6Addr>()
+            && !ip.is_unspecified()
+        {
+            assert_eq!(
+                ip.segments()[..2],
+                [0x2001, 0x0db8],
+                "SKILL.md contains non-RFC-3849 IPv6 address: {ip}"
+            );
+        }
+    }
+
+    let url_re = regex(r#"(?i)https?://([^/\s:)`"']+)"#);
+    for caps in url_re.captures_iter(&skill) {
+        let host = caps[1].trim_end_matches('.').to_ascii_lowercase();
+        if host.starts_with('<') {
+            continue;
+        }
+        let is_doc_domain = [
+            "example.com",
+            "example.org",
+            "example.net",
+            "example.test",
+            "example.internal",
+        ]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+        assert!(
+            is_doc_domain,
+            "SKILL.md contains non-RFC-2606 URL host: {host}"
+        );
+    }
 }

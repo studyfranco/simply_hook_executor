@@ -1391,7 +1391,7 @@ async fn signing_secrets_are_encrypted_at_rest_when_a_key_is_configured() {
     let key_id = created.string("key_id");
     let created_api_key = created.string("plaintext_key");
     assert!(key_id.starts_with("shk_"));
-    assert!(!signing_secret.is_empty());
+    assert_ne!(signing_secret, "");
 
     // The stored column must not contain the secret in any readable form.
     let stored = ApiKey::find_by_id(Uuid::parse_str(&created.string("id")).expect("valid uuid"))
@@ -5678,11 +5678,10 @@ async fn timed_out_executions_do_not_leave_zombie_children() {
             &format!("ps -o stat=,ppid= -A 2>/dev/null | awk '$1 ~ /^Z/ && $2 == {pid}'"),
         ])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
 
-    assert!(
-        zombies.is_empty(),
+    assert_eq!(
+        zombies, "",
         "timed-out hooks left zombie children behind:\n{zombies}"
     );
 }
@@ -5932,15 +5931,11 @@ async fn regression_non_master_cannot_mint_a_master_key() {
     // Nothing was created by any of the refused attempts.
     let (_mid, master) = insert_key(&db, "master", "", KeyScopes::master()).await;
     let keys = send(&app, json_request("GET", "/api/keys", &master, None)).await;
-    let names: Vec<&str> = keys
-        .json
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|k| k.get("name").and_then(|n| n.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let names: Vec<&str> = keys.json.as_array().map_or_default(|rows| {
+        rows.iter()
+            .filter_map(|k| k.get("name").and_then(|n| n.as_str()))
+            .collect()
+    });
     assert!(
         !names.contains(&"escalated"),
         "a refused creation must not persist a row: {names:?}"

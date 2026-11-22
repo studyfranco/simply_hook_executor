@@ -13,7 +13,11 @@ use sea_schema::probe::SchemaProbe;
 pub(super) mod prelude {
     pub(in crate::migration) use super::migration_name;
     pub use super::{MigrationTrait, SchemaManager};
-    pub use sea_orm::{DbErr, DeriveIden, sea_query::*};
+    pub use sea_orm::sea_query::{
+        ColumnDef, Expr, ExprTrait, ForeignKey, ForeignKeyAction, Index, IndexOrder, IntoIden,
+        Query, Table, TableAlterStatement,
+    };
+    pub use sea_orm::{DbErr, DeriveIden};
 }
 
 macro_rules! migration_name {
@@ -220,56 +224,60 @@ pub trait MigratorTrait {
     ///
     /// # Errors
     /// Returns an error for an unrecognized applied version or if a migration fails.
-    #[must_use]
-    async fn up(db: &DatabaseConnection, steps: Option<u32>) -> Result<(), DbErr> {
-        let mut table =
-            Schema::new(db.get_database_backend()).create_table_from_entity(history::Entity);
-        db.execute(table.if_not_exists()).await?;
+    async fn up(db: &DatabaseConnection, steps: Option<u32>) -> Result<(), DbErr>;
+}
 
-        let migrations = Self::migrations();
-        let applied: BTreeSet<_> = history::Entity::find()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|row| row.version)
-            .collect();
-        for version in &applied {
-            if !migrations
-                .iter()
-                .any(|migration| migration.name() == version)
-            {
-                return Err(DbErr::Migration(format!(
-                    "Applied migration {version} is missing from the registry"
-                )));
-            }
-        }
+pub(super) async fn apply_migrations(
+    migrations: Vec<Box<dyn MigrationTrait>>,
+    db: &DatabaseConnection,
+    steps: Option<u32>,
+) -> Result<(), DbErr> {
+    let mut table =
+        Schema::new(db.get_database_backend()).create_table_from_entity(history::Entity);
+    db.execute(table.if_not_exists()).await?;
 
-        let pending = migrations
-            .into_iter()
-            .filter(|migration| !applied.contains(migration.name()))
-            .take(steps.map_or(usize::MAX, |count| count as usize));
-        for migration in pending {
-            let version = migration.name();
-            tracing::info!(version, "Applying database migration");
-            let row = history::ActiveModel {
-                version: Set(version.to_owned()),
-                applied_at: Set(time::OffsetDateTime::now_utc().unix_timestamp()),
-            };
-            // MySQL implicitly commits DDL. SQLite and PostgreSQL can record the
-            // migration atomically with the schema changes.
-            if db.get_database_backend() == DatabaseBackend::MySql {
-                migration.up(&SchemaManager::new(db)).await?;
-                history::Entity::insert(row).exec(db).await?;
-            } else {
-                let transaction = db.begin().await?;
-                let manager = SchemaManager(Connection::Transaction(&transaction));
-                migration.up(&manager).await?;
-                history::Entity::insert(row).exec(&transaction).await?;
-                transaction.commit().await?;
-            }
+    let applied: BTreeSet<_> = history::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.version)
+        .collect();
+    for version in &applied {
+        if !migrations
+            .iter()
+            .any(|migration| migration.name() == version)
+        {
+            return Err(DbErr::Migration(format!(
+                "Applied migration {version} is missing from the registry"
+            )));
         }
-        Ok(())
     }
+
+    let pending = migrations
+        .into_iter()
+        .filter(|migration| !applied.contains(migration.name()))
+        .take(steps.map_or(usize::MAX, |count| count as usize));
+    for migration in pending {
+        let version = migration.name();
+        tracing::info!(version, "Applying database migration");
+        let row = history::ActiveModel {
+            version: Set(version.to_owned()),
+            applied_at: Set(time::OffsetDateTime::now_utc().unix_timestamp()),
+        };
+        // MySQL implicitly commits DDL. SQLite and PostgreSQL can record the
+        // migration atomically with the schema changes.
+        if db.get_database_backend() == DatabaseBackend::MySql {
+            migration.up(&SchemaManager::new(db)).await?;
+            history::Entity::insert(row).exec(db).await?;
+        } else {
+            let transaction = db.begin().await?;
+            let manager = SchemaManager(Connection::Transaction(&transaction));
+            migration.up(&manager).await?;
+            history::Entity::insert(row).exec(&transaction).await?;
+            transaction.commit().await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

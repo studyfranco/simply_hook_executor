@@ -1,6 +1,6 @@
 # Simply Hook Executor - AI Agent Context & Directives
 
-See [GOALS.md](GOALS.md) for the mission, execution boundary, and network placement.
+See [GOALS.md](GOALS.md) for the mission, execution boundary, and network placement, and [.agents/skills/use-hook-executor/SKILL.md](.agents/skills/use-hook-executor/SKILL.md) for the operator & agent skill.
 
 Hello AI Agent! You are assisting with the development of `simply_hook_executor`. Read and strictly adhere to these guidelines before inspecting or writing any code.
 

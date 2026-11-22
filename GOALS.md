@@ -41,3 +41,5 @@ the server and the script.
 - Optionally attach `ext` when an admin reverse proxy provides dashboard or webhook ingress,
   for example at `https://hooks.example.com`. The host SSH gateway and internal sibling traffic
   use `isolate`.
+
+See [.agents/skills/use-hook-executor/SKILL.md](.agents/skills/use-hook-executor/SKILL.md) for the operational agent skill.

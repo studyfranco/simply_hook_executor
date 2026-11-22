@@ -51,4 +51,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20261119_000000_unify_variable_columns_to_text::Migration),
         ]
     }
+
+    async fn up(
+        db: &sea_orm::DatabaseConnection,
+        steps: Option<u32>,
+    ) -> Result<(), sea_orm::DbErr> {
+        runner::apply_migrations(Self::migrations(), db, steps).await
+    }
 }

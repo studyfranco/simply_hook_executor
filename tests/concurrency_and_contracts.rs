@@ -364,8 +364,9 @@ fn assert_error_envelope(response: &TestResponse, expected: StatusCode, context:
     let text = message
         .as_str()
         .unwrap_or_else(|| panic!("{context}: `error` must be a string, got {message}"));
-    assert!(
-        !text.trim().is_empty(),
+    assert_ne!(
+        text.trim(),
+        "",
         "{context}: the envelope carried an empty message, which tells a caller nothing"
     );
 }

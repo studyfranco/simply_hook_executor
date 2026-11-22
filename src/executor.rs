@@ -569,9 +569,10 @@ fn process_identity() -> String {
 
 #[cfg(not(unix))]
 fn process_identity() -> String {
-    std::env::var("USERNAME")
-        .map(|name| format!("'{name}'"))
-        .unwrap_or_else(|_| "the service account".to_owned())
+    std::env::var("USERNAME").map_or_else(
+        |_| "the service account".to_owned(),
+        |name| format!("'{name}'"),
+    )
 }
 
 /// Finds the shallowest directory the daemon lacks *search* (`x`) permission on.
@@ -1441,7 +1442,7 @@ mod tests {
             ]),
         )
         .expect("no unknown keys");
-        assert!(resolved.missing_required.is_empty());
+        assert_eq!(resolved.missing_required, Vec::<String>::new());
         assert_eq!(
             resolved.values,
             vec![
@@ -1639,7 +1640,7 @@ mod tests {
                 plan.program, "/usr/local/bin/demo.sh",
                 "{blank:?} must not trigger sudo"
             );
-            assert!(plan.args.is_empty());
+            assert_eq!(plan.args, Vec::<String>::new());
             assert_eq!(plan.run_as_user, None);
         }
     }
@@ -1692,9 +1693,15 @@ mod tests {
             extract_template_variable_names("add $target_ip block ${target_ip} port ${port}"),
             vec!["target_ip", "target_ip", "port"]
         );
-        assert!(extract_template_variable_names("no variables here").is_empty());
+        assert_eq!(
+            extract_template_variable_names("no variables here"),
+            Vec::<String>::new()
+        );
         // A bare trailing '$' or an empty '${}' names nothing.
-        assert!(extract_template_variable_names("cost is $5 not ${}").is_empty());
+        assert_eq!(
+            extract_template_variable_names("cost is $5 not ${}"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

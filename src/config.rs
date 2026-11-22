@@ -1323,7 +1323,7 @@ mod tests {
             parse_env_var_list(" PATH , LANG ,, TERM "),
             vec!["PATH", "LANG", "TERM"]
         );
-        assert!(parse_env_var_list("  ,, ").is_empty());
+        assert_eq!(parse_env_var_list("  ,, "), Vec::<String>::new());
     }
 
     #[test]
@@ -1356,7 +1356,7 @@ mod tests {
         );
         // A relative root would move with the daemon's working directory, so it is not a boundary.
         assert_eq!(parse_script_roots("hooks,../escape"), Vec::<PathBuf>::new());
-        assert!(parse_script_roots("").is_empty());
+        assert_eq!(parse_script_roots(""), Vec::<PathBuf>::new());
     }
 
     /// Builds a header map from `(name, value)` pairs.
@@ -1416,15 +1416,13 @@ mod tests {
         // Empty is the secure default: no peer is trusted, so no forwarding header is believed.
         // Note that empty is *not* an error — "trust nothing" is the intended production posture,
         // not a misconfiguration.
-        assert!(
-            parse_trusted_proxies("")
-                .expect("empty is valid")
-                .is_empty()
+        assert_eq!(
+            parse_trusted_proxies("").expect("empty is valid"),
+            Vec::<ProxySpec>::new()
         );
-        assert!(
-            parse_trusted_proxies("  ,, ")
-                .expect("blanks are skipped")
-                .is_empty()
+        assert_eq!(
+            parse_trusted_proxies("  ,, ").expect("blanks are skipped"),
+            Vec::<ProxySpec>::new()
         );
         assert!(RuntimeConfig::default().trusted_proxies.is_empty());
     }
@@ -1454,8 +1452,8 @@ mod tests {
             let err = parse_trusted_proxies(malformed)
                 .expect_err("{malformed:?} must abort startup, not be silently dropped");
             assert_eq!(err.entry, malformed);
-            assert!(
-                !err.reason.is_empty(),
+            assert_ne!(
+                err.reason, "",
                 "the abort must say which spelling nearly matched"
             );
         }
@@ -1801,8 +1799,11 @@ mod tests {
         );
 
         // A configuration with nothing to look up is a no-op rather than a spurious success log.
-        assert!(trusted("10.0.0.0/8").prime().await.is_empty());
-        assert!(TrustedProxies::default().prime().await.is_empty());
+        assert_eq!(trusted("10.0.0.0/8").prime().await, Vec::<String>::new());
+        assert_eq!(
+            TrustedProxies::default().prime().await,
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]
