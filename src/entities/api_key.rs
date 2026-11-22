@@ -98,9 +98,11 @@ pub struct Model {
     /// master, which has no creator, and for every key issued before lineage was recorded.
     pub parent_key_id: Option<Uuid>,
     /// Key generation timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Key last-update timestamp.
-    pub updated_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
     /// Override of the `CANONICAL_V1` canonical string template this key's own signatures are
     /// verified against. `None` means the service-wide default,
     /// `{method}\n{path}\n{timestamp}\n{body}`.

@@ -11,12 +11,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
 use tokio::sync::mpsc;
 
 use crate::config::RuntimeConfig;
 use crate::entities::{execution, hook};
+use crate::time_serde::{Bound, database_bound, now_utc};
 
 /// How long a soft-deleted hook stays recoverable before the sweep drops it for good.
 ///
@@ -46,9 +46,13 @@ pub async fn purge_expired_executions(
         return Ok(0);
     }
 
-    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let threshold = now_utc() - time::Duration::days(retention_days);
     let result = execution::Entity::delete_many()
-        .filter(execution::Column::Timestamp.lt(threshold))
+        .filter(execution::Column::Timestamp.lt(database_bound(
+            db.get_database_backend(),
+            threshold,
+            Bound::Lower,
+        )))
         .exec(db)
         .await?;
 
@@ -84,11 +88,15 @@ pub async fn purge_expired_deleted_hooks(
         return Ok(0);
     }
 
-    let threshold = (Utc::now() - chrono::Duration::days(retention_days)).naive_utc();
+    let threshold = now_utc() - time::Duration::days(retention_days);
     let result = hook::Entity::delete_many()
         .filter(hook::Column::IsDeleted.eq(true))
         .filter(hook::Column::DeletedAt.is_not_null())
-        .filter(hook::Column::DeletedAt.lt(threshold))
+        .filter(hook::Column::DeletedAt.lt(database_bound(
+            db.get_database_backend(),
+            threshold,
+            Bound::Lower,
+        )))
         .exec(db)
         .await?;
 

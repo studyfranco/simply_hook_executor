@@ -7940,3 +7940,14 @@ Peer sync before inspecting `example/simply_ip_vault/static/*`: `git -C example/
    - Moved `form#form-manage-rights` into `#manage-rights-modal` (triggered by `+ Assign Hook Rights` in `#tab-keys` header), `form#form-create-ssh-credential` into `#create-ssh-credential-modal` (`+ Add SSH Credential` in SSH Credentials header), and `form#form-create-ssh-target` into `#create-ssh-target-modal` (`+ Add SSH Target` in SSH Targets header).
    - Widened form and reveal modals (`>= 720px`), set `#383e45` modal card surface with `#17191b` inputs, constrained `.key-reveal` / `.key-reveal-value` for 1-line ellipsis reveal, added `Global Rights` labeling/spacing, and synced Audit Logs datalist/scrolling classes.
 
+
+## 2026-11-22 — Chantiers 7 and 8
+
+- The SeaORM runner keeps the existing migration version strings and the
+  `seaql_migrations` ledger. Schema probes use SeaSchema on each supported backend.
+- UTC timestamps use `time` while preserving the dashboard and API timestamp format.
+  SQLite range filters cover both the previous and current driver encodings.
+- The pre-push script and CI enforce an audit with warnings denied. The local
+  dependency patches that remove the legacy date library from the lockfile are
+  documented in [vendor/README.md](vendor/README.md).
+- [GOALS.md](GOALS.md) records the execution boundary and network placement.

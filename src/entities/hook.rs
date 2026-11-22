@@ -129,7 +129,8 @@ pub struct Model {
     /// `DELETE` used to destroy the audit record of everything the hook had ever run.
     pub is_deleted: bool,
     /// When the hook was moved to the trash, and the clock the 92-day purge measures from.
-    pub deleted_at: Option<DateTime>,
+    #[serde(default, with = "crate::time_serde::optional")]
+    pub deleted_at: Option<time::PrimitiveDateTime>,
     /// The `api_keys.id` of whoever deleted it, as text.
     ///
     /// Deliberately not a foreign key: attribution must outlive the acting key, which an FK would
@@ -137,9 +138,11 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub deleted_by: Option<String>,
     /// Hook creation timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Hook last-update timestamp.
-    pub updated_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
     /// How a keyless caller must authenticate to invoke this hook. See [`AuthMode`].
     pub auth_mode: AuthMode,
     /// `HMAC_ONLY`'s signing secret, encrypted at rest through the same [`super::api_key::Model`]

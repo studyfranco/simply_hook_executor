@@ -8,7 +8,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, EntityTrait};
-use sea_orm_migration::MigratorTrait;
+use simply_hook_executor::migration::MigratorTrait;
 use simply_hook_executor::{
     config::{RuntimeConfig, TrustedProxies},
     crypto::SecretCipher,
@@ -310,7 +310,7 @@ pub async fn insert_key_with_mode(
     let plaintext = simply_hook_executor::api::generate_random_key();
     let key_id = simply_hook_executor::api::generate_key_id();
     let signing_secret = simply_hook_executor::crypto::generate_signing_secret();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
 
     api_key::ActiveModel {
         id: Set(id),
@@ -400,7 +400,7 @@ pub async fn set_parent(db: &DatabaseConnection, child: Uuid, parent: Uuid) {
 /// The current Unix timestamp, as a client would stamp a request.
 #[must_use]
 pub fn now_timestamp() -> i64 {
-    chrono::Utc::now().timestamp()
+    time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
 /// Computes an `X-Signature-256` value over the canonical
@@ -614,7 +614,7 @@ pub async fn insert_hook_full(
     owner_key_id: Option<Uuid>,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
 
     hook::ActiveModel {
         id: Set(id),
@@ -664,8 +664,9 @@ pub async fn insert_hook_deleted_days_ago(
     deleted_by: Uuid,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
-    let deleted_at = (chrono::Utc::now() - chrono::Duration::days(deleted_days_ago)).naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
+    let deleted_at =
+        simply_hook_executor::time_serde::now_utc() - time::Duration::days(deleted_days_ago);
 
     hook::ActiveModel {
         id: Set(id),
@@ -732,7 +733,7 @@ pub async fn insert_parameter(
         description: Set(None),
         default_value: Set(default_value.map(str::to_owned)),
         is_required: Set(is_required),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_hook_executor::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -759,7 +760,7 @@ pub async fn insert_execution_aged(db: &DatabaseConnection, hook_id: Uuid, age_d
         stderr: Set(String::new()),
         parameters_json: Set("{}".to_owned()),
         duration_ms: Set(5),
-        timestamp: Set((chrono::Utc::now() - chrono::Duration::days(age_days)).naive_utc()),
+        timestamp: Set(simply_hook_executor::time_serde::now_utc() - time::Duration::days(age_days)),
         caller_ip: Set("127.0.0.1".to_owned()),
     }
     .insert(db)
@@ -832,7 +833,7 @@ pub async fn grant_full(
         can_execute: Set(can_execute),
         can_manage: Set(can_manage),
         can_view_execution: Set(can_view_execution),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_hook_executor::time_serde::now_utc()),
     }
     .insert(db)
     .await

@@ -48,7 +48,7 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
-use chrono::{NaiveDateTime, Utc};
+
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, SqlErr,
 };
@@ -204,9 +204,11 @@ pub struct SshCredentialView {
     /// Whether the calling key is master or the owner of this credential.
     pub is_owner: bool,
     /// Creation timestamp.
-    pub created_at: NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Last-update timestamp.
-    pub updated_at: NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
 }
 
 fn build_credential_view(key: &api_key::Model, model: ssh_credential::Model) -> SshCredentialView {
@@ -281,7 +283,7 @@ pub(crate) async fn create_ssh_credential(
     };
 
     let id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let model = ssh_credential::ActiveModel {
         id: Set(id),
         name: Set(name.clone()),
@@ -451,7 +453,7 @@ pub(crate) async fn update_ssh_credential(
     if payload.private_key.is_some() || payload.passphrase.is_some() || payload.password.is_some() {
         changes.push("secret material".to_owned());
     }
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
 
     let updated = match active.update(&state.db).await {
         Ok(m) => m,
@@ -602,9 +604,11 @@ pub struct SshTargetView {
     /// Whether the calling key is permitted to use this target in a hook.
     pub can_use_in_hook: bool,
     /// Creation timestamp.
-    pub created_at: NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Last-update timestamp.
-    pub updated_at: NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
 }
 
 async fn build_target_view(
@@ -689,7 +693,7 @@ pub(crate) async fn create_ssh_target(
     }
 
     let id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let model = ssh_target::ActiveModel {
         id: Set(id),
         name: Set(name.clone()),
@@ -980,7 +984,7 @@ fn apply_ssh_target_update(
             Some(fingerprint)
         });
     }
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
 
     Ok((active, changes))
 }
@@ -1016,7 +1020,7 @@ pub(crate) async fn delete_ssh_target(
         active.is_active = Set(false);
         active.disabled_reason = Set(Some(format!("SSH target '{}' was deleted", model.name)));
         active.ssh_target_id = Set(None);
-        active.updated_at = Set(Utc::now().naive_utc());
+        active.updated_at = Set(crate::time_serde::now_utc());
         active.update(&state.db).await?;
     }
 
@@ -1179,7 +1183,8 @@ pub struct SshTargetPermissionView {
     /// Whether the key can use this target in hooks.
     pub can_use_in_hook: bool,
     /// Grant timestamp.
-    pub created_at: NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
 }
 
 /// Handles `GET /api/ssh-targets/{id}/permissions`.
@@ -1242,7 +1247,7 @@ pub(crate) async fn grant_ssh_target_permission(
             AppError::InvalidInput("api_key_id does not name an existing API key".to_owned())
         })?;
 
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let existing = ApiKeySshTargetPermission::find_by_id((payload.api_key_id, id))
         .one(&state.db)
         .await?;

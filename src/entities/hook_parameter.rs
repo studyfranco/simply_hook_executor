@@ -26,7 +26,8 @@ pub struct Model {
     pub is_required: bool,
     /// Parameter creation timestamp. Doubles as the ordering key for positional CLI arguments —
     /// see [`crate::executor::resolve_parameters`].
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `hook_parameters` to other entities.

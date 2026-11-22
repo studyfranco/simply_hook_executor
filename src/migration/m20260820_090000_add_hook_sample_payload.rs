@@ -8,7 +8,7 @@
 //! only when both are present (`api::hooks::validate_sample_payload_matches_parameters`); this
 //! migration adds the storage, not the requirement.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 #[derive(DeriveIden)]
 enum Hooks {
@@ -16,12 +16,13 @@ enum Hooks {
     SamplePayloadJson,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -32,7 +33,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

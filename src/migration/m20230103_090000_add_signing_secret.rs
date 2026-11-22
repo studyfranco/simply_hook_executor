@@ -8,7 +8,7 @@
 //!
 //! Multiple `NULL`s coexist happily under the unique index: SQL treats them as distinct.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The subset of the `api_keys` table this migration touches.
 #[derive(DeriveIden)]
@@ -22,12 +22,13 @@ enum ApiKeys {
 }
 
 /// The signing-secret migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -63,7 +64,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

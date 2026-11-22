@@ -58,6 +58,7 @@ pub mod replay;
 pub mod retention;
 pub mod ssh;
 pub mod state;
+pub mod time_serde;
 
 use state::AppState;
 

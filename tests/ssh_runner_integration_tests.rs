@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
@@ -123,7 +122,7 @@ async fn spawn_test_server(expected_password: &str) -> (u16, String) {
 /// this suite's convention of not exercising the encryption-at-rest question in the same tests as the
 /// transport question — that is `crypto`'s own unit tests' job).
 fn password_credential(password: &str) -> ssh_credential::Model {
-    let now = Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     ssh_credential::Model {
         id: Uuid::new_v4(),
         name: "test-credential".to_owned(),
@@ -142,7 +141,7 @@ fn password_credential(password: &str) -> ssh_credential::Model {
 }
 
 fn target(credential_id: Uuid, port: u16, host_key_fingerprint: Option<&str>) -> ssh_target::Model {
-    let now = Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     ssh_target::Model {
         id: Uuid::new_v4(),
         name: "test-target".to_owned(),

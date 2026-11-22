@@ -32,6 +32,7 @@ use crate::entities::{api_key, audit_log, prelude::*};
 use crate::error::AppError;
 use crate::extract::StrictQuery;
 use crate::state::AppState;
+use crate::time_serde::{Bound, database_bound};
 
 use super::DEFAULT_PAGE_LIMIT;
 use super::executions::resolve_api_key_filter;
@@ -59,7 +60,7 @@ pub struct AuditLogQuery {
     /// type="datetime-local">` needs a manual round trip through to get, so this exists to be filled
     /// by client code rather than typed by hand.
     pub since: Option<String>,
-    /// Only entries strictly before this instant. Same shape as `since`.
+    /// Only entries at or before this instant. Same shape as `since`.
     pub until: Option<String>,
     /// Pagination limit.
     pub limit: Option<u64>,
@@ -106,11 +107,20 @@ pub(crate) async fn list_audit_logs(
             q = q.filter(cond);
         }
     }
+    let backend = state.db.get_database_backend();
     if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(audit_log::Column::Timestamp.gte(parse_instant("since", since)?));
+        q = q.filter(audit_log::Column::Timestamp.gte(database_bound(
+            backend,
+            parse_instant("since", since)?,
+            Bound::Lower,
+        )));
     }
     if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(audit_log::Column::Timestamp.lte(parse_instant("until", until)?));
+        q = q.filter(audit_log::Column::Timestamp.lte(database_bound(
+            backend,
+            parse_instant("until", until)?,
+            Bound::Upper,
+        )));
     }
 
     let logs = q

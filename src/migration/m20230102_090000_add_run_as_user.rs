@@ -3,7 +3,7 @@
 //! Written as a separate migration rather than folded into the initial schema so databases
 //! already created by an earlier release are upgraded in place instead of silently diverging.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The subset of the `hooks` table this migration touches.
 #[derive(DeriveIden)]
@@ -15,12 +15,13 @@ enum Hooks {
 }
 
 /// The `run_as_user` migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -33,7 +34,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

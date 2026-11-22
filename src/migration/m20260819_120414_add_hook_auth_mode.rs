@@ -23,7 +23,7 @@
 //! `api_keys.signing_secret`, for the same reason: verifying an `HMAC_ONLY` signature means
 //! recomputing it, which requires the secret back in plaintext, so it cannot be hashed.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The subset of the `hooks` table this migration touches.
 #[derive(DeriveIden)]
@@ -47,12 +47,13 @@ enum Hooks {
 }
 
 /// The hook-auth-mode migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -104,7 +105,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for column in [
             Hooks::CanonicalTemplate,
             Hooks::SignaturePrefix,

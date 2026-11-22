@@ -64,7 +64,7 @@ async fn insert_execution_by(db: &DatabaseConnection, hook_id: Uuid, key_id: Uui
         stderr: Set(String::new()),
         parameters_json: Set("{}".to_owned()),
         duration_ms: Set(5),
-        timestamp: Set(chrono::Utc::now().naive_utc()),
+        timestamp: Set(simply_hook_executor::time_serde::now_utc()),
         caller_ip: Set("127.0.0.1".to_owned()),
     }
     .insert(db)
@@ -86,7 +86,7 @@ async fn insert_audit_by(db: &DatabaseConnection, key_id: Uuid, action: &str) ->
         action: Set(action.to_owned()),
         target_resource: Set(None),
         details: Set(None),
-        timestamp: Set(chrono::Utc::now().naive_utc()),
+        timestamp: Set(simply_hook_executor::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -247,7 +247,7 @@ async fn a_row_referencing_a_nonexistent_parent_is_refused_at_insert() {
             can_execute: Set(true),
             can_manage: Set(false),
             can_view_execution: Set(false),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
         };
         assert!(
             ApiKeyHookPermission::insert(row).exec(&db).await.is_err(),
@@ -277,7 +277,7 @@ async fn a_parameter_cannot_be_attached_to_a_hook_that_does_not_exist() {
         description: Set(None),
         default_value: Set(None),
         is_required: Set(true),
-        created_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_hook_executor::time_serde::now_utc()),
     };
     assert!(HookParameter::insert(orphan).exec(&db).await.is_err());
 }

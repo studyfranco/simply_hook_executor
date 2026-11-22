@@ -23,6 +23,7 @@ use crate::executor;
 use crate::extract::{StrictBytes, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
+use crate::time_serde::{Bound, database_bound};
 
 use super::DEFAULT_PAGE_LIMIT;
 use super::guards::{
@@ -66,7 +67,8 @@ pub struct ExecutionView {
     /// Wall-clock duration in milliseconds.
     pub duration_ms: i32,
     /// Execution start timestamp.
-    pub timestamp: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub timestamp: time::PrimitiveDateTime,
     /// The resolved client IP of whoever triggered this execution — same trust-aware resolution
     /// (`X-Forwarded-For`/`X-Real-IP` only from a configured trusted proxy, the raw TCP peer
     /// otherwise) as `audit_logs.client_ip`. Empty for any execution recorded before this field
@@ -461,15 +463,20 @@ pub(crate) async fn list_executions(
         let ids = resolve_api_key_filter(&state.db, api_key_filter).await?;
         q = q.filter(execution::Column::ApiKeyId.is_in(ids));
     }
+    let backend = state.db.get_database_backend();
     if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(
-            execution::Column::Timestamp.gte(crate::api::support::parse_instant("since", since)?),
-        );
+        q = q.filter(execution::Column::Timestamp.gte(database_bound(
+            backend,
+            crate::api::support::parse_instant("since", since)?,
+            Bound::Lower,
+        )));
     }
     if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
-        q = q.filter(
-            execution::Column::Timestamp.lte(crate::api::support::parse_instant("until", until)?),
-        );
+        q = q.filter(execution::Column::Timestamp.lte(database_bound(
+            backend,
+            crate::api::support::parse_instant("until", until)?,
+            Bound::Upper,
+        )));
     }
 
     let (limit, offset, page, per_page) =

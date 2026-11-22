@@ -1,5 +1,7 @@
 # Simply Hook Executor - AI Agent Context & Directives
 
+See [GOALS.md](GOALS.md) for the mission, execution boundary, and network placement.
+
 Hello AI Agent! You are assisting with the development of `simply_hook_executor`. Read and strictly adhere to these guidelines before inspecting or writing any code.
 
 ---
@@ -125,13 +127,13 @@ That automation does **not** discharge the directive above. The script syncs onl
 ## 🛠️ Tech Stack & Constraints
 
 - **Backend:** Rust + Axum (0.8+) + Tokio (1.x).
-- **ORM (SQL-Agnostic):** SeaORM (2.0+). Defaults to **SQLite** for zero-config local development/testing, but MUST remain strictly **SQL-agnostic** (PostgreSQL-ready). **Never write vendor-specific raw SQL queries.** `sea-orm` and `sea-orm-migration` in `Cargo.toml` MUST enable the **same three backend features** (`sqlx-sqlite`, `sqlx-postgres`, `sqlx-mysql`) — they are separate feature lists on separate crates, and `SchemaManager::has_index`/`has_table`/`has_column` (used by `src/master.rs` on every boot) compile one match arm per backend feature *enabled on `sea-orm-migration` specifically*. Narrowing that list compiles cleanly and only fails at runtime, as `DbErr::BackendNotSupported`, on whichever backend was dropped — a hole invisible to `cargo check`. `sea_orm_migration_declares_every_backend_sea_orm_does` (`tests/source_hygiene.rs`) pins the two lists together.
+- **ORM (SQL-Agnostic):** SeaORM (2.0+). Defaults to **SQLite** for zero-config local development/testing, but MUST remain strictly **SQL-agnostic** (PostgreSQL-ready). **Never write vendor-specific raw SQL queries.** `sea-orm` and `sea-schema` in `Cargo.toml` must enable the same three backends (`sqlx-sqlite`, `sqlx-postgres`, `sqlx-mysql`). The migration runner uses SeaORM's typed schema statements and SeaSchema's probes for each backend. The manifest checks in `tests/source_hygiene.rs` enforce feature parity.
 - **Frontend:** STRICTLY Vanilla JS, HTML5, and CSS3. **NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios). Native `fetch()` only. Dark theme matching `simply_ip_vault`.
 - **Quality & Safety:**
   - Zero compiler warnings, zero `clippy` warnings.
   - **Zero `.unwrap()` or `.expect()`** in production code or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
   - **Mandatory `rustdoc`**: All public modules, structs, enums, functions, and Axum handlers MUST be documented using `///` (or `//!` for crates/modules). Enforce `#![warn(missing_docs)]` in `lib.rs`.
-  - **Dependency & Supply Chain Security:** All external libraries/Cargo dependencies must always be kept at their latest compatible versions (`cargo update`, latest semver). `scripts/test_e2e.sh` and GitHub CI/CD workflows enforce `cargo update` and `cargo audit` (ignoring accepted upstream advisories `--ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2023-0071`). Testing and auditing are mandatory prerequisites before any deployment or container release.
+  - **Dependency & Supply Chain Security.** Use `cargo update` to refresh compatible versions and review the lockfile changes. Run `cargo audit --deny warnings` with zero advisory suppressions. Testing and auditing are mandatory before deployment or container release.
 
 ---
 
@@ -796,7 +798,8 @@ Four things can ship broken while every other gate passes green, because no othe
 
 `scripts/test_e2e.sh` and all GitHub CI/CD workflows (`ci.yml`, `docker-publish.yml`, `release-latest.yml`) strictly enforce:
 - Dependency currency via `cargo update` (logging failures loudly).
-- Vulnerability scanning via `cargo audit --ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2023-0071`.
+- Run `./scripts/pre_push.sh` before pushing. To enable the repository's `.githooks/pre-push` hook, run `git config core.hooksPath .githooks` in this checkout.
+- The pre-push gate checks formatting, Clippy with warnings denied, the test suite with zero failed or ignored tests, `cargo audit --deny warnings`, and Bash syntax for the E2E harness.
 - Mandatory test suite execution (`cargo test --workspace --verbose`) prior to binary compilation, Docker publishing, or artifact release.
 
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*

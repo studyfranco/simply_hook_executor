@@ -1303,7 +1303,7 @@ pub(crate) async fn execute_hook(
 
     let plan = build_command_plan(hook, resolved, &state.config)?;
     let timeout = state.config.timeout_for(hook.default_timeout_seconds);
-    let started_at = chrono::Utc::now().naive_utc();
+    let started_at = crate::time_serde::now_utc();
 
     // `run_as_user` is logged on every privileged execution: an operator auditing what ran as root
     // should be able to find it in journald without cross-referencing the hooks table.
@@ -1387,7 +1387,6 @@ pub(crate) async fn execute_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn declared(key: &str, default: Option<&str>, required: bool) -> hook_parameter::Model {
         hook_parameter::Model {
@@ -1397,7 +1396,7 @@ mod tests {
             description: None,
             default_value: default.map(str::to_owned),
             is_required: required,
-            created_at: Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
         }
     }
 
@@ -1515,8 +1514,8 @@ mod tests {
             is_deleted: false,
             deleted_at: None,
             deleted_by: None,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: crate::time_serde::now_utc(),
+            updated_at: crate::time_serde::now_utc(),
             auth_mode: hook::AuthMode::CanonicalV1,
             hmac_secret: None,
             signature_header: None,

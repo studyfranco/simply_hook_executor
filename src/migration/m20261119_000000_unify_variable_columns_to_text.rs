@@ -15,8 +15,8 @@
 //! column with `TEXT` affinity and no 255-character limit. This migration therefore short-circuits
 //! cleanly on `DatabaseBackend::Sqlite` while widening columns on PostgreSQL and MySQL.
 
+use super::runner::prelude::*;
 use sea_orm::DatabaseBackend;
-use sea_orm_migration::prelude::*;
 
 /// The `hooks` columns widened to `TEXT`.
 #[derive(DeriveIden)]
@@ -38,12 +38,13 @@ enum SshTargets {
 }
 
 /// Variable-length column type unification migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             return Ok(());
         }
@@ -72,7 +73,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         if manager.get_database_backend() == DatabaseBackend::Sqlite {
             return Ok(());
         }

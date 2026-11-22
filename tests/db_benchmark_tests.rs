@@ -53,8 +53,8 @@ async fn seed_hook_benchmark(db: &sea_orm::DatabaseConnection, master_id: Uuid) 
             is_deleted: Set(false),
             deleted_at: Set(None),
             deleted_by: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
+            updated_at: Set(simply_hook_executor::time_serde::now_utc()),
             auth_mode: Set(hook::AuthMode::CanonicalV1),
             hmac_secret: Set(None),
             signature_header: Set(None),
@@ -80,7 +80,7 @@ async fn seed_hook_benchmark(db: &sea_orm::DatabaseConnection, master_id: Uuid) 
                 description: Set(None),
                 default_value: Set(None),
                 is_required: Set(true),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_hook_executor::time_serde::now_utc()),
             }
             .insert(db)
             .await
@@ -110,8 +110,8 @@ async fn seed_hook_benchmark(db: &sea_orm::DatabaseConnection, master_id: Uuid) 
             can_manage_hooks: Set(false),
             can_manage_ssh: Set(false),
             parent_key_id: Set(Some(master_id)),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
+            updated_at: Set(simply_hook_executor::time_serde::now_utc()),
             canonical_template: Set(None),
         }
         .insert(db)
@@ -129,7 +129,7 @@ async fn seed_hook_benchmark(db: &sea_orm::DatabaseConnection, master_id: Uuid) 
                 can_execute: Set(true),
                 can_manage: Set(false),
                 can_view_execution: Set(true),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_hook_executor::time_serde::now_utc()),
             }
             .insert(db)
             .await
@@ -253,8 +253,8 @@ async fn benchmark_target_listing(db: &sea_orm::DatabaseConnection, master_id: U
         encrypted_passphrase: Set(None),
         encrypted_password: Set(Some("v1.plain.1234".to_owned())),
         owner_key_id: Set(Some(master_id)),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_hook_executor::time_serde::now_utc()),
+        updated_at: Set(simply_hook_executor::time_serde::now_utc()),
     }
     .insert(db)
     .await
@@ -273,8 +273,8 @@ async fn benchmark_target_listing(db: &sea_orm::DatabaseConnection, master_id: U
             credential_id: Set(cred_id),
             host_key_fingerprint: Set(Some("SHA256:fingerprint".to_owned())),
             owner_key_id: Set(Some(master_id)),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
+            updated_at: Set(simply_hook_executor::time_serde::now_utc()),
         }
         .insert(db)
         .await

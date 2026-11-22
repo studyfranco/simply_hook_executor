@@ -16,7 +16,7 @@
 //! point-in-time record of who did it, matching how `audit_logs` already denormalizes the acting
 //! key's name and prefix.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The subset of the `hooks` table this migration touches.
 #[derive(DeriveIden)]
@@ -32,8 +32,9 @@ enum Hooks {
 }
 
 /// The hook soft-delete migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 /// Adds one column, as its own `ALTER TABLE`.
 ///
@@ -65,7 +66,7 @@ async fn drop_column(manager: &SchemaManager<'_>, column: Hooks) -> Result<(), D
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         add_column(
             manager,
             ColumnDef::new(Hooks::IsDeleted)
@@ -90,7 +91,7 @@ impl MigrationTrait for Migration {
         .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         drop_column(manager, Hooks::DeletedBy).await?;
         drop_column(manager, Hooks::DeletedAt).await?;
         drop_column(manager, Hooks::IsDeleted).await

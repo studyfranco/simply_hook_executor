@@ -19,6 +19,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
       - name: Run tests
         run: cargo test --workspace --verbose
 
@@ -47,13 +53,13 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build binary
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
           mkdir staging
           cp target/${{ matrix.target }}/release/simply_hook_executor staging/
-          cp README.md LICENSE staging/
+          cp README.md GOALS.md LICENSE staging/
           cp -r deploy staging/
           cp -r static staging/
           tar -czf ${{ matrix.artifact_name }}.tar.gz -C staging .

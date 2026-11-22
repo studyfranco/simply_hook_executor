@@ -3,7 +3,7 @@
 //! Written entirely through `SeaORM`'s schema builder (no raw SQL) so it applies unchanged to
 //! SQLite, PostgreSQL, and MySQL.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// Column identifiers for the `api_keys` table.
 #[derive(DeriveIden)]
@@ -148,12 +148,13 @@ pub enum AuditLogs {
 }
 
 /// The initial schema migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         create_api_keys(manager).await?;
         create_hooks_and_parameters(manager).await?;
         create_hook_permissions(manager).await?;
@@ -162,7 +163,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
             .await?;

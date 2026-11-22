@@ -64,8 +64,8 @@
 
 use std::time::Duration;
 
+use crate::migration::MigratorTrait;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr, SqlxSqliteConnector};
-use sea_orm_migration::MigratorTrait;
 
 use crate::config::RuntimeConfig;
 
@@ -497,7 +497,7 @@ mod tests {
             can_execute: sea_orm::ActiveValue::Set(true),
             can_manage: sea_orm::ActiveValue::Set(false),
             can_view_execution: sea_orm::ActiveValue::Set(false),
-            created_at: sea_orm::ActiveValue::Set(chrono::Utc::now().naive_utc()),
+            created_at: sea_orm::ActiveValue::Set(crate::time_serde::now_utc()),
         };
         assert!(
             crate::entities::prelude::ApiKeyHookPermission::insert(orphan)
@@ -762,7 +762,7 @@ mod tests {
             can_execute: sea_orm::ActiveValue::Set(true),
             can_manage: sea_orm::ActiveValue::Set(false),
             can_view_execution: sea_orm::ActiveValue::Set(false),
-            created_at: sea_orm::ActiveValue::Set(chrono::Utc::now().naive_utc()),
+            created_at: sea_orm::ActiveValue::Set(crate::time_serde::now_utc()),
         };
         assert!(
             crate::entities::prelude::ApiKeyHookPermission::insert(orphan)

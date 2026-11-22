@@ -32,7 +32,7 @@
 //! were `BODY_ONLY` is not recoverable once forgotten, and `down()` restoring the *column* is not the
 //! same claim as restoring the *data*.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The subset of the `api_keys` table this migration touches.
 #[derive(DeriveIden)]
@@ -46,12 +46,13 @@ enum ApiKeys {
 }
 
 /// The hmac-mode-consolidation migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Data fix first: no window in which the column holds a value the Rust enum (post-deploy)
         // cannot parse. Built through `sea_query`'s typed statement builder rather than a raw SQL
         // string — `tests/source_hygiene.rs` enforces that every query path does, migrations
@@ -78,7 +79,7 @@ impl MigrationTrait for Migration {
 
     /// Drops `canonical_template`. Does **not** attempt to restore any row to `BODY_ONLY` — see the
     /// module header on why that half of `up()` has no meaningful inverse.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

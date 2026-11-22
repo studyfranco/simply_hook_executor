@@ -37,11 +37,12 @@
 //! operator's judgement, not a schema change's — and refusing to start is the honest outcome.
 //! Recovery is to demote or delete the extra row directly and restart.
 
+use super::runner::prelude::*;
 use sea_orm::DatabaseBackend;
-use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 /// Table and generated-column identifiers for `api_keys.master_marker`.
 #[derive(DeriveIden)]
@@ -81,7 +82,7 @@ impl Migration {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         let backend = manager.get_database_backend();
 
         manager
@@ -101,7 +102,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Index first: SQLite refuses `DROP COLUMN` on a column that participates in an index, and
         // dropping the index before the column it covers is correct everywhere else too.
         manager

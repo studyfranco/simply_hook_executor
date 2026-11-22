@@ -100,7 +100,7 @@ async fn bootstrap_master_key(
         std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
 
     let prefix = plaintext_key.chars().take(8).collect::<String>();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
 
     // The bootstrap key gets a full signing pair too, so webhook signature auth is usable
     // immediately rather than requiring a rotation first.

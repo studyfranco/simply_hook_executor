@@ -15,7 +15,6 @@
 //! a handler at all — and `deny_unknown_fields`, which they enforce, is a `RBAC_MODEL.md` §5
 //! control rather than plumbing. See that module's header for the full reasoning.
 
-use chrono::Utc;
 use ipnet::IpNet;
 use rand::RngExt;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
@@ -95,9 +94,12 @@ pub(crate) fn format_reference(name: &str, id: Uuid) -> String {
 /// distinguishable from the other. Shared between [`super::audit`]'s and [`super::executions`]'s
 /// `since`/`until` filters, which parse and apply the range identically (`since` inclusive, `until`
 /// strictly exclusive).
-pub(crate) fn parse_instant(field: &str, raw: &str) -> Result<chrono::NaiveDateTime, AppError> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.to_utc().naive_utc())
+pub(crate) fn parse_instant(field: &str, raw: &str) -> Result<time::PrimitiveDateTime, AppError> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .map(|dt| {
+            let utc = dt.to_utc();
+            time::PrimitiveDateTime::new(utc.date(), utc.time())
+        })
         .map_err(|_| {
             AppError::InvalidInput(format!(
                 "Invalid '{field}': expected an RFC 3339 timestamp, e.g. 2026-08-19T00:00:00Z"
@@ -163,7 +165,7 @@ pub(crate) async fn create_audit_log(
         action: Set(action.to_owned()),
         target_resource: Set(target_resource),
         details: Set(details),
-        timestamp: Set(Utc::now().naive_utc()),
+        timestamp: Set(crate::time_serde::now_utc()),
     };
     AuditLog::insert(log).exec(db).await?;
     Ok(())

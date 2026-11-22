@@ -874,7 +874,7 @@ async fn hmac_mode_is_settable_at_creation_only_and_defaults_to_canonical() {
 
 #[tokio::test]
 async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
-    use sea_orm_migration::MigratorTrait;
+    use simply_hook_executor::migration::MigratorTrait;
     use simply_hook_executor::{entities::api_key::HmacMode, migration::Migrator};
 
     let db = sea_orm::Database::connect("sqlite::memory:")
@@ -912,7 +912,7 @@ async fn hmac_mode_migration_defaults_existing_keys_to_canonical() {
 #[tokio::test]
 async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use sea_orm_migration::MigratorTrait;
+    use simply_hook_executor::migration::MigratorTrait;
     use simply_hook_executor::{
         entities::api_key::{self, HmacMode},
         migration::Migrator,
@@ -931,7 +931,7 @@ async fn the_consolidation_migration_rewrites_stored_body_only_rows() {
         .expect("earlier migrations apply");
     let id = Uuid::new_v4();
     let plaintext = simply_hook_executor::api::generate_random_key();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     api_key::Entity::insert(api_key::ActiveModel {
         id: sea_orm::Set(id),
         key_hash: sea_orm::Set(simply_hook_executor::api::hash_key(&plaintext)),
@@ -2748,7 +2748,7 @@ async fn positional_argument_order_is_deterministic_and_append_only() {
 #[tokio::test]
 async fn run_as_user_migration_upgrades_an_existing_database() {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-    use sea_orm_migration::MigratorTrait;
+    use simply_hook_executor::migration::MigratorTrait;
     use simply_hook_executor::{entities::hook, migration::Migrator};
 
     let db = sea_orm::Database::connect("sqlite::memory:")
@@ -2767,7 +2767,7 @@ async fn run_as_user_migration_upgrades_an_existing_database() {
         .expect("the run_as_user migration applies to an existing schema");
 
     // The new column is present, nullable, and defaults to NULL for pre-existing rows.
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     let legacy = hook::ActiveModel {
         id: Set(Uuid::new_v4()),
         name: Set("legacy".to_owned()),
@@ -6225,7 +6225,7 @@ async fn the_database_rejects_a_second_master_row_with_no_handler_involved() {
     let (_id, _master) = insert_key(&db, "the-master", "", KeyScopes::master()).await;
 
     let plaintext = simply_hook_executor::api::generate_random_key();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     let second = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(simply_hook_executor::api::hash_key(&plaintext)),
@@ -11403,12 +11403,9 @@ async fn execution_and_audit_history_filter_by_time_range() {
     assert_eq!(created.status, StatusCode::OK, "{}", created.raw);
     let hook_id = created.string("id");
 
-    let boundary = chrono::Utc::now();
-    // `to_rfc3339()` renders a UTC offset as "+00:00", and an unescaped "+" in a query string is
-    // form-decoded as a space, which breaks `parse_instant`'s RFC 3339 parse before this test's own
-    // assertion is ever reached. `use_z: true` renders "Z" instead, which contains nothing a query
-    // string reinterprets.
-    let boundary_str = boundary.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let boundary_str = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339");
 
     let ran = send(
         &app,
@@ -12586,45 +12583,66 @@ async fn assert_inclusive_audit_boundary(
     app: &axum::Router,
     master: &str,
 ) {
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::Expr};
+    use simply_hook_executor::entities::audit_log;
+    use time::macros::format_description;
 
-    // Exact boundary check for `until` (`<=`).
-    let boundary_ts = chrono::DateTime::from_timestamp(
-        (chrono::Utc::now() - chrono::Duration::seconds(60)).timestamp(),
-        0,
-    )
-    .expect("timestamp");
-    simply_hook_executor::entities::audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        api_key_id: Set(None),
-        api_key_name: Set("SnapshotBot".to_owned()),
-        api_key_prefix: Set("snap1234".to_owned()),
-        client_ip: Set("127.0.0.1".to_owned()),
-        action: Set("INCLUSIVE_BOUNDARY_PROBE".to_owned()),
-        target_resource: Set(None),
-        details: Set(None),
-        timestamp: Set(boundary_ts.naive_utc()),
+    let boundary = time::OffsetDateTime::now_utc() - time::Duration::seconds(60);
+    for nanos in [0, 123_400_000] {
+        let boundary = boundary.replace_nanosecond(nanos).expect("valid fraction");
+        let timestamp = time::PrimitiveDateTime::new(boundary.date(), boundary.time());
+        let legacy_id = Uuid::new_v4();
+        for id in [legacy_id, Uuid::new_v4()] {
+            audit_log::ActiveModel {
+                id: Set(id),
+                api_key_id: Set(None),
+                api_key_name: Set("SnapshotBot".to_owned()),
+                api_key_prefix: Set("snap1234".to_owned()),
+                client_ip: Set("127.0.0.1".to_owned()),
+                action: Set("INCLUSIVE_BOUNDARY_PROBE".to_owned()),
+                target_resource: Set(None),
+                details: Set(None),
+                timestamp: Set(timestamp),
+            }
+            .insert(db)
+            .await
+            .expect("insert audit probe");
+        }
+
+        // Recreate the original SQLite encoding for one of the two identical instants.
+        let format = if nanos == 0 {
+            format_description!("[year]-[month]-[day] [hour]:[minute]:[second]")
+        } else {
+            format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
+            )
+        };
+        audit_log::Entity::update_many()
+            .col_expr(
+                audit_log::Column::Timestamp,
+                Expr::val(timestamp.format(format).unwrap()),
+            )
+            .filter(audit_log::Column::Id.eq(legacy_id))
+            .exec(db)
+            .await
+            .expect("store legacy timestamp");
+
+        let instant = boundary
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("RFC 3339");
+        let response = send(
+            app,
+            json_request(
+                "GET",
+                &format!("/api/audit-logs?action=INCLUSIVE_BOUNDARY_PROBE&since={instant}&until={instant}"),
+                master,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.raw);
+        let rows = response.json.as_array().expect("audit records");
+        assert_eq!(rows.len(), 2, "both SQLite timestamp spellings must match");
+        assert_eq!(rows[0]["timestamp"], rows[1]["timestamp"]);
     }
-    .insert(db)
-    .await
-    .expect("insert audit probe");
-
-    let until_str = boundary_ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let until_res = send(
-        app,
-        json_request(
-            "GET",
-            &format!("/api/audit-logs?action=INCLUSIVE_BOUNDARY_PROBE&until={until_str}"),
-            master,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(until_res.status, StatusCode::OK);
-    let until_rows = until_res.json.as_array().cloned().unwrap_or_default();
-    assert_eq!(
-        until_rows.len(),
-        1,
-        "audit `until` filter must be inclusive (<=)"
-    );
 }

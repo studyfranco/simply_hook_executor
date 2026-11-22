@@ -1,6 +1,7 @@
 //! Database migration registry for `simply_hook_executor`. Migrations run automatically on
 //! startup.
-pub use sea_orm_migration::prelude::*;
+mod runner;
+pub use runner::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
 
 mod m20230101_090000_initial_schema;
 mod m20230102_090000_add_run_as_user;

@@ -4,10 +4,11 @@
 //! - Executions dashboard & API queries: `ORDER BY timestamp DESC` filtered by `hook_id`, `api_key_id`, or `status`.
 //! - Audit log queries: `ORDER BY timestamp DESC` filtered by `action` or `api_key_id`.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[derive(DeriveIden)]
 enum Executions {
@@ -28,7 +29,7 @@ enum AuditLogs {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         // Composite index for executions by hook: WHERE hook_id = ? ORDER BY timestamp DESC
         manager
             .create_index(
@@ -92,7 +93,7 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

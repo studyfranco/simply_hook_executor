@@ -5,7 +5,7 @@ pub mod common;
 use axum::http::StatusCode;
 use common::*;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-use sea_orm_migration::SchemaManager;
+use simply_hook_executor::migration::SchemaManager;
 use simply_hook_executor::{
     create_app,
     entities::{
@@ -74,8 +74,8 @@ async fn list_hooks_batch_loads_parameters_and_permissions() {
             is_deleted: Set(false),
             deleted_at: Set(None),
             deleted_by: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
+            updated_at: Set(simply_hook_executor::time_serde::now_utc()),
             auth_mode: Set(hook::AuthMode::CanonicalV1),
             hmac_secret: Set(None),
             signature_header: Set(None),
@@ -101,7 +101,7 @@ async fn list_hooks_batch_loads_parameters_and_permissions() {
                 description: Set(None),
                 default_value: Set(None),
                 is_required: Set(true),
-                created_at: Set(chrono::Utc::now().naive_utc()),
+                created_at: Set(simply_hook_executor::time_serde::now_utc()),
             }
             .insert(&db)
             .await
@@ -139,8 +139,8 @@ async fn list_ssh_targets_batch_loads_credentials_and_permissions() {
         encrypted_passphrase: Set(None),
         encrypted_password: Set(Some("v1.plain.74657374".to_owned())),
         owner_key_id: Set(Some(master_id)),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_hook_executor::time_serde::now_utc()),
+        updated_at: Set(simply_hook_executor::time_serde::now_utc()),
     }
     .insert(&db)
     .await
@@ -157,8 +157,8 @@ async fn list_ssh_targets_batch_loads_credentials_and_permissions() {
             credential_id: Set(cred_id),
             host_key_fingerprint: Set(Some("SHA256:dGVzdA".to_owned())),
             owner_key_id: Set(Some(master_id)),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
+            updated_at: Set(simply_hook_executor::time_serde::now_utc()),
         }
         .insert(&db)
         .await
@@ -201,8 +201,8 @@ async fn list_api_keys_batch_loads_permissions() {
         is_deleted: Set(false),
         deleted_at: Set(None),
         deleted_by: Set(None),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+        created_at: Set(simply_hook_executor::time_serde::now_utc()),
+        updated_at: Set(simply_hook_executor::time_serde::now_utc()),
         auth_mode: Set(hook::AuthMode::CanonicalV1),
         hmac_secret: Set(None),
         signature_header: Set(None),
@@ -239,8 +239,8 @@ async fn list_api_keys_batch_loads_permissions() {
             can_manage_hooks: Set(false),
             can_manage_ssh: Set(false),
             parent_key_id: Set(Some(master_id)),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
+            updated_at: Set(simply_hook_executor::time_serde::now_utc()),
             canonical_template: Set(None),
         }
         .insert(&db)
@@ -254,7 +254,7 @@ async fn list_api_keys_batch_loads_permissions() {
             can_execute: Set(true),
             can_manage: Set(false),
             can_view_execution: Set(true),
-            created_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(simply_hook_executor::time_serde::now_utc()),
         }
         .insert(&db)
         .await

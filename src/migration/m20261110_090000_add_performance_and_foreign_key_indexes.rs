@@ -10,10 +10,11 @@
 //! - Retention purge sweeps: `hooks(deleted_at)`
 //! - Audit log target filtering: `audit_logs(target_resource)`
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[derive(DeriveIden)]
 enum ApiKeys {
@@ -66,13 +67,13 @@ enum AuditLogs {
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         add_ssh_and_permission_indexes(manager).await?;
         add_key_hook_and_audit_indexes(manager).await?;
         Ok(())
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()

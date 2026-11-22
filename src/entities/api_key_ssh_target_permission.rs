@@ -17,7 +17,8 @@ pub struct Model {
     /// Permission to use this target in a hook (`execution_type = SSH`).
     pub can_use_in_hook: bool,
     /// Assignment timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `api_key_ssh_target_permissions` to the entities it joins.

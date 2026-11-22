@@ -39,9 +39,11 @@ pub struct Model {
     /// The key that created or owns this target.
     pub owner_key_id: Option<Uuid>,
     /// Target creation timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Target last-update timestamp.
-    pub updated_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `ssh_targets` to other entities.

@@ -154,6 +154,30 @@ fn manifest_values<'a>(tokens: &'a [&'a str]) -> BTreeMap<Vec<String>, &'a [&'a 
     values
 }
 
+fn forbidden_dependencies(values: &BTreeMap<Vec<String>, &[&str]>) -> BTreeSet<String> {
+    let mut forbidden = BTreeSet::new();
+    for key in values.keys() {
+        for (index, segment) in key.iter().enumerate() {
+            if matches!(
+                segment.as_str(),
+                "dependencies" | "dev-dependencies" | "build-dependencies"
+            ) && let Some(dependency) = key.get(index + 1)
+            {
+                let mut package_key = key[..=index + 1].to_vec();
+                package_key.push("package".to_owned());
+                let package = match values.get(&package_key).copied() {
+                    Some([name]) => toml_text(name),
+                    _ => dependency.clone(),
+                };
+                if matches!(package.as_str(), "chrono" | "sea-orm-migration") {
+                    forbidden.insert(package);
+                }
+            }
+        }
+    }
+    forbidden
+}
+
 fn manifest_policy(source: &str) -> Vec<String> {
     let tokens = manifest_tokens(source);
     let values = manifest_values(&tokens);
@@ -201,26 +225,47 @@ fn manifest_policy(source: &str) -> Vec<String> {
             violations.push(format!("lints.clippy.{lint} must not be allow"));
         }
     }
-    let sqlx_features = |dependency| -> BTreeSet<_> {
+    violations.extend(
+        forbidden_dependencies(&values)
+            .into_iter()
+            .map(|package| format!("Forbidden dependency: {package}")),
+    );
+    let features = |dependency| -> BTreeSet<_> {
         get(&["dependencies", dependency, "features"])
             .into_iter()
             .flatten()
             .map(|token| toml_text(token))
-            .filter(|feature| feature.starts_with("sqlx-"))
             .collect()
     };
-    let orm_backends = sqlx_features("sea-orm");
-    let migration_backends = sqlx_features("sea-orm-migration");
-    for backend in ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] {
-        if !orm_backends.contains(backend) {
-            violations.push(format!("sea-orm is missing {backend}"));
+    let orm_features = features("sea-orm");
+    let schema_features = features("sea-schema");
+    for (dependency, declared, required) in [
+        ("sea-orm", &orm_features, &["with-time", "schema-sync"][..]),
+        (
+            "sea-schema",
+            &schema_features,
+            &["discovery", "probe", "runtime-tokio-rustls"][..],
+        ),
+    ] {
+        if get(&["dependencies", dependency, "default-features"]) != Some(&["false"][..]) {
+            violations.push(format!("{dependency} must disable default features"));
         }
-        if !migration_backends.contains(backend) {
-            violations.push(format!("sea-orm-migration is missing {backend}"));
+        for &feature in required
+            .iter()
+            .chain(&["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"])
+        {
+            if !declared.contains(feature) {
+                violations.push(format!("{dependency} is missing {feature}"));
+            }
         }
     }
-    for backend in orm_backends.symmetric_difference(&migration_backends) {
-        violations.push(format!("SeaORM backend features differ for {backend}"));
+    if orm_features.contains("with-chrono") || orm_features.contains("chrono") {
+        violations.push("sea-orm must not enable chrono".to_owned());
+    }
+    for backend in orm_features.symmetric_difference(&schema_features) {
+        if backend.starts_with("sqlx-") {
+            violations.push(format!("SeaORM backend features differ for {backend}"));
+        }
     }
     violations
 }
@@ -242,10 +287,11 @@ fn manifest_policy_rejects_drift() {
         all = { priority = -2, level = 'warn' }
         pedantic = { level = "warn", priority = -1 }
         [dependencies.sea-orm]
+        default-features = false
         features = ["sqlx-sqlite", # Keep database support in sync.
-            "sqlx-postgres", "sqlx-mysql"]
+            "sqlx-postgres", "sqlx-mysql", "with-time", "schema-sync"]
         [dependencies]
-        sea-orm-migration = { features = ['sqlx-postgres', 'sqlx-sqlite', 'sqlx-mysql'] }
+        sea-schema = { default-features = false, features = ['sqlx-postgres', 'sqlx-sqlite', 'sqlx-mysql', 'discovery', 'probe', 'runtime-tokio-rustls'] }
     "#;
     assert!(manifest_policy(manifest).is_empty());
     for (before, after, diagnostic) in [
@@ -265,6 +311,35 @@ fn manifest_policy_rejects_drift() {
             "clippy.needless_pass_by_value",
         ),
         ("'sqlx-sqlite'", "'with-uuid'", "missing sqlx-sqlite"),
+        (
+            "default-features = false",
+            "default-features = true",
+            "default features",
+        ),
+        ("schema-sync", "with-json", "sea-orm is missing schema-sync"),
+        ("with-time", "with-chrono", "sea-orm is missing with-time"),
+        ("'discovery'", "'writer'", "sea-schema is missing discovery"),
+        ("'probe'", "'writer'", "sea-schema is missing probe"),
+        (
+            "'runtime-tokio-rustls'",
+            "'runtime-tokio'",
+            "sea-schema is missing runtime-tokio-rustls",
+        ),
+        (
+            "'sqlx-mysql'",
+            "'sqlx-other'",
+            "SeaORM backend features differ",
+        ),
+        (
+            "[dependencies]",
+            "[dependencies]\nchrono = '0.4'",
+            "Forbidden dependency: chrono",
+        ),
+        (
+            "[dependencies]",
+            "[dependencies]\nold = { package = 'sea-orm-migration', version = '2' }",
+            "Forbidden dependency: sea-orm-migration",
+        ),
     ] {
         let violations = manifest_policy(&manifest.replace(before, after));
         assert!(
@@ -1415,4 +1490,121 @@ fn offline_asset_check_rejects_external_resources_and_svg_data() {
         const local = `<img src="./local.png" alt="try https://example.test">`;
         fetch(this.requestBase + path);"#;
     assert!(external_asset_violations(benign, "js").is_empty());
+}
+
+#[test]
+fn retired_rust_dependencies_are_absent_from_sources() {
+    let retired = regex(r"\b(?:chrono\s*::|sea_orm_migration\b|extern\s+crate\s+chrono\b)");
+    for path in rust_files("src").chain(rust_files("tests")) {
+        let source = read(path.to_str().expect("UTF-8 path"));
+        assert!(
+            !retired.is_match(&rust_source(&source).code),
+            "{} imports a retired dependency",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn supply_chain_checks_have_no_advisory_suppressions() {
+    let suppression =
+        regex(r#"(?im)--ignore(?:\s|=)+["']?RUSTSEC-|^[ \t]*["']?ignore["']?\s*(?:=\s*\[|:)"#);
+    let paths = std::iter::once(PathBuf::from(".cargo/audit.toml"))
+        .chain(files_under(".github/workflows", true))
+        .chain(files_under("scripts", true));
+    for path in paths {
+        let source = read(path.to_str().expect("UTF-8 path"));
+        assert!(
+            !suppression.is_match(&source),
+            "{} contains an advisory suppression",
+            path.display()
+        );
+    }
+}
+
+fn non_documentation_addresses(source: &str) -> Vec<&str> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let ipv6 = regex(r"(?i)(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*");
+    let dotted =
+        regex(r"(?i)\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+\b");
+    ipv6.find_iter(source)
+        .map(|candidate| candidate.as_str().trim_end_matches('.'))
+        .filter(|candidate| {
+            candidate
+                .parse::<Ipv6Addr>()
+                .is_ok_and(|ip| ip != Ipv6Addr::LOCALHOST)
+        })
+        .chain(
+            dotted
+                .find_iter(source)
+                .map(|candidate| candidate.as_str())
+                .filter(|candidate| {
+                    if let Ok(ip) = candidate.parse::<Ipv4Addr>() {
+                        return !matches!(
+                            ip.octets(),
+                            [192, 0, 2, _]
+                                | [198, 51, 100, _]
+                                | [203, 0, 113, _]
+                                | [127, 0, 0, 1]
+                                | [0, 0, 0, 0]
+                        );
+                    }
+                    let host = candidate.to_ascii_lowercase();
+                    !["example", "example.com", "example.net", "example.org"]
+                        .iter()
+                        .any(|domain| {
+                            host == *domain
+                                || host
+                                    .strip_suffix(domain)
+                                    .is_some_and(|prefix| prefix.ends_with('.'))
+                        })
+                }),
+        )
+        .collect()
+}
+
+#[test]
+fn onboarding_links_goals_and_uses_documentation_addresses() {
+    for document in ["AGENT.MD", "README.md"] {
+        assert!(
+            read(document)
+                .lines()
+                .take(10)
+                .any(|line| line.contains("[GOALS.md](GOALS.md)")),
+            "{document} must link GOALS.md near the top"
+        );
+    }
+    let goals = read("GOALS.md");
+    let addresses = non_documentation_addresses(&goals);
+    assert!(
+        addresses.is_empty(),
+        "Unexpected addresses in GOALS.md: {addresses:?}"
+    );
+}
+
+#[test]
+fn onboarding_address_check_rejects_network_address_drift() {
+    assert!(
+        non_documentation_addresses(
+            "http://hooks.example.com:3560 hooks.example test.example.net example.org \
+             192.0.2.10 198.51.100.15/24 203.0.113.42 127.0.0.1 [::1] 0.0.0.0"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        non_documentation_addresses(
+            "http://hooks.invalid-domain.test:3560 hooks.example.org.invalid \
+             192.0.3.10 127.0.0.2 10.0.0.4 [2001:db8::1] fe80::12"
+        ),
+        [
+            "2001:db8::1",
+            "fe80::12",
+            "hooks.invalid-domain.test",
+            "hooks.example.org.invalid",
+            "192.0.3.10",
+            "127.0.0.2",
+            "10.0.0.4",
+        ]
+    );
 }

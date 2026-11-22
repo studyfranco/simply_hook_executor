@@ -27,7 +27,7 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
-use chrono::Utc;
+
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
     QueryOrder, sea_query::OnConflict,
@@ -437,7 +437,8 @@ pub struct ApiKeySummary {
     /// on that list.
     pub parent_key_id: Option<Uuid>,
     /// Creation timestamp.
-    pub created_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Per-hook permissions held by this key.
     pub hook_permissions: Vec<HookPermissionView>,
 }
@@ -568,7 +569,7 @@ pub(crate) async fn create_api_key(
         (None, None, None)
     };
     let id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
 
     let model = api_key::ActiveModel {
         id: Set(id),
@@ -843,7 +844,7 @@ pub(crate) async fn update_api_key(
     if let Some(v) = payload.can_manage_ssh {
         active.can_manage_ssh = Set(v);
     }
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     let updated = active.update(&state.db).await?;
 
     // Uses the post-update name: if this call renamed the key, that is what a reader will
@@ -1105,7 +1106,7 @@ pub(crate) async fn delete_api_key(
 
     validate_reassignments(&state.db, &subtree, &payload.resolutions).await?;
 
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let mut deleted_hooks = 0usize;
     let mut reassigned_hooks = 0usize;
     for (entity_id, resolution) in &payload.resolutions {
@@ -1207,7 +1208,7 @@ pub(crate) async fn rotate_api_key(
     active.prefix = Set(prefix);
     active.key_id = Set(Some(key_id.clone()));
     active.signing_secret = Set(Some(sealed_secret));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     active.update(&state.db).await?;
 
     create_audit_log(
@@ -1272,7 +1273,7 @@ pub(crate) async fn regenerate_key(
     let mut active: api_key::ActiveModel = target.into();
     active.key_hash = Set(key_hash);
     active.prefix = Set(prefix);
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     active.update(&state.db).await?;
 
     create_audit_log(
@@ -1333,7 +1334,7 @@ pub(crate) async fn regenerate_secret(
     let mut active: api_key::ActiveModel = target.into();
     active.key_id = Set(Some(key_id.clone()));
     active.signing_secret = Set(Some(sealed_secret));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     active.update(&state.db).await?;
 
     create_audit_log(
@@ -1517,7 +1518,7 @@ async fn upsert_hook_permission(
         can_execute: Set(payload.can_execute),
         can_manage: Set(payload.can_manage),
         can_view_execution: Set(payload.can_view_execution),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(crate::time_serde::now_utc()),
     };
     ApiKeyHookPermission::insert(perm)
         .on_conflict(

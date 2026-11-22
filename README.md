@@ -1,5 +1,7 @@
 # simply_hook_executor
 
+See [GOALS.md](GOALS.md) for the mission, execution boundary, and network placement.
+
 Simply efficient. A secure hook execution daemon.
 
 `simply_hook_executor` is a small, self-hosted API and dashboard that turns authenticated HTTP

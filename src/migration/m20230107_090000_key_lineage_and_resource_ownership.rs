@@ -52,7 +52,7 @@
 //! inventory could refuse. SQLite also does not enforce foreign keys unless `PRAGMA foreign_keys`
 //! is on, so a DDL constraint would have been decorative on the default backend regardless.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The `api_keys` columns this migration touches.
 #[derive(DeriveIden)]
@@ -75,8 +75,9 @@ enum Hooks {
 }
 
 /// The lineage-and-ownership migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 /// Adds one nullable UUID column to a table, as its own `ALTER TABLE`.
 ///
@@ -126,7 +127,7 @@ where
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         add_key_reference(manager, ApiKeys::Table, ApiKeys::ParentKeyId).await?;
         add_key_reference(manager, ApiKeys::Table, ApiKeys::OwnerKeyId).await?;
         add_key_reference(manager, Hooks::Table, Hooks::OwnerKeyId).await?;
@@ -158,7 +159,7 @@ impl MigrationTrait for Migration {
         .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         for (name, table) in [
             ("idx_hooks_owner_key_id", Hooks::Table.into_iden()),
             ("idx_api_keys_owner_key_id", ApiKeys::Table.into_iden()),

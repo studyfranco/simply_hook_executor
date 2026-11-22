@@ -67,7 +67,7 @@ fn validate_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
         ))
     })?;
 
-    let skew = (chrono::Utc::now().timestamp() - presented).abs();
+    let skew = (time::OffsetDateTime::now_utc().unix_timestamp() - presented).abs();
     if skew > max_age_seconds {
         return Err(AppError::Unauthorized(format!(
             "Request timestamp is outside the permitted {max_age_seconds}s window (off by {skew}s); \
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn timestamps_inside_the_window_are_accepted() {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         assert!(validate_timestamp(&now.to_string(), 300).is_ok());
         assert!(validate_timestamp(&(now - 299).to_string(), 300).is_ok());
         // Symmetric: modest forward skew is tolerated for clients whose clocks run fast.
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn timestamps_outside_the_window_are_rejected() {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         let stale = validate_timestamp(&(now - 301).to_string(), 300)
             .expect_err("a stale timestamp must be rejected");
@@ -863,7 +863,7 @@ mod tests {
     /// client computed correctly over the bytes it actually sent.
     #[test]
     fn a_valid_timestamp_is_returned_exactly_as_received() {
-        let padded = format!("  {}  ", chrono::Utc::now().timestamp());
+        let padded = format!("  {}  ", time::OffsetDateTime::now_utc().unix_timestamp());
         let headers = headers_with(Some(&padded), Some(SIGNATURE_HEADER));
         assert_eq!(
             prevalidate_timestamp_header(&headers, 300).expect("inside the window"),
@@ -876,7 +876,7 @@ mod tests {
     /// key record in hand, which is to say before the database is touched at all.
     #[test]
     fn a_stale_or_malformed_timestamp_fails_without_a_key_record() {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         for rejected in [
             (now - 301).to_string(),

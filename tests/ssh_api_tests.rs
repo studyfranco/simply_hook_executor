@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// Inserts a `PASSWORD` SSH credential directly (bypassing the API), returning its id.
 async fn insert_password_credential(db: &sea_orm::DatabaseConnection, name: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     ssh_credential::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),
@@ -45,7 +45,7 @@ async fn insert_password_credential(db: &sea_orm::DatabaseConnection, name: &str
 /// meaningless fingerprint, returning its id.
 async fn insert_target(db: &sea_orm::DatabaseConnection, name: &str, credential_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     ssh_target::ActiveModel {
         id: Set(id),
         name: Set(name.to_owned()),

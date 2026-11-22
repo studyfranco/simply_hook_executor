@@ -10,7 +10,7 @@ use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
-use chrono::Utc;
+
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, SqlErr, sea_query::OnConflict,
@@ -220,7 +220,8 @@ pub struct HookDetail {
     #[serde(flatten)]
     pub lifecycle: HookLifecycleFlags,
     /// When it was trashed, if it was.
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    #[serde(with = "crate::time_serde::optional")]
+    pub deleted_at: Option<time::PrimitiveDateTime>,
     /// The `api_keys.id` of whoever trashed it, if it was.
     pub deleted_by: Option<String>,
     /// Declared parameters, in the order used for positional CLI arguments.
@@ -229,9 +230,11 @@ pub struct HookDetail {
     #[serde(flatten)]
     pub permissions: HookPermissionFlags,
     /// Creation timestamp.
-    pub created_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Last-update timestamp.
-    pub updated_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
     /// How a keyless caller must authenticate to invoke this hook.
     pub auth_mode: AuthMode,
     /// Whether an `HMAC_ONLY` secret has been set. The secret itself is never returned — it left
@@ -506,7 +509,7 @@ pub(crate) async fn grant_full_hook_permission(
         // may reassign `owner_key_id` at any time (§3), and a creator that has handed ownership on
         // still holds the grant it was given.
         can_view_execution: Set(true),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(crate::time_serde::now_utc()),
     };
     ApiKeyHookPermission::insert(model)
         .on_conflict(
@@ -602,7 +605,7 @@ pub(crate) async fn create_hook(
     // a referenced parameter still has no resolved value.
 
     let id = Uuid::new_v4();
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let model = hook::ActiveModel {
         id: Set(id),
         name: Set(name.clone()),
@@ -711,7 +714,7 @@ async fn insert_hook_with_parameters(
             description: Set(param.description.clone()),
             default_value: Set(param.default_value.clone()),
             is_required: Set(param.is_required.unwrap_or(true)),
-            created_at: Set(Utc::now().naive_utc()),
+            created_at: Set(crate::time_serde::now_utc()),
         };
         if let Err(err) = HookParameter::insert(param_model).exec(db).await {
             if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
@@ -1167,7 +1170,7 @@ fn apply_hook_update(
         effective_execution_type,
         effective_ssh_target_id,
     )?;
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
 
     Ok((active, changes))
 }
@@ -1279,7 +1282,7 @@ pub(crate) async fn delete_hook(
     // deletion and two operators each told they performed it. Filtering on `is_deleted = false`
     // makes the database pick the winner, and the loser takes the same `404` it would have taken a
     // moment later.
-    let now = Utc::now().naive_utc();
+    let now = crate::time_serde::now_utc();
     let soft_deleted = Hook::update_many()
         .col_expr(
             hook::Column::IsDeleted,
@@ -1356,7 +1359,7 @@ pub(crate) async fn restore_hook(
     active.is_deleted = Set(false);
     active.deleted_at = Set(None);
     active.deleted_by = Set(None);
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::time_serde::now_utc());
     active.update(&state.db).await?;
 
     create_audit_log(
@@ -1479,7 +1482,7 @@ pub(crate) async fn create_hook_parameter(
         description: Set(payload.description.clone()),
         default_value: Set(payload.default_value.clone()),
         is_required: Set(payload.is_required.unwrap_or(true)),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(crate::time_serde::now_utc()),
     };
 
     if let Err(err) = HookParameter::insert(param).exec(&state.db).await {

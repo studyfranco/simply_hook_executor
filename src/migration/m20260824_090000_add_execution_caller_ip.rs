@@ -10,7 +10,7 @@
 //! `ALTER TABLE ... ADD COLUMN NOT NULL` requirement against rows that predate this migration and
 //! were never able to record one at all.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 #[derive(DeriveIden)]
 enum Executions {
@@ -18,12 +18,13 @@ enum Executions {
     CallerIp,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -39,7 +40,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

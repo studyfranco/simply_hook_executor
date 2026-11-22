@@ -53,7 +53,8 @@ pub struct Model {
     /// Total wall-clock execution time in milliseconds.
     pub duration_ms: i32,
     /// Execution start timestamp (UTC).
-    pub timestamp: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub timestamp: time::PrimitiveDateTime,
     /// The resolved client IP of whoever triggered this execution — same trust-aware resolution
     /// as `audit_log::Model::client_ip` (`config::resolve_client_ip`).
     pub caller_ip: String,

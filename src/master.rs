@@ -29,8 +29,8 @@
 //! hold. Nothing at this layer could be. It closes the specific, cheap, and otherwise invisible
 //! escalation of flipping a boolean on a row you already control.
 
+use crate::migration::SchemaManager;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use sea_orm_migration::SchemaManager;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 

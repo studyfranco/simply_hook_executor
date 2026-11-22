@@ -1049,7 +1049,7 @@ mod tests {
             can_execute,
             can_manage,
             can_view_execution,
-            created_at: chrono::NaiveDateTime::default(),
+            created_at: time::macros::datetime!(1970-01-01 00:00:00),
         }
     }
 

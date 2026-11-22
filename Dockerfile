@@ -4,7 +4,8 @@ FROM rust:slim AS builder
 WORKDIR /app
 
 # Copy the source code
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
+COPY vendor vendor
 COPY src src
 COPY static static
 
@@ -15,7 +16,7 @@ RUN set -x \
     && rm -rf /var/cache/* /var/lib/apt/lists/* /var/log/* /var/tmp/* /tmp/*
 
 # Build the release binary
-RUN cargo build --release
+RUN cargo build --locked --release
 
 # Runtime stage
 FROM ghcr.io/studyfranco/docker-baseimages-debian:testing

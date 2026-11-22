@@ -16,22 +16,16 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # All three SQL drivers stay enabled on purpose: AGENT.MD requires the codebase to remain
 # SQL-agnostic and PostgreSQL-ready, even though SQLite is the zero-config default.
-sea-orm = { version = "2", features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
-# All three backend features, matching `sea-orm` above. Without `sqlx-postgres`/`sqlx-mysql` here,
-# `SchemaManager::has_index`/`has_table`/`has_column` compile only the SQLite match arm in *this*
-# crate and hit `DbErr::BackendNotSupported` on Postgres/MySQL at runtime — a silent portability
-# hole `cargo check` cannot catch, since the code compiles fine and only the backend match arms
-# differ. `src/master.rs` calls `has_index` on every boot to verify RBAC_MODEL.md §5's uniqueness
-# index; AGENT.MD requires the daemon stay SQL-agnostic and PostgreSQL-ready, so this crate's
-# feature set must not silently narrow that promise.
-sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
+sea-orm = { version = "2", default-features = false, features = ["sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-json", "with-time", "schema-sync", "sqlite-use-returning-for-3_35"] }
+sea-schema = { version = "0.18", default-features = false, features = ["discovery", "probe", "runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"] }
+async-trait = "0.1"
 ipnet = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 sha2 = "0.11"
 hmac = "0.13"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
@@ -87,3 +81,8 @@ regex = "1"
 [target.'cfg(unix)'.dev-dependencies]
 # Test fixture for the real session boundary without the util-linux setsid executable.
 rustix = { version = "1", features = ["process"] }
+
+[patch.crates-io]
+# Keep the audited lockfile free of unused optional and alternate-target dependencies.
+sea-orm = { path = "vendor/sea-orm" }
+russh-util = { path = "vendor/russh-util" }

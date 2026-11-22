@@ -33,7 +33,8 @@ pub struct Model {
     /// Defaults to `false`, including for rows that predate the column.
     pub can_view_execution: bool,
     /// Assignment timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `api_key_hook_permissions` to the entities it joins.

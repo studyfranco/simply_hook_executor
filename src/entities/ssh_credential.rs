@@ -59,9 +59,11 @@ pub struct Model {
     /// The key that created or owns this credential.
     pub owner_key_id: Option<Uuid>,
     /// Credential creation timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub created_at: time::PrimitiveDateTime,
     /// Credential last-update timestamp.
-    pub updated_at: DateTime,
+    #[serde(with = "crate::time_serde")]
+    pub updated_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `ssh_credentials` to other entities.

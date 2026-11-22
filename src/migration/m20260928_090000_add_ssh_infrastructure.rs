@@ -61,7 +61,7 @@
 //! rest" question for one feature would fragment a property this codebase already has right, for no
 //! security benefit.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// Column identifiers for the new `ssh_credentials` table.
 #[derive(DeriveIden)]
@@ -134,12 +134,13 @@ enum Hooks {
 }
 
 /// The SSH-infrastructure migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_table(
                 Table::create()
@@ -243,7 +244,7 @@ impl MigrationTrait for Migration {
         add_hook_dispatch_columns(manager).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

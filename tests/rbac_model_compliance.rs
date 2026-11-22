@@ -22,8 +22,8 @@ use common::*;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
 };
-use sea_orm_migration::SchemaManager;
 use serde_json::json;
+use simply_hook_executor::migration::SchemaManager;
 use simply_hook_executor::{
     create_app,
     entities::{api_key, prelude::ApiKey},
@@ -1496,7 +1496,7 @@ async fn s5_exactly_one_master_immutable_and_undeletable() {
     let (master_id, master) = insert_key(&db, "s5-master", "", KeyScopes::master()).await;
 
     // Enforced by the database, not by application logic alone: a direct insert must fail.
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     let plaintext = simply_hook_executor::api::generate_random_key();
     let second = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -1813,7 +1813,7 @@ async fn s7_every_required_index_and_constraint_exists() {
     // be rejected, which is only possible if the index exists.
     let (_id, _plain) = insert_key(&db, "s7-probe", "", KeyScopes::plain()).await;
     let existing = ApiKey::find().one(&db).await.expect("query").expect("row");
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     let clash = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(existing.key_hash.clone()),
@@ -1887,7 +1887,7 @@ async fn s5_adversarial_direct_sql_insert_cannot_mint_a_second_master() {
     let plaintext = simply_hook_executor::api::generate_random_key();
     let key_hash = simply_hook_executor::api::hash_key(&plaintext);
     let key_id = simply_hook_executor::api::generate_key_id();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
 
     // Every column named explicitly except `master_marker`, exactly as an operator writing this by
     // hand would — they cannot name a column they do not know exists.
@@ -1966,7 +1966,7 @@ async fn s5_adversarial_the_marker_column_refuses_to_be_written() {
     let db = setup_test_db().await;
     let (master_id, _master) = insert_key(&db, "s5-adv-write", "", KeyScopes::master()).await;
 
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_hook_executor::time_serde::now_utc();
     let plaintext = simply_hook_executor::api::generate_random_key();
     let key_hash = simply_hook_executor::api::hash_key(&plaintext);
     let key_id = simply_hook_executor::api::generate_key_id();

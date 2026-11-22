@@ -50,7 +50,7 @@
 //!
 //! Nothing reads that table; it exists only so the information is recoverable by hand.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The `api_keys` column this migration removes.
 #[derive(DeriveIden)]
@@ -69,8 +69,9 @@ enum ApiKeys {
 const OWNER_INDEX: &str = "idx_api_keys_owner_key_id";
 
 /// The drop-dormant-column migration.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
@@ -79,7 +80,7 @@ impl MigrationTrait for Migration {
     /// The order matters on PostgreSQL and MySQL, where dropping a column out from under an index is
     /// an error. SQLite rebuilds the table and would tolerate either order, but a migration that only
     /// works on the backend the tests happen to use is a migration that fails in production.
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .drop_index(
                 Index::drop()
@@ -101,7 +102,7 @@ impl MigrationTrait for Migration {
 
     /// Restores the column and its index — **empty**. See the module header: the values cannot be
     /// recovered, because a drop does not keep them. Rolling back returns a schema, not data.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()

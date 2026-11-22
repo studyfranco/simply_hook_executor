@@ -49,7 +49,7 @@
 //! boolean with two values and a heavy skew toward `false` is close to the worst possible index
 //! candidate — it would cost writes and buy nothing.
 
-use sea_orm_migration::prelude::*;
+use super::runner::prelude::*;
 
 /// The permission-table identifiers this migration touches.
 ///
@@ -64,12 +64,13 @@ enum ApiKeyHookPermissions {
     CanViewExecution,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+migration_name!(Migration);
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn up(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
@@ -89,7 +90,7 @@ impl MigrationTrait for Migration {
             .await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .alter_table(
                 Table::alter()
